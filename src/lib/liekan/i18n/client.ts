@@ -37,6 +37,14 @@ export function useLiekanI18n() {
 export function useLiekanPageTitle(title: string) {
   const { locale, system } = useLiekanI18n();
   useEffect(() => {
-    document.title = `${system(title)} | ${liekanProduct.name}`;
+    const value = `${system(title)} | ${liekanProduct.name}`;
+    const apply = () => {
+      if (document.title !== value) document.title = value;
+    };
+    apply();
+    // Next.js inserts the route's static English metadata <title> after client navigation commits.
+    const observer = new MutationObserver(apply);
+    observer.observe(document.head, { childList: true, subtree: true, characterData: true });
+    return () => observer.disconnect();
   }, [title, locale]);
 }
