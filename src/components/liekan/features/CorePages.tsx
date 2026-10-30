@@ -1491,7 +1491,7 @@ function RecorderSettings() {
                       ['moderate', i18n.text('标准：遮蔽输入内容')],
                     ]}
                     localizeLabels
-                    defaultValue={config.maskLevel || 'moderate'}
+                    defaultValue={config.maskLevel || 'strict'}
                     disabled={!manage}
                   />
                   <Select

@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { readFileSync } from 'node:fs';
-import { transformSync } from 'esbuild';
+import { fileURLToPath } from 'node:url';
+import { buildSync } from 'esbuild';
 import { JSDOM } from 'jsdom';
 import { afterEach, expect, test, vi } from 'vitest';
 import { z } from 'zod';
@@ -8,14 +9,35 @@ import type { UmamiTracker } from './index';
 
 // Exercise the same classic script boundary as the published tracker, with a fresh
 // browser for every test so history hooks and window-only state cannot leak.
-const trackerScript = transformSync(
-  readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
-    .replaceAll('__COLLECT_API_HOST__', '')
-    .replaceAll('__COLLECT_API_ENDPOINT__', '/api/send'),
-  { loader: 'ts', format: 'iife', target: 'es2022' },
-).code;
+const trackerScript = buildSync({
+  stdin: {
+    contents: readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
+      .replaceAll('__COLLECT_API_HOST__', '')
+      .replaceAll('__COLLECT_API_ENDPOINT__', '/api/send'),
+    loader: 'ts',
+    resolveDir: fileURLToPath(new URL('.', import.meta.url)),
+  },
+  bundle: true,
+  write: false,
+  format: 'iife',
+  target: 'es2022',
+}).outputFiles[0].text;
 const browsers: { close: () => void }[] = [];
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+test('explicit tracker payloads redact credentials before the network boundary', () => {
+  const browser = createBrowser();
+  browser.load({ 'website-id': 'website-id', 'auto-track': 'false' });
+  browser.window.umami.track({
+    website: 'website-id',
+    url: '/callback?token=browser-private-value&utm_source=google#access_token=fragment-private-value',
+  });
+  const payload = browser.requests()[0].payload;
+  expect(JSON.stringify(payload)).not.toMatch(/browser-private-value|fragment-private-value/);
+  expect(new URL(payload.url, 'https://shop.example.com').searchParams.get('utm_source')).toBe(
+    'google',
+  );
+});
 
 test('case variants of a website UUID share one tracker identity', () => {
   const browser = createBrowser();

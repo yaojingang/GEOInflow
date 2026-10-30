@@ -38,7 +38,7 @@ export async function GET(
       heatmapEnabled: config.heatmapEnabled === true,
       sampleRate: config.sampleRate ?? 0.15,
       heatmapSampleRate: config.heatmapSampleRate ?? 0.15,
-      maskLevel: config.maskLevel ?? 'moderate',
+      maskLevel: config.maskLevel ?? 'strict',
       maxDuration: config.maxDuration ?? 300000,
       blockSelector: config.blockSelector ?? '',
     },

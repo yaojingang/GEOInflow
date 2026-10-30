@@ -11,6 +11,12 @@ const mocks = vi.hoisted(() => ({
   getAllUserTeams: vi.fn(),
   saveAuth: vi.fn(),
   isTwoFactorConfigured: vi.fn(),
+  acquireLoginAttempt: vi.fn(),
+  releaseAttempt: vi.fn(),
+}));
+
+vi.mock('@/lib/liekan/upstream/login-attempts', () => ({
+  acquireLoginAttempt: mocks.acquireLoginAttempt,
 }));
 
 vi.mock('@/lib/request', () => ({
@@ -65,8 +71,36 @@ vi.mock('@/lib/two-factor/crypto', () => ({
 
 import { POST } from './route';
 import redis from '@/lib/redis';
+import { ShareAttemptError } from '@/lib/liekan/upstream/share-attempts';
+
+test.each([429, 503] as const)(
+  'rejects login before user lookup when admission returns %s',
+  async status => {
+    mocks.acquireLoginAttempt.mockRejectedValue(new ShareAttemptError(status, 7));
+    const response = await POST(new Request('http://localhost/api/auth/login', { method: 'POST' }));
+    expect(response.status).toBe(status);
+    expect(response.headers.get('Retry-After')).toBe('7');
+    expect(response.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(mocks.getUserByUsername).not.toHaveBeenCalled();
+    expect(mocks.createSecureToken).not.toHaveBeenCalled();
+  },
+);
+
+test('releases admission after invalid credentials and database errors', async () => {
+  mocks.getUserByUsername.mockResolvedValue(null);
+  expect(
+    (await POST(new Request('http://localhost/api/auth/login', { method: 'POST' }))).status,
+  ).toBe(401);
+  mocks.getUserByUsername.mockRejectedValue(new Error('database unavailable'));
+  await expect(
+    POST(new Request('http://localhost/api/auth/login', { method: 'POST' })),
+  ).rejects.toThrow('database unavailable');
+  expect(mocks.releaseAttempt).toHaveBeenCalledTimes(2);
+});
 
 beforeEach(() => {
+  mocks.acquireLoginAttempt.mockReset().mockResolvedValue(mocks.releaseAttempt);
+  mocks.releaseAttempt.mockReset();
   redis.enabled = false;
   mocks.parseRequest.mockReset();
   mocks.getUserByUsername.mockReset();
@@ -103,6 +137,7 @@ test('password login issues a full session for exactly 90 days', async () => {
   mocks.getAllUserTeams.mockResolvedValue([]);
   const response = await POST(new Request('http://localhost/api/auth/login', { method: 'POST' }));
   expect(response.status).toBe(200);
+  expect(mocks.releaseAttempt).toHaveBeenCalledTimes(1);
   expect(mocks.createSecureToken).toHaveBeenCalledWith(
     { userId: 'user-1', role: 'admin', pwd: 'pwd-fingerprint' },
     'app-secret',

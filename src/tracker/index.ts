@@ -1,3 +1,5 @@
+import { sanitizeCollectionUrl } from './privacy';
+
 /** Public types for the browser tracker. */
 export type TrackedProperties = {
   /**
@@ -321,7 +323,7 @@ type MetricEntry = PerformanceEntry & {
   const normalize = (raw: string | URL): string => {
     if (!raw) return raw as string;
     try {
-      const u = new URL(raw, location.href);
+      const u = new URL(sanitizeCollectionUrl(String(raw), location.href));
       if (excludeSearch) u.search = '';
       if (excludeHash) u.hash = '';
       return u.toString();
@@ -455,6 +457,22 @@ type MetricEntry = PerformanceEntry & {
     }
 
     if (!payload) return;
+
+    // Apply privacy after user callbacks and explicit payload overrides as well.
+    payload = {
+      ...payload,
+      ...(typeof payload.url === 'string'
+        ? {
+            url:
+              payload.url.startsWith('/') && !payload.url.startsWith('//')
+                ? stripOrigin(normalize(payload.url))
+                : normalize(payload.url),
+          }
+        : {}),
+      ...(typeof payload.referrer === 'string' && payload.referrer
+        ? { referrer: stripOrigin(normalize(payload.referrer)) }
+        : {}),
+    };
 
     // Preserve observed automation even when a before-send hook replaces the payload.
     if (window.navigator.webdriver === true) payload = { ...payload, webdriver: true };

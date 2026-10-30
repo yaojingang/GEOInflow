@@ -38,6 +38,10 @@ Default endpoints:
 
 A fresh installation starts with `admin / liekan`. Change the password after signing in and confirm the country and analytics timezone. Upgrades preserve customized credentials, renamed accounts, and deleted accounts.
 
+Password login uses fixed one-minute limits: 10 attempts per account, 30 per trusted client source, and 120 across the shared instance, with a concurrent verification limit. Rejected attempts return `429` and `Retry-After`; an unavailable configured Redis returns `503`. Counters use `REDIS_URL`, then `LIEKAN_ANALYTICS_REDIS_URL`, or process-local memory when neither is configured. Process restarts and Redis eviction can reset counters, so public ingress should also enforce independent limits. Only explicitly configured trusted ingress headers establish client identities; missing or invalid addresses share one unknown-source quota. Multiple application instances should share Redis, and the ingress proxy must overwrite the trusted address header.
+
+The browser tracker and collector redact known sensitive URL query and fragment parameters while retaining ordinary UTM attribution parameters. This applies to new events; existing records, page titles, and custom properties require separate review. Recording defaults to strict masking when no level is configured, while explicitly saved moderate masking remains supported. Strict masking covers text and inputs; exclude sensitive elements or omit the recorder from sensitive pages.
+
 Repeated deployments preserve the existing `.env`, database credentials, and data volumes. If an existing database volume is found without its original configuration, the script stops and asks for that configuration to be restored. Upgrades retain the original database container and image major version to avoid an unintended storage-version change.
 
 Commands in this guide explicitly use `docker-compose.liekan.yml`. Other Docker files at the repository root retain upstream compatibility uses. Standard deployments use the product deployment script.

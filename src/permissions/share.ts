@@ -55,8 +55,8 @@ export async function canViewWebsiteSection(
   websiteId: string,
   section: ShareSectionInput,
 ) {
-  if (auth?.user) {
-    return canViewWebsite(auth, websiteId);
+  if (auth?.user && (await canViewAuthenticatedWebsite(auth, websiteId))) {
+    return true;
   }
 
   const { shareToken } = auth || {};
@@ -78,8 +78,8 @@ export async function canViewWebsiteSection(
 }
 
 export async function canViewSharedWebsite(auth: Auth | null | undefined, websiteId: string) {
-  if (auth?.user) {
-    return canViewWebsite(auth, websiteId);
+  if (auth?.user && (await canViewAuthenticatedWebsite(auth, websiteId))) {
+    return true;
   }
 
   return shareTokenIncludesWebsite(auth, websiteId);
@@ -89,13 +89,15 @@ export async function canViewSharedWebsiteFilters(
   auth: Auth | null | undefined,
   websiteId: string,
 ) {
-  if (auth?.user) {
-    return canViewWebsite(auth, websiteId);
+  if (auth?.user && (await canViewAuthenticatedWebsite(auth, websiteId))) {
+    return true;
   }
 
   const { shareToken } = auth || {};
 
-  return shareTokenIncludesWebsite(auth, websiteId) && shareToken?.parameters?.allowFilter !== false;
+  return (
+    shareTokenIncludesWebsite(auth, websiteId) && shareToken?.parameters?.allowFilter !== false
+  );
 }
 
 export async function canViewAuthenticatedWebsite(
@@ -106,5 +108,6 @@ export async function canViewAuthenticatedWebsite(
     return false;
   }
 
-  return canViewWebsite(auth, websiteId);
+  // Private reads require the user's own membership, independent of a share token.
+  return canViewWebsite({ ...auth, shareToken: undefined }, websiteId);
 }

@@ -48,6 +48,25 @@ const answer = {
   suggestions: [],
   limitations: [],
 };
+it('redacts sensitive data from both current and historical questions before external transmission', () => {
+  const result = prepareAiPrompt({
+    context,
+    question: '联系 current@example.com token=current-private-value',
+    history: [
+      {
+        state: 'completed',
+        question: 'history@example.com password=history-private-value',
+        answer,
+        context,
+      },
+    ],
+    connectionConfig,
+  });
+  expect(result.prompt).not.toMatch(
+    /current@example\.com|history@example\.com|current-private-value|history-private-value/,
+  );
+  expect(result.prompt).toContain('[已脱敏]');
+});
 describe('AI actual serialized prompt budget', () => {
   it.each(['anthropic', 'openai'])(
     'includes protocol overhead for %s in each output/stream mode',
@@ -651,4 +670,14 @@ it('instructs new English answers while preserving raw website, question, facts 
   expect(prepared.prompt).toContain(question);
   expect(prepared.prompt).toContain('测试演示网站');
   expect(prepared.prompt).toContain('历史回答保持原样');
+});
+
+it('preserves ordinary multiline questions while applying outbound redaction', () => {
+  const prepared = prepareAiPrompt({
+    context,
+    question: 'Compare traffic\nExplain changes\tthis week',
+    history: [],
+    connectionConfig,
+  });
+  expect(JSON.parse(prepared.prompt).question).toBe('Compare traffic Explain changes this week');
 });
