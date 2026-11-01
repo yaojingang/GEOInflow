@@ -6,7 +6,7 @@ export async function checkNavigation(page, expected, width, baseline) {
     baseline.languageSwitchApproval.maxAdditionalHeaderHeight,
     (baseline.languageSwitchApproval.desktopToolbarMaxRows - 1) *
       (baseline.websiteLayout.toolbar.desktopControlHeight + 8),
-    'Header allowance follows the approved wrapped rows',
+    'Header allowance follows the approved toolbar rows',
   );
   assertLanguageHeader(await page.evaluate(languageHeaderGeometry), 'zh-CN');
   const sidebar = page.locator('#liekan-navigation');
@@ -52,7 +52,11 @@ export async function checkNavigation(page, expected, width, baseline) {
         ),
         primaryButtons: side.querySelectorAll('[data-navigation-primary] button').length,
         footerHeight: side.querySelector('footer').getBoundingClientRect().height,
-        footerColors: [...side.querySelectorAll('footer > div > a, footer > div > button[aria-haspopup="dialog"]')].map(a => ({
+        footerColors: [
+          ...side.querySelectorAll(
+            'footer > div > a, footer > div > button[aria-haspopup="dialog"]',
+          ),
+        ].map(a => ({
           selected: a.getAttribute('aria-current') === 'page',
           color: getComputedStyle(a).color,
         })),
@@ -121,7 +125,10 @@ export async function checkNavigation(page, expected, width, baseline) {
       .getByRole('button', { name: '个人账户', exact: true })
       .count()
       .then(n => assert.equal(n, 1));
-    assert.equal(await sidebar.getByRole('button', { name: '关于 GEOInflow', exact: true }).count(), 1);
+    assert.equal(
+      await sidebar.getByRole('button', { name: '关于 GEOInflow', exact: true }).count(),
+      1,
+    );
     assert.equal(
       await sidebar
         .getByRole('link', { name: kind === 'website' ? '网站设置' : '系统管理', exact: true })
@@ -326,9 +333,15 @@ export async function checkNavigation(page, expected, width, baseline) {
       return {
         frame: rect(el),
         picker: rect(el.querySelector('.site-switch')),
+        rail: rect(el.querySelector('[data-toolbar-action-rail]')),
         actions: [...el.querySelectorAll('[data-website-toolbar-actions] button')].map(rect),
       };
     });
+    assert.equal(
+      new Set(topLayout.actions.map(action => Math.round(action.y))).size,
+      1,
+      'Website page actions share one row',
+    );
     if (!mobile) {
       const controlHeight = baseline.websiteLayout.toolbar.desktopControlHeight;
       const maxRows = baseline.languageSwitchApproval.desktopToolbarMaxRows;
@@ -336,16 +349,18 @@ export async function checkNavigation(page, expected, width, baseline) {
       assert(
         topLayout.frame.height <=
           baseline.websiteLayout.toolbar.desktopHeight + (maxRows - 1) * (controlHeight + 8) + 1,
-        'Toolbar wraps within its approved header rows',
+        'Toolbar stays within its approved header rows',
       );
       for (const action of topLayout.actions) {
         assert.equal(action.height, baseline.websiteLayout.toolbar.desktopControlHeight);
         assert(action.y >= topLayout.picker.y - 1, 'Toolbar actions stay below the first row');
-        assert(
-          action.x >= topLayout.picker.x + topLayout.picker.width + 16 ||
-            action.y >= topLayout.picker.y + topLayout.picker.height + 7,
-          'Wrapped actions stay clear of the website picker',
-        );
+        const left = Math.max(action.x, topLayout.rail.x);
+        const right = Math.min(action.x + action.width, topLayout.rail.x + topLayout.rail.width);
+        if (right > left)
+          assert(
+            left >= topLayout.picker.x + topLayout.picker.width + 12,
+            'Visible actions stay clear of the website picker',
+          );
       }
     }
     if (await page.locator('[data-liekan-ui]').count()) {

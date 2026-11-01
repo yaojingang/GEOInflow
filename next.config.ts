@@ -216,6 +216,7 @@ headers.push({
   ],
 });
 const crawlerPrivatePaths = [
+  '/liekan/robots-agent/:path*',
   '/liekan/crawler-handoffs/:path*',
   '/liekan/history-repair/:path*',
   '/liekan/cache-manifest/:path*',
@@ -227,6 +228,7 @@ const crawlerPrivatePaths = [
   '/liekan/catalog-version/:path*',
   ...[
     'control-connections',
+    'robots',
     'crawler-analysis',
     'crawler-recognition',
     'crawler-candidates',

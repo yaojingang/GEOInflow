@@ -3534,6 +3534,14 @@ export const operations = {
     queryParams: [],
     hasBody: true,
   },
+  postLiekanRobotsAgent: {
+    operationId: 'postLiekanRobotsAgent',
+    method: 'post',
+    path: '/api/liekan/robots-agent',
+    pathParams: [],
+    queryParams: [],
+    hasBody: true,
+  },
   previewLiekanTrafficPolicy: {
     operationId: 'previewLiekanTrafficPolicy',
     method: 'post',
@@ -6160,6 +6168,17 @@ export abstract class GeneratedUmamiClient {
     options?: RequestOptions,
   ): Promise<OperationOutput<'postLiekanLogsImport'>> {
     return this.execute('postLiekanLogsImport', input, options);
+  }
+
+  /**
+   * Pair an explicitly authorized robots helper or exchange a pinned-file job and receipt
+   * `POST /api/liekan/robots-agent`
+   */
+  postLiekanRobotsAgent(
+    input: OperationInput<'postLiekanRobotsAgent'>,
+    options?: RequestOptions,
+  ): Promise<OperationOutput<'postLiekanRobotsAgent'>> {
+    return this.execute('postLiekanRobotsAgent', input, options);
   }
 
   /**

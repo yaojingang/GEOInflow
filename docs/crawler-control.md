@@ -26,6 +26,8 @@
 
 robots 导出先解析已有内容；无法安全合并时提供片段与原因。robots 的遵守取决于访问方。Nginx 可导出屏蔽或限速配置，分别标明 http 与 server 上下文，并提供部署、语法检查和恢复说明。导出内容由网站维护者部署；猎看本版不远程修改 Nginx。
 
+robots 的线上读取、定时监控、服务器授权发布和回滚见 [robots.txt 管理](robots-management.md)。
+
 ## Cloudflare 操作流程
 
 网站流量需要经过 Cloudflare 代理。控制连接使用独立、仅限当前 Zone 的 Token，与日志采集授权分开。Token 使用 `LIEKAN_LOG_CREDENTIALS_KEY` 加密，浏览器只在输入时短暂持有，查询返回掩码。连接读取 Zone 和规则入口；实际套餐可用性、Token 写权限及边缘真实命中需要在用户测试 Zone 验收。

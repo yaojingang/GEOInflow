@@ -61,3 +61,18 @@ it('keeps collector and AI policies independent of crawler paths', async () => {
     'private, no-store',
   );
 });
+
+it.each(['', '/private-api'])(
+  'keeps robots drafts, publication evidence and pairing responses private under prefix %s',
+  async prefix => {
+    const api = prefix || '/api';
+    for (const path of [
+      '/liekan/websites/site/robots',
+      '/liekan/robots-agent',
+    ]) {
+      const headers = await effectiveHeaders(api + path, prefix);
+      expect(headers['cache-control'], path).toBe('private, no-store');
+      expect(headers.vary, path).toBe('Authorization');
+    }
+  },
+);

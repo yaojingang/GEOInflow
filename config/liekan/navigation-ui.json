@@ -1547,14 +1547,27 @@
       "mobileActionMinHeight": 40
     },
     "toolbar": {
-      "approval": "2026-10-05 用户要求网站统计页面顶部的网站切换与日期、页面操作水平左右对齐置顶",
+      "approval": "2026-10-31 用户要求移除顶部蜘蛛身份范围筛选、合并 robots 入口、将管理蜘蛛白名单简称管理蜘蛛，网站操作按钮统一单行展示",
       "contextPosition": "left",
       "actionsPosition": "right",
       "desktopHeight": 60,
       "desktopControlHeight": 36,
       "mobileControlMinHeight": 44,
-      "mobileActions": "wrap",
-      "titlePosition": "below"
+      "mobileActions": "single-row-horizontal-scroll",
+      "titlePosition": "below",
+      "desktopActionRows": 1,
+      "identityScopeFilter": "removed-from-header",
+      "robotsEntry": "shared-only",
+      "crawlerManagementLabel": "管理蜘蛛"
+    },
+    "robotsManagement": {
+      "label": "robots 管理",
+      "entry": "shared-website-toolbar",
+      "scope": "private-website",
+      "initialView": "overview",
+      "preserveOriginalBody": true,
+      "fileAddress": "https-origin-robots-and-authorized-server-path",
+      "advice": "current-file-snapshot-and-selected-period-crawler-evidence"
     }
   },
   "analysisTabs": {
@@ -1772,9 +1785,9 @@
       "fallback"
     ],
     "preserveOriginalBody": true,
-    "headerRows": "title-or-website-and-language-first-actions-wrap-below",
-    "desktopToolbarMaxRows": 3,
-    "maxAdditionalHeaderHeight": 88
+    "headerRows": "desktop-single-row-mobile-context-and-scrollable-actions",
+    "desktopToolbarMaxRows": 1,
+    "maxAdditionalHeaderHeight": 0
   },
   "productInformation": {
     "entry": "sidebar-footer-grid",

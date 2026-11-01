@@ -4,7 +4,7 @@ export const managementLabels: Record<string, string> = {
   导入日志: '导入网站日志',
   'sitemap 管理': '管理内容目录',
   'robots.txt 编辑': '编辑 robots.txt',
-  蜘蛛白名单: '管理蜘蛛白名单',
+  蜘蛛白名单: '管理蜘蛛',
   特征库管理: '蜘蛛识别规则',
   解析规则: '蜘蛛识别规则',
   日志查询: '查询访问日志',

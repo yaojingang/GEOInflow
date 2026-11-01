@@ -558,7 +558,12 @@ export function FeatureApp({
         />
         <div className="shell-content">
           {websiteLayout && (
-            <WebsiteToolbar contextRef={setWebsiteContextTarget} actions={websiteDateActions} />
+            <WebsiteToolbar
+              contextRef={setWebsiteContextTarget}
+              actions={websiteDateActions}
+              websiteId={websiteMatchesHandle(site, siteId) ? site.id : undefined}
+              range={range}
+            />
           )}
           <header className="header">
             <div className="header-inner">

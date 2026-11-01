@@ -17,6 +17,8 @@ function transaction() {
   const calls: Array<[string, ...unknown[]]> = [];
   const run = async (sql: string, ...params: unknown[]) => {
     calls.push([sql, ...params]);
+    if (sql.includes("to_regclass('liekan_robots_state')")) return [{ present: true }];
+    if (sql.startsWith('SELECT website_id FROM liekan_robots_state')) return [{ website_id: site }];
     return 1;
   };
   return { calls, $executeRawUnsafe: vi.fn(run), $queryRawUnsafe: vi.fn(run) };
@@ -51,4 +53,43 @@ it('does not change GEO state when the website write boundary rejects the operat
   h.lock.mockRejectedValue(new Error('denied'));
   await expect(resetLiekanStatistics(tx, site)).rejects.toThrow('denied');
   expect(tx.calls.some(([sql]) => sql.includes('liekan_geo_weight_'))).toBe(false);
+});
+it.each([false, true])(
+  'invalidates robots authority on website lifecycle changes (deleted=%s)',
+  async deleted => {
+    const tx = transaction();
+    await stopWebsiteSources(tx, site, deleted);
+    const lock = tx.calls.findIndex(
+      ([sql]) => sql.includes('FROM liekan_robots_state') && sql.includes('FOR UPDATE NOWAIT'),
+    );
+    const binding = tx.calls.findIndex(([sql]) => sql.startsWith('UPDATE liekan_robots_state'));
+    const source = tx.calls.findIndex(([sql]) => sql.startsWith('UPDATE liekan_crawler_state'));
+    expect(lock).toBeGreaterThan(0);
+    expect(binding).toBeGreaterThan(lock);
+    expect(source).toBeGreaterThan(binding);
+    expect(tx.calls[binding][0]).toContain('agent_enabled=false,agent_context=NULL');
+    expect(tx.calls[binding][0]).toContain('monitor=false');
+    expect(tx.calls[binding][0]).toContain('check_lease=NULL,checking_until=NULL');
+    const deployments = tx.calls.filter(([sql]) =>
+      sql.startsWith('UPDATE liekan_robots_deployment'),
+    );
+    expect(deployments).toHaveLength(3);
+    expect(deployments[0][0]).toContain("state='cancelled'");
+    expect(deployments[1][0]).toContain("state='unknown'");
+    expect(deployments[2][0]).toContain("state='verification_failed'");
+    for (const [sql, id] of [tx.calls[binding], ...deployments]) {
+      expect(sql).toContain('WHERE website_id=$1::uuid');
+      expect(id).toBe(site);
+    }
+  },
+);
+it('fails fast before source changes when the robots helper state lock is contended', async () => {
+  const tx = transaction();
+  const query = tx.$queryRawUnsafe.getMockImplementation()!;
+  tx.$queryRawUnsafe.mockImplementation(async (sql, ...params) => {
+    if (sql.includes('FROM liekan_robots_state')) throw { meta: { code: '55P03' } };
+    return query(sql, ...params);
+  });
+  await expect(stopWebsiteSources(tx, site)).rejects.toMatchObject({ status: 409 });
+  expect(tx.calls.some(([sql]) => sql.startsWith('UPDATE liekan_crawler_state'))).toBe(false);
 });

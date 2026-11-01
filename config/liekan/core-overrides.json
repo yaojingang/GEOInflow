@@ -234,6 +234,17 @@
       "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
     },
     {
+      "path": "README.ja.md",
+      "purpose": "Preserve the accepted Japanese community documentation and language navigation",
+      "tests": [
+        "Compare README blobs with accepted GitHub contribution #18",
+        "node scripts/liekan-static-check.mjs"
+      ],
+      "owner": "Liekan documentation maintenance",
+      "constraint": "Retain contributor attribution, project provenance and the accepted Japanese content",
+      "removalCondition": "Remove when the project adopts a replacement documentation locale structure"
+    },
+    {
       "path": "README.zh-CN.md",
       "purpose": "Retain the complete Simplified Chinese project overview alongside the default English README",
       "tests": [
@@ -318,7 +329,7 @@
     },
     {
       "path": "next.config.ts",
-      "purpose": "Typed production build, local font/branding and explicit agent rule control; externalize the pg driver for the website handle proxy; preserve private no-store headers for crawler recognition, candidates, administrator source health, crawler context and private traffic evidence; preserve private no-store headers for browser cache authorization manifests; preserve private no-store responses for durable analysis tasks, acceleration management, instance and website storage cleanup, and opted-in native aggregates",
+      "purpose": "Typed production build, local font/branding and explicit agent rule control; externalize the pg driver for the website handle proxy; preserve private no-store headers for crawler recognition, candidates, administrator source health, crawler context and private traffic evidence; preserve private no-store headers for browser cache authorization manifests; preserve private no-store responses for durable analysis tasks, acceleration management, instance and website storage cleanup, and opted-in native aggregates; preserve private no-store responses for robots drafts, server pairing credentials and deployment evidence",
       "tests": [
         "pnpm liekan:verify",
         "Liekan Docker and visual acceptance",
@@ -344,6 +355,18 @@
       "owner": "Liekan release maintenance",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Pin reproducible toolchain, offline prototype charts and license-compatible browser detection Preserve upstream behavior and protocols outside this recorded purpose: Pin reproducible toolchain, offline prototype charts and license-compatible browser detection; Preserve upstream behavior and protocols outside this recorded purpose: Pin reproducible toolchain, offline prototype charts and license-compatible browser detection",
       "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
+    },
+    {
+      "path": "public/liekan-robots-agent.mjs",
+      "purpose": "Distribute the authorized single-file robots server helper with source and Docker builds",
+      "tests": [
+        "src/liekan-agent/robots-agent.test.ts",
+        "pnpm test:robots",
+        "node scripts/liekan-static-check.mjs"
+      ],
+      "owner": "Liekan crawler management maintenance",
+      "constraint": "Keep writes pinned to the authorized robots.txt, preserve durable receipts and backups, and reject untrusted filesystem paths",
+      "removalCondition": "Remove when an equivalent reviewed helper distribution replaces this asset"
     },
     {
       "path": "packages/api-client/README.md",
