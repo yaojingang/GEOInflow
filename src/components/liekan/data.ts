@@ -22,7 +22,7 @@ export const pages: Array<{
     path: '/ai',
     resource: 'ai/overview',
     title: 'AI 访问总览',
-    actions: ['robots.txt 编辑', '蜘蛛白名单'],
+    actions: ['蜘蛛白名单'],
     group: 'AI 蜘蛛',
     icon: 2,
   },

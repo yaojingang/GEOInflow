@@ -71,5 +71,6 @@
   "063_dashboard_import_dependencies.sql": "3fda0e27f15520337ae5d51040da3f1afca2c5022d9ad7f0f91d3483e44b1e09",
   "064_dashboard_metadata_dependencies.sql": "7df545ee4bed6c89ce0a19913b2831c14a59d36ed5d358b7ee01518ce89bd9c2",
   "065_dashboard_semantic_metadata.sql": "b440d0be3b60df3d14a4e173f756b89108dfa0d3f031e82b40f7cbafbe254467",
-  "066_foreground_analysis_reads.sql": "77563a098c05f741e9415b8568e5a1a3097840a40420772f36589e844cb1c801"
+  "066_foreground_analysis_reads.sql": "77563a098c05f741e9415b8568e5a1a3097840a40420772f36589e844cb1c801",
+  "067_robots_management.sql": "a25cd64b9bd54816de76acf14dbbc77d61a2b30e762c2fb1b61ab4497634e34a"
 }

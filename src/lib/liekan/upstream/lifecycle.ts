@@ -1,6 +1,7 @@
 import { clearHistoryRepair, invalidateHistoryRepair } from './history-repair-lifecycle';
 import { clearAiWebsiteInTransaction } from './ai-lifecycle';
 import { lockWritableWebsite, type WriteIdentity } from './server';
+import { invalidateRobotsWebsite } from './robots-lifecycle';
 
 async function clearGeoSnapshots(tx: any, websiteId: string) {
   // Head deletion fences in-flight publication and removes its idempotency receipts.
@@ -96,6 +97,7 @@ export async function stopWebsiteSources(tx: any, websiteId: string, deleted = f
   if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schema)) throw new Error('Invalid database schema');
   await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${schema}"`);
   await lockWritableWebsite(tx, websiteId);
+  await invalidateRobotsWebsite(tx, websiteId);
   await tx.$queryRawUnsafe(
     'SELECT website_id FROM liekan_analysis_site WHERE website_id=$1::uuid FOR UPDATE',
     websiteId,

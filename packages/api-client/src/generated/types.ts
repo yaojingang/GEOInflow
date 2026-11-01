@@ -1073,6 +1073,23 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/liekan/robots-agent': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Pair an explicitly authorized robots helper or exchange a pinned-file job and receipt */
+    post: operations['postLiekanRobotsAgent'];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/liekan/storage': {
     parameters: {
       query?: never;
@@ -2143,6 +2160,24 @@ export interface paths {
     get: operations['getLiekanReport'];
     put?: never;
     post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/liekan/websites/{websiteId}/robots': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** getLiekanRobotsManagement */
+    get: operations['getLiekanRobotsManagement'];
+    put?: never;
+    /** postLiekanRobotsManagement */
+    post: operations['postLiekanRobotsManagement'];
     delete?: never;
     options?: never;
     head?: never;
@@ -15524,6 +15559,93 @@ export interface operations {
       };
       /** @description Persistent receiver or provider configuration unavailable; retry later */
       503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  postLiekanRobotsAgent: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        'application/json':
+          | {
+              /** @constant */
+              action: 'pair';
+              code: string;
+              path: string;
+            }
+          | {
+              /** @constant */
+              action: 'poll';
+              content: string | null;
+              receipt?: {
+                hash: string;
+                /**
+                 * Format: uuid
+                 * @description Unique identifier of the resource.
+                 */
+                id: string;
+                /** @enum {string} */
+                state: 'applied' | 'conflict' | 'failed' | 'unknown';
+              };
+            };
+      };
+    };
+    responses: {
+      /** @description Robots helper result */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json':
+            | {
+                /** Format: uuid */
+                agentId: string;
+                /** @description Hostname on which the activity occurred. */
+                hostname: string;
+                token: string;
+                /**
+                 * Format: uuid
+                 * @description ID of the website.
+                 */
+                websiteId: string;
+              }
+            | {
+                ack: string | null;
+                job: {
+                  content: string | null;
+                  expectedHash: string;
+                  /** @description Date and time the credential expires. */
+                  expiresAt: string;
+                  /**
+                   * Format: uuid
+                   * @description Unique identifier of the resource.
+                   */
+                  id: string;
+                  targetHash: string;
+                } | null;
+                revoked?: boolean;
+              };
+        };
+      };
+      /** @description Expired pairing code or invalid helper credential */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Website, authority or active operation changed */
+      409: {
         headers: {
           [name: string]: unknown;
         };
@@ -32520,6 +32642,463 @@ export interface operations {
         content: {
           'application/json': components['schemas']['ApiError'];
         };
+      };
+    };
+  };
+  getLiekanRobotsManagement: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description ID of the website. */
+        websiteId: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Authenticated website crawler operation */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': {
+            agent: {
+              connected: boolean;
+              contextValid: boolean;
+              path: string | null;
+              seenAt: string | null;
+            };
+            changePending: boolean;
+            checkedAt: string | null;
+            deployments: {
+              before_content: string | null;
+              content: string | null;
+              created_at: string;
+              error_code: string | null;
+              expires_at: string;
+              /**
+               * Format: uuid
+               * @description Unique identifier of the resource.
+               */
+              id: string;
+              rollback_of: string | null;
+              state: string;
+            }[];
+            draft: string;
+            /** @description Hostname on which the activity occurred. */
+            hostname: string;
+            interval: number;
+            lastError: string | null;
+            monitor: boolean;
+            observedContent: string | null;
+            observedHostname: string | null;
+            observedStatus: number | null;
+            permissions: {
+              canControl: boolean;
+              canDraft: boolean;
+            };
+            revision: number;
+            snapshots: {
+              content: string | null;
+              created_at: string;
+              /** @description Hostname on which the activity occurred. */
+              hostname: string;
+              /**
+               * Format: uuid
+               * @description Unique identifier of the resource.
+               */
+              id: string;
+              status: number;
+            }[];
+          };
+        };
+      };
+      /** @description Bad request. */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "bad-request",
+           *         "message": "Bad request.",
+           *         "status": 400
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Unauthorized. */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "unauthorized",
+           *         "message": "Unauthorized.",
+           *         "status": 401
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Forbidden. */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "forbidden",
+           *         "message": "Forbidden.",
+           *         "status": 403
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Not found. */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "not-found",
+           *         "message": "Not found.",
+           *         "status": 404
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Version, context, remote state or preview conflict */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Bounded rate exceeded */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Database, worker or provider unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  postLiekanRobotsManagement: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description ID of the website. */
+        websiteId: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        'application/json':
+          | {
+              /** @constant */
+              action: 'read';
+            }
+          | {
+              /** @constant */
+              action: 'save';
+              content: string;
+              revision: number;
+            }
+          | {
+              /** @constant */
+              action: 'monitor';
+              enabled: boolean;
+              interval: 15 | 60 | 360;
+            }
+          | {
+              /** @constant */
+              action: 'pair';
+            }
+          | {
+              /** @constant */
+              action: 'revoke';
+            }
+          | {
+              /** @constant */
+              action: 'preview';
+              /** Format: uuid */
+              rollbackOf?: string;
+            }
+          | {
+              /** @constant */
+              action: 'confirm';
+              /**
+               * Format: uuid
+               * @description Unique identifier of the resource.
+               */
+              id: string;
+            }
+          | {
+              /** @constant */
+              action: 'verify';
+              /**
+               * Format: uuid
+               * @description Unique identifier of the resource.
+               */
+              id: string;
+            }
+          | {
+              /** @constant */
+              action: 'reconcile';
+              /**
+               * Format: uuid
+               * @description Unique identifier of the resource.
+               */
+              id: string;
+            }
+          | {
+              /** @constant */
+              action: 'acknowledge';
+            };
+      };
+    };
+    responses: {
+      /** @description Authenticated website crawler operation */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json':
+            | {
+                agent: {
+                  connected: boolean;
+                  contextValid: boolean;
+                  path: string | null;
+                  seenAt: string | null;
+                };
+                changePending: boolean;
+                checkedAt: string | null;
+                deployments: {
+                  before_content: string | null;
+                  content: string | null;
+                  created_at: string;
+                  error_code: string | null;
+                  expires_at: string;
+                  /**
+                   * Format: uuid
+                   * @description Unique identifier of the resource.
+                   */
+                  id: string;
+                  rollback_of: string | null;
+                  state: string;
+                }[];
+                draft: string;
+                /** @description Hostname on which the activity occurred. */
+                hostname: string;
+                interval: number;
+                lastError: string | null;
+                monitor: boolean;
+                observedContent: string | null;
+                observedHostname: string | null;
+                observedStatus: number | null;
+                permissions: {
+                  canControl: boolean;
+                  canDraft: boolean;
+                };
+                revision: number;
+                snapshots: {
+                  content: string | null;
+                  created_at: string;
+                  /** @description Hostname on which the activity occurred. */
+                  hostname: string;
+                  /**
+                   * Format: uuid
+                   * @description Unique identifier of the resource.
+                   */
+                  id: string;
+                  status: number;
+                }[];
+              }
+            | {
+                code?: string;
+                /** @description Data returned by the operation. */
+                data: {
+                  agent: {
+                    connected: boolean;
+                    contextValid: boolean;
+                    path: string | null;
+                    seenAt: string | null;
+                  };
+                  changePending: boolean;
+                  checkedAt: string | null;
+                  deployments: {
+                    before_content: string | null;
+                    content: string | null;
+                    created_at: string;
+                    error_code: string | null;
+                    expires_at: string;
+                    /**
+                     * Format: uuid
+                     * @description Unique identifier of the resource.
+                     */
+                    id: string;
+                    rollback_of: string | null;
+                    state: string;
+                  }[];
+                  draft: string;
+                  /** @description Hostname on which the activity occurred. */
+                  hostname: string;
+                  interval: number;
+                  lastError: string | null;
+                  monitor: boolean;
+                  observedContent: string | null;
+                  observedHostname: string | null;
+                  observedStatus: number | null;
+                  permissions: {
+                    canControl: boolean;
+                    canDraft: boolean;
+                  };
+                  revision: number;
+                  snapshots: {
+                    content: string | null;
+                    created_at: string;
+                    /** @description Hostname on which the activity occurred. */
+                    hostname: string;
+                    /**
+                     * Format: uuid
+                     * @description Unique identifier of the resource.
+                     */
+                    id: string;
+                    status: number;
+                  }[];
+                };
+                /** @description Hostname on which the activity occurred. */
+                hostname?: string;
+                /**
+                 * Format: uuid
+                 * @description Unique identifier of the resource.
+                 */
+                id?: string;
+              };
+        };
+      };
+      /** @description Bad request. */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "bad-request",
+           *         "message": "Bad request.",
+           *         "status": 400
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Unauthorized. */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "unauthorized",
+           *         "message": "Unauthorized.",
+           *         "status": 401
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Forbidden. */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "forbidden",
+           *         "message": "Forbidden.",
+           *         "status": 403
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Not found. */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "not-found",
+           *         "message": "Not found.",
+           *         "status": 404
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Version, context, remote state or preview conflict */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Bounded rate exceeded */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Database, worker or provider unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
       };
     };
   };

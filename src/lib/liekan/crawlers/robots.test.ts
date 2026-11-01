@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { crawlerDirectory } from './directory';
 import {
   checkRobotsAccess,
+  setRobotsAccess,
   mergeRobotsPolicy,
   parseRobots,
   ROBOTS_MAX_BYTES,
@@ -321,5 +322,106 @@ describe('conservative robots merging', () => {
     const result = mergeRobotsPolicy('', { ...blockDocs, botIds: ['chatgpt-user'] });
     expect(result.fragment).toContain('may not apply robots.txt');
     expect(result.content).toContain('may not apply robots.txt');
+  });
+});
+
+describe('explicit one-click directory edits', () => {
+  it.each([
+    ['Disallow: /private', false],
+    ['Disallow: /\nAllow: /private', true],
+  ])(
+    'preserves boundary-crossing rules while allowing a directory: %s',
+    (rules, outsideAllowed) => {
+      const base = `User-agent: GPTBot\n${rules}\nDisallow: /private/secret\n`;
+      expect(checkRobotsAccess(base, 'GPTBot', '/private-other').allowed).toBe(outsideAllowed);
+      const result = setRobotsAccess(base, {
+        botIds: ['gptbot'],
+        paths: [{ value: '/private', match: 'prefix' }],
+        action: 'allow',
+      });
+      expect(result.safe).toBe(true);
+      expect(result.content).toContain('User-agent: GPTBot');
+      for (const path of ['/private', '/private/', '/private/secret'])
+        expect(checkRobotsAccess(result.content, 'GPTBot', path).allowed).toBe(true);
+      expect(checkRobotsAccess(result.content, 'GPTBot', '/private-other').allowed).toBe(
+        outsideAllowed,
+      );
+    },
+  );
+  it('refuses a scoped block whose boundary Allow also permits unrelated paths', () => {
+    const base = 'User-agent: GPTBot\nDisallow: /\nAllow: /private\n';
+    expect(checkRobotsAccess(base, 'GPTBot', '/private-other').allowed).toBe(true);
+    const result = setRobotsAccess(base, {
+      botIds: ['gptbot'],
+      paths: [{ value: '/private', match: 'prefix' }],
+      action: 'block',
+    });
+    expect(result.safe).toBe(false);
+    expect(result.content).toBeNull();
+    expect(result.fragment).toContain('Disallow: /private$');
+    expect(result.reasons.join(' ')).toContain('boundary');
+  });
+  it('retains a broad Disallow while blocking selected descendants in a shared group', () => {
+    const base =
+      'User-agent: GPTBot\nUser-agent: ClaudeBot\nDisallow: /private\nAllow: /private/open\n';
+    const result = setRobotsAccess(base, {
+      botIds: ['gptbot'],
+      paths: [{ value: '/private', match: 'prefix' }],
+      action: 'block',
+    });
+    expect(result.safe).toBe(true);
+    expect(result.content).toContain('User-agent: ClaudeBot');
+    expect(checkRobotsAccess(result.content, 'GPTBot', '/private/open').allowed).toBe(false);
+    expect(checkRobotsAccess(result.content, 'GPTBot', '/private-other').allowed).toBe(false);
+    expect(checkRobotsAccess(result.content, 'ClaudeBot', '/private/open').allowed).toBe(true);
+    expect(checkRobotsAccess(result.content, 'ClaudeBot', '/private-other').allowed).toBe(false);
+  });
+  it('switches all-site allow and block without affecting other crawlers', () => {
+    const base = 'User-agent: *\nDisallow: /private\nSitemap: https://example.com/sitemap.xml\n';
+    const block = setRobotsAccess(base, {
+      botIds: ['gptbot'],
+      paths: [{ value: '/', match: 'prefix' }],
+      action: 'block',
+    });
+    expect(block.safe).toBe(true);
+    expect(checkRobotsAccess(block.content, 'GPTBot', '/public').allowed).toBe(false);
+    const allow = setRobotsAccess(block.content, {
+      botIds: ['gptbot'],
+      paths: [{ value: '/', match: 'prefix' }],
+      action: 'allow',
+    });
+    expect(allow.safe).toBe(true);
+    expect(checkRobotsAccess(allow.content, 'GPTBot', '/private').allowed).toBe(true);
+    expect(checkRobotsAccess(allow.content, 'ClaudeBot', '/private').allowed).toBe(false);
+    expect(allow.content).toContain('Sitemap: https://example.com/sitemap.xml');
+  });
+  it('splits a shared UA group and preserves unrelated scopes and identities', () => {
+    const base =
+      'User-agent: GPTBot\nUser-agent: ClaudeBot\nAllow: /docs/open\nDisallow: /private\n';
+    const result = setRobotsAccess(base, {
+      botIds: ['gptbot'],
+      paths: [{ value: '/docs', match: 'prefix' }],
+      action: 'block',
+    });
+    expect(result.safe).toBe(true);
+    expect(checkRobotsAccess(result.content, 'GPTBot', '/docs/open').allowed).toBe(false);
+    expect(checkRobotsAccess(result.content, 'GPTBot', '/private').allowed).toBe(false);
+    expect(checkRobotsAccess(result.content, 'ClaudeBot', '/docs/open').allowed).toBe(true);
+  });
+  it('preserves rule-free trailing groups and refuses ambiguous scoped wildcard edits', () => {
+    const result = setRobotsAccess('User-agent: OtherBot', {
+      botIds: ['gptbot'],
+      paths: [{ value: '/', match: 'prefix' }],
+      action: 'block',
+    });
+    expect(checkRobotsAccess(result.content, 'OtherBot', '/').allowed).toBe(true);
+    expect(checkRobotsAccess(result.content, 'GPTBot', '/').allowed).toBe(false);
+    expect(
+      setRobotsAccess('User-agent: *\nDisallow: /*.pdf$', {
+        botIds: ['gptbot'],
+        paths: [{ value: '/docs', match: 'prefix' }],
+        action: 'allow',
+      }).safe,
+    ).toBe(false);
   });
 });

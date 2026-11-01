@@ -108,6 +108,52 @@ test('measures the active BaseUI modal without counting its hidden background la
     dom.window.close();
   }
 });
+test('permits bounded horizontal action scrolling and still rejects real header overflow', async () => {
+  const { JSDOM } = await import('jsdom');
+  const { languageHeaderGeometry } = await import('../../scripts/liekan-i18n-visual.mjs');
+  const dom = new JSDOM(`<div data-website-toolbar>
+    <button class="site-switch">Website</button>
+    <div data-website-toolbar-actions id="rail"><button id="action">Robots</button></div>
+    <div data-language-placement="header"><select><option value="en-US">English</option></select></div>
+  </div>`);
+  const previous = {
+    document: globalThis.document,
+    innerWidth: globalThis.innerWidth,
+    getComputedStyle: globalThis.getComputedStyle,
+  };
+  const box = (left, right, top = 60, height = 44) => ({
+    left,
+    right,
+    top,
+    bottom: top + height,
+    width: right - left,
+    height,
+  });
+  const document = dom.window.document;
+  document.querySelector('[data-website-toolbar]').getBoundingClientRect = () =>
+    box(0, 390, 0, 104);
+  document.querySelector('.site-switch').getBoundingClientRect = () => box(16, 190, 0);
+  document.querySelector('select').getBoundingClientRect = () => box(220, 374, 0);
+  const rail = document.querySelector('#rail');
+  rail.getBoundingClientRect = () => box(16, 374);
+  Object.defineProperty(rail, 'scrollWidth', { value: 600 });
+  document.querySelector('#action').getBoundingClientRect = () => box(400, 520);
+  try {
+    globalThis.document = document;
+    globalThis.innerWidth = 390;
+    globalThis.getComputedStyle = dom.window.getComputedStyle.bind(dom.window);
+    assert.deepEqual(languageHeaderGeometry().clippedControls, ['Robots']);
+    rail.setAttribute('data-toolbar-action-rail', '');
+    assert.deepEqual(languageHeaderGeometry().clippedControls, ['Robots']);
+    rail.style.overflowX = 'auto';
+    assert.deepEqual(languageHeaderGeometry().clippedControls, []);
+    rail.getBoundingClientRect = () => box(16, 410);
+    assert.deepEqual(languageHeaderGeometry().clippedControls, ['Robots']);
+  } finally {
+    Object.assign(globalThis, previous);
+    dom.window.close();
+  }
+});
 test('accepts complete, stable bilingual messages and preserved executable literals', () => {
   assert.doesNotThrow(() => assertLanguagePair(...pair('已读取 {v0} 条记录', 'Read {v0} records')));
   assert.doesNotThrow(() => assertLanguagePair(...pair('eq.AI 搜索引荐', 'eq.AI 搜索引荐')));
