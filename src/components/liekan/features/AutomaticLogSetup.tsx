@@ -1,17 +1,16 @@
 'use client';
-import { useLiekanI18n } from '@/lib/liekan/i18n/client';
-
-import { useTaskPolling } from '@/lib/liekan/contracts/manual-refresh';
 import { useEffect, useRef, useState } from 'react';
 import {
-  logPublicOrigin,
   type InstallationStatus,
   type LogCapability,
   type LogSetupCheckId,
+  logPublicOrigin,
 } from '@/lib/liekan/contracts/installation';
+import { useTaskPolling } from '@/lib/liekan/contracts/manual-refresh';
+import { useLiekanI18n } from '@/lib/liekan/i18n/client';
+import styles from '@/styles/liekan/Installation.module.css';
 import { useFeature } from './context';
 import { Badge, Button, Code, Field, Form, LiekanDialog, Notice } from './ui';
-import styles from '@/styles/liekan/Installation.module.css';
 
 const setupLabels: Record<LogSetupCheckId, string> = {
   'public-url': '公网 HTTPS 地址',
@@ -303,11 +302,17 @@ export function AutomaticLogSetup({
     pairingCode?: string;
   } | null>(null);
   const [deploymentCommand, setDeploymentCommand] = useState('');
+  const [manualPairing, setManualPairing] = useState<{
+    url: string;
+    pairingCode: string;
+    expiresAt: string;
+  } | null>(null);
   const scope = useRef('');
   scope.current = `${websiteId}:${method}:${runtime}`;
   useEffect(() => {
     setCommand(null);
     setDeploymentCommand('');
+    setManualPairing(null);
   }, [websiteId, method, runtime]);
   const [authorization, setAuthorization] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
@@ -423,6 +428,73 @@ export function AutomaticLogSetup({
                 )}
           </p>
         </div>
+      )}
+      {method === 'server' && (
+        <details>
+          <summary>{i18n.text('手动部署（自带部署包）')}</summary>
+          <div className="stack">
+            <p className="field-help">
+              {i18n.text(
+                '适用于不便使用一键安装命令的环境：将 liekan-agent-deploy 文件夹拷贝到日志服务器，填好 .env 后一条命令启动，容器首次启动自动完成配对。详细步骤见文件夹内 README。',
+              )}
+            </p>
+            <ol className="field-help">
+              <li>
+                {i18n.text(
+                  '构建机执行 pnpm liekan:build-agent 生成采集程序，将整个 liekan-agent-deploy 文件夹拷贝到日志服务器的非公开目录。',
+                )}
+              </li>
+              <li>
+                {i18n.text(
+                  '复制 .env.example 为 .env，填写日志目录、文件名与日志用户组 GID，并粘贴下方几行配置。',
+                )}
+              </li>
+              <li>
+                {i18n.text(
+                  '创建状态目录并启动：mkdir -p state && chown 65532:65532 state，然后执行 docker compose up -d --build。',
+                )}
+              </li>
+            </ol>
+            <Button
+              disabled={!manage || busy}
+              onClick={() =>
+                run(async () => {
+                  const requestedScope = scope.current;
+                  const data = await c.api.post(
+                    `/liekan/websites/${websiteId}/log-sources/server/pairing`,
+                    { manual: true },
+                  );
+                  if (!alive.current || scope.current !== requestedScope) return;
+                  setManualPairing(data);
+                })
+              }
+            >
+              {i18n.text('生成一次性配对码（手动部署）')}
+            </Button>
+            {manualPairing && (
+              <div className="stack">
+                <Code>{`LIEKAN_PUBLIC_URL=${manualPairing.url}\nLIEKAN_WEBSITE_ID=${websiteId}\nLIEKAN_PAIRING_CODE=${manualPairing.pairingCode}`}</Code>
+                <p className="field-help">
+                  {i18n.fragment('配对码失效时间：', false, true)}
+                  {new Date(manualPairing.expiresAt).toLocaleTimeString(i18n.locale)}。
+                  {i18n.text(
+                    '配对码 10 分钟内有效且只能使用一次；容器启动成功后即失效，可从 .env 删除。重启和升级无需重新生成。',
+                  )}
+                </p>
+                <Button
+                  onClick={async () => {
+                    await navigator.clipboard.writeText(
+                      `LIEKAN_PUBLIC_URL=${manualPairing.url}\nLIEKAN_WEBSITE_ID=${websiteId}\nLIEKAN_PAIRING_CODE=${manualPairing.pairingCode}`,
+                    );
+                    c.notify('配对码已复制');
+                  }}
+                >
+                  {i18n.text('复制 .env 配置')}
+                </Button>
+              </div>
+            )}
+          </div>
+        </details>
       )}
       <div className="form-actions">
         {!available ? (

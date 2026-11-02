@@ -9,7 +9,7 @@
 - `LIEKAN_PUBLIC_URL`：对用户开放的 HTTPS 网站根地址，也是日志接收与 OAuth 回调地址。网站设置页面应通过同一域名访问。
 - `LIEKAN_LOG_CREDENTIALS_KEY`：32 字节随机密钥的 Base64，用于加密供应商凭据。
 - `CLOUDFLARE_OAUTH_CLIENT_ID`、`CLOUDFLARE_OAUTH_CLIENT_SECRET`：平台的服务器端 OAuth 应用配置。回调地址为 `/api/liekan/oauth/cloudflare/callback`。
-- `LIEKAN_AGENT_SIGNING_KEY_FILE`：构建机上的 Ed25519 私钥文件路径，供 `pnpm liekan:build-agent` 签名。私钥保留在受控构建环境；安装资产位于生成目录 `public/liekan-agent`。本地验收可加 `--development-key` 使用 `.local` 中的专用测试密钥；正式环境使用平台维护的签名密钥。
+- `LIEKAN_AGENT_SIGNING_KEY_FILE`：构建机上的 Ed25519 私钥文件路径，供 `pnpm liekan:build-agent` 签名。私钥保留在受控构建环境；引导式安装资产位于生成目录 `public/liekan-agent`，同一次构建也会把采集程序生成到 `liekan-agent-deploy/` 供手动部署使用。本地验收可加 `--development-key` 使用 `.local` 中的专用测试密钥；正式环境使用平台维护的签名密钥。
 
 Cloudflare 应用应按[官方 OAuth 指南](https://developers.cloudflare.com/fundamentals/oauth/create-an-oauth-client/)中的可选权限配置读取匹配 Zone 与管理 Logpush 所需的最小权限，并完成供应商的应用登记、域名验证及可见性要求。Zone 与 Logpush 的实际可用性在授权和任务创建时核对。账户套餐、日志字段和费用由 Cloudflare 决定，连接前需要用户确认。官方权限标识通过授权账户的 scopes API 获取，避免猜测权限 ID。
 
@@ -40,6 +40,14 @@ Logpush 返回“当前账户未启用”时，连接显示独立的能力提示
 重复安装先只读核对已有来源的接收授权，授权有效时复用配对及进度；网络异常保留原配置并停止安装。凭据已撤销时可使用新配对码重连，旧来源配置和缓存继续保留。Docker 配对同时核对网站标识，错误网站的配对码会在消耗前被拒绝。配置绑定规范化后的宿主机日志目录及文件名，目录改变或接收地址冲突时停止。候选编排在环境检查完成后切换并重新创建容器，升级启动失败恢复旧镜像。停止采集时，管理员终端运行 `sh start.sh --stop`，普通账户使用 `sudo sh start.sh --stop`，配置、持久卷和历史数据保留；网站后台的“断开连接”用于撤销接收权限。首次自动采集从文件末尾开始，历史日志继续通过手动导入补充。
 
 Docker 部署包与直接安装包独立检查可用性。部署管理员执行 `pnpm liekan:build-agent`，使用受控签名密钥生成带 Docker 资产的签名清单并重新构建应用镜像。部署包下载需要完整登录和网站管理权限，下载不会创建或消耗配对码。安装检查分别展示采集服务连接、真实日志接收、后台处理、积压及本站 AI 蜘蛛匹配；已收到日志且 AI 匹配为零时明确显示暂未匹配。
+
+### 手动部署（自带部署包）
+
+适用于不便在目标服务器执行一键安装命令的环境。仓库内的 `liekan-agent-deploy/` 文件夹是自包含部署单元：Dockerfile、编排模板、`.env.example` 和双语 README 随源码维护；部署管理员在构建机执行 `pnpm liekan:build-agent` 后，采集程序会生成到同一文件夹（构建结束打印各文件 SHA-256 供传输核对），随后整文件夹拷贝到日志服务器的非公开目录。
+
+目标服务器进入文件夹后复制 `.env.example` 为 `.env`，填写公网接收地址、网站标识、网站访问日志目录与文件名、日志用户组 GID 及后台生成的一次性配对码，创建状态目录（`mkdir -p state && chown 65532:65532 state`）并执行 `docker compose up -d --build` 一条命令完成构建与启动。容器首次启动且状态目录为空时，使用环境变量 `LIEKAN_PAIRING_CODE` 中的配对码在容器内完成配对交换，长期接收凭据只写入状态目录（绑定挂载于 `/var/lib/liekan-agent`）中的配置文件；状态目录已有配置时忽略该环境变量，日常重启和升级无需重新配对。配对码十分钟有效且仅消耗一次，启动成功后即为废码，可从 `.env` 删除；配对失败时容器退出并在日志中说明原因，重新生成配对码并更新 `.env` 后重建容器即可。
+
+手动模式沿引导式安装的日志要求：挂载包含当前日志及轮转文件的整个目录、日志对指定用户组可读、格式为 Nginx / Apache Combined。状态目录包含明文长期凭据与加密缓冲，必须保持仅属主可读，不得置于仓库或网页可访问目录；`.env`、容器编排和镜像始终不含长期接收凭据。手动模式下配对码生成仅要求公网地址、日志队列和处理服务就绪，不要求应用镜像内的安装资产；部署包完整性由管理员从构建机安全传输并按 SHA-256 核对负责。升级时从构建机重新拷贝生成的采集程序并重建容器，状态目录保留进度；停止与卸载使用 `docker compose down`，后台“断开连接”撤销接收权限。
 
 ### 直接安装到系统
 

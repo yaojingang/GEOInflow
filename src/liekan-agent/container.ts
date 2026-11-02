@@ -1,9 +1,10 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { readFile, readdir, unlink } from 'node:fs/promises';
-import { join, dirname } from 'node:path';
-import { atomicWrite, openRegularLog } from './collector';
+import { readdir, readFile, unlink } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { logPublicOrigin } from '../lib/liekan/contracts/installation';
 import { parseCombinedDate } from '../lib/liekan/strict-date';
+import { atomicWrite, openRegularLog } from './collector';
+import { pairingDecision } from './pairing-decision';
 
 class SetupError extends Error {}
 const directory = '/var/lib/liekan-agent';
@@ -47,6 +48,37 @@ async function configuration() {
   )
     throw new SetupError('已有采集配置与接收地址或日志路径不一致，请保留配置并核对部署目录。');
   return { path, config };
+}
+
+async function exchange(code: string, failure: string) {
+  if (!url || !websiteId || !hostLogDirectory) throw new SetupError('接收地址或日志文件名无效。');
+  let source: string;
+  try {
+    source = execFileSync(
+      process.execPath,
+      [
+        '/app/agent.mjs',
+        'pair',
+        '--url',
+        url,
+        '--code',
+        code,
+        '--log',
+        logPath,
+        '--directory',
+        directory,
+        '--website',
+        websiteId,
+        '--host-log-directory',
+        hostLogDirectory,
+      ],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    ).trim();
+  } catch {
+    throw new SetupError(failure);
+  }
+  if (!uuid.test(source)) throw new SetupError('配对响应无效。');
+  await atomicWrite(pointer, source);
 }
 
 async function preflight() {
@@ -144,40 +176,30 @@ async function main() {
     }
     const code = input.trim();
     if (!/^[A-Za-z0-9_-]{43}$/.test(code)) throw new SetupError('请在后台生成新的配对码。');
-    let source: string;
-    try {
-      source = execFileSync(
-        process.execPath,
-        [
-          '/app/agent.mjs',
-          'pair',
-          '--url',
-          url!,
-          '--code',
-          code,
-          '--log',
-          logPath,
-          '--directory',
-          directory,
-          '--website',
-          websiteId!,
-          '--host-log-directory',
-          hostLogDirectory!,
-        ],
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
-      ).trim();
-    } catch {
-      throw new SetupError(
-        '配对失败或配对码已过期。环境已准备好，请回到后台生成新的配对码后重试。',
-      );
-    }
-    if (!uuid.test(source)) throw new SetupError('配对响应无效。');
-    await atomicWrite(pointer, source);
+    await exchange(code, '配对失败或配对码已过期。环境已准备好，请回到后台生成新的配对码后重试。');
     console.log('配对完成，配置已保存到持久卷。');
     return;
   }
-  const saved = await configuration();
-  if (!saved) throw new SetupError('尚未配对，请运行安装脚本完成连接。');
+  let saved = await configuration();
+  if (!saved) {
+    const decision = pairingDecision(false, process.env.LIEKAN_PAIRING_CODE);
+    if (decision.action === 'missing-code')
+      throw new SetupError('尚未配对，请在 .env 配置一次性配对码，或运行安装脚本完成连接。');
+    if (decision.action === 'invalid-code')
+      throw new SetupError('配对码格式无效，请在后台生成新的配对码并更新 .env。');
+    if (decision.action === 'pair' && command === 'run') {
+      // Only the long-running entry pairs by itself; health probes stay read-only.
+      await preflight();
+      await exchange(
+        decision.code,
+        '配对失败或配对码已过期。请回到后台生成新的配对码，更新 .env 中的 LIEKAN_PAIRING_CODE 后重新启动容器。',
+      );
+      console.log('首次启动自动配对完成，长期接收凭据已保存到状态目录。');
+      saved = await configuration();
+      if (!saved) throw new SetupError('自动配对后未找到配置，请保留状态目录后重试。');
+    }
+  }
+  if (!saved) throw new SetupError('尚未配对，请运行容器或安装脚本完成连接。');
   const readyPath = join(saved.config.stateDir, 'ready.json');
   if (command === 'health') {
     const ready = JSON.parse(await readFile(readyPath, 'utf8'));

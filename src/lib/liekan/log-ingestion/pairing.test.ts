@@ -1,5 +1,6 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import { createPairing, exchangePairing } from './pairing';
+
 const mocks = vi.hoisted(() => ({
   query: vi.fn(),
   execute: vi.fn(),
@@ -74,10 +75,52 @@ it('accepts explicit website binding and preserves legacy code-only exchange', a
 it('preserves legacy command generation and offers Docker explicitly', async () => {
   mocks.query.mockResolvedValue([{ count: 0 }]);
   const legacy = await createPairing(website, { userId: other });
+  if (!('command' in legacy)) throw new Error('legacy pairing must not be manual');
   expect(legacy.runtime).toBe('systemd');
   expect(legacy.command.includes('/liekan-agent/install.sh')).toBe(true);
   const docker = await createPairing(website, { userId: other }, { runtime: 'docker' });
+  if (!('command' in docker)) throw new Error('docker pairing must not be manual');
   expect(docker.runtime).toBe('docker');
   expect(docker.command.includes(`/liekan-agent/install-docker.sh`)).toBe(true);
   expect(docker.command.includes(`--website '${website}'`)).toBe(true);
+});
+it('issues a manual pairing code without app-served installer assets', async () => {
+  mocks.query.mockResolvedValue([{ count: 0 }]);
+  mocks.capabilities.mockResolvedValue({
+    server: {
+      available: false,
+      reason: '采集器部署包尚未准备完成',
+      runtimes: { docker: false, systemd: false },
+      checks: [
+        { id: 'public-url', state: 'ready' },
+        { id: 'queue', state: 'ready' },
+        { id: 'worker', state: 'ready' },
+        { id: 'agent-package', state: 'missing' },
+      ],
+    },
+  });
+  const manual = await createPairing(website, { userId: other }, { manual: true });
+  expect(manual).toMatchObject({
+    manual: true,
+    websiteId: website,
+    url: 'https://stats.example.com',
+  });
+  expect(manual.pairingCode).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  expect((manual as { command?: string }).command).toBeUndefined();
+});
+it('keeps manual pairing gated on shared ingestion prerequisites', async () => {
+  mocks.capabilities.mockResolvedValue({
+    server: {
+      available: false,
+      checks: [
+        { id: 'public-url', state: 'ready' },
+        { id: 'queue', state: 'unverified' },
+        { id: 'worker', state: 'ready' },
+      ],
+    },
+  });
+  await expect(createPairing(website, { userId: other }, { manual: true })).rejects.toThrow(
+    '日志队列尚未初始化',
+  );
+  expect(mocks.query).not.toHaveBeenCalled();
 });

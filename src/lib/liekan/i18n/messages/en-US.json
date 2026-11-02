@@ -5151,5 +5151,14 @@
   "m_8a711345d3e7": "Prepared range",
   "m_863c4cbb0b0e": "The current deployment mode does not support the optional historical log analytics copy.",
   "m_434866700125": "The analytics connection configuration is invalid. Ask the deployment administrator to check it.",
-  "m_7ecbf3a1608d": "Complete pending cleanup on the original connection before changing the analytics destination."
+  "m_7ecbf3a1608d": "Complete pending cleanup on the original connection before changing the analytics destination.",
+  "m_6465c259cf80": "Manual deployment (pre-built kit)",
+  "m_479cee1ea136": "For environments where the one-shot install command is inconvenient: copy the liekan-agent-deploy folder to the log server, fill in .env, and start with a single command; the container pairs automatically on first start. See the README inside the folder for full steps.",
+  "m_23ff2da8e9bb": "Run pnpm liekan:build-agent on the build machine, then copy the whole liekan-agent-deploy folder to a non-public directory on the log server.",
+  "m_7ef1b4d80c68": "Create the state directory and start: mkdir -p state && chown 65532:65532 state, then run docker compose up -d --build.",
+  "m_dd8678acc350": "Generate one-time pairing code (manual deployment)",
+  "m_33e3ee659903": "Pairing code expires at:",
+  "m_610d1cea9599": "The pairing code is valid for 10 minutes and can be used once; it becomes inert once the container starts and can be removed from .env. Restarts and upgrades never need a new code.",
+  "m_ab9fd0f853c3": "Copy .env settings",
+  "m_959016724ac4": "Copy .env.example to .env, fill in the log directory, file name and log group GID, and paste the lines below."
 }
