@@ -137,6 +137,7 @@ docker compose -f docker-compose.liekan.yml exec app node scripts/liekan-seed-de
 - 浏览采集默认采用无 Cookie 方式；可选录制、事件属性及业务接入需按自己的数据范围配置。
 - AI 分析默认关闭，启用后由用户选择模型连接与网站资料，数据发送范围见 [AI 配置器](docs/ai.md)。
 - GEO 权重为 Beta，基于最近 30 个完整自然日内具备既定证据的 AI 内容访问计算，提供公式、依据和限制。[权重说明](docs/geo-weight.md)列出固定政策与适用范围。
+- 可选 [ClickHouse 历史日志分析](docs/clickhouse-analytics.md) 承担已验证的历史聚合，PostgreSQL 继续保存原始数据和事务状态。
 - GEO 扩展、补充旅程、完整导出及统计加速主要面向 PostgreSQL。保留的 ClickHouse、链接和像素入口按各自已有协议工作，不能据此推定全部 GEO 扩展均已支持。
 - 服务器自动采集需要公网 HTTPS、接收密钥与已签名安装资产；Cloudflare 接入另需 OAuth、权限与相应产品能力。
 - 搜索曝光、实际排名、模型回答引用、训练入库和正文完成率需要额外数据。当前项目提供的观察与评分范围见详细文档。

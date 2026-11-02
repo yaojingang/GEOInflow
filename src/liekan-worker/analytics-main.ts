@@ -1,3 +1,4 @@
+import { pumpAnalyticsEngine } from '../lib/liekan/upstream/analytics-engine-worker';
 import { probeAnalysisExpansion } from '../lib/liekan/upstream/analysis-expansion';
 import { pumpDashboardDemand } from '../lib/liekan/upstream/dashboard-snapshots';
 import {
@@ -114,6 +115,8 @@ await boss.work<{ id: string; kind: 'history' | 'incremental' }>(
         await processAnalysisBuild(job.data.id, job.data.kind, { shouldStop: () => stopped });
   },
 );
+const engineMaintenance = setInterval(() => { void pumpAnalyticsEngine().catch(() => {}); }, 5000);
+void pumpAnalyticsEngine().catch(() => {});
 const maintenance = setInterval(() => {
   void pump();
 }, 5000);
@@ -126,6 +129,7 @@ for (const signal of ['SIGINT', 'SIGTERM'])
   process.on(signal, async () => {
     stopped = true;
     clearInterval(maintenance);
+    clearInterval(engineMaintenance);
     clearInterval(geoMaintenance);
     clearInterval(heartbeat);
     clearInterval(storageMaintenance);

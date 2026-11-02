@@ -94,7 +94,8 @@
     "liekan:check-demo": "node scripts/liekan-check-demo.mjs",
     "liekan:export-demo": "node scripts/liekan-export-demo.mjs",
     "test:default-demo": "node tests/liekan/default-demo.integration.mjs",
-    "test:robots": "node tests/liekan/robots-management.integration.mjs"
+    "test:robots": "node tests/liekan/robots-management.integration.mjs",
+    "test:analytics-engine": "node tests/liekan/analytics-engine.integration.mjs"
   },
   "cacheDirectories": [
     ".next/cache"

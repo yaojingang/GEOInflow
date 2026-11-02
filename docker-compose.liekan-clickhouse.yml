@@ -1,0 +1,19 @@
+services:
+  analytics-clickhouse:
+    image: clickhouse/clickhouse-server:26.8.34.13
+    cpus: 2.0
+    mem_limit: 4g
+    environment:
+      CLICKHOUSE_DB: geoinflow_analytics
+      CLICKHOUSE_USER: geoinflow_analytics
+      CLICKHOUSE_PASSWORD: ${LIEKAN_CLICKHOUSE_PASSWORD:?ClickHouse deployment password required}
+    volumes:
+      - liekan-clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '--spider', 'http://127.0.0.1:8123/ping']
+      interval: 15s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+volumes:
+  liekan-clickhouse-data:

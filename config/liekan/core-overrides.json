@@ -6132,6 +6132,48 @@
       "owner": "Liekan automatic logs maintenance",
       "constraint": "Keep the existing browser test environment unchanged",
       "removalCondition": "Remove when the primary test configuration supports explicit multi-environment projects"
+    },
+    {
+      "path": "docker-compose.liekan-clickhouse.yml",
+      "purpose": "Optional historical ClickHouse analytics deployment and administrator entry",
+      "tests": [
+        "pnpm test:analytics-engine",
+        "node --test tests/liekan/deployment.test.mjs"
+      ],
+      "owner": "Liekan analytics maintenance",
+      "constraint": "Keep PostgreSQL authoritative and default deployment compatible; preserve installation, source epoch, permissions and upstream ClickHouse behavior",
+      "removalCondition": "Remove when the supported analytics extension provides equivalent verified coverage and lifecycle behavior"
+    },
+    {
+      "path": "scripts/liekan-deploy.sh",
+      "purpose": "Preserve existing deployment state while adding an optional historical analytics service",
+      "tests": [
+        "node --test tests/liekan/deployment.test.mjs"
+      ],
+      "owner": "Liekan analytics maintenance",
+      "constraint": "Keep PostgreSQL authoritative and preserve configuration, credentials, data volumes and immutable deployment candidates",
+      "removalCondition": "Remove when the supported deployment entrypoint covers these lifecycle guarantees"
+    },
+    {
+      "path": "src/app/(main)/admin/analytics-engine/page.tsx",
+      "purpose": "Optional historical ClickHouse analytics deployment and administrator entry",
+      "tests": [
+        "pnpm test:analytics-engine",
+        "node --test tests/liekan/deployment.test.mjs"
+      ],
+      "owner": "Liekan analytics maintenance",
+      "constraint": "Keep PostgreSQL authoritative and default deployment compatible; preserve installation, source epoch, permissions and upstream ClickHouse behavior",
+      "removalCondition": "Remove when the supported analytics extension provides equivalent verified coverage and lifecycle behavior"
+    },
+    {
+      "path": "tests/liekan/fixtures/deployment-docker.sh",
+      "purpose": "Model optional analytics service lifecycle in isolated deployment verification",
+      "tests": [
+        "node --test tests/liekan/deployment.test.mjs"
+      ],
+      "owner": "Liekan analytics maintenance",
+      "constraint": "Keep PostgreSQL authoritative and preserve configuration, credentials, data volumes and immutable deployment candidates",
+      "removalCondition": "Remove when the supported deployment entrypoint covers these lifecycle guarantees"
     }
   ]
 }

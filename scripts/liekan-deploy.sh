@@ -1,15 +1,17 @@
 #!/bin/sh
 set -eu
+with_clickhouse=0
+if [ "${1:-}" = '--with-clickhouse' ]; then with_clickhouse=1; shift; fi
 
 if [ "${1:-}" = '--help' ]; then
-  printf '%s\n' '用法：sh scripts/liekan-deploy.sh [--check]' '需要 Docker 和 Docker Compose，源码构建要求 Docker 至少配置 6 GiB 内存，建议 8 GiB 或以上并预留空闲内存。' '首次生成私有配置，构建并启动GEOInflow；再次运行保留配置与数据。--check 只检查 Docker 和构建内存门槛。'
+  printf '%s\n' '用法：sh scripts/liekan-deploy.sh [--with-clickhouse] [--check]' '需要 Docker 和 Docker Compose，源码构建要求 Docker 至少配置 6 GiB 内存，建议 8 GiB 或以上并预留空闲内存。' '首次生成私有配置，构建并启动GEOInflow；再次运行保留配置与数据。--check 只检查 Docker 和构建内存门槛。' '可选 ClickHouse 使用独立内部服务和数据卷，后台完成同步对账后启用。'
   exit 0
 fi
 check_only=0
 if [ "$#" -eq 1 ] && [ "$1" = '--check' ]; then
   check_only=1
 elif [ "$#" -ne 0 ]; then
-  printf '%s\n' '用法：sh scripts/liekan-deploy.sh [--check]' >&2
+  printf '%s\n' '用法：sh scripts/liekan-deploy.sh [--with-clickhouse] [--check]' >&2
   exit 1
 fi
 cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -112,6 +114,7 @@ fi
 
 docker compose -f docker-compose.liekan.yml config --quiet
 compose_configuration=$(docker compose -f docker-compose.liekan.yml config --format yaml)
+compose_project=$(printf '%s\n' "$compose_configuration" | awk '/^name: / { sub(/^name: /, ""); print; exit }' | tr -d "\"'")
 application_image=$(printf '%s\n' "$compose_configuration" | awk '
   /^services:$/ { in_services=1; next }
   in_services && /^[^[:space:]]/ { in_services=0 }
@@ -184,6 +187,51 @@ start_existing_dependency() {
   printf '%s\n' "$dependency_name 容器健康检查超时，部署已停止。" >&2
   return 1
 }
+
+if [ "$with_clickhouse" = 1 ] || grep -Eq '^LIEKAN_ANALYTICS_CLICKHOUSE_URL=http://geoinflow_analytics:[a-f0-9]+@analytics-clickhouse:8123/geoinflow_analytics$' .env; then
+  if grep -Eq '^LIEKAN_ANALYTICS_CLICKHOUSE_URL=.+$' .env && ! grep -Eq '^LIEKAN_ANALYTICS_CLICKHOUSE_URL=http://geoinflow_analytics:[a-f0-9]+@analytics-clickhouse:8123/geoinflow_analytics$' .env; then
+    printf '%s\n' '当前已配置外部 ClickHouse，请保留该连接并使用默认部署命令。' >&2
+    exit 1
+  fi
+  if grep -Eq '^LIEKAN_CLICKHOUSE_PASSWORD=.+$' .env && ! grep -Eq '^LIEKAN_ANALYTICS_CLICKHOUSE_URL=.+$' .env; then
+    printf '%s\n' '请先恢复完整的 ClickHouse 连接配置，部署会保留已有密码。' >&2
+    exit 1
+  fi
+  case "$compose_project" in
+    ''|*[!a-zA-Z0-9_.-]*) printf '%s\n' '无法确认 ClickHouse 所属 Compose 项目，部署已停止。' >&2; exit 1 ;;
+  esac
+  clickhouse_volume="${compose_project}_liekan-clickhouse-data"
+  if ! grep -Eq '^LIEKAN_CLICKHOUSE_PASSWORD=.+$' .env; then
+    if printf '%s\n' "$existing_volumes" | grep -Fx "$clickhouse_volume" >/dev/null; then
+      printf '%s\n' '发现已有 ClickHouse 数据卷，请先恢复原连接配置和密码。' >&2
+      exit 1
+    fi
+    if grep -Eq '^LIEKAN_ANALYTICS_CLICKHOUSE_URL=.+$' .env; then
+      printf '%s\n' '当前已配置外部 ClickHouse，请保留该连接并使用默认部署命令。' >&2
+      exit 1
+    fi
+    if [ -L .env ]; then printf '%s\n' '请在原配置文件中添加 ClickHouse 连接，再执行部署。' >&2; exit 1; fi
+    clickhouse_password=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+    temporary=$(mktemp .local/liekan-clickhouse-env.XXXXXX)
+    # Remove empty optional keys before appending one authoritative value.
+    sed '/^LIEKAN_CLICKHOUSE_PASSWORD=$/d; /^LIEKAN_ANALYTICS_CLICKHOUSE_URL=$/d' .env > "$temporary"
+    printf '\nLIEKAN_CLICKHOUSE_PASSWORD=%s\nLIEKAN_ANALYTICS_CLICKHOUSE_URL=http://geoinflow_analytics:%s@analytics-clickhouse:8123/geoinflow_analytics\n' "$clickhouse_password" "$clickhouse_password" >> "$temporary"
+    mv "$temporary" .env
+    temporary=''
+    unset clickhouse_password
+  fi
+  docker compose -f docker-compose.liekan.yml -f docker-compose.liekan-clickhouse.yml config --quiet
+  clickhouse_container=$(docker compose -f docker-compose.liekan.yml -f docker-compose.liekan-clickhouse.yml ps --all --quiet analytics-clickhouse)
+  case "$clickhouse_container" in *[!a-zA-Z0-9_.-]*) printf '%s\n' 'ClickHouse 容器无法识别，部署已停止。' >&2; exit 1 ;; esac
+  if [ -n "$clickhouse_container" ]; then
+    start_existing_dependency 'ClickHouse' "$clickhouse_container"
+  elif printf '%s\n' "$existing_volumes" | grep -Fx "$clickhouse_volume" >/dev/null; then
+    printf '%s\n' '发现 ClickHouse 数据卷，但原容器缺失。请先恢复原容器并检查数据。' >&2
+    exit 1
+  else
+    docker compose -f docker-compose.liekan.yml -f docker-compose.liekan-clickhouse.yml up -d --no-deps --wait --wait-timeout 300 analytics-clickhouse
+  fi
+fi
 
 # Build a private tag so another build cannot replace our candidate between build and inspect.
 # Git is optional for source archives. Unknown metadata never substitutes for an image ID.

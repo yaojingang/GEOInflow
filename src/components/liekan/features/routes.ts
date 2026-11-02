@@ -24,6 +24,7 @@ export const featurePages = [
   },
 ];
 const unscopedPages = new Set([
+  'admin-analytics-engine',
   'history-repair',
   'analytics-acceleration',
   'crawlers-manage',
@@ -72,6 +73,7 @@ export function matchFeatureRoute(
   pathname: string,
   query: Record<string, string> = {},
 ): FeatureRoute | null {
+  if (/^\/admin\/analytics-engine\/?$/.test(pathname)) return { page: 'admin-analytics-engine', context: 'admin' };
   if (/^\/settings\/analytics-acceleration\/?$/.test(pathname)) return { page: 'analytics-acceleration' };
   if (/^\/settings\/data-repair\/?$/.test(pathname)) return { page: 'history-repair' };
   if (/^\/crawlers\/manage\/?$/.test(pathname)) return { page: 'crawlers-manage' };
@@ -123,6 +125,7 @@ export function matchFeatureRoute(
   return null;
 }
 export function featureHref(page: string, params: Record<string, any> = {}): string {
+  if (page === 'admin-analytics-engine') return '/admin/analytics-engine';
   if (page === 'analytics-acceleration') {
     const search = new URLSearchParams();
     if (typeof params.websiteId === 'string' && /^[a-f0-9-]{36}$/i.test(params.websiteId)) search.set('websiteId',params.websiteId);

@@ -1,3 +1,4 @@
+import { readClickHouseLogRollup, readClickHouseLogSeries } from './analytics-engine-read';
 import {
   readAnalysisLogRollup,
   readAnalysisLogSeries,
@@ -19,6 +20,11 @@ import { LiekanError, query } from './server';
 import { staticRequestExtensionPattern } from './log-content-boundary';
 
 export { staticRequestExtensionPattern, isStaticRequestPath } from './log-content-boundary';
+
+const readPreferredLogRollup = async (input: Parameters<typeof readAnalysisLogRollup>[0]) =>
+  (await readClickHouseLogRollup(input)) ?? readAnalysisLogRollup(input);
+const readPreferredLogSeries = async (input: Parameters<typeof readAnalysisLogSeries>[0]) =>
+  (await readClickHouseLogSeries(input)) ?? readAnalysisLogSeries(input);
 export async function getLogFacts(...args: Parameters<typeof readLogFacts>) {
   return withLogStatisticsRead(() => readLogFacts(...args));
 }
@@ -103,7 +109,7 @@ async function readLogFacts(
     !filter &&
     !search &&
     /^[a-f0-9-]{36}$/i.test(id)
-      ? await readAnalysisLogRollup({
+      ? await readPreferredLogRollup({
           websiteId: id,
           startDate: start,
           endDate: end,
@@ -186,7 +192,7 @@ async function readLogFacts(
   const selectedAggregates = Object.entries(aggregateQueries).filter(([field]) => needs(field));
   const accelerated =
     selectedAggregates.length && /^[a-f0-9-]{36}$/i.test(id)
-      ? await readAnalysisLogRollup({
+      ? await readPreferredLogRollup({
           websiteId: id,
           startDate: start,
           endDate: end,
@@ -275,7 +281,7 @@ async function readLogFacts(
   const previousEnd = new Date(+start - (metrics.crawlerMetricsVersion === 1 ? 0 : 1));
   const previousRollup =
     needs('previousBots') && withForms && /^[a-f0-9-]{36}$/i.test(id)
-      ? await readAnalysisLogRollup({
+      ? await readPreferredLogRollup({
           websiteId: id,
           startDate: previousStart,
           endDate: previousEnd,
@@ -386,7 +392,7 @@ export async function getMonthlyAiShare(
       `${new Date(Date.UTC(y, m - 6, 1)).toISOString().slice(0, 10)}T00:00:00`,
       timezone,
     );
-    const series = await readAnalysisLogSeries({
+    const series = await readPreferredLogSeries({
       websiteId: id,
       startDate: start,
       endDate: end,
@@ -428,7 +434,7 @@ export async function getPlotLogs(
   metrics: CrawlerMetricOptions = { crawlerIdentityScope: 'all' },
 ) {
   if (/^[a-f0-9-]{36}$/i.test(id)) {
-    const series = await readAnalysisLogSeries({
+    const series = await readPreferredLogSeries({
       websiteId: id,
       startDate: start,
       endDate: end,

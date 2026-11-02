@@ -558,6 +558,24 @@ export interface paths {
     patch: operations['saveLiekanAccountPreferences'];
     trace?: never;
   };
+  '/api/liekan/admin/analytics-engine': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read optional analytics engine state (administrator session) */
+    get: operations['getLiekanAnalyticsEngine'];
+    put?: never;
+    /** Manage optional historical log analytics (administrator session) */
+    post: operations['changeLiekanAnalyticsEngine'];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/liekan/admin/crawler-registry': {
     parameters: {
       query?: never;
@@ -8566,6 +8584,269 @@ export interface operations {
         content: {
           'application/json': components['schemas']['ApiError'];
         };
+      };
+    };
+  };
+  getLiekanAnalyticsEngine: {
+    parameters: {
+      query?: {
+        cursor?: string;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description System analytics engine state; complete administrator session required */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': {
+            checkedAt: string | null;
+            configured: boolean;
+            connection: string | null;
+            enabled: boolean;
+            /** @description Error details returned when the operation fails. */
+            error: string | null;
+            healthy: boolean;
+            nextCursor?: string | null;
+            revision: number;
+            sites: {
+              completed: string;
+              failed: string;
+              lastPublishedAt: string | null;
+              /** @description Display name of the resource. */
+              name: string;
+              pending: string;
+              purgePending: boolean;
+              rangeEnd: string | null;
+              rangeStart: string | null;
+              rows: string;
+              /**
+               * Format: uuid
+               * @description ID of the website.
+               */
+              websiteId: string;
+            }[];
+            supported: boolean;
+            syncing: boolean;
+            version: string | null;
+            workerAt: string | null;
+          };
+        };
+      };
+      /** @description Bad request. */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "bad-request",
+           *         "message": "Bad request.",
+           *         "status": 400
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Unauthorized. */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "unauthorized",
+           *         "message": "Unauthorized.",
+           *         "status": 401
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Forbidden. */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "forbidden",
+           *         "message": "Forbidden.",
+           *         "status": 403
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description State changed or preparation and verification are required */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description The configured analytics service or background worker is unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  changeLiekanAnalyticsEngine: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: {
+      content: {
+        'application/json': {
+          /** @enum {string} */
+          action:
+            | 'check'
+            | 'prepare'
+            | 'verify'
+            | 'enable'
+            | 'disable'
+            | 'pause'
+            | 'resume'
+            | 'retry';
+          expectedRevision: number;
+          /**
+           * @default zh-CN
+           * @enum {string}
+           */
+          locale?: 'zh-CN' | 'en-US';
+          /** Format: uuid */
+          requestId: string;
+        };
+      };
+    };
+    responses: {
+      /** @description System analytics engine state; complete administrator session required */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': {
+            checkedAt: string | null;
+            configured: boolean;
+            connection: string | null;
+            enabled: boolean;
+            /** @description Error details returned when the operation fails. */
+            error: string | null;
+            healthy: boolean;
+            nextCursor?: string | null;
+            revision: number;
+            sites: {
+              completed: string;
+              failed: string;
+              lastPublishedAt: string | null;
+              /** @description Display name of the resource. */
+              name: string;
+              pending: string;
+              purgePending: boolean;
+              rangeEnd: string | null;
+              rangeStart: string | null;
+              rows: string;
+              /**
+               * Format: uuid
+               * @description ID of the website.
+               */
+              websiteId: string;
+            }[];
+            supported: boolean;
+            syncing: boolean;
+            version: string | null;
+            workerAt: string | null;
+          };
+        };
+      };
+      /** @description Bad request. */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "bad-request",
+           *         "message": "Bad request.",
+           *         "status": 400
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Unauthorized. */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "unauthorized",
+           *         "message": "Unauthorized.",
+           *         "status": 401
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Forbidden. */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "forbidden",
+           *         "message": "Forbidden.",
+           *         "status": 403
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description State changed or preparation and verification are required */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description The configured analytics service or background worker is unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
       };
     };
   };
