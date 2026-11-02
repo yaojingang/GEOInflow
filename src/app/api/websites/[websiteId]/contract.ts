@@ -1,6 +1,8 @@
 import { defineOperation } from '@/openapi/operation';
 import {
   badRequestResponse,
+  forbiddenResponse,
+  notFoundResponse,
   jsonResponse,
   okSchema,
   serverErrorResponse,
@@ -75,6 +77,8 @@ const deleteWebsiteOperation = defineOperation({
     responses: {
       '200': jsonResponse(okSchema, 'Website deleted.'),
       '401': unauthorizedResponse,
+      '403': forbiddenResponse,
+      '404': notFoundResponse,
     },
   },
 });

@@ -162,6 +162,25 @@ beforeEach(() => {
   updateSessionMock.mockResolvedValue(undefined as any);
 });
 
+test('collector redacts direct-submitted URL and referrer secrets while preserving UTM', async () => {
+  const response = await callPOST({
+    type: 'event',
+    payload: {
+      website: WEBSITE_ID,
+      url: 'https://example.com/landing?token=private-url-secret&utm_source=google#access_token=private-fragment',
+      referrer: 'https://search.example.com/?email=private%40example.com&q=analytics',
+    },
+  });
+  expect(response.status).toBe(200);
+  const saved = saveEventMock.mock.calls[0][0];
+  expect(JSON.stringify(saved)).not.toMatch(
+    /private-url-secret|private-fragment|private%40example/,
+  );
+  expect(new URLSearchParams(saved.urlQuery).get('token')).toBe('[redacted]');
+  expect(saved.utmSource).toBe('google');
+  expect(new URLSearchParams(saved.referrerQuery).get('q')).toBe('analytics');
+});
+
 describe('parseRequest error handling', () => {
   test('returns the parseRequest error response and does not process the event', async () => {
     parseRequestMock.mockResolvedValue({

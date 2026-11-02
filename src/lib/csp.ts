@@ -17,7 +17,9 @@ export function getContentSecurityPolicy() {
   const directives = [
     `default-src 'self'`,
     `img-src 'self' https: data: blob:`,
-    `script-src 'self' 'unsafe-eval' 'unsafe-inline'`,
+    `script-src 'self' 'unsafe-inline'${process.env.NODE_ENV === 'production' ? '' : " 'unsafe-eval'"}`,
+    `object-src 'none'`,
+    `base-uri 'self'`,
     `style-src 'self' 'unsafe-inline'`,
     `connect-src ${connectSrc}`,
     `frame-src 'self' http: https:`,

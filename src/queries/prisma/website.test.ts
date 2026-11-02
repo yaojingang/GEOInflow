@@ -6,21 +6,35 @@ const {
   redisDelMock,
   redisSetMock,
   resetLiekanMock,
+  stopWebsiteSourcesMock,
   findUniqueMock,
   findFirstMock,
   shareFindFirstMock,
+  lockMock,
 } = vi.hoisted(() => ({
   transactionMock: vi.fn(),
   redisDelMock: vi.fn(),
   redisSetMock: vi.fn(),
   resetLiekanMock: vi.fn(),
+  stopWebsiteSourcesMock: vi.fn(),
   findUniqueMock: vi.fn(),
   findFirstMock: vi.fn(),
   shareFindFirstMock: vi.fn(),
+  lockMock: vi.fn(),
 }));
 
 vi.mock('@/lib/liekan/upstream/ai-lifecycle', () => ({ clearAiWebsiteInTransaction: vi.fn() }));
-vi.mock('@/lib/liekan/upstream/lifecycle', () => ({ resetLiekanStatistics: resetLiekanMock,stopWebsiteSources:vi.fn() }));
+vi.mock('@/lib/liekan/upstream/server', () => ({ lockWritableWebsite: lockMock }));
+vi.mock('@/lib/liekan/upstream/lifecycle', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/liekan/upstream/lifecycle')>(
+    '@/lib/liekan/upstream/lifecycle',
+  );
+  return {
+    ...actual,
+    resetLiekanStatistics: resetLiekanMock,
+    stopWebsiteSources: stopWebsiteSourcesMock,
+  };
+});
 
 vi.mock('@/lib/prisma', () => ({
   default: {
@@ -69,9 +83,11 @@ function createDeleteTx(calls: string[]) {
         calls.push('eventData');
       }),
     },
-    $executeRawUnsafe: vi.fn(async () => {
+    $executeRawUnsafe: vi.fn(async (_sql: string) => {
       calls.push('rawSql');
+      return 0;
     }),
+    $queryRawUnsafe: vi.fn(async (_sql: string, _arg?: string): Promise<{ name: string }[]> => []),
     sessionData: {
       deleteMany: vi.fn(async () => {
         calls.push('sessionData');
@@ -180,47 +196,112 @@ describe('getWebsite dual-track resolution', () => {
 });
 
 describe('website delete dependencies', () => {
+  let steps: string[];
+  let transactions: { calls: string[]; sql: string[]; query: string[] }[];
+  let catalogRows: { name: string }[];
+  let keysFor: (table?: string) => { name: string }[];
+  let executeResult: (sql: string) => number;
+  let onWebsiteDelete: (() => void) | undefined;
+  let activeCalls: string[];
+
   beforeEach(() => {
+    steps = [];
+    transactions = [];
+    catalogRows = [];
+    keysFor = () => [];
+    executeResult = () => 0;
+    onWebsiteDelete = undefined;
+    activeCalls = [];
     transactionMock.mockReset();
     redisDelMock.mockReset();
     redisSetMock.mockReset();
+    resetLiekanMock.mockReset();
+    stopWebsiteSourcesMock.mockReset();
+    lockMock.mockReset();
     delete process.env.CLOUD_MODE;
     process.env.DATABASE_URL = 'postgresql://user:pass@localhost:5432/umami?schema=public';
+    lockMock.mockImplementation(async () => {
+      steps.push('lock');
+    });
+    resetLiekanMock.mockImplementation(async () => {
+      activeCalls.push('liekanReset');
+    });
+    stopWebsiteSourcesMock.mockImplementation(async () => {
+      activeCalls.push('stop');
+    });
+    transactionMock.mockImplementation(async (work, options) => {
+      expect(options).toEqual({ timeout: 600000, maxWait: 10000 });
+      activeCalls = [];
+      const tx = createDeleteTx(activeCalls);
+      tx.$executeRawUnsafe.mockImplementation(async (sql: string) => {
+        activeCalls.push('rawSql');
+        if (sql.includes('DELETE FROM') || sql.includes('delete from event_data')) steps.push(sql);
+        return executeResult(sql);
+      });
+      tx.$queryRawUnsafe = vi.fn(async (sql: string, arg?: string) => {
+        if (sql.includes('pg_constraint')) return catalogRows;
+        if (sql.includes('indisprimary')) return keysFor(arg);
+        return [];
+      });
+      tx.website.delete.mockImplementation(async () => {
+        activeCalls.push('websiteDelete');
+        onWebsiteDelete?.();
+        return { id: 'website-1' };
+      });
+      const recorded = activeCalls;
+      try {
+        return await work(tx);
+      } finally {
+        transactions.push({
+          calls: [...recorded],
+          sql: tx.$executeRawUnsafe.mock.calls.map(call => String(call[0])),
+          query: tx.$queryRawUnsafe.mock.calls.map(call => String(call[0])),
+        });
+      }
+    });
   });
 
-  test('deleteWebsite runs fast event-data cleanup, a relational safety pass, and heatmap cleanup before deleting website events', async () => {
-    const calls: string[] = [];
-    const tx = createDeleteTx(calls);
+  function batchSql() {
+    return transactions.flatMap(tx => tx.sql).filter(sql => sql.includes('LIMIT'));
+  }
 
-    transactionMock.mockImplementation(async callback => callback(tx));
+  function finalTransaction() {
+    return transactions.find(
+      tx => tx.calls.includes('websiteDelete') || tx.calls.includes('websiteUpdate'),
+    );
+  }
 
+  test('keeps the authority lock and every deleting batch in one transaction', async () => {
+    const identity = { userId: 'owner-1' };
+    await resetWebsite('website-1', identity);
+    expect(transactionMock).toHaveBeenCalledTimes(1);
+    expect(steps[0]).toBe('lock');
+    expect(finalTransaction()?.sql.some(sql => sql.includes('LIMIT 5000'))).toBe(true);
+    expect(lockMock).toHaveBeenCalledWith(expect.anything(), 'website-1', identity);
+  });
+
+  test('deleteWebsite batches dependent rows before changing the website row', async () => {
     await deleteWebsite('website-1');
+    const sql = batchSql();
+    const safety = sql.findIndex(statement => statement.includes('event_data.website_event_id'));
+    const events = sql.findIndex(statement => statement.startsWith('DELETE FROM website_event'));
+    const sessions = sql.findIndex(statement => statement.startsWith('DELETE FROM session '));
+    expect(safety).toBeGreaterThan(-1);
+    expect(events).toBeGreaterThan(safety);
+    expect(sessions).toBeGreaterThan(events);
+    expect(sql.some(statement => statement.includes('LIMIT 5000'))).toBe(true);
+    expect(
+      transactions.some(tx => tx.query.some(statement => statement.includes('confdeltype'))),
+    ).toBe(true);
 
-    expect(tx.eventData.deleteMany).toHaveBeenCalledWith({
-      where: { websiteId: 'website-1' },
-    });
-    expect(tx.heatmapEvent.deleteMany).toHaveBeenCalledWith({
-      where: { websiteId: 'website-1' },
-    });
-    expect(tx.$executeRawUnsafe).toHaveBeenNthCalledWith(1, 'SET search_path TO "public";');
-    expect(tx.$executeRawUnsafe).toHaveBeenNthCalledWith(
-      2,
-      expect.stringContaining('delete from event_data'),
-      'website-1',
-    );
-    expect(tx.$executeRawUnsafe).toHaveBeenNthCalledWith(
-      2,
-      expect.stringContaining('website_event.website_id = $1'),
-      'website-1',
-    );
-    expect(calls).toEqual([
+    const final = finalTransaction();
+    expect(final?.calls.filter(call => call !== 'rawSql')).toEqual([
+      'stop',
       'sessionReplaySaved',
       'sessionReplay',
       'heatmapEvent',
       'revenue',
       'eventData',
-      'rawSql',
-      'rawSql',
       'sessionData',
       'sessionLink',
       'websiteEvent',
@@ -230,65 +311,105 @@ describe('website delete dependencies', () => {
       'annotation',
       'share',
       'websiteDelete',
-      'rawSql',
-      'rawSql',
     ]);
+    expect(final?.sql.some(statement => statement.includes('delete from event_data'))).toBe(true);
+    expect(final?.sql.some(statement => statement.includes('liekan_analytics_revision'))).toBe(
+      true,
+    );
+    expect(transactions.at(-1)).toBe(final);
   });
 
-  test('resetWebsite uses the same two-pass event-data cleanup before resetting the website', async () => {
-    const calls: string[] = [];
-    const tx = createDeleteTx(calls);
+  test('hard delete purges cascaded tables and soft delete leaves them', async () => {
+    catalogRows = [{ name: 'liekan_log' }];
+    await deleteWebsite('website-1');
+    expect(batchSql().some(statement => statement.startsWith('DELETE FROM liekan_log'))).toBe(true);
 
-    transactionMock.mockImplementation(async callback => callback(tx));
+    transactions = [];
+    steps = [];
+    process.env.CLOUD_MODE = '1';
+    await deleteWebsite('website-1');
+    expect(
+      transactions.some(tx => tx.query.some(statement => statement.includes('pg_constraint'))),
+    ).toBe(false);
+    expect(batchSql().some(statement => statement.includes('liekan_log'))).toBe(false);
+    expect(finalTransaction()?.calls).toContain('websiteUpdate');
+    expect(redisDelMock).toHaveBeenCalledWith('website:website-1');
+  });
 
-    resetLiekanMock.mockImplementation(async () => {
-      calls.push('liekanReset');
-    });
+  test('rejects a cascaded table name that is not an identifier', async () => {
+    catalogRows = [{ name: 'bad-name' }];
+    await expect(deleteWebsite('website-1')).rejects.toThrow('Invalid SQL identifier');
+    expect(steps.some(step => step.includes('DELETE FROM'))).toBe(false);
+  });
+
+  test('uses the primary key for batches and repeats a full batch', async () => {
+    keysFor = table => (table === 'website_event' ? [{ name: 'event_id' }] : []);
+    let passes = 0;
+    executeResult = sql => {
+      if (!sql.startsWith('DELETE FROM website_event')) return 0;
+      passes += 1;
+      return passes === 1 ? 5000 : 0;
+    };
+    await deleteWebsite('website-1');
+    const eventDeletes = batchSql().filter(statement =>
+      statement.startsWith('DELETE FROM website_event'),
+    );
+    expect(eventDeletes).toHaveLength(2);
+    expect(eventDeletes[0]).toContain('(event_id) IN (SELECT event_id FROM website_event');
+    expect(batchSql().find(statement => statement.startsWith('DELETE FROM session '))).toContain(
+      '(ctid) IN (SELECT ctid FROM session ',
+    );
+  });
+
+  test('propagates final failure without independently committing or retrying purge batches', async () => {
+    onWebsiteDelete = () => {
+      throw Object.assign(new Error('transaction failure'), { code: 'P2028' });
+    };
+    await expect(deleteWebsite('website-1')).rejects.toMatchObject({ code: 'P2028' });
+    expect(transactionMock).toHaveBeenCalledTimes(1);
+    expect(redisDelMock).not.toHaveBeenCalled();
+    expect(transactions[0].sql.some(sql => sql.includes('LIMIT 5000'))).toBe(true);
+  });
+
+  test('resetWebsite checks write access before batched deletes and then resets the row', async () => {
     const identity = { userId: 'owner-1' };
     await resetWebsite('website-1', identity);
-    expect(resetLiekanMock).toHaveBeenCalledWith(tx, 'website-1', identity);
-
-    expect(tx.eventData.deleteMany).toHaveBeenCalledWith({
-      where: { websiteId: 'website-1' },
-    });
-    expect(tx.heatmapEvent.deleteMany).toHaveBeenCalledWith({
-      where: { websiteId: 'website-1' },
-    });
-    expect(tx.$executeRawUnsafe).toHaveBeenNthCalledWith(1, 'SET search_path TO "public";');
-    expect(tx.$executeRawUnsafe).toHaveBeenNthCalledWith(
-      2,
-      expect.stringContaining('website_event.website_id = $1'),
-      'website-1',
-    );
-    expect(calls).toEqual([
+    expect(steps[0]).toBe('lock');
+    expect(lockMock).toHaveBeenCalledWith(expect.anything(), 'website-1', identity);
+    const sql = batchSql();
+    const logs = sql.findIndex(statement => statement.startsWith('DELETE FROM liekan_log'));
+    const events = sql.findIndex(statement => statement.startsWith('DELETE FROM website_event'));
+    expect(logs).toBeGreaterThan(-1);
+    expect(events).toBeGreaterThan(logs);
+    const final = finalTransaction();
+    expect(resetLiekanMock).toHaveBeenCalledWith(expect.anything(), 'website-1', identity);
+    expect(final?.calls.filter(call => call !== 'rawSql')).toEqual([
       'liekanReset',
       'sessionReplaySaved',
       'sessionReplay',
       'heatmapEvent',
       'revenue',
       'eventData',
-      'rawSql',
-      'rawSql',
       'sessionData',
       'sessionLink',
       'websiteEvent',
       'session',
       'websiteUpdate',
-      'rawSql',
-      'rawSql',
     ]);
+    expect(transactions.at(-1)).toBe(final);
   });
 
-  test('revoked write access stops reset before upstream statistics are deleted', async () => {
-    const calls: string[] = [];
-    const tx = createDeleteTx(calls);
-    transactionMock.mockImplementation(async callback => callback(tx));
-    resetLiekanMock.mockRejectedValue(new Error('Permission revoked'));
+  test('revoked write access stops reset before dependent rows are deleted', async () => {
+    lockMock.mockImplementation(async () => {
+      steps.push('lock');
+      throw new Error('Permission revoked');
+    });
     await expect(resetWebsite('website-1', { userId: 'owner-1' })).rejects.toThrow(
       'Permission revoked',
     );
-    expect(calls).toEqual([]);
-    expect(tx.websiteEvent.deleteMany).not.toHaveBeenCalled();
-    expect(tx.website.update).not.toHaveBeenCalled();
+    expect(steps).toEqual(['lock']);
+    expect(batchSql()).toEqual([]);
+    expect(resetLiekanMock).not.toHaveBeenCalled();
+    expect(finalTransaction()).toBeUndefined();
   });
 });

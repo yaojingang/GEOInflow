@@ -30,7 +30,7 @@ export function WebsiteReplaySettings({ websiteId }: { websiteId: string }) {
   const [heatmapEnabled, setHeatmapEnabled] = useState(config.heatmapEnabled === true);
   const [sampleRate, setSampleRate] = useState(config.sampleRate ?? 0.15);
   const [heatmapSampleRate, setHeatmapSampleRate] = useState(config.heatmapSampleRate ?? 0.15);
-  const [maskLevel, setMaskLevel] = useState(config.maskLevel ?? 'moderate');
+  const [maskLevel, setMaskLevel] = useState(config.maskLevel ?? 'strict');
   const [maxDuration, setMaxDuration] = useState(String(config.maxDuration ?? 300000));
   const [blockSelector, setBlockSelector] = useState(config.blockSelector ?? '');
 
@@ -39,7 +39,7 @@ export function WebsiteReplaySettings({ websiteId }: { websiteId: string }) {
     setHeatmapEnabled(config.heatmapEnabled === true);
     setSampleRate(config.sampleRate ?? 0.15);
     setHeatmapSampleRate(config.heatmapSampleRate ?? 0.15);
-    setMaskLevel(config.maskLevel ?? 'moderate');
+    setMaskLevel(config.maskLevel ?? 'strict');
     setMaxDuration(String(config.maxDuration ?? 300000));
     setBlockSelector(config.blockSelector ?? '');
   }, [

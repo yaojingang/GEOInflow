@@ -764,7 +764,7 @@ describe('core form flows', () => {
           heatmapEnabled: false,
           sampleRate: 0.5,
           heatmapSampleRate: 0.15,
-          maskLevel: 'moderate',
+          maskLevel: 'strict',
           maxDuration: 600000,
           blockSelector: '',
         },
