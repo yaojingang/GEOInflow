@@ -3,6 +3,7 @@ import { primary, LiekanError } from './server';
 import { TRAFFIC_POLICY_VERSION } from './traffic-query';
 import { CRAWLER_POPULATION_VERSION } from '../rules/population';
 import { staticRequestExtensionPattern } from './log-content-boundary';
+import { analyticsRemaining, timedAnalyticsClient } from './analytics-deadline';
 import {
   ANALYSIS_ROLLUP_VERSION,
   ANALYSIS_GLOBAL_LIMIT,
@@ -13,17 +14,20 @@ import {
 export async function analysisTransaction<T>(
   work: (tx: AnalysisTx) => Promise<T>,
   isolationLevel: 'ReadCommitted' | 'RepeatableRead' = 'ReadCommitted',
+  deadline?: number,
 ): Promise<T> {
   const schema = new URL(process.env.DATABASE_URL).searchParams.get('schema') || 'public';
   if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schema)) throw new LiekanError('数据库设置无效', 500);
+  const remaining = deadline === undefined ? 30000 : analyticsRemaining(deadline);
   return primary().$transaction(
     async (tx: AnalysisTx) => {
+      if (deadline !== undefined) tx = timedAnalyticsClient(tx, deadline);
       await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${schema}"`);
       await tx.$executeRawUnsafe("SET LOCAL statement_timeout TO '5s'");
       await tx.$executeRawUnsafe("SET LOCAL lock_timeout TO '2s'");
       return work(tx);
     },
-    { timeout: 30000, maxWait: 1000, isolationLevel },
+    { timeout: Math.min(30000, remaining), maxWait: Math.min(1000, remaining), isolationLevel },
   ) as Promise<T>;
 }
 
@@ -70,6 +74,9 @@ export const analysisTables = [
   'liekan_analysis_query_viewer',
   'liekan_analysis_probe',
   'liekan_dashboard_snapshot',
+  'liekan_report_fragment',
+  'liekan_analytics_input_summary',
+  'liekan_analytics_input_state',
   'liekan_dashboard_dirty',
   'liekan_analysis_browser_detail',
   'liekan_analysis_browser_visit',
@@ -88,7 +95,10 @@ export async function analysisCapacity(tx: AnalysisTx, websiteId: string) {
   const [site] = await tx.$queryRawUnsafe<{ bytes: bigint }[]>(
     `SELECT (derived_bytes+pg_column_size(s)*2+coalesce((SELECT sum(bytes) FROM liekan_analysis_meter m WHERE m.website_id=s.website_id),0)
        +coalesce((SELECT sum(result_bytes) FROM liekan_analysis_query q WHERE q.website_id=s.website_id),0)*2
-       +coalesce((SELECT sum(result_bytes) FROM liekan_dashboard_snapshot d WHERE d.website_id=s.website_id),0)*2)::bigint AS bytes
+       +coalesce((SELECT sum(result_bytes) FROM liekan_dashboard_snapshot d WHERE d.website_id=s.website_id),0)*2
+       +coalesce((SELECT sum(result_bytes) FROM liekan_report_fragment f WHERE f.website_id=s.website_id),0)*2
+       +(SELECT count(*)*512 FROM liekan_analytics_input_summary i WHERE i.website_id=s.website_id)
+       +(SELECT count(*)*512 FROM liekan_analytics_input_state i WHERE i.website_id=s.website_id))::bigint AS bytes
      FROM liekan_analysis_site s WHERE website_id=$1::uuid`,
     websiteId,
   );

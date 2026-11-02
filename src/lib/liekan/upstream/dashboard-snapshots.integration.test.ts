@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { randomUUID } from 'node:crypto';
+import { writeFile } from 'node:fs/promises';
 import { PgBoss } from 'pg-boss';
 import { Client } from 'pg';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -110,6 +111,43 @@ async function finish(id: string) {
     id,
   );
   expect(row).toEqual({ status: 'ready', error_code: null });
+}
+async function aiLogs(times: number[], path = '/synthetic-ai-snapshot') {
+  const imported = randomUUID();
+  await sql(
+    'INSERT INTO liekan_import(id,website_id,digest,accepted,rejected) VALUES($1::uuid,$2::uuid,$1,$3,0)',
+    imported,
+    site,
+    times.length,
+  );
+  const ids: string[] = [];
+  for (const at of times) {
+    const id = randomUUID();
+    await sql(
+      `INSERT INTO liekan_log(id,website_id,import_id,created_at,path,method,status,bytes,ip_masked,ip_hash,user_agent,location,bot,vendor,bot_type,verification,ai_eligible,recognition_state)
+       VALUES($1,$2::uuid,$3::uuid,$4,$5,'GET',200,0,'','','GPTBot/fixture','','GPTBot','OpenAI','训练','unverified',true,'recognized')`,
+      id,
+      site,
+      imported,
+      new Date(at),
+      path,
+    );
+    ids.push(id);
+  }
+  return ids;
+}
+function aiSnapshotNow() {
+  let now = Math.ceil(Date.now() / 30000) * 30000 + 5000;
+  if (Math.floor(now / 86400000) !== Math.floor((now + 31000) / 86400000)) now += 30000;
+  return now;
+}
+async function expectAiProducerClock(jobId: string, through: number) {
+  const [timing] = await q(
+    `SELECT pending_through,last_read_at,clock_timestamp() AS database_now
+     FROM liekan_dashboard_snapshot WHERE job_id=$1::uuid`,
+    jobId,
+  );
+  expect(+new Date(timing.pending_through), JSON.stringify(timing)).toBe(through);
 }
 describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () => {
   afterEach(() => vi.restoreAllMocks());
@@ -561,6 +599,270 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
         )
       )[0].n,
     ).toBe(2);
+  });
+  it.each([
+    ['ai/overview', 'zh-CN'],
+    ['ai/bots', 'en-US'],
+    ['ai/pages', 'zh-CN'],
+    ['ai/preference', 'en-US'],
+  ] as const)(
+    'reuses unchanged %s with the same public projection as recomputation in %s',
+    async (resource, locale) => {
+      const now = aiSnapshotNow();
+      const today = Math.floor(now / 86400000) * 86400000;
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+      const [log] = await aiLogs([now - 60000]);
+      await event(new Date(now - 60000).toISOString());
+      await sql(
+        `INSERT INTO liekan_catalog(website_id,path,title,content_type,content_updated_at)
+         VALUES($1::uuid,'/synthetic-ai-snapshot','Snapshot page','article',$2)`,
+        site,
+        new Date(now - 2 * 3600000),
+      );
+      const parameters = {
+        startAt: today - 2 * 86400000,
+        endAt: today + 86400000,
+        resource,
+        chartPeriod: '30d',
+        timezone: 'UTC',
+        crawlerMetricsVersion: 1,
+      };
+      const request = (refresh = false) =>
+        withPublishedRegistry(() =>
+          requestDashboardSnapshot(
+            site,
+            actor,
+            'feature:page-report',
+            { ...parameters, ...(refresh ? { refresh: '1' } : {}) },
+            locale,
+          ),
+        );
+      const initial = await request();
+      if (initial.ready) throw new Error('expected a cold AI page');
+      await finish(initial.analysisJob.id);
+      const before = await request();
+      if (!before.ready) throw new Error('expected a published AI page');
+      clock.mockReturnValue(now + 31000);
+      const reused = await request();
+      if (!reused.ready) throw new Error('expected a reused AI page');
+      const nextEnd = Math.floor((now + 31000) / 30000) * 30000;
+      expect(reused.value.range.endAt).toBe(nextEnd);
+      expect(reused.value.meta.snapshot).toMatchObject({ dataThrough: nextEnd, state: 'ready' });
+      expect(
+        await q('SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid', site),
+      ).toHaveLength(1);
+      if (reused.value.meta.population)
+        expect(reused.value.meta.population.range.endAt).toBe(nextEnd);
+      const [saved] = await q(
+        'SELECT result FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
+        site,
+      );
+      if (['ai/overview', 'ai/preference'].includes(resource))
+        expect(saved.result.populations.length).toBeGreaterThan(0);
+      expect(saved.result.populations.every(population => population.range.endAt === nextEnd)).toBe(
+        true,
+      );
+      if (['ai/bots', 'ai/pages'].includes(resource)) {
+        expect(reused.value.meta.crawlerEvidenceView.query.endAt).toBe(nextEnd);
+        expect(reused.value.meta.crawlerEvidenceView.snapshot).not.toBe(
+          before.value.meta.crawlerEvidenceView.snapshot,
+        );
+      }
+      const forced = await request(true);
+      if (forced.ready) throw new Error('expected an explicit recomputation');
+      await expectAiProducerClock(forced.analysisJob.id, nextEnd);
+      await finish(forced.analysisJob.id);
+      const recomputed = await request();
+      if (!recomputed.ready) throw new Error('expected a recomputed AI page');
+      const content = (value: any) => {
+        const copy = structuredClone(value);
+        delete copy.meta.generatedAt;
+        delete copy.meta.expiresAt;
+        return copy;
+      };
+      if (process.env.LIEKAN_ANALYSIS_ROLLUPS_OUTPUT)
+        await writeFile(
+          `${process.env.LIEKAN_ANALYSIS_ROLLUPS_OUTPUT}/snapshot-reuse-${resource.replace('/', '-')}.json`,
+          JSON.stringify(
+            { reused: content(reused.value), recomputed: content(recomputed.value) },
+            null,
+            2,
+          ),
+          { mode: 0o600 },
+        );
+      expect(content(reused.value)).toEqual(content(recomputed.value));
+      await sql('UPDATE liekan_log SET status=201 WHERE website_id=$1::uuid AND id=$2', site, log);
+      clock.mockReturnValue(now + 62000);
+      expect(await request()).toMatchObject({ ready: true, snapshotState: 'updating' });
+      expect(
+        await q('SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid', site),
+      ).toHaveLength(3);
+    },
+  );
+  it('recomputes bot trends when the moving previous interval admits an existing historical log', async () => {
+    const now = aiSnapshotNow();
+    const today = Math.floor(now / 86400000) * 86400000;
+    const oldEnd = Math.floor(now / 30000) * 30000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const startAt = today - 86400000;
+    await aiLogs([now - 60000, 2 * startAt - oldEnd - 10000]);
+    const parameters = {
+      startAt,
+      endAt: today + 86400000,
+      resource: 'ai/bots',
+      timezone: 'UTC',
+      crawlerMetricsVersion: 1,
+    };
+    const request = () =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+      );
+    const pending = await request();
+    if (pending.ready) throw new Error('expected cold bots');
+    await finish(pending.analysisJob.id);
+    const before = await request();
+    if (!before.ready) throw new Error('expected published bots');
+    expect(before.value.tables.botBody[0].trend).toBeNull();
+    clock.mockReturnValue(now + 31000);
+    await request();
+    const jobs = await q(
+      'SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid ORDER BY sequence',
+      site,
+    );
+    expect(jobs).toHaveLength(2);
+    await expectAiProducerClock(jobs[1].id, Math.floor((now + 31000) / 30000) * 30000);
+    await finish(jobs[1].id);
+    const after = await request();
+    if (!after.ready) throw new Error('expected recomputed bots');
+    expect(after.value.tables.botBody[0].trend).toBe(0);
+  });
+  it('recomputes page freshness when elapsed content age crosses a displayed day', async () => {
+    const now = aiSnapshotNow();
+    const today = Math.floor(now / 86400000) * 86400000;
+    const oldEnd = Math.floor(now / 30000) * 30000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    await aiLogs([now - 60000]);
+    await sql(
+      `INSERT INTO liekan_catalog(website_id,path,title,content_type,content_updated_at)
+       VALUES($1::uuid,'/synthetic-ai-snapshot','Fresh page','article',$2)`,
+      site,
+      new Date(oldEnd - 86400000 + 15000),
+    );
+    const parameters = {
+      startAt: today - 86400000,
+      endAt: today + 86400000,
+      resource: 'ai/pages',
+      timezone: 'UTC',
+      crawlerMetricsVersion: 1,
+    };
+    const request = () =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+      );
+    const pending = await request();
+    if (pending.ready) throw new Error('expected cold pages');
+    await finish(pending.analysisJob.id);
+    const before = await request();
+    if (!before.ready) throw new Error('expected published pages');
+    expect(before.value.tables.apBody[0].freshness).toBe('0 天');
+    clock.mockReturnValue(now + 31000);
+    await request();
+    const jobs = await q(
+      'SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid ORDER BY sequence',
+      site,
+    );
+    expect(jobs).toHaveLength(2);
+    await expectAiProducerClock(jobs[1].id, Math.floor((now + 31000) / 30000) * 30000);
+    await finish(jobs[1].id);
+    const after = await request();
+    if (!after.ready) throw new Error('expected recomputed pages');
+    expect(after.value.tables.apBody[0].freshness).toBe('1 天');
+  });
+  it('attaches advanced crawler evidence with the fingerprint transaction and its repeatable snapshot', async () => {
+    const now = aiSnapshotNow();
+    const today = Math.floor(now / 86400000) * 86400000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    await aiLogs([now - 60000]);
+    const parameters = {
+      startAt: today,
+      endAt: today + 86400000,
+      resource: 'ai/bots',
+      timezone: 'UTC',
+      crawlerMetricsVersion: 1,
+    };
+    const request = () =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+      );
+    const pending = await request();
+    if (pending.ready) throw new Error('expected cold bots');
+    await finish(pending.analysisJob.id);
+    const transaction = rollupDatabase.analysisTransaction;
+    let fingerprintTransaction: object | undefined;
+    let evidenceTransaction: object | undefined;
+    vi.spyOn(rollupDatabase, 'analysisTransaction').mockImplementation((work, isolation) =>
+      transaction(
+        tx =>
+          work(
+            new Proxy(tx, {
+              get(target, property) {
+                if (property !== '$queryRawUnsafe') return Reflect.get(target, property);
+                return async (statement: string, ...values: unknown[]) => {
+                  if (statement.includes('SELECT liekan_dashboard_fingerprint'))
+                    fingerprintTransaction = tx;
+                  if (statement.startsWith('SELECT path,updated_at AS "updatedAt"')) {
+                    evidenceTransaction = tx;
+                    expect(isolation).toBe('RepeatableRead');
+                  }
+                  return target.$queryRawUnsafe(statement, ...values);
+                };
+              },
+            }),
+          ),
+        isolation,
+      ),
+    );
+    clock.mockReturnValue(now + 31000);
+    const reused = await request();
+    expect(reused.ready).toBe(true);
+    expect(evidenceTransaction).toBeDefined();
+    expect(evidenceTransaction).toBe(fingerprintTransaction);
+  });
+  it('falls back to normal admission when an unchanged-clock transaction loses a serialization race', async () => {
+    const now = aiSnapshotNow();
+    const today = Math.floor(now / 86400000) * 86400000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const parameters = {
+      startAt: today,
+      endAt: today + 86400000,
+      resource: 'ai/bots',
+      timezone: 'UTC',
+      crawlerMetricsVersion: 1,
+    };
+    const request = () =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+      );
+    const pending = await request();
+    if (pending.ready) throw new Error('expected cold bots');
+    await finish(pending.analysisJob.id);
+    const transaction = rollupDatabase.analysisTransaction;
+    let rejected = false;
+    vi.spyOn(rollupDatabase, 'analysisTransaction').mockImplementation((work, isolation) => {
+      if (!rejected && isolation === 'RepeatableRead') {
+        rejected = true;
+        return Promise.reject(
+          Object.assign(new Error('synthetic concurrent publication'), { code: 'P2034' }),
+        );
+      }
+      return transaction(work, isolation);
+    });
+    clock.mockReturnValue(now + 31000);
+    expect(await request()).toMatchObject({ ready: true, snapshotState: 'updating' });
+    expect(rejected).toBe(true);
+    expect(
+      await q('SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid', site),
+    ).toHaveLength(2);
   });
   it('invalidates a reused overview when import metadata changes without new logs', async () => {
     const now = Date.now();

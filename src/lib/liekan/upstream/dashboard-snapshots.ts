@@ -18,7 +18,10 @@ import {
 import type { CrawlerActor } from './crawler-access';
 import { noteBrowserPopulation } from './cache-context';
 import { pageReportParts } from '../contracts/page-report';
+import { parseReportQuery } from '../contracts/query';
 import { withPublishedRegistry } from './crawler-registry-context';
+import { withinQuerySnapshot } from './query-snapshot';
+import { attachReportEvidenceView } from './report-evidence-view';
 import { LiekanError } from './errors';
 import { hasAnalysisBuildCapacity } from './storage-capacity';
 import {
@@ -29,7 +32,7 @@ import {
   dashboardCapacityLockNamespace,
 } from './dashboard-demand';
 
-type MaintenancePass = { coldRegistered: boolean };
+type MaintenancePass = { coldRegistered: boolean; dispatchQueries?: () => Promise<void> };
 type AnalysisResponse = Awaited<ReturnType<typeof requestAnalysisQuery>>;
 type DashboardResponse =
   | (Extract<AnalysisResponse, { ready: true }> & {
@@ -97,7 +100,7 @@ type Snapshot = {
 
 async function fingerprint(tx: AnalysisTx, row: Pick<Snapshot, 'website_id' | 'epoch'>, end: Date) {
   const [value] = await tx.$queryRawUnsafe<{ fingerprint: string }[]>(
-    'SELECT liekan_dashboard_fingerprint($1::uuid,$2::bigint,$3::timestamptz) AS fingerprint',
+    'SELECT liekan_dashboard_fingerprint_v2($1::uuid,$2::bigint,$3::timestamptz) AS fingerprint',
     row.website_id,
     String(row.epoch),
     end,
@@ -164,9 +167,49 @@ async function advanceUnchangedSnapshot(
     if ((await fingerprint(tx, saved, end)) !== saved.fingerprint) return;
     const envelope = decodeAnalysisEnvelope(saved.result, saved.website_id);
     const value: any = envelope.value;
-    const previousEnd = Math.min(Number(saved.parameters.endAt), +new Date(saved.data_through) - 1);
-    const nextEnd = Math.min(Number(saved.parameters.endAt), window.through - 1);
+    const halfOpen = saved.parameters.crawlerMetricsVersion === 1;
+    const previousEnd = Math.min(
+      Number(saved.parameters.endAt),
+      +new Date(saved.data_through) - (halfOpen ? 0 : 1),
+    );
+    const nextEnd = Math.min(Number(saved.parameters.endAt), window.through - (halfOpen ? 0 : 1));
     if (value?.range?.endAt !== previousEnd) return;
+    if (saved.parameters.resource === 'ai/bots') {
+      const start = Number(saved.parameters.startAt);
+      const previousStart = Math.max(0, start - (previousEnd - start + (halfOpen ? 0 : 1)));
+      const nextStart = Math.max(0, start - (nextEnd - start + (halfOpen ? 0 : 1)));
+      // A wider comparison can admit old physical logs without changing any revision marker.
+      // The website/time index proves an empty prefix without evaluating the reporting view.
+      if (nextStart < previousStart) {
+        const [prefix] = await tx.$queryRawUnsafe<{ present: boolean }[]>(
+          `SELECT EXISTS(SELECT 1 FROM liekan_log WHERE website_id=$1::uuid
+           AND created_at>=$2::timestamptz AND created_at<$3::timestamptz) AS present`,
+          saved.website_id,
+          new Date(nextStart),
+          new Date(previousStart),
+        );
+        if (prefix.present) return;
+      }
+    }
+    if (saved.parameters.resource === 'ai/pages') {
+      if (!Array.isArray(value.tables?.apBody)) return;
+      const catalog = await tx.$queryRawUnsafe<{ content_updated_at: Date }[]>(
+        `SELECT content_updated_at FROM liekan_catalog WHERE website_id=$1::uuid
+         AND path=ANY($2::text[]) AND content_updated_at IS NOT NULL`,
+        saved.website_id,
+        value.tables.apBody.map((page: any) => page.path),
+      );
+      const freshness = (at: number, updatedAt: Date) =>
+        Math.max(0, Math.floor((at - +new Date(updatedAt)) / 86400000));
+      if (
+        catalog.some(
+          page =>
+            freshness(previousEnd, page.content_updated_at) !==
+            freshness(nextEnd, page.content_updated_at),
+        )
+      )
+        return;
+    }
     value.range.endAt = nextEnd;
     if (value.meta?.snapshot) value.meta.snapshot.dataThrough = window.through;
     for (const population of [
@@ -179,6 +222,11 @@ async function advanceUnchangedSnapshot(
         population.range.timezone === saved.parameters.timezone
       )
         population.range.endAt = nextEnd;
+    if (halfOpen && ['ai/bots', 'ai/pages'].includes(saved.parameters.resource)) {
+      const parsed = parseReportQuery(saved.parameters);
+      if (!parsed.success) return;
+      await withinQuerySnapshot(tx, () => attachReportEvidenceView(value, parsed.data));
+    }
     const bytes = Buffer.byteLength(JSON.stringify(envelope));
     if (bytes > 2 * 1024 * 1024) return;
     if (bytes > saved.result_bytes) {
@@ -210,6 +258,20 @@ async function advanceUnchangedSnapshot(
       dependency_end: end,
       next_refresh_at: new Date(window.nextRefresh),
     };
+  }, 'RepeatableRead').catch(error => {
+    // An overlapping publisher can replace a row after this repeatable snapshot was captured.
+    // Let normal admission rejoin or recompute that publication on serialization contention.
+    if (
+      error?.code === 'P2034' ||
+      [
+        error?.code,
+        error?.cause?.code,
+        error?.meta?.code,
+        error?.meta?.driverAdapterError?.cause?.originalCode,
+      ].includes('40001')
+    )
+      return undefined;
+    throw error;
   });
 }
 
@@ -863,7 +925,8 @@ export async function pumpDashboardSnapshots(
      ORDER BY (d.last_read_at>clock_timestamp()-interval '2 minutes') DESC,d.next_refresh_at,d.website_id LIMIT 8`,
     ),
   );
-  for (const row of rows) {
+  for (const [index, row] of rows.entries()) {
+    if (index > 0 && index % 2 === 0) await maintenance.dispatchQueries?.();
     try {
       await withPublishedRegistry(async () => {
         const actor = { id: row.actor_id, role: '' };
@@ -1003,7 +1066,8 @@ export async function seedDashboardSnapshots(
      ORDER BY s.dashboard_seed_checked_at NULLS FIRST,w.website_id LIMIT 8`,
     ),
   );
-  for (const site of sites) {
+  for (const [index, site] of sites.entries()) {
+    if (index > 0) await maintenance.dispatchQueries?.();
     if (!site.actor_id) continue;
     const remembered = await analysisTransaction(tx =>
       tx.$queryRawUnsafe<{ timezone: string; locale: 'zh-CN' | 'en-US' }[]>(
@@ -1082,9 +1146,12 @@ export async function seedDashboardSnapshots(
     });
     const keys = new Set(existing.map(row => row.query_key));
     let space = Math.max(0, 200 - keys.size);
+    let visited = 0;
     for (const { parameters, locale, key } of candidates) {
       if (keys.has(key)) continue;
       if (space === 0) break;
+      if (visited > 0 && visited % 2 === 0) await maintenance.dispatchQueries?.();
+      visited++;
       try {
         const result = await withPublishedRegistry(() =>
           requestDashboardSnapshot(
@@ -1116,11 +1183,13 @@ export async function seedDashboardSnapshots(
 
 /** Coordinate bounded common-range prewarming and existing publication maintenance. */
 let seedFirst = true;
-export async function pumpDashboardDemand() {
+export async function pumpDashboardDemand(dispatchQueries?: () => Promise<void>) {
   const first = seedFirst;
   seedFirst = !seedFirst;
-  const maintenance = { coldRegistered: false };
+  const maintenance = { coldRegistered: false, dispatchQueries };
   if (first) await seedDashboardSnapshots(maintenance);
+  await dispatchQueries?.();
   await pumpDashboardSnapshots(maintenance);
+  await dispatchQueries?.();
   if (!first) await seedDashboardSnapshots(maintenance);
 }

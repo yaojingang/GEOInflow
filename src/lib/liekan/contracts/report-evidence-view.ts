@@ -20,7 +20,7 @@ export function reportEvidenceViewPayload(
   const table = { 'ai/bots': 'botBody', 'ai/pages': 'apBody', logs: 'logBody' }[
     String(view.query.resource)
   ];
-  return JSON.stringify({
+  const payload = {
     query: view.query,
     policySnapshot: view.policySnapshot,
     display: normalized,
@@ -35,5 +35,15 @@ export function reportEvidenceViewPayload(
     ),
     totalLogs: report.meta.totalLogs,
     tablePage: report.meta.tablePages?.[table],
-  });
+  };
+  // PostgreSQL JSONB can reorder object keys; the evidence keeps displayed array order.
+  return JSON.stringify(payload, (_key, value) =>
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(
+          Object.keys(value)
+            .sort()
+            .map(key => [key, value[key]]),
+        )
+      : value,
+  );
 }

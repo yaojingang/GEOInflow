@@ -20,7 +20,7 @@ interface CacheContext {
   request?: Request;
   parameters?: Record<string, unknown>;
   versions?: Map<string, Promise<unknown>>;
-  reauthorize?: () => Promise<boolean>;
+  reauthorize?: (deadline?: number) => Promise<boolean>;
   prepared?: boolean;
   background?: boolean;
   workKind?: 'interactive' | 'preheat';
@@ -60,7 +60,7 @@ export function bindCacheRequest(
   request: Request,
   auth: any,
   parameters?: Record<string, unknown>,
-  reauthorize?: () => Promise<boolean>,
+  reauthorize?: (deadline?: number) => Promise<boolean>,
 ) {
   const context = contexts.getStore();
   if (!context) return;
@@ -136,7 +136,7 @@ export function analyticsWorkerContext<T>(
   work: () => Promise<T>,
   options?: {
     deadline?: number;
-    reauthorize?: () => Promise<boolean>;
+    reauthorize?: (deadline?: number) => Promise<boolean>;
     kind?: 'interactive' | 'preheat';
     refresh?: boolean;
   },

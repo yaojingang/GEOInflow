@@ -429,6 +429,8 @@ try {
                 'src/lib/liekan/upstream/analysis-queries.integration.test.ts',
                 'src/lib/liekan/upstream/dashboard-snapshots.integration.test.ts',
                 'src/lib/liekan/upstream/dashboard-scheduling.integration.test.ts',
+                'src/lib/liekan/upstream/report-fragments.integration.test.ts',
+                'src/lib/liekan/upstream/analytics-input-summary.integration.test.ts',
               ]
             : scopeC
               ? [
@@ -436,6 +438,8 @@ try {
                   'src/lib/liekan/upstream/analysis-queries.integration.test.ts',
                   'src/lib/liekan/upstream/dashboard-snapshots.integration.test.ts',
                   'src/lib/liekan/upstream/dashboard-scheduling.integration.test.ts',
+                  'src/lib/liekan/upstream/report-fragments.integration.test.ts',
+                  'src/lib/liekan/upstream/analytics-input-summary.integration.test.ts',
                   'src/lib/liekan/upstream/bounded-browser-events.integration.test.ts',
                   'src/lib/liekan/upstream/visit-build-paging.integration.test.ts',
                 ]
@@ -449,6 +453,8 @@ try {
                   'src/lib/liekan/upstream/dashboard-scheduling.integration.test.ts',
                   'src/lib/liekan/upstream/bounded-browser-events.integration.test.ts',
                   'src/lib/liekan/upstream/browser-detail-facts.integration.test.ts',
+                  'src/lib/liekan/upstream/report-fragments.integration.test.ts',
+                  'src/lib/liekan/upstream/analytics-input-summary.integration.test.ts',
                   'src/lib/liekan/upstream/visit-build-paging.integration.test.ts',
                 ];
   await run(
