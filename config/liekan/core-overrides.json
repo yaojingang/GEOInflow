@@ -6368,6 +6368,17 @@
       "owner": "Liekan lifecycle compatibility",
       "constraint": "Preserve source facts on failure, current website authority, source cleanup and soft-delete settings",
       "removalCondition": "Remove when upstream provides bounded atomic large-site cleanup with equivalent permission and rollback regressions"
+    },
+    {
+      "path": "src/tracker/privacy.d.ts",
+      "purpose": "Generated declarations for the tracker and collector URL privacy helpers",
+      "tests": [
+        "pnpm build:tracker:types",
+        "Repeated declaration generation leaves the source tree unchanged"
+      ],
+      "owner": "Liekan tracker compatibility",
+      "constraint": "Keep declarations synchronized with privacy.ts and preserve the existing tracker SDK contract",
+      "removalCondition": "Remove when the privacy helper is removed or declaration output moves to an ignored build directory"
     }
   ]
 }
