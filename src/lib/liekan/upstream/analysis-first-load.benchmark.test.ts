@@ -27,9 +27,27 @@ const summary = (values: number[]) => {
 };
 const statistical = (body: any) => {
   const { generatedAt, expiresAt, snapshot, canManage, keywordReadAt, ...meta } = body.meta || {};
+  if (meta.crawlerEvidenceView) {
+    // Proof serialization has its own cross-browser contract regression; compare its statistical inputs.
+    const { snapshot: proof, ...view } = meta.crawlerEvidenceView;
+    meta.crawlerEvidenceView = view;
+  }
   return { ...body, meta };
 };
-const digest = (value: any) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const digest = (value: any) =>
+  createHash('sha256')
+    .update(
+      JSON.stringify(value, (_key, item) =>
+        item && typeof item === 'object' && !Array.isArray(item)
+          ? Object.fromEntries(
+              Object.keys(item)
+                .sort()
+                .map(key => [key, item[key]]),
+            )
+          : item,
+      ),
+    )
+    .digest('hex');
 it.skipIf(!enabled)(
   'compares production first loads on the same owned 30-day spider population',
   async () => {
@@ -109,7 +127,7 @@ it.skipIf(!enabled)(
       cacheCondition:
         'Every cold sample restarts both application and worker and deletes only this fixture’s result tables; Redis is unset. PostgreSQL and OS buffers remain warm.',
       distribution:
-        'Every day has the same input count, 120 paths, static and status variants; events are concentrated in the first closed hour. This exercises 300000 logs/day without claiming a production path distribution.',
+        `Every day has the same input count, 120 paths, static and status variants; events are concentrated in the first closed hour. The fixture has ${logRows / 30} logs/day.`,
       measurements: [],
       passed: false,
     };
@@ -189,6 +207,7 @@ it.skipIf(!enabled)(
       token = (await login.json()).token;
     };
     const clear = async () => {
+      await db.query('DELETE FROM liekan_report_fragment WHERE website_id=$1::uuid', [site]);
       await db.query('DELETE FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid', [site]);
       await db.query('DELETE FROM liekan_analysis_query WHERE website_id=$1::uuid', [site]);
       // Both owned runtimes have stopped; reset abandoned control leases before an independent trial.
@@ -371,6 +390,17 @@ it.skipIf(!enabled)(
           [site],
         )
       ).rows;
+      for (let pass = 0; pass < 1000; pass++) {
+        const ready = (
+          await db.query(
+            'SELECT ready FROM liekan_analytics_input_state WHERE website_id=$1::uuid AND epoch=1',
+            [site],
+          )
+        ).rows[0]?.ready;
+        if (ready) break;
+        assert(pass < 999, 'Input summary preparation did not finish');
+        await db.query('SELECT liekan_analytics_input_backfill($1::uuid)', [site]);
+      }
       const ranges = [
         { name: 'today', startAt: today, endAt: frozenEnd, chartPeriod: 'today' },
         { name: '7d', startAt: today - 6 * 86400000, endAt: frozenEnd, chartPeriod: '7d' },

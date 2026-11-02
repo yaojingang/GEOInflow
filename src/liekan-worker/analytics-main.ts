@@ -36,6 +36,7 @@ import { analyticsRedis } from '../lib/liekan/upstream/analytics-redis';
 import prisma from '../lib/prisma';
 import { processAnalyticsRefresh, readAnalyticsHotStrongVersion } from './analytics-refresh';
 import { pumpStorageRetention } from '../lib/liekan/upstream/storage-retention';
+import { maintainAnalyticsInputSummaries } from '../lib/liekan/upstream/analytics-input-summary';
 
 const boss = new PgBoss({
   connectionString: process.env.DATABASE_URL,
@@ -52,12 +53,15 @@ async function pump() {
   if (stopped || pumping) return;
   pumping = true;
   try {
+    await pumpAnalysisQueries(boss);
     await bootstrapAnalysisHistory();
+    await pumpAnalysisQueries(boss);
     await reconcileAnalysisRollups();
-    await pumpDashboardDemand();
+    await pumpDashboardDemand(() => pumpAnalysisQueries(boss));
     await pumpAnalysisQueries(boss);
     await pumpAnalysisBuilds(boss);
     await pumpAnalyticsHot(boss, readAnalyticsHotStrongVersion);
+    await maintainAnalyticsInputSummaries();
   } catch {
     /* A maintenance failure leaves persistent hot demand for the next pass. */
   } finally {
@@ -115,7 +119,9 @@ await boss.work<{ id: string; kind: 'history' | 'incremental' }>(
         await processAnalysisBuild(job.data.id, job.data.kind, { shouldStop: () => stopped });
   },
 );
-const engineMaintenance = setInterval(() => { void pumpAnalyticsEngine().catch(() => {}); }, 5000);
+const engineMaintenance = setInterval(() => {
+  void pumpAnalyticsEngine().catch(() => {});
+}, 5000);
 void pumpAnalyticsEngine().catch(() => {});
 const maintenance = setInterval(() => {
   void pump();

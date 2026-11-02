@@ -4,27 +4,57 @@ import { pageReportParts } from '../contracts/page-report';
 import { LiekanError } from './errors';
 import { readFeatureDateRange } from './date-range';
 import { featureDateRange } from '../contracts/analysis';
-import { calendarDayRange } from '../contracts/calendar';
+import { calendarDayCount, calendarDayRange } from '../contracts/calendar';
 
 export const DASHBOARD_INTERVAL = 30000;
 export const DASHBOARD_SETTLE = 0;
-export const DASHBOARD_FORMAT = 'dashboard-snapshot-v4';
-/** These pages derive values from facts; their within-day clock only bounds source reads. */
+export const DASHBOARD_FORMAT = 'dashboard-snapshot-v5';
+/** Reuse facts only while their displayed calendar and average denominators stay stable. */
 export function canAdvanceDashboardClock(
   target: string,
   parameters: Record<string, any>,
   from: number,
   to: number,
 ) {
-  return (
-    target === 'feature:page-report' &&
-    ['overview', 'human/overview'].includes(parameters.resource) &&
-    Number.isFinite(from) &&
-    from > 0 &&
-    to > from &&
-    formatInTimeZone(from, parameters.timezone || 'UTC', 'yyyy-MM-dd') ===
-      formatInTimeZone(to, parameters.timezone || 'UTC', 'yyyy-MM-dd')
-  );
+  const resource = parameters.resource;
+  const timezone = parameters.timezone || 'UTC';
+  const day = (at: number) => formatInTimeZone(at, timezone, 'yyyy-MM-dd');
+  if (
+    target !== 'feature:page-report' ||
+    !['overview', 'human/overview', 'ai/overview', 'ai/bots', 'ai/pages', 'ai/preference'].includes(
+      resource,
+    ) ||
+    !Number.isFinite(from) ||
+    !Number.isFinite(to) ||
+    from <= 0 ||
+    to <= from ||
+    day(from) !== day(to)
+  )
+    return false;
+  if (!resource.startsWith('ai/')) return true;
+  if (parameters.crawlerMetricsVersion !== 1) return false;
+  const start = Number(parameters.startAt);
+  const end = Number(parameters.endAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return false;
+  const halfOpen = parameters.crawlerMetricsVersion === 1;
+  const previousEnd = Math.min(end, from - (halfOpen ? 0 : 1));
+  const nextEnd = Math.min(end, to - (halfOpen ? 0 : 1));
+  if (
+    nextEnd <= previousEnd ||
+    day(Math.max(start, previousEnd - (halfOpen ? 1 : 0))) !==
+      day(Math.max(start, nextEnd - (halfOpen ? 1 : 0)))
+  )
+    return false;
+  if (!['ai/overview', 'ai/bots'].includes(resource)) return true;
+  const calendarStart = calendarDayRange(start, timezone).startAt === start;
+  const days = (endAt: number) =>
+    Math.max(
+      1,
+      calendarStart
+        ? calendarDayCount(start, Math.max(start, endAt - (halfOpen ? 1 : 0)), timezone)
+        : Math.ceil((endAt - start + (halfOpen ? 0 : 1)) / 86400000),
+    );
+  return days(previousEnd) === days(nextEnd);
 }
 export const dashboardInterval = (target: string) =>
   [

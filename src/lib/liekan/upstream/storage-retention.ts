@@ -668,6 +668,12 @@ export async function pumpStorageRetention(
       await tx.$executeRawUnsafe(
         "DELETE FROM liekan_storage_cleanup WHERE id IN(SELECT r.id FROM liekan_storage_cleanup r WHERE r.status IN('completed','stopped','failed','preview') AND r.created_at<clock_timestamp()-interval '180 days' AND NOT EXISTS(SELECT 1 FROM liekan_storage_candidate c WHERE c.run_id=r.id) LIMIT 100)",
       );
+      await tx.$executeRawUnsafe(
+        `DELETE FROM liekan_report_fragment WHERE (website_id,query_key) IN(
+         SELECT website_id,query_key FROM liekan_report_fragment
+         WHERE last_read_at<clock_timestamp()-interval '7 days'
+         ORDER BY last_read_at LIMIT 200 FOR UPDATE SKIP LOCKED)`,
+      );
     });
   } finally {
     pumping = false;

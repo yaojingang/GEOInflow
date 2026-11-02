@@ -596,11 +596,15 @@ export async function processAnalysisQuery(id: string, options: { firstPage?: bo
     try {
       return await withPublishedRegistry(async () => {
         const actor = { id: row.actor_id, role: '' };
-        const allowed = () =>
-          analysisTransaction(async tx => {
-            const s = await state(tx, row.website_id, actor);
-            return s.strong === row.strong_version && String(s.epoch) === String(row.epoch);
-          });
+        const allowed = (deadline?: number) =>
+          analysisTransaction(
+            async tx => {
+              const s = await state(tx, row.website_id, actor);
+              return s.strong === row.strong_version && String(s.epoch) === String(row.epoch);
+            },
+            'ReadCommitted',
+            deadline,
+          );
         if (!(await allowed())) throw new LiekanError('统计条件已变化', 410);
         const { dashboardJobClock, publishDashboardSnapshot } = await import(
           './dashboard-snapshots'
