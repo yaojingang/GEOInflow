@@ -57,6 +57,7 @@ const CrawlerRegistryPage = dynamic(() =>
   import('./CrawlerRegistryPage').then(module => module.CrawlerRegistryPage),
 );
 const HelpCenter = dynamic(() => import('./HelpCenter').then(module => module.HelpCenter));
+const AnalyticsEnginePage = dynamic(() => import('./AnalyticsEnginePage').then(module => module.AnalyticsEnginePage));
 const AnalyticsAccelerationPage = dynamic(() =>
   import('./AnalyticsAccelerationPage').then(module => module.AnalyticsAccelerationPage),
 );
@@ -73,6 +74,7 @@ import { Button, DialogActions, LiekanDialog, Field, Form, Icon, Notice, QuerySt
 import { WorkspacePages, workspacePages } from './WorkspacePages';
 
 export const coreFeaturePages = new Set([
+  'admin-analytics-engine',
   'history-repair',
   'analytics-acceleration',
   'crawlers-manage',
@@ -794,6 +796,7 @@ function FeaturePage({ page }: { page: string }) {
   if (aiPages.has(page)) return <AiPages page={page} />;
   if (page === 'help') return <HelpCenter />;
   if (page === 'crawlers-manage') return <CrawlerRegistryPage />;
+  if (page === 'admin-analytics-engine') return <AnalyticsEnginePage />;
   if (page === 'analytics-acceleration') return <AnalyticsAccelerationPage />;
   if (page === 'history-repair') return <HistoryRepairPage />;
   if (coreFeaturePages.has(page)) return <CorePages page={page} />;

@@ -48,6 +48,7 @@ GEOInflow 将浏览器访客、AI 爬虫日志、搜索引荐和内容目录关�
 | [流量质量](traffic-quality.md) | 浏览总体、可信输入、排除策略和审计 |
 | [历史修复](history-repair.md) | 扫描、预览、确认、发布代次与回退 |
 | [统计加速](analytics-acceleration.md) | 精确汇总、持久任务、覆盖、预热与计算准入 |
+| [可选 ClickHouse 分析](clickhouse-analytics.md) | 历史日志副本、后台开关、同步对账、回退与独立服务预算 |
 | [缓存](analytics-cache.md) | 缓存身份、容量、失效及公开分享 |
 | [性能](performance.md) | 查询与性能验证方法 |
 | [地域](geography.md) | 地理来源、缺失状态与授权文件 |

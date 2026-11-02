@@ -567,6 +567,14 @@
       "summary": "管理新增输入维护与历史统计构建。",
       "route": "/settings/analytics-acceleration",
       "kind": "增补流程"
+    },
+    {
+      "id": "admin-analytics-engine",
+      "title": "存储与分析",
+      "group": "workspace",
+      "summary": "历史日志分析引擎",
+      "route": "/admin/analytics-engine",
+      "kind": "增量功能"
     }
   ],
   "routes": [
@@ -934,6 +942,12 @@
       "source": "src/app/(main)/settings/analytics-acceleration/page.tsx",
       "route": "/settings/analytics-acceleration",
       "target": "analytics-acceleration.html",
+      "entry": "页面"
+    },
+    {
+      "source": "src/app/(main)/admin/analytics-engine/page.tsx",
+      "route": "/admin/analytics-engine",
+      "target": "admin-analytics-engine.html",
       "entry": "页面"
     }
   ]

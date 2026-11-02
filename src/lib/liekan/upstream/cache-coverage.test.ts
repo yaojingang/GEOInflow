@@ -20,6 +20,7 @@ it('requires a module strategy for every product, compatibility and public navig
   });
   expect(pageCacheModules.security.securityStatus).toBe('direct');
   expect(pageCacheModules['admin-security'].securityStatus).toBe('direct');
+  expect(pageCacheModules['admin-analytics-engine']).toEqual({ status: 'direct', tasks: 'direct' });
   expect(pageCacheModules.revenue).toMatchObject({ statistics: 'aggregate', records: 'direct' });
   expect(pageCacheModules['ai-chat']).toMatchObject({ conversations: 'direct', answers: 'direct' });
   expect(pageCacheModules['ai-config']).toMatchObject({ connections: 'direct', connectionTests: 'direct' });

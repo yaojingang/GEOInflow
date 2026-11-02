@@ -175,6 +175,7 @@ export const websiteNavigationIcons: Record<string, string> = {
   'geo-logs': 'list',
 };
 export const adminNavigation: NavigationGroup[] = [
+  { id: 'admin-analytics-engine', page: 'admin-analytics-engine', label: '存储与分析', icon: 'layers' },
   { id: 'admin-users', page: 'admin-users', label: '用户管理', icon: 'users' },
   { id: 'admin-websites', page: 'admin-websites', label: '所有网站', icon: 'globe' },
   { id: 'admin-teams', page: 'admin-teams', label: '所有团队', icon: 'box' },
@@ -240,6 +241,7 @@ const pageDefinitions: Array<[PageScope, string, string | undefined, string[]]> 
   ['admin', 'admin-websites', undefined, ['admin-websites']],
   ['admin', 'admin-teams', undefined, ['admin-teams']],
   ['admin', 'admin-security', undefined, ['admin-security']],
+  ['admin', 'admin-analytics-engine', undefined, ['admin-analytics-engine']],
   ['global', 'boards', undefined, ['boards']],
   ['global', 'sharing', undefined, ['sharing']],
   ['global', 'boards', 'boards', ['board-editor', 'board-view']],

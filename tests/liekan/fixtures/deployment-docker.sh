@@ -28,6 +28,8 @@ case "$*" in
     printf 'name: "%s"\nservices:\n  app:\n    image: liekan:1.2.0\nvolumes:\n  liekan-data:\n    name: "%s"\n  liekan-geography:\n    name: %s_liekan-geography\n' "$compose_project" "$database_volume" "$compose_project" ;;
   'compose -f docker-compose.liekan.yml ps --all --quiet db') printf '%s\n' "$db_container" ;;
   'compose -f docker-compose.liekan.yml ps --all --quiet analytics-cache') printf '%s\n' "$cache_container" ;;
+  'compose -f docker-compose.liekan.yml ps --all --quiet analytics-clickhouse') printf '%s\n' "${DEPLOY_TEST_CLICKHOUSE_CONTAINER:-}" ;;
+  'compose -f docker-compose.liekan.yml up -d --no-deps --wait --wait-timeout 300 analytics-clickhouse') exit 0 ;;
   'compose -f docker-compose.liekan.yml ps --all --quiet '*) printf '%s\n' "$7-container" ;;
   'image inspect --format '*)
     if [ "$4" = '{{.Id}}' ]; then printf '%s\n' "${DEPLOY_TEST_CANDIDATE_IMAGE:-$candidate}"

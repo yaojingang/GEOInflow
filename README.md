@@ -139,6 +139,7 @@ Initial calculations, cache hits, and background updates have different costs. A
 - Browser tracking is cookieless by default. Optional recording, event properties, and business integrations use the data scope configured for each deployment.
 - AI analysis is disabled by default. When enabled, users choose model connections and website materials. See the [AI configuration guide](docs/ai.md) for the data sent to models.
 - GEO Weight is in Beta. It uses qualified AI content access from the most recent 30 complete calendar days, with a documented formula, evidence, and limitations. The [weight guide](docs/geo-weight.md) defines the fixed policy and applicable scope.
+- Optional [ClickHouse historical log analytics](docs/clickhouse-analytics.md) offloads verified historical aggregates while PostgreSQL retains source data and transactional state.
 - GEO extensions, supplemental journeys, complete exports, and analytics acceleration primarily target PostgreSQL. Retained ClickHouse, link, and pixel endpoints follow their existing protocols; support for each GEO extension must be checked separately.
 - Automatic server collection requires public HTTPS, an ingestion secret, and signed installation assets. Cloudflare integration also requires OAuth, permissions, and the relevant provider capabilities.
 - Search impressions, actual rankings, model-answer citations, training inclusion, and article completion rates require additional data. The detailed guides define the observations and scores this project provides.
