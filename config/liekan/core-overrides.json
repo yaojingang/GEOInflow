@@ -405,10 +405,14 @@
     },
     {
       "path": "packages/api-client/src/generated/types.ts",
-      "purpose": "Deterministically generated API client from explicit upstream and Liekan contracts",
+      "purpose": "Deterministically generated API client from explicit upstream and Liekan contracts; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; Batch large website mutations inside one atomic live-authority transaction",
       "tests": [
         "pnpm liekan:verify",
-        "Liekan Docker and visual acceptance"
+        "Liekan Docker and visual acceptance",
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "src/queries/prisma/website.test.ts",
+        "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
+        "TypeScript and generated API consistency"
       ],
       "owner": "Liekan API compatibility",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Deterministically generated API client from explicit upstream and Liekan contracts",
@@ -1220,6 +1224,26 @@
       "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
     },
     {
+      "path": "public/intl/messages/en-US.json",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
+    },
+    {
+      "path": "public/intl/messages/zh-CN.json",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
+    },
+    {
       "path": "public/intl/messages/zh-TW.json",
       "purpose": "Preserved geography and localized display compatibility",
       "tests": [
@@ -1695,10 +1719,11 @@
     },
     {
       "path": "src/app/(main)/websites/[websiteId]/settings/WebsiteReplaySettings.tsx",
-      "purpose": "Render the recorder snippet with the canonical website UUID even when the settings URL carries a short site number",
+      "purpose": "Render the recorder snippet with the canonical website UUID even when the settings URL carries a short site number; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
       "tests": [
         "pnpm liekan:verify",
-        "Liekan Docker and visual acceptance"
+        "Liekan Docker and visual acceptance",
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
       ],
       "owner": "Liekan compatibility adapters",
       "constraint": "The embedded data-website-id must be the website UUID; only the surrounding navigation uses the site number handle",
@@ -1810,13 +1835,24 @@
       "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
     },
     {
+      "path": "src/app/api/auth/login/contract.ts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
+    },
+    {
       "path": "src/app/api/auth/login/route.test.ts",
-      "purpose": "90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions",
+      "purpose": "90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
       "tests": [
         "src/lib/auth-session.test.ts",
         "src/app/api/auth/login/route.test.ts",
         "src/app/api/2fa/verify/route.test.ts",
-        "pnpm liekan:verify"
+        "pnpm liekan:verify",
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
       ],
       "owner": "Liekan authentication compatibility",
       "constraint": "Preserve opaque bearer token format, live account/password checks, five-minute partial 2FA challenge and existing SSO, API-key, share and tracker protocols",
@@ -1824,12 +1860,13 @@
     },
     {
       "path": "src/app/api/auth/login/route.ts",
-      "purpose": "90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions",
+      "purpose": "90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
       "tests": [
         "src/lib/auth-session.test.ts",
         "src/app/api/auth/login/route.test.ts",
         "src/app/api/2fa/verify/route.test.ts",
-        "pnpm liekan:verify"
+        "pnpm liekan:verify",
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
       ],
       "owner": "Liekan authentication compatibility",
       "constraint": "Preserve opaque bearer token format, live account/password checks, five-minute partial 2FA challenge and existing SSO, API-key, share and tracker protocols",
@@ -1963,10 +2000,11 @@
     },
     {
       "path": "src/app/api/send/route.test.ts",
-      "purpose": "Preserve cookieless Umami collection while verifying exact event deduplication and uniform traffic quality",
+      "purpose": "Preserve cookieless Umami collection while verifying exact event deduplication and uniform traffic quality; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
       "tests": [
         "pnpm liekan:verify",
-        "Isolated traffic quality database integration"
+        "Isolated traffic quality database integration",
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
       ],
       "owner": "Liekan collection compatibility",
       "constraint": "Preserve existing SDK fields, response shapes, legitimate refreshes and original raw analytics rows",
@@ -1974,11 +2012,12 @@
     },
     {
       "path": "src/app/api/send/route.ts",
-      "purpose": "Preserve cookieless collection, exact event deduplication and uniform quality; retain positive WebDriver and public request UA automation evidence; persist finite request-header observations atomically with existing public PV quality and optional UUID receipts",
+      "purpose": "Preserve cookieless collection, exact event deduplication and uniform quality; retain positive WebDriver and public request UA automation evidence; persist finite request-header observations atomically with existing public PV quality and optional UUID receipts; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
       "tests": [
         "pnpm liekan:verify",
         "Isolated traffic quality database integration",
-        "pnpm test:crawler-evidence"
+        "pnpm test:crawler-evidence",
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
       ],
       "owner": "Liekan collection compatibility",
       "constraint": "Preserve old SDK payloads, response shapes, legitimate refreshes, authorized server transport and original raw analytics; missing automation evidence never proves human identity",
@@ -2650,6 +2689,26 @@
       "removalCondition": "Remove when upstream provides equivalent bounded caching, invalidation and freshness extension points"
     },
     {
+      "path": "src/app/api/websites/[websiteId]/recorder/route.test.ts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
+    },
+    {
+      "path": "src/app/api/websites/[websiteId]/recorder/route.ts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
+    },
+    {
       "path": "src/app/api/websites/[websiteId]/replays/[replayId]/route.ts",
       "purpose": "Browser population isolation and identity availability across collection, analytics and generated contracts",
       "tests": [
@@ -2660,6 +2719,16 @@
       "owner": "Liekan analytics maintenance",
       "constraint": "Preserve cookieless tracking and ClickHouse, link and pixel compatibility; require trusted browser source for website identity metrics",
       "removalCondition": "Remove when upstream provides equivalent source boundaries and identity coverage with these regression checks"
+    },
+    {
+      "path": "src/app/api/websites/[websiteId]/replays/route.security.test.ts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
     },
     {
       "path": "src/app/api/websites/[websiteId]/replays/route.ts",
@@ -2760,9 +2829,12 @@
     },
     {
       "path": "src/app/api/websites/[websiteId]/route.ts",
-      "purpose": "Account calendar and published share timezone compatibility",
+      "purpose": "Account calendar and published share timezone compatibility; Batch large website mutations inside one atomic live-authority transaction",
       "tests": [
-        "Today calendar, public share and native date parameter regression tests"
+        "Today calendar, public share and native date parameter regression tests",
+        "src/queries/prisma/website.test.ts",
+        "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
+        "TypeScript and generated API consistency"
       ],
       "owner": "Liekan analytics maintenance",
       "constraint": "Preserve permissions, explicit historical epochs and existing 7/30-day definitions",
@@ -4544,6 +4616,26 @@
       "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
     },
     {
+      "path": "src/lib/csp.test.ts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
+    },
+    {
+      "path": "src/lib/csp.ts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
+    },
+    {
       "path": "src/lib/date.test.ts",
       "purpose": "Verify Monday-to-Sunday calendar weeks shared by both product locales",
       "tests": [
@@ -4872,6 +4964,26 @@
       "removalCondition": "Remove when upstream source analysis supports delegated handlers and these contract regressions pass"
     },
     {
+      "path": "src/permissions/share-boundary.test.ts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
+    },
+    {
+      "path": "src/permissions/share.ts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
+    },
+    {
       "path": "src/proxy.test.ts",
       "purpose": "Cover the website handle rewrite behavior shared by the local and Docker middleware pipelines",
       "tests": [
@@ -5052,12 +5164,14 @@
     },
     {
       "path": "src/queries/prisma/website.test.ts",
-      "purpose": "Verify reset passes authenticated identity to Liekan lifecycle and refuses revoked access before upstream cleanup Verify reset passes authenticated identity to Liekan lifecycle and refuses revoked access before upstream cleanup; Verify reset passes authenticated identity to Liekan lifecycle and refuses revoked access before upstream cleanup；AI 加密配置、实时测试、授权分析与生命周期事务集成",
+      "purpose": "Verify reset passes authenticated identity to Liekan lifecycle and refuses revoked access before upstream cleanup Verify reset passes authenticated identity to Liekan lifecycle and refuses revoked access before upstream cleanup; Verify reset passes authenticated identity to Liekan lifecycle and refuses revoked access before upstream cleanup；AI 加密配置、实时测试、授权分析与生命周期事务集成; Batch large website mutations inside one atomic live-authority transaction",
       "tests": [
         "src/queries/prisma/website.test.ts",
         "tests/api/liekan.spec.ts",
         "AI backend integration and lifecycle tests",
-        "pnpm liekan:verify"
+        "pnpm liekan:verify",
+        "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
+        "TypeScript and generated API consistency"
       ],
       "owner": "Liekan compatibility adapters",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Verify reset passes authenticated identity to Liekan lifecycle and refuses revoked access before upstream cleanup Preserve upstream behavior and protocols outside this recorded purpose: Verify reset passes authenticated identity to Liekan lifecycle and refuses revoked access before upstream cleanup; Preserve upstream behavior and protocols outside this recorded purpose: Verify reset passes authenticated identity to Liekan lifecycle and refuses revoked access before upstream cleanup",
@@ -5065,7 +5179,7 @@
     },
     {
       "path": "src/queries/prisma/website.ts",
-      "purpose": "Fence automatic log sources when websites reset, change ownership/domain or are deleted; preserve upstream deletion order; coordinate statistics reset and deletion with Liekan AI lifecycle transactions and invalidate bounded statistics caches; resolve website lookups by UUID or short site number",
+      "purpose": "Fence automatic log sources when websites reset, change ownership/domain or are deleted; preserve upstream deletion order; coordinate statistics reset and deletion with Liekan AI lifecycle transactions and invalidate bounded statistics caches; resolve website lookups by UUID or short site number; Batch large website mutations inside one atomic live-authority transaction",
       "tests": [
         "pnpm test:log-ingestion",
         "node scripts/liekan-log-integration.mjs",
@@ -5073,7 +5187,9 @@
         "Liekan release acceptance",
         "AI backend integration and lifecycle tests",
         "pnpm exec vitest run src/lib/liekan/upstream/query-cache.test.ts src/lib/liekan/upstream/page-report-route.test.ts",
-        "src/queries/prisma/website.test.ts"
+        "src/queries/prisma/website.test.ts",
+        "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
+        "TypeScript and generated API consistency"
       ],
       "owner": "Liekan compatibility adapters",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: UUID and site-number lookups must behave identically (neither path adds a deletedAt filter, matching the upstream getWebsite; both attach shareId) and mutating queries keep addressing the UUID",
@@ -5703,6 +5819,26 @@
       "removalCondition": "Remove when upstream provides equivalent bounded caching, invalidation and freshness extension points"
     },
     {
+      "path": "src/recorder/index.js",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
+    },
+    {
+      "path": "src/recorder/privacy.test.ts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
+    },
+    {
       "path": "src/store/app.ts",
       "purpose": "Account calendar preferences and Today defaults",
       "tests": [
@@ -5759,10 +5895,11 @@
     },
     {
       "path": "src/tracker/index.test.ts",
-      "purpose": "Preserve cookieless collection, exact event deduplication and uniform quality; retain positive WebDriver and public request UA automation evidence",
+      "purpose": "Preserve cookieless collection, exact event deduplication and uniform quality; retain positive WebDriver and public request UA automation evidence; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
       "tests": [
         "pnpm liekan:verify",
-        "Isolated traffic quality database integration"
+        "Isolated traffic quality database integration",
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
       ],
       "owner": "Liekan collection compatibility",
       "constraint": "Preserve old SDK payloads, response shapes, legitimate refreshes, authorized server transport and original raw analytics; missing automation evidence never proves human identity",
@@ -5770,14 +5907,35 @@
     },
     {
       "path": "src/tracker/index.ts",
-      "purpose": "Preserve cookieless collection, exact event deduplication and uniform quality; retain positive WebDriver and public request UA automation evidence",
+      "purpose": "Preserve cookieless collection, exact event deduplication and uniform quality; retain positive WebDriver and public request UA automation evidence; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
       "tests": [
         "pnpm liekan:verify",
-        "Isolated traffic quality database integration"
+        "Isolated traffic quality database integration",
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
       ],
       "owner": "Liekan collection compatibility",
       "constraint": "Preserve old SDK payloads, response shapes, legitimate refreshes, authorized server transport and original raw analytics; missing automation evidence never proves human identity",
       "removalCondition": "Remove when upstream provides equivalent versioned quality and idempotency extension points"
+    },
+    {
+      "path": "src/tracker/privacy.test.ts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
+    },
+    {
+      "path": "src/tracker/privacy.ts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
+      "removalCondition": "Remove when upstream provides equivalent privacy and authorization safeguards with passing regressions"
     },
     {
       "path": "tests/api/analytics.spec.ts",
@@ -6174,6 +6332,42 @@
       "owner": "Liekan analytics maintenance",
       "constraint": "Keep PostgreSQL authoritative and preserve configuration, credentials, data volumes and immutable deployment candidates",
       "removalCondition": "Remove when the supported deployment entrypoint covers these lifecycle guarantees"
+    },
+    {
+      "path": "src/app/api/websites/[websiteId]/contract.ts",
+      "purpose": "Batch large website mutations inside one atomic live-authority transaction",
+      "tests": [
+        "src/queries/prisma/website.test.ts",
+        "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
+        "TypeScript and generated API consistency"
+      ],
+      "owner": "Liekan lifecycle compatibility",
+      "constraint": "Preserve source facts on failure, current website authority, source cleanup and soft-delete settings",
+      "removalCondition": "Remove when upstream provides bounded atomic large-site cleanup with equivalent permission and rollback regressions"
+    },
+    {
+      "path": "src/lib/liekan/upstream/lifecycle.ts",
+      "purpose": "Batch large website mutations inside one atomic live-authority transaction",
+      "tests": [
+        "src/queries/prisma/website.test.ts",
+        "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
+        "TypeScript and generated API consistency"
+      ],
+      "owner": "Liekan lifecycle compatibility",
+      "constraint": "Preserve source facts on failure, current website authority, source cleanup and soft-delete settings",
+      "removalCondition": "Remove when upstream provides bounded atomic large-site cleanup with equivalent permission and rollback regressions"
+    },
+    {
+      "path": "src/lib/liekan/upstream/website-mutation.integration.test.ts",
+      "purpose": "Batch large website mutations inside one atomic live-authority transaction",
+      "tests": [
+        "src/queries/prisma/website.test.ts",
+        "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
+        "TypeScript and generated API consistency"
+      ],
+      "owner": "Liekan lifecycle compatibility",
+      "constraint": "Preserve source facts on failure, current website authority, source cleanup and soft-delete settings",
+      "removalCondition": "Remove when upstream provides bounded atomic large-site cleanup with equivalent permission and rollback regressions"
     }
   ]
 }
