@@ -1,0 +1,20 @@
+<clickhouse>
+  <max_server_memory_usage_to_ram_ratio>0.7</max_server_memory_usage_to_ram_ratio>
+  <mark_cache_size>134217728</mark_cache_size>
+  <uncompressed_cache_size>67108864</uncompressed_cache_size>
+  <background_pool_size>8</background_pool_size>
+  <background_schedule_pool_size>16</background_schedule_pool_size>
+  <merge_tree>
+    <number_of_free_entries_in_pool_to_execute_mutation>2</number_of_free_entries_in_pool_to_execute_mutation>
+    <number_of_free_entries_in_pool_to_lower_max_size_of_merge>2</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+    <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>2</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+  </merge_tree>
+  <logger><level>warning</level><console>true</console></logger>
+  <storage_configuration>
+    <disks>
+      <default><keep_free_space_bytes>1073741824</keep_free_space_bytes></default>
+      <backups><type>local</type><path>/var/lib/clickhouse/backups/</path></backups>
+    </disks>
+  </storage_configuration>
+  <backups><allowed_disk>backups</allowed_disk><remove_backup_files_after_failure>true</remove_backup_files_after_failure></backups>
+</clickhouse>

@@ -2,7 +2,13 @@
 
 产品显示名称为 GEOInflow，界面版本 v1.2 对应工程和镜像版本 1.2.0。`liekan` 命令、镜像仓库名、Compose 项目、数据卷与环境变量沿用原标识。升级已有实例时保留运行中的数据库大版本和私有配置，仅更新应用与后台处理服务。
 
-## 一键部署
+## ClickHouse 版本入口
+
+完整 CH 版本需要 Docker Compose 和 Python 3。新安装运行 `python3 scripts/liekan-warehouse-deploy.py --mode fresh`；已有 PG 实例运行 `python3 scripts/liekan-warehouse-deploy.py --mode pg-transition`，随后按 [CH 安装与迁移说明](warehouse.md) 完成历史迁移、核验和切换。已迁移实例更新时继续使用原安装模式；程序保留持久记录的 CH 权威和已有凭据。
+
+仅执行旧 Compose 文件会缺少 CH 与队列配置。已登记 CH 安装的应用和 worker 会拒绝这种启动方式，防止显示过时的 PG 统计结果。下面的旧部署入口只适用于尚未启用 CH 的实例。
+
+## 尚未启用 CH 的部署入口
 
 安装并启动 Docker 与 Docker Compose 后，在项目根目录运行 `sh scripts/liekan-deploy.sh`。服务器无需安装 Node.js 或 pnpm，镜像内使用固定版本完成构建。首次运行生成权限为 0600 的 `.env`，分别创建独立随机数据库密码、应用密钥和 2FA 密钥；配置与密钥不会打印。随后构建镜像、启动服务并等待健康检查。应用默认绑定 `127.0.0.1:3002`，公网通过反向代理配置域名与 HTTPS。
 

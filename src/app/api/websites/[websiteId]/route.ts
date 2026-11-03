@@ -1,4 +1,5 @@
 import { captureShareCalendar } from '@/lib/liekan/upstream/share-calendar';
+import { api } from '@/lib/liekan/http';
 import type { Prisma } from '@/generated/prisma/client';
 import { ENTITY_TYPE } from '@/lib/constants';
 import { uuid } from '@/lib/crypto';
@@ -123,7 +124,8 @@ export async function DELETE(
     return unauthorized();
   }
 
-  await deleteWebsite(websiteId);
-
-  return ok();
+  return api(async () => {
+    await deleteWebsite(websiteId, { userId: auth.user.id });
+    return ok();
+  });
 }

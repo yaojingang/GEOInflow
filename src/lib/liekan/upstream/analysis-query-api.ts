@@ -1,3 +1,4 @@
+import { warehouseEnabled,warehouseTransitionEnabled } from '@/lib/liekan/warehouse/authority-routing';
 import { z } from 'zod';
 import type { requestAnalysisQuery } from './analysis-queries';
 import { noteCacheResult } from './cache-context';
@@ -38,6 +39,7 @@ async function earlyHandoff(id: string) {
 
 export function analysisAsyncRequested(request: Request, target?: string) {
   if (
+    warehouseEnabled() || warehouseTransitionEnabled() ||
     process.env.CLICKHOUSE_URL ||
     ['3', '4'].includes(new URL(request.url).searchParams.get('eventType')) ||
     !request.headers
@@ -114,6 +116,8 @@ export async function analysisJobResponse(
   if (!z.uuid().safeParse(jobId).success) throw new LiekanError('统计任务标识无效', 400);
   const actor = await authenticateCrawlerMaintenance(request);
   const access = await authorize(request, websiteId);
+  if (warehouseEnabled())
+    throw new LiekanError('统计服务已升级，请刷新页面重新查询',410,'analysis-query-upgraded');
   const data = await readAnalysisQuery(access.website.id, actor, jobId, result);
   if (!result) return Response.json(data, { headers: { 'Cache-Control': 'private, no-store' } });
   return analysisResponse(data);

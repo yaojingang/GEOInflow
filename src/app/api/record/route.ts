@@ -6,6 +6,9 @@ import { corsPreflight, withCorsHeaders } from '@/lib/cors';
 import { secret } from '@/lib/crypto';
 import { getClientInfo, hasBlockedIp } from '@/lib/detect';
 import { parseToken } from '@/lib/jwt';
+import { CollectionConflictError } from '@/lib/liekan/upstream/collection-write';
+import { WarehouseUnavailable } from '@/lib/liekan/warehouse/completion';
+import { warehouseIntakeEnabled } from '@/lib/liekan/warehouse/runtime';
 import { fetchAccount, fetchTeam } from '@/lib/load';
 import { getRecorderConfig } from '@/lib/recorder';
 import { getReplayEventCount } from '@/lib/replay';
@@ -241,12 +244,17 @@ export async function POST(request: Request) {
         await saveHeatmapEvents(heatmapRows);
       }
     } catch (e) {
+      if (warehouseIntakeEnabled()) throw e;
       // eslint-disable-next-line no-console
       console.log('heatmap save failed', serializeError(e));
     }
 
     return withCorsHeaders(json({ ok: true }));
   } catch (e) {
+    if (e instanceof WarehouseUnavailable)
+      return withCorsHeaders(Response.json({ error: 'collection_unavailable' }, { status: 503 }));
+    if (e instanceof CollectionConflictError)
+      return withCorsHeaders(Response.json({ error: 'collection_conflict' }, { status: 409 }));
     return withCorsHeaders(serverError(e));
   }
 }

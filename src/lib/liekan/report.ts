@@ -1,11 +1,16 @@
+import {
+  reportLogRange,
+  reportLogRow,
+  reportBotRow,
+  reportAiPageRow,
+  addReportAiPage,
+  compareReportAiPages,
+} from './report-log-tables';
 import { applyReportPopulation, identityUnavailableReason } from './contracts/population-results';
 import { identityComplete, identityUsable } from './contracts/browser-population';
-import { dashboardClock } from './upstream/dashboard-clock';
 import { getPublishedCatalog } from './crawlers/published';
-import { crawlerAiRequests, isUnknownCrawler } from './rules/population';
-import { endOfDay } from 'date-fns';
-import { formatInTimeZone, fromZonedTime, toZonedTime } from 'date-fns-tz';
-import { isbot } from 'isbot';
+import { crawlerAiRequests } from './rules/population';
+import { formatInTimeZone } from 'date-fns-tz';
 import { pageReportParts, visitorOverviewCards } from './contracts/page-report';
 import { parseReportQuery, pagableTables, tablePageSize } from './contracts/query';
 import {
@@ -16,7 +21,7 @@ import {
 } from './contracts/report';
 import { summarizeSearchEngines, searchChannels } from './contracts/search-engines';
 import { sharedReportParts } from './contracts/shared-report';
-import { calendarDayRange, calendarDayCount } from './contracts/calendar';
+import { calendarDayRange } from './contracts/calendar';
 import { getSettings } from './store';
 import {
   classifyEntrySource,
@@ -45,6 +50,7 @@ import {
 } from './upstream/logs';
 import { humanPathFromEncoded } from './upstream/paths';
 import { LiekanError } from './upstream/server';
+import type { PreparedReport } from './report-prepared';
 
 const pct = (a: number, b: number): number | null => (b ? Math.round((a / b) * 10000) / 100 : null);
 const ratio = (a: number, b: number) => (b ? Math.round((a / b) * 100) / 100 : null);
@@ -64,6 +70,7 @@ function stringifySafe(value: unknown): any {
 // legacy /report 与 share 路径保持显式请求才切，避免破坏既有全量消费方。
 function capTablePages(report: LiekanReport, tablePages: Record<string, number>, always: boolean) {
   for (const table of pagableTables) {
+    if (report.meta.tablePages?.[table]) continue;
     const requested = tablePages[table];
     if (!always && !requested) continue;
     const rows = report.tables[table];
@@ -91,6 +98,7 @@ export async function buildReport(
   pageOnly: boolean | 'share' = false,
   fullTableExport = false,
   comparisonBoundary?: [Date, string],
+  prepared?: PreparedReport,
 ): Promise<LiekanReport> {
   const parsed = parseReportQuery(input);
   if (!parsed.success) throw new LiekanError('统计参数无效');
@@ -104,32 +112,16 @@ export async function buildReport(
     pageOnly === 'share'
       ? resources.includes('human/overview')
       : !pageOnly || resources.includes(p.resource);
-  const clock = dashboardClock();
-  const now = clock?.cutoff ?? Date.now();
-  let latestEnd: number;
-  try {
-    new Intl.DateTimeFormat('en', { timeZone: p.timezone }).format();
-    latestEnd = Math.max(
-      now + 86400000,
-      +fromZonedTime(endOfDay(toZonedTime(now, p.timezone)), p.timezone) + 1,
-    );
-  } catch {
-    throw new LiekanError('时区无效');
-  }
-  const readEndAt =
-    clock || (p.crawlerMetricsVersion === 1 && p.resource.startsWith('ai/'))
-      ? Math.min(p.endAt, now - (clock && p.crawlerMetricsVersion !== 1 ? 1 : 0))
-      : p.endAt;
-  if (readEndAt < p.startAt || p.endAt - p.startAt > 1096 * 86400000 || p.endAt > latestEnd)
-    throw new LiekanError('日期范围无效，上限 3 年');
-  const start = new Date(p.startAt),
-    end = new Date(readEndAt);
+  const { clock, now, start, end, readEndAt, days, halfOpen } = prepared?.range ?? reportLogRange(p);
   const todayStart = new Date(calendarDayRange(clock?.dayAt ?? now, p.timezone).startAt);
-  const plotStart = new Date(p.chartPeriod === 'today' ? calendarDayRange(p.endAt, p.timezone).startAt :
-    Math.max(
-      pageOnly === 'share' ? p.startAt : 0,
-      (clock ? p.endAt : readEndAt) - { '30d': 30, '7d': 7, '24h': 1 }[p.chartPeriod] * 86400000,
-    ),
+  const plotStart = new Date(
+    p.chartPeriod === 'today'
+      ? calendarDayRange(p.endAt, p.timezone).startAt
+      : Math.max(
+          pageOnly === 'share' ? p.startAt : 0,
+          (clock ? p.endAt : readEndAt) -
+            { '30d': 30, '7d': 7, '24h': 1 }[p.chartPeriod] * 86400000,
+        ),
   );
   const [
     rawHuman,
@@ -142,22 +134,24 @@ export async function buildReport(
     plotHuman,
     plotLogs,
   ] = await Promise.all([
-    getHumanFacts(website.id, start, end, p.timezone, parts?.human as readonly HumanFact[]),
-    getLogFacts(
-      website.id,
-      start,
-      end,
-      p.timezone,
-      p.page,
-      p.filter,
-      p.search,
-      p.cursor,
-      p.seek,
-      parts?.logs,
-      p,
-      fullTableExport,
-      comparisonBoundary,
-    ),
+    prepared?.human ??
+      getHumanFacts(website.id, start, end, p.timezone, parts?.human as readonly HumanFact[]),
+    prepared?.logs ??
+      getLogFacts(
+        website.id,
+        start,
+        end,
+        p.timezone,
+        p.page,
+        p.filter,
+        p.search,
+        p.cursor,
+        p.seek,
+        parts?.logs,
+        p,
+        fullTableExport,
+        comparisonBoundary,
+      ),
     getSettings(website.id),
     needed('overview', 'logs') && (!clock || now > +todayStart)
       ? getLogToday(website.id, todayStart, new Date(Math.max(+todayStart, now)))
@@ -173,25 +167,30 @@ export async function buildReport(
     needed('content') ? getContentImpact(website.id, start, end, p) : Promise.resolve([]),
     needed('ai/overview') ? getMonthlyAiShare(website.id, end, p.timezone, p) : Promise.resolve([]),
     needed('overview', 'human/overview')
-      ? getHumanDays(website.id, plotStart, end, p.timezone, ['today', '24h'].includes(p.chartPeriod))
+      ? getHumanDays(
+          website.id,
+          plotStart,
+          end,
+          p.timezone,
+          ['today', '24h'].includes(p.chartPeriod),
+        )
       : Promise.resolve([]),
     needed('overview', 'human/overview')
-      ? getPlotLogs(website.id, plotStart, end, p.timezone, ['today', '24h'].includes(p.chartPeriod), p)
+      ? getPlotLogs(
+          website.id,
+          plotStart,
+          end,
+          p.timezone,
+          ['today', '24h'].includes(p.chartPeriod),
+          p,
+        )
       : Promise.resolve([]),
   ]);
   const h = stringifySafe(rawHuman),
     l = stringifySafe(rawLogs);
-  const halfOpen = p.crawlerMetricsVersion === 1;
-  const calendarStart =
-    calendarDayRange(+start, p.timezone).startAt === +start;
-  const days = Math.max(
-    1,
-    calendarStart
-      ? calendarDayCount(+start, Math.max(p.startAt, readEndAt - (halfOpen ? 1 : 0)), p.timezone)
-      : Math.ceil((readEndAt - p.startAt + (halfOpen ? 0 : 1)) / 86400000),
-  );
   h.geo = mergeGeography(h.geo);
   const t = h.totals;
+  const catalogCount = prepared?.catalogCount ?? l.catalog.length;
   const identityReady = identityUsable(t.population);
   const humanState: DataState = t.pageviews ? 'available' : 'empty',
     logState: DataState =
@@ -200,7 +199,7 @@ export async function buildReport(
           ? 'available'
           : 'empty'
         : 'not_connected',
-    catalogState: DataState = l.catalog.length ? 'available' : 'not_connected',
+    catalogState: DataState = catalogCount ? 'available' : 'not_connected',
     goalState: DataState = h.goals.length ? 'available' : 'not_connected';
   const r: LiekanReport = {
     contractVersion: 2,
@@ -296,52 +295,47 @@ export async function buildReport(
   };
   const catalog = new Map<string, any>(l.catalog.map(c => [c.path, c]));
   const catalogLogState: DataState = logState === 'not_connected' ? logState : catalogState;
-  const preference = (bot: string, botId?: string | null) => {
-    if (!catalog.size) return null;
-    const totals = new Map<string, number>();
-    for (const row of l.pages.filter(
-      page => page.bot === bot && (botId === undefined || (page.botId ?? null) === botId),
-    )) {
+  const preferenceCounts = new Map<string, Map<string, number>>();
+  const preferenceTotals = new Map<string, number>();
+  const preferenceKeys = (bot: string, botId?: string | null) => [
+    JSON.stringify([bot]),
+    JSON.stringify([bot, botId ?? null]),
+  ];
+  if (catalog.size) {
+    for (const row of l.pages) {
       const type = catalog.get(row.path)?.type;
-      if (type) totals.set(type, (totals.get(type) ?? 0) + row.requests);
+      if (!type) continue;
+      for (const key of preferenceKeys(row.bot, row.botId)) {
+        const counts = preferenceCounts.get(key) ?? new Map<string, number>();
+        counts.set(type, (counts.get(type) ?? 0) + row.requests);
+        preferenceCounts.set(key, counts);
+      }
     }
-    const top = [...totals].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0];
-    const total = l.bots
-      .filter(b => b.name === bot && (botId === undefined || (b.botId ?? null) === botId))
-      .reduce((sum, b) => sum + Number(b.requests), 0);
-    return top && total ? `${top[0]}（${pct(top[1], total)}% 抓取集中）` : null;
-  };
-  const paths = new Map<string, any>();
-  for (const row of l.pages) {
-    const old = paths.get(row.path) ?? {
-      path: row.path,
-      requests: 0,
-      bots: 0,
-      bot: row.bot,
-      botId: row.botId,
-      lastCrawled: row.lastCrawled,
-      main: 0,
-      leaders: [],
-    };
-    old.requests += row.requests;
-    old.bots++;
-    old.leaders = [...old.leaders, row]
-      .sort(
-        (a, b) =>
-          b.requests - a.requests ||
-          String(a.bot).localeCompare(String(b.bot)) ||
-          String(a.botId ?? '').localeCompare(String(b.botId ?? '')),
-      )
-      .slice(0, 2);
-    old.bot = old.leaders[0].bot;
-    old.botId = old.leaders[0].botId;
-    old.main = old.leaders[0].requests;
-    if (row.lastCrawled > old.lastCrawled) old.lastCrawled = row.lastCrawled;
-    paths.set(row.path, old);
+    for (const bot of l.bots)
+      for (const key of preferenceKeys(bot.name, bot.botId))
+        preferenceTotals.set(key, (preferenceTotals.get(key) ?? 0) + Number(bot.requests));
   }
-  const aiPages = Array.from(paths.values()).sort(
-    (a, b) => b.requests - a.requests || String(a.path).localeCompare(String(b.path)),
-  );
+  const preferences = new Map<string, string>();
+  for (const [key, counts] of preferenceCounts) {
+    let top: [string, number] | undefined;
+    for (const entry of counts)
+      if (!top || entry[1] > top[1] || (entry[1] === top[1] && entry[0].localeCompare(top[0]) < 0))
+        top = entry;
+    const total = preferenceTotals.get(key);
+    if (top && total) preferences.set(key, `${top[0]}（${pct(top[1], total)}% 抓取集中）`);
+  }
+  const preference = (bot: string, botId?: string | null) =>
+    preferences.get(JSON.stringify(botId === undefined ? [bot] : [bot, botId])) ?? null;
+  const previousBotKey = (bot: any) =>
+    JSON.stringify([bot.name, bot.vendor, bot.type, bot.botId ?? null]);
+  const previousBots = new Map<string, any>();
+  for (const bot of l.previousBots ?? []) {
+    const key = previousBotKey(bot);
+    if (!previousBots.has(key)) previousBots.set(key, bot);
+  }
+  const paths = new Map<string, any>();
+  for (const row of l.pages) paths.set(row.path, addReportAiPage(paths.get(row.path), row));
+  const aiPages = Array.from(paths.values()).sort(compareReportAiPages);
   const humanAiPages = new Map<
     string,
     { requests: number; bot: string; botId?: string | null; main: number }
@@ -364,13 +358,21 @@ export async function buildReport(
   }
   const knownCovered = l.catalog.filter(c => paths.has(c.path)).length,
     blind = l.catalog.filter(c => !paths.has(c.path));
+  // Preserve the first matching row and strict sourceLabel identity (including undefined).
+  const previousSources = new Map<
+    string,
+    Map<string, Map<string | undefined, (typeof h.previousSources)[number]>>
+  >();
+  for (const previous of h.previousSources) {
+    let byChannel = previousSources.get(previous.source);
+    if (!byChannel) previousSources.set(previous.source, (byChannel = new Map()));
+    const previousChannel = channel(previous);
+    let byLabel = byChannel.get(previousChannel);
+    if (!byLabel) byChannel.set(previousChannel, (byLabel = new Map()));
+    if (!byLabel.has(previous.sourceLabel)) byLabel.set(previous.sourceLabel, previous);
+  }
   const src: Row[] = h.sources.map(s => {
-    const previous = h.previousSources.find(
-      prev =>
-        prev.source === s.source &&
-        channel(prev) === channel(s) &&
-        prev.sourceLabel === s.sourceLabel,
-    );
+    const previous = previousSources.get(s.source)?.get(channel(s))?.get(s.sourceLabel);
     return {
       source: s.source,
       ...(s.sourceLabel === 'direct' ? { sourceLabel: 'direct' } : {}),
@@ -424,7 +426,10 @@ export async function buildReport(
     path: page.path,
     humanPv: page.pv,
     aiRequests: l.latest ? (humanAiPages.get(page.path)?.requests ?? 0) : null,
-    ratio: l.latest && identityComplete(t.population) ? ratio(humanAiPages.get(page.path)?.requests ?? 0, page.pv) : null,
+    ratio:
+      l.latest && identityComplete(t.population)
+        ? ratio(humanAiPages.get(page.path)?.requests ?? 0, page.pv)
+        : null,
     bot: humanAiPages.get(page.path)?.bot ?? null,
     ...(humanAiPages.get(page.path)?.botId !== undefined && {
       botId: humanAiPages.get(page.path).botId,
@@ -435,55 +440,17 @@ export async function buildReport(
         ? '已被抓取'
         : '所选范围未被抓取',
   }));
-  r.tables.botBody = l.bots.map(b => ({
-    name: b.name,
-    botId: b.botId ?? null,
-    aiRequests: crawlerAiRequests(b),
-    vendor: b.vendor,
-    type: b.type,
-    productForm: b.productForm ?? 'unknown',
-    requests: b.requests,
-    dailyAverage: Math.round((b.requests / days) * 100) / 100,
-    pages: b.pages,
-    preference: preference(b.name, b.botId ?? null),
-    lastVisit: b.lastVisit,
-    trend: l.previousBots?.find(
-      prev =>
-        prev.name === b.name &&
-        prev.vendor === b.vendor &&
-        prev.type === b.type &&
-        (prev.botId ?? null) === (b.botId ?? null),
-    )?.requests
-      ? Math.round(
-          (b.requests /
-            l.previousBots.find(
-              prev =>
-                prev.name === b.name &&
-                prev.vendor === b.vendor &&
-                prev.type === b.type &&
-                (prev.botId ?? null) === (b.botId ?? null),
-            ).requests -
-            1) *
-            10000,
-        ) / 100
-      : null,
-  }));
-  r.tables.apBody = aiPages.map(page => ({
-    path: page.path,
-    title: catalog.get(page.path)?.title?.trim() || null,
-    requests: page.requests,
-    bots: page.bots,
-    heat: pct(page.requests, aiPages[0]?.requests ?? 0),
-    repeatRate: null,
-    bot: page.bot,
-    ...(page.botId !== undefined && { botId: page.botId }),
-    bot2: page.leaders[1]?.bot ?? null,
-    ...(page.leaders[1]?.botId !== undefined && { bot2Id: page.leaders[1].botId }),
-    lastCrawled: page.lastCrawled,
-    freshness: catalog.get(page.path)?.updatedAt
-      ? `${Math.max(0, Math.floor((readEndAt - new Date(catalog.get(page.path).updatedAt).getTime()) / 86400000))} 天`
-      : null,
-  }));
+  r.tables.botBody = l.bots.map(b =>
+    reportBotRow(
+      b,
+      days,
+      preference(b.name, b.botId ?? null),
+      previousBots.get(previousBotKey(b))?.requests,
+    ),
+  );
+  r.tables.apBody = aiPages.map(page =>
+    reportAiPageRow(page, catalog.get(page.path), aiPages[0]?.requests ?? 0, readEndAt),
+  );
   const cityTable = geographyTableDisplay(
     h.geo,
     t.visits,
@@ -529,18 +496,7 @@ export async function buildReport(
     trend: g.previous ? Math.round((g.count / g.previous - 1) * 10000) / 100 : null,
     path: g.path,
   }));
-  r.tables.logBody = l.recent.map(row => ({
-    ...row,
-    ...(row.identityEvidence != null && typeof row.identityEvidence === 'object'
-      ? { identityEvidence: JSON.stringify(row.identityEvidence) }
-      : {}),
-    time: row.time,
-    classification: isUnknownCrawler(row)
-      ? isbot(row.userAgent || '')
-        ? '自动化特征 · 身份未核验'
-        : '未知／未分类'
-      : `${row.bot} · ${row.verification === 'verified_range' ? '官方 IP 范围匹配' : row.verification === 'verified_dns' ? '官方 DNS 双向核验' : row.verification === 'verified_edge' ? '可信边缘身份核验' : row.verification === 'range_mismatch' ? '官方范围未匹配' : '身份未核验'}`,
-  }));
+  r.tables.logBody = l.recent.map(reportLogRow);
   r.tables.blindList = (l.latest ? blind : []).map(page => ({
     path: page.path,
     reason: '已收录目录，所选范围无 AI 抓取',
@@ -579,8 +535,8 @@ export async function buildReport(
     { name: '身份验证', detail: '官方 IP 范围核验；历史或过期依据保留未核验', state: '已接入' },
     {
       name: '内容目录',
-      detail: `${l.catalog.length} 条目录记录`,
-      state: catalog.size ? '已接入' : '待接入',
+      detail: `${catalogCount} 条目录记录`,
+      state: catalogCount ? '已接入' : '待接入',
     },
   ];
   r.tables.envGrid = ['device', 'browser', 'os'].flatMap(category =>
@@ -955,7 +911,9 @@ export async function buildReport(
   );
   card(
     '案例页 AI/浏览 比值',
-    l.latest && catalog.size && identityComplete(t.population) ? ratio(cases.ai, cases.human) : null,
+    l.latest && catalog.size && identityComplete(t.population)
+      ? ratio(cases.ai, cases.human)
+      : null,
     catalogLogState,
   );
   card(
@@ -1149,6 +1107,7 @@ export async function buildReport(
   };
   if (Object.values(geography).some(entries => Object.keys(entries).length))
     r.meta.geography = geography;
+  prepared?.decorate?.(r);
   if (!fullTableExport) capTablePages(r, p.tablePages, pageOnly === true);
   return applyReportPopulation(r, t.population);
 }

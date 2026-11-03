@@ -1,36 +1,44 @@
-import { withPublishedRegistry } from '../upstream/crawler-registry-context';
-import { getPublishedCatalog } from './published';
-import { readReportEvidence, reportEvidenceCsv } from './report-evidence';
-import { readOutcomes } from './outcomes-read';
-import { parseObservationQuery, readObservations } from './observation-read';
-import { parsePerformanceQuery, readPerformance } from './performance-read';
-import { evidenceExportSchema, type EvidenceQuery } from '../contracts/traffic-evidence';
+import { createHash } from 'node:crypto';
 import {
-  safeCsvCell,
-  sanitizeExportValue,
   EXPORT_MAX_BYTES,
   EXPORT_MAX_ROWS,
+  safeCsvCell,
+  sanitizeExportValue,
 } from '../contracts/exports';
+import { parseReportQuery } from '../contracts/query';
+import { reportEvidenceViewPayload } from '../contracts/report-evidence-view';
+import { evidenceExportSchema } from '../contracts/traffic-evidence';
+import { decodeCursor } from '../cursor';
+import { buildReport } from '../report';
 import {
-  queryEvidence,
+  authenticateCrawler,
+  authorizeCrawler,
+  type CrawlerActor,
+  crawlerTransaction,
+} from '../upstream/crawler-access';
+import { withPublishedRegistry } from '../upstream/crawler-registry-context';
+import { LiekanError } from '../upstream/errors';
+import { attachReportEvidenceView } from '../upstream/report-evidence-view';
+import {
+  warehouseEvidenceRows,
+  withWarehouseEvidenceResources,
+} from '../upstream/warehouse-evidence-table';
+import { warehouseReportPageComparison } from '../upstream/warehouse-report-page-comparison';
+import { withinWarehouseReport } from '../upstream/warehouse-report-snapshot';
+import { warehouseEnabled } from '../warehouse/authority-routing';
+import { warehouseEvidenceCsv } from './evidence-csv-artifact';
+import {
   parseEvidenceQuery,
+  queryEvidence,
   readCrawlerEvidence,
   readReconciliation,
 } from './evidence-read';
-import {
-  authenticateCrawler,
-  type CrawlerActor,
-  crawlerTransaction,
-  authorizeCrawler,
-} from '../upstream/crawler-access';
-import { LiekanError } from '../upstream/errors';
-import { parseReportQuery } from '../contracts/query';
-import { buildReport } from '../report';
-import { withinQuerySnapshot } from '../upstream/query-snapshot';
-import { attachReportEvidenceView } from '../upstream/report-evidence-view';
-import { decodeCursor } from '../cursor';
-import { createHash } from 'node:crypto';
-import { reportEvidenceViewPayload } from '../contracts/report-evidence-view';
+import { evidenceSnapshot } from './evidence-snapshot';
+import { parseObservationQuery, readObservations } from './observation-read';
+import { readOutcomes } from './outcomes-read';
+import { parsePerformanceQuery, readPerformance } from './performance-read';
+import { getPublishedCatalog } from './published';
+import { readReportEvidence, reportEvidenceCsv } from './report-evidence';
 
 async function exportEvidenceSnapshot(
   actor: CrawlerActor,
@@ -108,13 +116,20 @@ async function exportEvidenceSnapshot(
             throw new LiekanError('日志游标无效', 400);
           }
         }
-        const page = await withinQuerySnapshot(
-          {
-            aiPrivate: true,
-            $queryRawUnsafe: (sql, ...args) => tx.queryPrepared(sql, ...args),
-            $executeRawUnsafe: (sql, ...args) => tx.execute(sql, ...args),
-          },
-          async () =>
+        if (warehouseEnabled()) {
+          value.meta.pageComparisonSnapshot = await warehouseReportPageComparison(
+            tx,
+            id,
+            viewQuery.data,
+            evidence,
+            'reportDisplay' in query && query.reportDisplay
+              ? query.reportDisplay
+              : { filter: '全部', sort: { label: '', direction: 1 }, search: '' },
+            boundary,
+            value[warehouseEvidenceRows],
+          );
+        } else {
+          const page = await evidenceSnapshot(tx, async () =>
             attachReportEvidenceView(
               await buildReport(
                 { id, name: evidence.access.name, domain: evidence.access.domain },
@@ -126,17 +141,18 @@ async function exportEvidenceSnapshot(
               ),
               viewQuery.data,
             ),
-        );
-        value.meta.pageComparisonSnapshot = createHash('sha256')
-          .update(
-            reportEvidenceViewPayload(
-              page,
-              'reportDisplay' in query && query.reportDisplay
-                ? query.reportDisplay
-                : { filter: '全部', sort: { label: '', direction: 1 }, search: '' },
-            ),
-          )
-          .digest('hex');
+          );
+          value.meta.pageComparisonSnapshot = createHash('sha256')
+            .update(
+              reportEvidenceViewPayload(
+                page,
+                'reportDisplay' in query && query.reportDisplay
+                  ? query.reportDisplay
+                  : { filter: '全部', sort: { label: '', direction: 1 }, search: '' },
+              ),
+            )
+            .digest('hex');
+        }
       }
       return value;
     },
@@ -156,6 +172,16 @@ async function exportEvidenceSnapshot(
       ? input.viewSnapshot !== (result.meta.pageComparisonSnapshot ?? result.meta.snapshot)
       : null,
   };
+  if (warehouseEnabled())
+    return warehouseEvidenceCsv(
+      result,
+      metadata,
+      actor,
+      websiteId,
+      input.kind,
+      input.locale,
+      request,
+    );
   const records: unknown[][] = [
     [
       input.locale === 'zh-CN' ? '导出说明' : 'Export metadata',
@@ -199,7 +225,7 @@ async function exportEvidenceSnapshot(
     csv =
       '\ufeff' +
       records[0]
-        .map(value => '\"' + String(safeCsvCell(value) ?? '').replaceAll('\"', '\"\"') + '\"')
+        .map(value => '"' + String(safeCsvCell(value) ?? '').replaceAll('"', '""') + '"')
         .join(',') +
       '\r\n' +
       reportEvidenceCsv(result, input.locale).replace(/^\ufeff/, '');
@@ -222,8 +248,18 @@ async function exportEvidenceSnapshot(
 export async function exportEvidence(...args: Parameters<typeof exportEvidenceSnapshot>) {
   const requested = args[3].headers.get('X-Liekan-Catalog-Version') || undefined;
   return withPublishedRegistry(async () => {
-    const response = await exportEvidenceSnapshot(...args);
-    response.headers.set('X-Liekan-Catalog-Version', getPublishedCatalog().version);
-    return response;
+    let response: Response;
+    try {
+      response = await (warehouseEnabled()
+        ? withWarehouseEvidenceResources(() =>
+            withinWarehouseReport(async () => (response = await exportEvidenceSnapshot(...args))),
+          )
+        : exportEvidenceSnapshot(...args));
+      response.headers.set('X-Liekan-Catalog-Version', getPublishedCatalog().version);
+      return response;
+    } catch (error) {
+      await response?.body?.cancel().catch(() => {});
+      throw error;
+    }
   }, requested);
 }

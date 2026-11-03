@@ -1,13 +1,14 @@
-import { getPublishedCatalog } from '../crawlers/published';
-import { normalizeIp, configuredIp } from '@/lib/ip';
 import { createHash } from 'node:crypto';
 import { browserName } from 'detect-browser';
 import ipaddr from 'ipaddr.js';
 import { isbot } from 'isbot';
+import { configuredIp, normalizeIp } from '@/lib/ip';
+import { getPublishedCatalog } from '../crawlers/published';
 import { getBrowserRangeSources } from '../crawlers/range-sources';
-import { collectionRegistryIsCurrent } from './crawler-registry-context';
+import { classifyBot, getBotRules } from '../rules/bots';
 import { rangeContainsAddress, type VerificationSnapshots } from '../rules/verify';
-import { getBotRules, classifyBot } from '../rules/bots';
+import { hasUrlAuthority, normalizeCollectionHostname } from '../traffic-quality/hostname';
+import { collectionRegistryIsCurrent } from './crawler-registry-context';
 
 export const COLLECTION_RULE_VERSION = 'traffic-quality-v4';
 export type CollectionClassification = 'browser' | 'automated' | 'suspected' | 'unknown';
@@ -53,38 +54,7 @@ function registeredCrawler(ua: string) {
   return !!match.crawlerId || !!match.candidateIds?.length;
 }
 
-function hasUrlAuthority(value: unknown): value is string {
-  return typeof value === 'string' && /^(?:[a-z][a-z0-9+.-]*:)?\/\/[^/\\]/i.test(value.trim());
-}
-
-export function normalizeCollectionHostname(value: unknown): string | null {
-  if (typeof value !== 'string' || !value.trim()) return null;
-  const trimmed = value.trim();
-  const fullUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed);
-  const protocolRelative = trimmed.startsWith('//');
-  if ((fullUrl || protocolRelative) && !hasUrlAuthority(trimmed)) return null;
-  if (/^[/\\]/.test(trimmed) && !protocolRelative) return null;
-  try {
-    const url = new URL(
-      protocolRelative ? `https:${trimmed}` : fullUrl ? trimmed : `https://${trimmed}`,
-    );
-    if (!['http:', 'https:'].includes(url.protocol)) return null;
-    if (
-      !fullUrl &&
-      !protocolRelative &&
-      (url.username || url.password || url.pathname !== '/' || url.search || url.hash)
-    )
-      return null;
-    const hostname = url.hostname
-      .toLowerCase()
-      .replace(/\.$/, '')
-      .replace(/^www\./, '');
-    if (!hostname || hostname.length > 253) return null;
-    return hostname;
-  } catch {
-    return null;
-  }
-}
+export { normalizeCollectionHostname } from '../traffic-quality/hostname';
 
 function address(value: unknown) {
   const clean = typeof value === 'string' ? normalizeIp(value) : undefined;

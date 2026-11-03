@@ -1,3 +1,4 @@
+import { warehouseEnabled } from '../warehouse/authority-routing';
 import { applyFeaturePopulation } from '../contracts/population-results';
 import { readBrowserPopulation } from './browser-population';
 import { nativeSnapshot } from './native-snapshot';
@@ -128,6 +129,12 @@ export async function featureAnalytics(websiteId: string, input: unknown) {
   return featurePopulation(websiteId, p, () => computeFeatureAnalytics(websiteId, p, filters));
 }
 async function computeFeatureAnalytics(websiteId: string, p: any, filters: any) {
+  if (warehouseEnabled())
+    return (await import('./warehouse-feature-analytics')).warehouseFeatureAnalytics(
+      websiteId,
+      p,
+      filters,
+    );
   let source = p.retentionDate ? 'cohort_events' : 'filtered_events';
   let { cte, params } = selectEvents(websiteId, filters, !!p.retentionDate, source);
   if (p.retentionDate) {
@@ -436,13 +443,18 @@ async function computeFeatureJourney(
   p: any,
   nodes?: string[],
 ): Promise<JourneyData> {
-  const { cte, params } = selectEvents(
-    websiteId,
-    await filtersFor(websiteId, {
-      ...p,
-      ...(p.type === 'all' ? {} : { eventType: p.type === 'pages' ? 1 : 2 }),
-    }),
-  );
+  const filters = await filtersFor(websiteId, {
+    ...p,
+    ...(p.type === 'all' ? {} : { eventType: p.type === 'pages' ? 1 : 2 }),
+  });
+  if (warehouseEnabled())
+    return (await import('./warehouse-feature-journey')).warehouseFeatureJourney(
+      websiteId,
+      p,
+      filters,
+      nodes,
+    );
+  const { cte, params } = selectEvents(websiteId, filters);
   // Read each visit's first source from the full selection once before applying journey bounds.
   const sql = `${cte}, first_sources AS(SELECT DISTINCT ON(visit_id) visit_id,referrer_domain AS source FROM selected ORDER BY visit_id,created_at,event_id),annotated AS(SELECT *,COALESCE(NULLIF(event_name,''),url_path) AS node,LAG(COALESCE(NULLIF(event_name,''),url_path)) OVER(PARTITION BY visit_id ORDER BY created_at,event_id) AS previous FROM selected),deduplicated AS(SELECT * FROM annotated WHERE node IS DISTINCT FROM previous),ordered AS(SELECT *,ROW_NUMBER() OVER(PARTITION BY visit_id ORDER BY created_at,event_id)::int AS rn FROM deduplicated),starts AS(SELECT visit_id,MIN(rn) FILTER(WHERE {{startStep}}='' OR node={{startStep}}) AS start_rn FROM ordered GROUP BY visit_id),bounds AS(SELECT o.visit_id,s.start_rn,CASE WHEN {{endStep}}='' THEN s.start_rn+{{steps}}::int-1 ELSE MIN(o.rn) FILTER(WHERE o.rn>s.start_rn AND o.node={{endStep}}) END AS end_rn FROM ordered o JOIN starts s ON s.visit_id=o.visit_id GROUP BY o.visit_id,s.start_rn),windowed AS(SELECT o.* FROM ordered o JOIN bounds b ON b.visit_id=o.visit_id WHERE b.start_rn IS NOT NULL AND b.end_rn IS NOT NULL AND b.end_rn<=b.start_rn+{{steps}}::int-1 AND o.rn BETWEEN b.start_rn AND b.end_rn),eligible AS(SELECT w.visit_id,w.session_id,ARRAY_AGG(w.node ORDER BY w.rn) AS nodes,EXTRACT(EPOCH FROM MAX(w.created_at)-MIN(w.created_at)) AS seconds,source.source FROM windowed w JOIN first_sources source ON source.visit_id=w.visit_id GROUP BY w.visit_id,w.session_id,source.source HAVING COUNT(*)>=2)`;
   const run = (query: string, extra: any = {}) =>
@@ -532,14 +544,21 @@ async function computeFeatureGoal(
     .replace(p.unit === 'week' ? "date_trunc('day'," : '__unused__', "date_trunc('week',");
   const run = (sql: string) =>
     prisma.rawQuery(`${cte} ${sql}`, { ...params, target }, 'liekanFeatureGoal').then(clean);
-  const [totals, series] = await Promise.all([
-    run(
-      `SELECT COUNT(*) FILTER(WHERE ${matching}) AS conversions,COUNT(DISTINCT session_id) FILTER(WHERE ${matching}) AS num,COUNT(DISTINCT session_id) AS total FROM selected`,
-    ),
-    run(
-      `SELECT ${dateSQL} AS x,COUNT(*) AS y FROM selected WHERE ${matching} GROUP BY 1 ORDER BY 1`,
-    ),
-  ]);
+  const [totals, series] = warehouseEnabled()
+    ? await (await import('./warehouse-feature-analytics')).warehouseFeatureGoal(
+        websiteId,
+        goal,
+        p,
+        filters,
+      )
+    : await Promise.all([
+        run(
+          `SELECT COUNT(*) FILTER(WHERE ${matching}) AS conversions,COUNT(DISTINCT session_id) FILTER(WHERE ${matching}) AS num,COUNT(DISTINCT session_id) AS total FROM selected`,
+        ),
+        run(
+          `SELECT ${dateSQL} AS x,COUNT(*) AS y FROM selected WHERE ${matching} GROUP BY 1 ORDER BY 1`,
+        ),
+      ]);
   const starts: any = {
     minute: startOfMinute,
     hour: startOfHour,

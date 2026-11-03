@@ -117,6 +117,26 @@ test('rerunning preserves existing configuration and credentials byte for byte',
   assert.deepEqual(await readFile(path.join(root, '.env')), original);
 });
 
+test('legacy deployment refuses warehouse configuration before Docker calls and preserves it', async t => {
+  const { root, calls, run } = await installation(t);
+  const text = 'POSTGRES_PASSWORD=private-fixture\nexport LIEKAN_INSTALL_MODE=pg-transition\n';
+  await writeFile(path.join(root, '.env'), text, { mode: 0o600 });
+  const result = run();
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /liekan-warehouse-deploy\.py/);
+  assert.ok(!result.stderr.includes('private-fixture'));
+  assert.equal(await readFile(path.join(root, '.env'), 'utf8'), text);
+  await assert.rejects(access(calls));
+});
+
+test('app checks persisted warehouse mode before migrations or opening the HTTP server', async () => {
+  const script = await readFile('scripts/liekan-start.sh', 'utf8');
+  const guard = script.indexOf('node dist/liekan-warehouse-start-check.mjs');
+  assert.ok(guard >= 0);
+  for (const command of ['node scripts/check-db.js', 'node scripts/liekan-migrate.mjs', 'exec node server.js'])
+    assert.ok(guard < script.indexOf(command));
+});
+
 test('an existing database without its configuration is refused before a build', async t => {
   const { root, calls, run } = await installation(t, { DEPLOY_TEST_VOLUME_EXISTS: '0' });
   assert.equal(run().status, 1);

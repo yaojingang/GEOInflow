@@ -86,7 +86,11 @@
     "liekan:ai:maintenance": "node generated/ai-maintenance.mjs",
     "test:crawler-evidence": "node tests/liekan/crawler-evidence.integration.mjs",
     "test:history-repair": "node tests/liekan/history-repair.integration.mjs",
-    "test:analytics-rollups": "node tests/liekan/analysis-rollups.integration.mjs"
+    "test:analytics-rollups": "node tests/liekan/analysis-rollups.integration.mjs",
+    "liekan:warehouse": "tsx scripts/liekan-warehouse.ts",
+    "liekan:warehouse-worker": "node dist/liekan-warehouse-worker.mjs",
+    "liekan:warehouse-transition": "node dist/liekan-transition-worker.mjs",
+    "liekan:warehouse-maintenance": "node dist/liekan-maintenance-worker.mjs"
   },
   "cacheDirectories": [
     ".next/cache"
@@ -96,6 +100,7 @@
     "@ai-sdk/openai": "4.0.83",
     "@ai-sdk/openai-compatible": "3.0.62",
     "@clickhouse/client": "^1.23.1",
+    "@confluentinc/kafka-javascript": "1.11.0",
     "@dicebear/collection": "^9.4.3",
     "@dicebear/core": "^9.4.3",
     "@noble/hashes": "2.2.0",
@@ -162,6 +167,7 @@
     "thenby": "^1.4.1",
     "undici": "^7.30.0",
     "uuid": "^14.0.2",
+    "yazl": "3.3.1",
     "zod": "^4.6.2",
     "zustand": "^5.0.15"
   },
@@ -181,6 +187,7 @@
     "@types/qrcode": "^1.5.6",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "@types/yazl": "3.3.0",
     "babel-plugin-react-compiler": "19.1.0-rc.2",
     "dotenv-cli": "^11.0.0",
     "jsdom": "^30.0.1",

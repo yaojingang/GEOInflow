@@ -1,10 +1,3 @@
-import {
-  collectionAdmission,
-  normalizeCollectionOrigin,
-} from '@/lib/liekan/upstream/collection-admission';
-import { withPublishedRegistry } from '@/lib/liekan/upstream/crawler-registry-context';
-import { observeCollection } from '@/lib/liekan/upstream/collection-observation';
-import { recordGeographyIngress } from '@/lib/liekan/upstream/geography-ingress';
 import { startOfHour } from 'date-fns';
 import { isbot } from 'isbot';
 import { z } from 'zod';
@@ -12,24 +5,35 @@ import clickhouse from '@/lib/clickhouse';
 import { CACHE_TOKEN_TYPE, COLLECTION_TYPE, EVENT_TYPE, FIELD_LENGTH } from '@/lib/constants';
 import { getSalt, hash, secret, uuid } from '@/lib/crypto';
 import { getClientInfo, hasBlockedIp } from '@/lib/detect';
+import { truncateString } from '@/lib/format';
+import { createToken, parseToken } from '@/lib/jwt';
+import {
+  collectionAdmission,
+  normalizeCollectionOrigin,
+} from '@/lib/liekan/upstream/collection-admission';
 import { isAuthenticatedCollection } from '@/lib/liekan/upstream/collection-auth';
-import { classifyCollection } from '@/lib/liekan/upstream/collection-quality';
-import { collectionIdentity } from '@/lib/liekan/upstream/collection-identity';
 import { collectionFingerprint } from '@/lib/liekan/upstream/collection-fingerprint';
+import { collectionIdentity } from '@/lib/liekan/upstream/collection-identity';
+import { observeCollection } from '@/lib/liekan/upstream/collection-observation';
+import { classifyCollection } from '@/lib/liekan/upstream/collection-quality';
 import { collectionSnapshots } from '@/lib/liekan/upstream/collection-snapshots';
 import {
   CollectionConflictError,
-  withCollectionWrite,
   recordCollectionIdentity,
+  withCollectionWrite,
 } from '@/lib/liekan/upstream/collection-write';
-import { truncateString } from '@/lib/format';
-import { createToken, parseToken } from '@/lib/jwt';
+import { withPublishedRegistry } from '@/lib/liekan/upstream/crawler-registry-context';
+import { recordGeographyIngress } from '@/lib/liekan/upstream/geography-ingress';
+import { submitWarehouseCollection } from '@/lib/liekan/upstream/warehouse-collection';
+import { WarehouseCollectionPackage } from '@/lib/liekan/upstream/warehouse-collection-package';
+import { WarehouseUnavailable } from '@/lib/liekan/warehouse/completion';
+import { warehouseIntakeEnabled } from '@/lib/liekan/warehouse/runtime';
 import { fetchWebsite } from '@/lib/load';
-import { getLink, getPixel } from '@/queries/prisma';
 import { parseRequest } from '@/lib/request';
 import { badRequest, forbidden, json, serverError } from '@/lib/response';
 import { anyObjectParam, urlOrPathParam } from '@/lib/schema';
 import { safeDecodeURI, safeDecodeURIComponent } from '@/lib/url';
+import { getLink, getPixel } from '@/queries/prisma';
 import {
   createSession,
   saveEvent,
@@ -268,9 +272,34 @@ async function collect(request: Request) {
       iat = now;
     }
 
+    const collectionInput = {
+      websiteId: sourceId,
+      eventId: type === COLLECTION_TYPE.identify ? undefined : payload.eventId,
+      fingerprint: collectionFingerprint(type, payload),
+      quality,
+      identity,
+      expectedPolicyRevision: admission?.revision,
+      identify: type === COLLECTION_TYPE.identify,
+      geography: geographyEvidence,
+      observation: isAuthenticatedCollection(request)
+        ? undefined
+        : observeCollection(request, receivedAt),
+    };
+    const warehousePackage = warehouseIntakeEnabled()
+      ? new WarehouseCollectionPackage(collectionInput, receivedAt, resourceType)
+      : undefined;
+    const writer = warehousePackage ?? {
+      createSession,
+      saveEvent,
+      saveSessionData,
+      saveSessionLink,
+      updateSession,
+      identity: recordCollectionIdentity,
+    };
+
     const collect = async () => {
       if (!clickhouse.enabled) {
-        await createSession({
+        await writer.createSession({
           id: sessionId,
           websiteId: sourceId,
           browser,
@@ -285,7 +314,7 @@ async function collect(request: Request) {
           createdAt,
         });
       }
-      if (identity) await recordCollectionIdentity(websiteId, identity);
+      if (identity) await writer.identity(websiteId, identity);
       if (type === COLLECTION_TYPE.event) {
         const base = hostname ? `https://${hostname}` : 'https://localhost';
         const currentUrl = new URL(url, base);
@@ -351,7 +380,7 @@ async function collect(request: Request) {
               ? EVENT_TYPE.customEvent
               : EVENT_TYPE.pageView;
 
-        await saveEvent({
+        await writer.saveEvent({
           websiteId: sourceId,
           sessionId,
           visitId,
@@ -405,13 +434,13 @@ async function collect(request: Request) {
           if (sessionLinkId !== newLinkId) {
             const identify = async () => {
               await Promise.all([
-                saveSessionLink({
+                writer.saveSessionLink({
                   websiteId,
                   sessionId,
                   distinctId,
                   createdAt,
                 }),
-                updateSession({
+                writer.updateSession({
                   websiteId,
                   sessionId,
                   distinctId,
@@ -425,7 +454,7 @@ async function collect(request: Request) {
         }
 
         if (data) {
-          await saveSessionData({
+          await writer.saveSessionData({
             websiteId,
             sessionId,
             sessionData: data,
@@ -438,7 +467,7 @@ async function collect(request: Request) {
         const currentUrl = new URL(url, base);
         const urlPath = currentUrl.pathname === '/undefined' ? '' : currentUrl.pathname;
 
-        await saveEvent({
+        await writer.saveEvent({
           websiteId: sourceId,
           sessionId,
           visitId,
@@ -462,23 +491,23 @@ async function collect(request: Request) {
         });
       }
     };
-    if (qualityEnabled) {
-      const result = await withCollectionWrite(
-        {
-          websiteId,
-          eventId: type === COLLECTION_TYPE.identify ? undefined : payload.eventId,
-          fingerprint: collectionFingerprint(type, payload),
-          quality,
-          identity,
-          expectedPolicyRevision: admission?.revision,
-          identify: type === COLLECTION_TYPE.identify,
-          geography: geographyEvidence,
-          observation: isAuthenticatedCollection(request)
-            ? undefined
-            : observeCollection(request, receivedAt),
-        },
-        collect,
+    if (warehousePackage) {
+      await collect();
+      const result = await submitWarehouseCollection(
+        warehousePackage,
+        resourceType,
+        sessionId,
+        visitId,
+        receivedAt,
       );
+      if (result.status === 'duplicate') {
+        sessionId = result.sessionId;
+        visitId = result.visitId;
+        iat = now;
+        if (cache?.sessionId !== sessionId || cache?.visitId !== visitId) sessionLinkId = undefined;
+      }
+    } else if (qualityEnabled) {
+      const result = await withCollectionWrite(collectionInput, collect);
       if (result.status === 'duplicate') {
         sessionId = result.sessionId;
         visitId = result.visitId;
@@ -505,6 +534,17 @@ async function collect(request: Request) {
 
     return json({ cache: token, sessionId, visitId });
   } catch (e) {
+    if (e instanceof WarehouseUnavailable)
+      return Response.json(
+        {
+          error: {
+            message: 'Collection processing is temporarily unavailable',
+            code: e.code,
+            status: 503,
+          },
+        },
+        { status: 503, headers: { 'Retry-After': '2' } },
+      );
     if (e instanceof CollectionConflictError)
       return Response.json(
         {

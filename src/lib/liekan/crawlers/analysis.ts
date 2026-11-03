@@ -1,30 +1,38 @@
-import { readTransactionBrowserPopulation } from '../upstream/browser-population';
-import { identityUsable, type BrowserPopulation } from '../contracts/browser-population';
-import { TRAFFIC_POLICY_VERSION } from '../upstream/traffic-query';
-import { withPublishedRegistry } from '../upstream/crawler-registry-context';
-import { platformForReferral, platformHasReferrals } from '../contracts/sources';
-import { getCrawlerPlatformIds } from './registry';
-import { crawlerIdentitySql } from './metric-scope';
-import type { CrawlerIdentityScope } from '../contracts/crawler-metrics';
-import { CRAWLER_POPULATION_VERSION, unknownCrawlerSql } from '../rules/population';
 import { z } from 'zod';
+import { type BrowserPopulation, identityUsable } from '../contracts/browser-population';
 import type { CrawlerAnalyzedBot, CrawlerAnalyzedPage } from '../contracts/crawler-analysis';
+import type { CrawlerIdentityScope } from '../contracts/crawler-metrics';
 import type { CrawlerObservationQuality } from '../contracts/crawlers';
 import { crawlerPathSchema } from '../contracts/crawlers';
-import { classifyEntrySource } from '../contracts/sources';
+import {
+  classifyEntrySource,
+  platformForReferral,
+  platformHasReferrals,
+} from '../contracts/sources';
+import { CRAWLER_POPULATION_VERSION, unknownCrawlerSql } from '../rules/population';
 import type { AiTx } from '../upstream/ai-db';
 import { crawlerReferralRows } from '../upstream/analytics';
+import { readTransactionBrowserPopulation } from '../upstream/browser-population';
+import { noteBrowserPopulation, noteCacheResult } from '../upstream/cache-context';
 import {
   authorizeCrawler,
   type CrawlerActor,
   crawlerTransaction,
 } from '../upstream/crawler-access';
+import { withPublishedRegistry } from '../upstream/crawler-registry-context';
 import { LiekanError } from '../upstream/errors';
 import { humanPathFromEncoded } from '../upstream/paths';
 import { analyticsCache, analyticsCacheKey, websiteCacheTag } from '../upstream/query-cache';
-import { noteCacheResult, noteBrowserPopulation } from '../upstream/cache-context';
+import { TRAFFIC_POLICY_VERSION } from '../upstream/traffic-query';
 import { crawlerDirectoryForObserved } from './directory';
 import { crawlerOwnedBlock, crawlerOwnedMatch } from './execution';
+import { crawlerIdentitySql } from './metric-scope';
+import { getCrawlerPlatformIds } from './registry';
+import { warehouseEnabled } from '../warehouse/runtime';
+import { withinWarehouseReport, warehouseReportMetadata, warehouseReportQuery } from '../upstream/warehouse-report-snapshot';
+import { factRelation } from '../warehouse/read';
+import { warehouseControlRead } from '../upstream/warehouse-control-read';
+import { warehouseCrawlerBots, warehouseCrawlerPages } from '../upstream/warehouse-crawler-queries';
 
 const DAY = 86_400_000;
 export const crawlerCriticalPathsSchema = z.strictObject({
@@ -85,12 +93,22 @@ export async function crawlerWindowQuality(
 ): Promise<CrawlerObservationQuality> {
   const args = [websiteId, new Date(startAt), new Date(endAt), ...(sourceId ? [sourceId] : [])];
   const sourceFilter = sourceId ? ' AND source_id=$4::uuid' : '';
-  const [versions] = await tx.query(
-    `SELECT count(distinct coalesce(e.classification_version,'legacy'))::int AS classes,
+  const [versions] =
+    warehouseEnabled()
+      ? [
+          await (await import('../upstream/warehouse-geo-weight')).warehouseCrawlerWindowVersions(
+            websiteId,
+            startAt,
+            endAt,
+            sourceId,
+          ),
+        ]
+      : await tx.query(
+          `SELECT count(distinct coalesce(e.classification_version,'legacy'))::int AS classes,
     min(e.classification_version) AS classification,count(distinct coalesce(l.source_id::text,'manual'))::int AS sources,min(l.source_id::text) AS source,
     count(*) FILTER(WHERE e.classification_version IS NULL)::int AS legacy ${crawlerBase}${sourceId ? ' AND l.source_id=$4::uuid' : ''}`,
-    ...args,
-  );
+          ...args,
+        );
   const [gap] = await tx.query(
     `SELECT count(*)::int AS count FROM liekan_crawler_quality WHERE website_id=$1::uuid AND starts_at<$3 AND ends_at>$2 AND state='partial'${sourceFilter}`,
     ...args,
@@ -181,17 +199,18 @@ async function crawlerAnalysisSnapshot(
       identityScope,
       populationVersion: TRAFFIC_POLICY_VERSION,
       ...access.version,
+      ...(warehouseEnabled() ? {warehouse: await warehouseReportMetadata(websiteId)} : {}),
     }),
     30000,
     [websiteCacheTag(websiteId)],
     () =>
-      crawlerTransaction(
+      (warehouseEnabled() ? warehouseCrawlerRead : crawlerTransaction)(
         async tx => {
           await authorizeCrawler(tx, actor, websiteId);
           const { startAt, endAt, timezone } = range;
           const args = [websiteId, new Date(startAt), new Date(endAt)];
           const quality = await crawlerWindowQuality(tx, websiteId, startAt, endAt, timezone);
-          const bots = await tx.query<CrawlerAnalyzedBot>(
+          const bots = warehouseEnabled() ? await warehouseCrawlerBots(websiteId,startAt,endAt,identityScope) : await tx.query<CrawlerAnalyzedBot>(
             `SELECT l.reporting_crawler_id AS "botId",l.bot AS name,${crawlerCountColumns},sum(bytes)::float8 AS bytes,
       count(*) FILTER(WHERE verification='verified_range')::float8 AS "verifiedRange",count(*) FILTER(WHERE verification='verified_dns')::float8 AS "verifiedDns",count(*) FILTER(WHERE verification='verified_edge')::float8 AS "verifiedEdge",count(*) FILTER(WHERE verification='range_mismatch')::float8 AS "rangeMismatch",
       count(*) FILTER(WHERE verification NOT IN('verified_range','verified_dns','verified_edge','range_mismatch'))::float8 AS unverified,
@@ -199,7 +218,7 @@ async function crawlerAnalysisSnapshot(
       max(created_at) AS "lastVisit",count(*) FILTER(WHERE l.reporting_classification_version IS NULL)::int AS "legacyRecords" ${reportingCrawlerBase}${crawlerIdentitySql(identityScope, 'l')} AND NOT ${unknownCrawlerSql('l')} GROUP BY 1,2 ORDER BY requests DESC`,
             ...args,
           );
-          const pages = await tx.query<CrawlerAnalyzedPage>(
+          const pages = warehouseEnabled() ? await warehouseCrawlerPages(tx,websiteId,startAt,endAt,identityScope) : await tx.query<CrawlerAnalyzedPage>(
             `SELECT l.reporting_crawler_id AS "botId",path,l.bot AS name,${crawlerCountColumns},sum(bytes)::float8 AS bytes,
       count(*) FILTER(WHERE ${crawlerOwnedBlock})::int AS "ownedTerminatingBlocks",
       count(*) FILTER(WHERE ${crawlerOwnedMatch})::int AS "ownedMatches"
@@ -212,7 +231,7 @@ async function crawlerAnalysisSnapshot(
             endAt: startAt,
             timezone,
           };
-          const previousBots = await tx.query(
+          const previousBots = warehouseEnabled() ? await warehouseCrawlerBots(websiteId,previousRange.startAt,previousRange.endAt,identityScope,false) : await tx.query(
             `SELECT l.reporting_crawler_id AS "botId",l.bot AS name,${crawlerCountColumns},sum(bytes)::float8 AS bytes ${reportingCrawlerBase}${crawlerIdentitySql(identityScope, 'l')} AND NOT ${unknownCrawlerSql('l')} GROUP BY 1,2`,
             websiteId,
             new Date(previousRange.startAt),
@@ -247,7 +266,7 @@ async function crawlerAnalysisSnapshot(
             websiteId,
             previousRange,
           );
-          const [browser] = await tx.query(
+          const [browser] = warehouseEnabled() ? await warehouseReportQuery<{connected:number}>(websiteId,`SELECT EXISTS(SELECT 1 FROM ${factRelation('website_event')} LIMIT 1) AS connected`) : await tx.query(
             'SELECT EXISTS(SELECT 1 FROM liekan_raw_website_event WHERE website_id=$1::uuid LIMIT 1) AS connected',
             websiteId,
           );
@@ -438,5 +457,9 @@ export async function changeCrawlerFinding(
 }
 
 export const crawlerAnalysis: typeof crawlerAnalysisSnapshot = (...args) => {
-  return withPublishedRegistry(() => crawlerAnalysisSnapshot(...args));
+  const work = () => withPublishedRegistry(() => crawlerAnalysisSnapshot(...args));
+  return warehouseEnabled() ? withinWarehouseReport(work) : work();
 };
+function warehouseCrawlerRead<T>(work:(tx:AiTx)=>Promise<T>,_options?:unknown) {
+  return warehouseControlRead(work);
+}

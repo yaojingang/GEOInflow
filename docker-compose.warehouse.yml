@@ -1,0 +1,133 @@
+# Use with docker-compose.liekan.yml. Existing PG/geography volumes and private
+# configuration are preserved; new analytical data uses independent volumes.
+x-warehouse-environment: &warehouse-environment
+  LIEKAN_ANALYTICS_BACKEND: clickhouse
+  LIEKAN_WAREHOUSE_TRANSITION: 'true'
+  LIEKAN_CLICKHOUSE_URL: http://warehouse-ch:8123
+  LIEKAN_CLICKHOUSE_DATABASE: ${LIEKAN_CLICKHOUSE_DATABASE:-liekan}
+  LIEKAN_CLICKHOUSE_USERNAME: ${LIEKAN_CLICKHOUSE_USERNAME:-liekan}
+  LIEKAN_CLICKHOUSE_PASSWORD: ${LIEKAN_CLICKHOUSE_PASSWORD:?ClickHouse password required}
+  LIEKAN_QUEUE_BROKERS: warehouse-queue:9092
+  LIEKAN_QUEUE_TOPIC: ${LIEKAN_QUEUE_TOPIC:-liekan-input-v1}
+  LIEKAN_RESULT_TOPIC: ${LIEKAN_RESULT_TOPIC:-liekan-authority-v1}
+  LIEKAN_QUEUE_PARTITIONS: ${LIEKAN_QUEUE_PARTITIONS:-8}
+  LIEKAN_QUEUE_REPLICATION_FACTOR: '1'
+  LIEKAN_EXPORT_DIRECTORY: /app/warehouse-exports
+  LIEKAN_CH_QUERY_MEMORY_BYTES: ${LIEKAN_CH_QUERY_MEMORY_BYTES:-1073741824}
+x-warehouse-worker: &warehouse-worker
+  image: liekan:1.2.0
+  environment:
+    <<: *warehouse-environment
+    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    APP_SECRET: ${APP_SECRET:?APP_SECRET required}
+    DISABLE_TELEMETRY: '1'
+  depends_on:
+    app: {condition: service_healthy}
+  restart: unless-stopped
+services:
+  warehouse-ch:
+    image: clickhouse/clickhouse-server:26.8.34.13@sha256:8b28eb09479c36c4533eec7a6268917d04ba3a6fd90e3f4205f70e761b6d7779
+    environment:
+      CLICKHOUSE_DB: ${LIEKAN_CLICKHOUSE_DATABASE:-liekan}
+      CLICKHOUSE_USER: ${LIEKAN_CLICKHOUSE_USERNAME:-liekan}
+      CLICKHOUSE_PASSWORD: ${LIEKAN_CLICKHOUSE_PASSWORD:?ClickHouse password required}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: '1'
+    volumes:
+      - liekan-warehouse-ch:/var/lib/clickhouse
+      - ./docker/warehouse/clickhouse.xml:/etc/clickhouse-server/config.d/liekan.xml:ro
+    cpus: ${LIEKAN_CH_CPUS:-4}
+    mem_limit: ${LIEKAN_CH_MEMORY:-4g}
+    ulimits: {nofile: {soft: 262144, hard: 262144}}
+    healthcheck:
+      test: ['CMD-SHELL', 'clickhouse-client --user "$${CLICKHOUSE_USER}" --password "$${CLICKHOUSE_PASSWORD}" --query "SELECT 1" >/dev/null']
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+  warehouse-queue:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.2@sha256:468bd13a9f2bd24794cb7fddc867c767fb1008b9a07b297b89fde48c564d7d96
+    entrypoint: [/bin/sh, -c]
+    command:
+      - >-
+        cp -f /liekan/redpanda.yaml /etc/redpanda/redpanda.yaml &&
+        cp -f /liekan/bootstrap.yaml /etc/redpanda/.bootstrap.yaml &&
+        chmod 600 /etc/redpanda/redpanda.yaml /etc/redpanda/.bootstrap.yaml &&
+        exec /usr/bin/rpk redpanda start --config /etc/redpanda/redpanda.yaml
+        --smp=${LIEKAN_QUEUE_CPUS:-2} --memory=${LIEKAN_QUEUE_MEMORY:-1536M}
+        --reserve-memory=0M --overprovisioned --check=false --unsafe-bypass-fsync=false
+    volumes:
+      - liekan-warehouse-queue:/var/lib/redpanda/data
+      - ./docker/warehouse/redpanda.yaml:/liekan/redpanda.yaml:ro
+      - ./docker/warehouse/redpanda-bootstrap.yaml:/liekan/bootstrap.yaml:ro
+    cpus: ${LIEKAN_QUEUE_CPUS:-2}
+    mem_limit: ${LIEKAN_QUEUE_CONTAINER_MEMORY:-2g}
+    healthcheck:
+      test: [CMD, rpk, cluster, info, -X, brokers=127.0.0.1:9092]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+  warehouse-init:
+    <<: *warehouse-worker
+    command: [sh, scripts/liekan-warehouse-init.sh]
+    environment:
+      <<: *warehouse-environment
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      APP_SECRET: ${APP_SECRET:?APP_SECRET required}
+      TWO_FACTOR_ENCRYPTION_KEY: ${TWO_FACTOR_ENCRYPTION_KEY:?TWO_FACTOR_ENCRYPTION_KEY required}
+      LIEKAN_INSTALL_MODE: ${LIEKAN_INSTALL_MODE:?Choose fresh or pg-transition}
+      LIEKAN_SEED_DEMO: ${LIEKAN_SEED_DEMO:-true}
+    depends_on:
+      db: {condition: service_healthy}
+      warehouse-ch: {condition: service_healthy}
+      warehouse-queue: {condition: service_healthy}
+    restart: 'no'
+  app:
+    environment:
+      <<: *warehouse-environment
+    depends_on:
+      warehouse-init: {condition: service_completed_successfully}
+    volumes:
+      - liekan-warehouse-backups:/app/warehouse-backups
+      - liekan-warehouse-exports:/app/warehouse-exports
+  log-worker:
+    environment:
+      <<: *warehouse-environment
+  analytics-worker:
+    environment:
+      <<: *warehouse-environment
+  warehouse-worker:
+    <<: *warehouse-worker
+    command: [node, dist/liekan-warehouse-worker.mjs]
+    cpus: ${LIEKAN_CONSUMER_CPUS:-2}
+    mem_limit: ${LIEKAN_CONSUMER_MEMORY:-1g}
+    healthcheck:
+      test: [CMD, node, -e, "const h=JSON.parse(require('fs').readFileSync('/tmp/liekan-warehouse-worker.health.json'));process.exit(h.healthy&&Date.now()-Date.parse(h.at)<60000?0:1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+  warehouse-transition:
+    <<: *warehouse-worker
+    command: [node, dist/liekan-transition-worker.mjs]
+    mem_limit: ${LIEKAN_TRANSITION_MEMORY:-1g}
+    healthcheck:
+      test: [CMD, node, -e, "const h=JSON.parse(require('fs').readFileSync('/tmp/liekan-transition-worker.health.json'));process.exit(h.healthy&&Date.now()-Date.parse(h.at)<120000?0:1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+  warehouse-maintenance:
+    <<: *warehouse-worker
+    command: [node, dist/liekan-maintenance-worker.mjs]
+    volumes:
+      - liekan-warehouse-exports:/app/warehouse-exports
+    mem_limit: 512m
+    healthcheck:
+      test: [CMD, node, -e, "const h=JSON.parse(require('fs').readFileSync('/tmp/liekan-warehouse-maintenance.health.json'));process.exit(h.healthy&&Date.now()-Date.parse(h.at)<120000?0:1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+volumes:
+  liekan-warehouse-ch:
+  liekan-warehouse-queue:
+  liekan-warehouse-backups:
+  liekan-warehouse-exports:

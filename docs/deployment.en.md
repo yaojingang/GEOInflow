@@ -2,7 +2,9 @@
 
 **English** | [简体中文](deployment.md)
 
-Use the repository's `scripts/liekan-deploy.sh` to deploy GEOInflow. It builds the current source, creates private configuration on first installation, runs migrations, checks health, and updates the application and workers.
+Install the ClickHouse version with `python3 scripts/liekan-warehouse-deploy.py --mode fresh`. For an existing PostgreSQL installation, use `--mode pg-transition`, then migrate, verify, and switch the historical data. Follow the [ClickHouse installation and migration guide](warehouse.md). Updates use the same entry point and original installation mode; a completed installation keeps its stored CH authority.
+
+The instructions below apply to installations that have not enabled CH. Once a warehouse installation is registered, the application and workers reject startup without its runtime configuration. Updating with only the legacy Compose file is not supported.
 
 This guide uses Docker Compose on a single host. See the [local deployment details](local-deployment.md) for existing-instance major-version protection, geographic data, and recovery. That guide and other advanced references linked below are currently in Simplified Chinese.
 

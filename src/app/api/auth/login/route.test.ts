@@ -103,6 +103,9 @@ test('password login issues a full session for exactly 90 days', async () => {
   mocks.getAllUserTeams.mockResolvedValue([]);
   const response = await POST(new Request('http://localhost/api/auth/login', { method: 'POST' }));
   expect(response.status).toBe(200);
+  expect(response.headers.get('set-cookie')).toContain(
+    'liekan_export_session=; Path=/api; HttpOnly; SameSite=Strict; Max-Age=0',
+  );
   expect(mocks.createSecureToken).toHaveBeenCalledWith(
     { userId: 'user-1', role: 'admin', pwd: 'pwd-fingerprint' },
     'app-secret',
@@ -138,6 +141,9 @@ test('the pending 2FA challenge remains valid for only five minutes', async () =
     { expiresIn: '5m' },
   );
   expect(mocks.saveAuth).not.toHaveBeenCalled();
+  expect(response.headers.get('set-cookie')).toContain(
+    'liekan_export_session=; Path=/api; HttpOnly; SameSite=Strict; Max-Age=0',
+  );
 });
 
 test('POST returns a configuration error instead of partial auth when 2FA is enabled but unavailable', async () => {
@@ -152,4 +158,14 @@ test('POST returns a configuration error instead of partial auth when 2FA is ena
     },
   });
   expect(response.status).toBe(503);
+});
+
+test('failed login expires the previous export identity without altering the authentication error', async () => {
+  mocks.checkPassword.mockReturnValue(false);
+  const response = await POST(new Request('http://localhost/api/auth/login', { method: 'POST' }));
+  expect(response.status).toBe(401);
+  expect(response.headers.get('set-cookie')).toContain(
+    'liekan_export_session=; Path=/api; HttpOnly; SameSite=Strict; Max-Age=0',
+  );
+  expect(await response.json()).toMatchObject({ error: { code: 'incorrect-username-password' } });
 });

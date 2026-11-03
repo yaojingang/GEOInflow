@@ -394,6 +394,14 @@ export const operations = {
     queryParams: [],
     hasBody: true,
   },
+  downloadLiekanExport: {
+    operationId: 'downloadLiekanExport',
+    method: 'get',
+    path: '/api/liekan/websites/{websiteId}/exports/{exportId}',
+    pathParams: ['websiteId', 'exportId'],
+    queryParams: [],
+    hasBody: false,
+  },
   exportLiekanHistoryRepair: {
     operationId: 'exportLiekanHistoryRepair',
     method: 'get',
@@ -3946,7 +3954,7 @@ export abstract class GeneratedUmamiClient {
 
   /**
    * 导出当前网站真实统计文件
-   * 返回 NDJSON：progress 为实际文件生成/传输进度，file 为文件元数据与字段清单，chunk 为顺序 Base64 数据，complete 为完成。普通 CSV/JSON 使用 summary；ZIP 使用勾选范围；kind=source-keywords 的 CSV 导出全部筛选关键词及搜索引擎，包含读取时间与条件。取消请求终止传输。查询阶段超过 100000 明细行或 50 MiB 返回 413；传输阶段错误为 error 帧。
+   * 返回 NDJSON：progress 为文件生成进度，file 为文件元数据与字段清单，complete 为完成，error 为生成失败。ClickHouse 导出按块生成完整文件，file.downloadUrl 提供受权限保护的下载地址，不设总行数或总文件字节数的业务上限；取消请求会停止生成。兼容迁移期间旧 PG 引擎的 chunk Base64 传输。普通 CSV/JSON 使用 summary；ZIP 使用勾选范围；kind=source-keywords 的 CSV 包含全部筛选关键词、搜索引擎、读取时间与条件。
    * `POST /api/liekan/websites/{websiteId}/exports`
    */
   createLiekanExport(
@@ -4346,6 +4354,18 @@ export abstract class GeneratedUmamiClient {
     options?: RequestOptions,
   ): Promise<OperationOutput<'disableTwoFactor'>> {
     return this.execute('disableTwoFactor', input, options);
+  }
+
+  /**
+   * 下载已生成的网站统计文件
+   * 使用创建导出时返回的 downloadUrl 流式下载 CSV、JSON 或 ZIP。仅创建者在仍有网站权限时可下载；支持完整登录或 API key，拒绝公开分享身份。浏览器可使用创建接口设置的路径专用 HttpOnly 凭据 cookie。传输期间继续复核权限和数据规则；权限或规则变化会中止传输。过期文件需要重新生成。
+   * `GET /api/liekan/websites/{websiteId}/exports/{exportId}`
+   */
+  downloadLiekanExport(
+    input: OperationInput<'downloadLiekanExport'>,
+    options?: RequestOptions,
+  ): Promise<OperationOutput<'downloadLiekanExport'>> {
+    return this.execute('downloadLiekanExport', input, options);
   }
 
   /**

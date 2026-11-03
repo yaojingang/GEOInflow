@@ -19,6 +19,7 @@ import { query, reportSnapshot } from './server';
 import { attachReportEvidenceView } from './report-evidence-view';
 import { dashboardClock } from './dashboard-clock';
 import { DASHBOARD_INTERVAL } from './dashboard-snapshot-model';
+import { warehouseEnabled } from '../warehouse/runtime';
 
 async function readPageReportSnapshot(
   website: { id: string; name: string; domain: string },
@@ -65,9 +66,22 @@ async function readPageReportSnapshot(
   }
   const load = async () => {
     const report = await reportSnapshot(() =>
-      withoutQueryCache(async () =>
-        attachReportEvidenceView(await buildReport(website, false, p, true), parsed.data),
-      ),
+      withoutQueryCache(async () => {
+        const prepared = warehouseEnabled()
+          ? await (await import('./warehouse-page-report')).prepareWarehousePageReport(
+              website,
+              parsed.data,
+            )
+          : undefined;
+        try {
+          return await attachReportEvidenceView(
+            await buildReport(website, false, p, true, false, undefined, prepared),
+            parsed.data,
+          );
+        } finally {
+          await prepared?.dispose?.();
+        }
+      }),
     );
     const generatedAt = Date.now();
     return pageReportSchema.parse({
@@ -107,7 +121,7 @@ async function readPageReportSnapshot(
         )
       )[0] || { data: '0', policy: '0' };
   const key = analyticsCacheKey(
-    `page-report-v10-${geographyVersion}-${CRAWLER_POPULATION_VERSION}`,
+    `page-report-v11-${geographyVersion}-${CRAWLER_POPULATION_VERSION}`,
     [process.env.DATABASE_URL, website.id, p, revision],
   );
   const result = await analyticsCache.read(
@@ -136,7 +150,7 @@ export async function peekPageReport(website: { id: string }, input: unknown) {
   // Production runtime resolves resource versions. Standalone tests keep the existing direct path.
   if (!analyticsCache.isRuntimeConfigured) return undefined;
   const key = analyticsCacheKey(
-    `page-report-v10-${geographyVersion}-${CRAWLER_POPULATION_VERSION}`,
+    `page-report-v11-${geographyVersion}-${CRAWLER_POPULATION_VERSION}`,
     [process.env.DATABASE_URL, website.id, p, undefined],
   );
   return analyticsCache.peek<LiekanPageReport>(key, [websiteCacheTag(website.id)]);

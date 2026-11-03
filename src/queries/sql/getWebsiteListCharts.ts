@@ -1,12 +1,13 @@
-import { identityUsable, type BrowserPopulation } from '@/lib/liekan/contracts/browser-population';
-import { readBrowserPopulation } from '@/lib/liekan/upstream/browser-population';
-import { nativeSnapshot } from '@/lib/liekan/upstream/native-snapshot';
-import { nativeAggregate } from '@/lib/liekan/upstream/native-aggregate';
+import { warehouseEnabled } from '@/lib/liekan/warehouse/authority-routing';
 import { addHours } from 'date-fns';
 import { formatInTimeZone } from 'date-fns-tz';
 import clickhouse from '@/lib/clickhouse';
 import { EVENT_TYPE } from '@/lib/constants';
 import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { type BrowserPopulation, identityUsable } from '@/lib/liekan/contracts/browser-population';
+import { readBrowserPopulation } from '@/lib/liekan/upstream/browser-population';
+import { nativeAggregate } from '@/lib/liekan/upstream/native-aggregate';
+import { nativeSnapshot } from '@/lib/liekan/upstream/native-snapshot';
 import prisma from '@/lib/prisma';
 
 const FUNCTION_NAME = 'getWebsiteListCharts';
@@ -76,8 +77,18 @@ export async function getWebsiteListCharts(
       ),
     [CLICKHOUSE]: async () => {
       const points = await clickhouseQuery(websiteIds, startDate, endDate, timezone, eventType);
-
-      return formatResults({ points, websiteIds, startDate, endDate, timezone });
+      const result = formatResults({ points, websiteIds, startDate, endDate, timezone });
+      if (warehouseEnabled()) {
+        for (const id of websiteIds) {
+          const population = await readBrowserPopulation(id, startDate, endDate, timezone);
+          result[id].population = population;
+          if (!identityUsable(population)) {
+            result[id].total = null;
+            result[id].values.fill(null);
+          }
+        }
+      }
+      return result;
     },
   });
 }

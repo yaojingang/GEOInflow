@@ -8,10 +8,11 @@ import { getFunnel } from '@/queries/sql';
 import { classifyEntrySource, classifyEntrySourceForDisplay } from '../contracts/sources';
 import { humanTotals, query, LiekanError } from './server';
 import { readBrowserDetailFacts } from './browser-detail-facts';
+import { warehouseEnabled } from '../warehouse/runtime';
 
 export { classifyEntrySource } from '../contracts/sources';
 
-function sourceFacts(rows: any[]) {
+export function sourceFacts(rows: any[]) {
   const grouped = new Map<string, any>();
   for (const row of rows) {
     const attribution = classifyEntrySourceForDisplay(row);
@@ -215,7 +216,7 @@ export async function getHumanFacts(
     args.push(geographyReadLimit.rows, geographyReadLimit.bytes);
   const [totals, definitions, current, previousSources, previousGoals] = await Promise.all([
     humanTotals(id, start, end, timezone),
-    query(
+    warehouseEnabled() ? (await import('./warehouse-report-snapshot')).warehouseReportMetadata(id).then(m=>m.reports) : query(
       "SELECT report_id AS id,name,type,parameters FROM report WHERE website_id=$1::uuid AND type IN('goal','funnel') ORDER BY created_at LIMIT 100",
       id,
     ),
@@ -358,6 +359,7 @@ export async function getHumanFacts(
   );
 }
 export async function getHumanConversions(id: string, start: Date, end: Date, timezone: string) {
+  if(warehouseEnabled())return (await import('./warehouse-browser-queries')).warehouseBrowserConversions(id,start,end,timezone);
   return (
     (
       await query(

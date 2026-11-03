@@ -1,3 +1,4 @@
+import { warehouseEnabled } from '@/lib/liekan/warehouse/authority-routing';
 import { emptyLogImpact } from '../history-repair/log-impact';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
@@ -23,7 +24,8 @@ import { invalidateWebsiteAnalytics } from './query-cache';
 import {
   canonicalRepairTimezone,
   emptyCounts,
-  publicRepairCounts, publicRepairPreview,
+  publicRepairCounts,
+  publicRepairPreview,
   hash,
   terminalStatuses,
   workingStatuses,
@@ -49,6 +51,8 @@ import {
   type RepairTx,
   type RunRow,
 } from './history-repair-db';
+import { repairDetailPresence, repairListPresence } from './warehouse-history-repair-presence';
+import { repairUploadList, warehouseCurrentInputSql } from './warehouse-history-repair-inputs';
 import { dayDto } from './history-repair-worker';
 export {
   processHistoryRepairJob,
@@ -117,7 +121,7 @@ export async function listHistoryRepair(
       websites: [],
       nextCursor: null,
     };
-  return repairTransaction(async tx => {
+  const result: HistoryRepairList & {nextCursor:string|null} = await repairTransaction(async tx => {
     const [user] = await tx.$queryRawUnsafe<{ role: string }[]>(
       'SELECT role FROM "user" WHERE user_id=$1::uuid AND deleted_at IS NULL FOR SHARE',
       identity.userId,
@@ -152,7 +156,7 @@ export async function listHistoryRepair(
       });
     }
     const [noticeState] = await tx.$queryRawUnsafe<{ eligible_data: boolean; unread: boolean }[]>(
-      `SELECT EXISTS(SELECT 1 FROM website w JOIN liekan_history_repair_campaign c ON c.id=$3 LEFT JOIN liekan_setting s USING(website_id) WHERE w.deleted_at IS NULL AND w.website_id=ANY(c.eligible_websites) AND NOT coalesce(s.is_demo,false) AND ($2 OR w.user_id=$1::uuid OR EXISTS(SELECT 1 FROM team_user tu JOIN team t ON t.team_id=tu.team_id WHERE tu.user_id=$1::uuid AND tu.team_id=w.team_id AND t.deleted_at IS NULL AND tu.role IN('team-owner','team-manager','team-member'))) AND (EXISTS(SELECT 1 FROM website_event e WHERE e.website_id=w.website_id) OR EXISTS(SELECT 1 FROM liekan_log l WHERE l.website_id=w.website_id))) AS eligible_data,
+      `SELECT EXISTS(SELECT 1 FROM website w JOIN liekan_history_repair_campaign c ON c.id=$3 LEFT JOIN liekan_setting s USING(website_id) WHERE w.deleted_at IS NULL AND w.website_id=ANY(c.eligible_websites) AND NOT coalesce(s.is_demo,false) AND ($2 OR w.user_id=$1::uuid OR EXISTS(SELECT 1 FROM team_user tu JOIN team t ON t.team_id=tu.team_id WHERE tu.user_id=$1::uuid AND tu.team_id=w.team_id AND t.deleted_at IS NULL AND tu.role IN('team-owner','team-manager','team-member'))) AND ${warehouseEnabled() ? 'false' : '(EXISTS(SELECT 1 FROM website_event e WHERE e.website_id=w.website_id) OR EXISTS(SELECT 1 FROM liekan_log l WHERE l.website_id=w.website_id))'}) AS eligible_data,
   EXISTS(SELECT 1 FROM liekan_history_repair_run r JOIN website w ON w.website_id=r.website_id LEFT JOIN liekan_history_repair_notice n ON n.user_id=$1::uuid AND n.campaign_id=r.campaign_id WHERE r.campaign_id=$3 AND w.deleted_at IS NULL AND r.status IN('completed','completed_limited') AND r.active_generation IS NOT NULL AND r.completed_at IS NOT NULL AND (n.read_at IS NULL OR r.completed_at>n.read_at) AND ($2 OR w.user_id=$1::uuid OR EXISTS(SELECT 1 FROM team_user tu JOIN team t ON t.team_id=tu.team_id WHERE tu.user_id=$1::uuid AND tu.team_id=w.team_id AND t.deleted_at IS NULL AND tu.role IN('team-owner','team-manager','team-member')))) AS unread`,
       identity.userId,
       admin,
@@ -180,6 +184,9 @@ export async function listHistoryRepair(
           : null,
     };
   });
+  return warehouseEnabled()
+    ? repairListPresence(identity, result)
+    : result;
 }
 export async function getHistoryRepair(
   websiteId: string,
@@ -190,7 +197,7 @@ export async function getHistoryRepair(
   const query = queryInput(parameters);
   if (query.page > 1 && !query.cursor && ['days', 'actions'].includes(query.view))
     throw new LiekanError('翻页需要上一页返回的游标', 400, 'history-repair-cursor-required');
-  return repairTransaction(async tx => {
+  const result = await repairTransaction(async tx => {
     await lockWritableWebsite(tx, websiteId, identity, 'share');
     const state = await eligibility(tx, websiteId),
       row = await runForSite(tx, websiteId, false);
@@ -200,8 +207,11 @@ export async function getHistoryRepair(
       run: row ? dto(row) : null,
     };
     if (!row) return response;
-    response.uploads = await tx.$queryRawUnsafe(
-      `WITH uploads AS (
+    response.uploads =
+      warehouseEnabled()
+        ? await repairUploadList(tx, row)
+        : await tx.$queryRawUnsafe(
+            `WITH uploads AS (
       SELECT upload_id,min(source) AS source,bool_and(state='finalized') AS finalized,bool_and(state='discarded') AS discarded,sum(rows)::text AS rows,sum(accepted)::text AS accepted,sum(rows-accepted)::text AS rejected,count(*)::int AS chunks,sum(jsonb_array_length(errors))>100 AS "moreErrors",min(created_at) AS created
       FROM liekan_history_repair_input i WHERE run_id=$1::uuid AND rulepack_hash=$2 AND ${currentRepairInputSql} GROUP BY upload_id
       ORDER BY bool_and(state='discarded'),min(created_at) DESC,upload_id LIMIT 100)
@@ -211,9 +221,9 @@ export async function getHistoryRepair(
        FROM liekan_history_repair_input i CROSS JOIN LATERAL jsonb_array_elements(i.errors) e(value)
        WHERE i.run_id=$1::uuid AND i.upload_id=u.upload_id ORDER BY i.sequence,(e.value->>'row')::integer LIMIT 100) err),'[]'::jsonb) AS errors
       FROM uploads u ORDER BY u.discarded,u.created DESC,u.upload_id`,
-      row.id,
-      row.snapshot.rulepack.hash,
-    );
+            row.id,
+            row.snapshot.rulepack.hash,
+          );
     const generation = query.generation || row.generation;
     // Only actual candidate/current/previous snapshots can be selected through public reads.
     if (
@@ -248,7 +258,9 @@ export async function getHistoryRepair(
         generation,
       );
       response.days = {
-        items: items.slice(0, query.pageSize).map(value => dayDto(value, selected?.preview?.metricScope)),
+        items: items
+          .slice(0, query.pageSize)
+          .map(value => dayDto(value, selected?.preview?.metricScope)),
         page: query.page,
         pageSize: query.pageSize,
         total: total.count,
@@ -308,6 +320,9 @@ export async function getHistoryRepair(
     }
     return response;
   });
+  return warehouseEnabled()
+    ? repairDetailPresence(websiteId, identity, result)
+    : result;
 }
 async function freshCandidate(tx: RepairTx, row: RunRow, refresh: boolean, actorId: string) {
   await archiveGeneration(tx, row);
@@ -319,11 +334,12 @@ async function freshCandidate(tx: RepairTx, row: RunRow, refresh: boolean, actor
       'SELECT clock_timestamp()::text AS time',
     );
     fixed.inputNotBefore = boundary.time;
-    await tx.$executeRawUnsafe(
-      `UPDATE liekan_history_repair_input i SET state='discarded',records='[]' WHERE i.ctid IN(SELECT i.ctid FROM liekan_history_repair_input i JOIN liekan_history_repair_run r ON r.id=i.run_id WHERE r.id=$1::uuid AND i.state<>'discarded' AND i.rulepack_hash<>$2 AND ${unreferencedRepairInputSql} LIMIT 100)`,
-      row.id,
-      fixed.rulepack.hash,
-    );
+    if (process.env.LIEKAN_ANALYTICS_BACKEND !== 'clickhouse')
+      await tx.$executeRawUnsafe(
+        `UPDATE liekan_history_repair_input i SET state='discarded',records='[]' WHERE i.ctid IN(SELECT i.ctid FROM liekan_history_repair_input i JOIN liekan_history_repair_run r ON r.id=i.run_id WHERE r.id=$1::uuid AND i.state<>'discarded' AND i.rulepack_hash<>$2 AND ${unreferencedRepairInputSql} LIMIT 100)`,
+        row.id,
+        fixed.rulepack.hash,
+      );
   }
   await tx.$executeRawUnsafe(
     `UPDATE liekan_history_repair_run SET generation=$2::uuid,revision=revision+1,status='scanning',phase='boundary',scope_finalized=false,scope_changed=false,cursor='{}',counts=$3::jsonb,log_impact='{}',preview=NULL,approved_digest=NULL,confirmed_at=NULL,partial_confirmed=false,snapshot=$4::jsonb,actor_id=$5::uuid,lease_token=NULL,lease_until=NULL,attempts=0,error_code=NULL,completed_at=NULL,updated_at=clock_timestamp() WHERE id=$1::uuid`,
@@ -353,7 +369,12 @@ export async function scanHistoryRepair(
         body.actionId,
         body,
       );
-      if (replay) return { ...replay, counts: publicRepairCounts(replay.counts), preview: publicRepairPreview(replay.preview) };
+      if (replay)
+        return {
+          ...replay,
+          counts: publicRepairCounts(replay.counts),
+          preview: publicRepairPreview(replay.preview),
+        };
       const state = await eligibility(tx, websiteId);
       if (!state.eligible)
         throw new LiekanError('该网站不在本次升级登记范围', 409, 'history-repair-ineligible');
@@ -417,7 +438,12 @@ export async function previewHistoryRepair(
         body.actionId,
         body,
       );
-      if (replay) return { ...replay, counts: publicRepairCounts(replay.counts), preview: publicRepairPreview(replay.preview) };
+      if (replay)
+        return {
+          ...replay,
+          counts: publicRepairCounts(replay.counts),
+          preview: publicRepairPreview(replay.preview),
+        };
       expected(row, body.expectedRevision, body.runId);
       if (row.active_generation)
         throw new LiekanError(
@@ -435,7 +461,9 @@ export async function previewHistoryRepair(
           ? row.snapshot.rulepack.hash
           : (await snapshot(tx, row.website_id, row.snapshot.timezone)).rulepack.hash;
       const incomplete = await tx.$queryRawUnsafe(
-        `SELECT 1 FROM liekan_history_repair_input i WHERE run_id=$1::uuid AND state='open' AND rulepack_hash=$2 AND ${currentRepairInputSql} LIMIT 1`,
+        warehouseEnabled()
+          ? `SELECT 1 FROM liekan_warehouse_repair_upload i WHERE run_id=$1::uuid AND rulepack_hash=$2 AND state='open' AND ${warehouseCurrentInputSql} LIMIT 1`
+          : `SELECT 1 FROM liekan_history_repair_input i WHERE run_id=$1::uuid AND state='open' AND rulepack_hash=$2 AND ${currentRepairInputSql} LIMIT 1`,
         row.id,
         nextRulepackHash,
       );
@@ -472,7 +500,12 @@ export async function confirmHistoryRepair(
         body.actionId,
         body,
       );
-      if (replay) return { ...replay, counts: publicRepairCounts(replay.counts), preview: publicRepairPreview(replay.preview) };
+      if (replay)
+        return {
+          ...replay,
+          counts: publicRepairCounts(replay.counts),
+          preview: publicRepairPreview(replay.preview),
+        };
       expected(row, body.expectedRevision, body.runId);
       await requireCompatibleRepairWorker(tx);
       await assertSnapshot(tx, row, true);
@@ -490,7 +523,9 @@ export async function confirmHistoryRepair(
           'history-repair-partial-confirmation-required',
         );
       const inputs = await tx.$queryRawUnsafe(
-        `SELECT 1 FROM liekan_history_repair_input i WHERE run_id=$1::uuid AND rulepack_hash=$2 AND ${currentRepairInputSql} AND (state='open' OR (state='finalized' AND jsonb_array_length(errors)>0)) LIMIT 1`,
+        warehouseEnabled()
+          ? `SELECT 1 FROM liekan_warehouse_repair_upload i WHERE run_id=$1::uuid AND rulepack_hash=$2 AND ${warehouseCurrentInputSql} AND (state='open' OR (state='finalized' AND accepted<rows)) LIMIT 1`
+          : `SELECT 1 FROM liekan_history_repair_input i WHERE run_id=$1::uuid AND rulepack_hash=$2 AND ${currentRepairInputSql} AND (state='open' OR (state='finalized' AND jsonb_array_length(errors)>0)) LIMIT 1`,
         row.id,
         row.snapshot.rulepack.hash,
       );
@@ -540,7 +575,12 @@ export async function actHistoryRepair(
         body.actionId,
         body,
       );
-      if (replay) return { ...replay, counts: publicRepairCounts(replay.counts), preview: publicRepairPreview(replay.preview) };
+      if (replay)
+        return {
+          ...replay,
+          counts: publicRepairCounts(replay.counts),
+          preview: publicRepairPreview(replay.preview),
+        };
       expected(row, body.expectedRevision, body.runId);
       if (body.action === 'pause') {
         if (!workingStatuses.includes(row.status))
@@ -696,7 +736,11 @@ export async function exportHistoryRepair(
             'Log rows',
             'Changed events',
             'Changed logs',
-            'Coverage', 'Before qualified UV', 'After qualified UV', 'Before missing identity PV', 'After missing identity PV',
+            'Coverage',
+            'Before qualified UV',
+            'After qualified UV',
+            'Before missing identity PV',
+            'After missing identity PV',
           ]
         : [
             '日期',
@@ -708,7 +752,11 @@ export async function exportHistoryRepair(
             '日志记录',
             '事件变化',
             '日志变化',
-            '证据覆盖', '原已确认身份UV', '预计已确认身份UV', '原缺失身份PV', '预计缺失身份PV',
+            '证据覆盖',
+            '原已确认身份UV',
+            '预计已确认身份UV',
+            '原缺失身份PV',
+            '预计缺失身份PV',
           ];
     const total = publicRepairCounts(saved.preview.counts, saved.preview.metricScope);
     const notes =
@@ -722,7 +770,8 @@ export async function exportHistoryRepair(
     const translatedLimitations: Record<string, string> =
       locale === 'en-US'
         ? {
-            'identity-input-incomplete': 'Missing identity evidence makes visitor totals unavailable; qualified visitor counts remain partial.',
+            'identity-input-incomplete':
+              'Missing identity evidence makes visitor totals unavailable; qualified visitor counts remain partial.',
             'browser-input-incomplete':
               'Some browser records have no evidence sufficient for reclassification.',
             'log-input-incomplete': 'Some retained logs have missing or truncated user agents.',
@@ -737,7 +786,8 @@ export async function exportHistoryRepair(
               'Records with no event timestamp are audited separately and have no inferred calendar day.',
           }
         : {
-            'identity-input-incomplete': '身份信息缺失，访客总数不可用；已确认身份的访客数为部分覆盖。',
+            'identity-input-incomplete':
+              '身份信息缺失，访客总数不可用；已确认身份的访客数为部分覆盖。',
             'browser-input-incomplete': '部分浏览记录缺少足以重新分类的原始证据。',
             'log-input-incomplete': '部分历史日志缺少完整的用户代理信息。',
             'missing-quality-scan-time-only':
@@ -761,8 +811,10 @@ export async function exportHistoryRepair(
           value.changed_events,
           value.changed_logs,
           translatedCoverage[String(value.coverage)],
-          dayDto(value, saved.preview.metricScope).beforeQualifiedUV, dayDto(value, saved.preview.metricScope).afterQualifiedUV,
-          dayDto(value, saved.preview.metricScope).beforeIdentityMissingPV, dayDto(value, saved.preview.metricScope).afterIdentityMissingPV,
+          dayDto(value, saved.preview.metricScope).beforeQualifiedUV,
+          dayDto(value, saved.preview.metricScope).afterQualifiedUV,
+          dayDto(value, saved.preview.metricScope).beforeIdentityMissingPV,
+          dayDto(value, saved.preview.metricScope).afterIdentityMissingPV,
         ]
           .map(csvCell)
           .join(','),
@@ -778,7 +830,10 @@ export async function exportHistoryRepair(
         total.changedEvents,
         total.changedLogs,
         translatedCoverage[saved.preview.partial ? 'partial' : 'complete'],
-        total.beforeQualifiedUV, total.afterQualifiedUV, total.beforeIdentityMissingPV, total.afterIdentityMissingPV,
+        total.beforeQualifiedUV,
+        total.afterQualifiedUV,
+        total.beforeIdentityMissingPV,
+        total.afterIdentityMissingPV,
       ]
         .map(csvCell)
         .join(','),

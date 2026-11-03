@@ -16,6 +16,16 @@ import { completeHourWindow, evaluateCrawlerRisks, transitionRisk } from './risk
 import { withPublishedRegistry } from '../upstream/crawler-registry-context';
 import { registryVersionIsCurrent } from '../upstream/crawler-registry';
 import type { AiTx } from '../upstream/ai-db';
+import {
+  warehouseEnabled,
+  warehouseTransitionEnabled,
+  withinWarehouseAuthority,
+} from '../warehouse/authority-routing';
+import { WarehouseConflict } from '../warehouse/control-db';
+import { withinWarehouseReport, warehouseReportMetadata, warehouseControlFingerprint } from '../upstream/warehouse-report-snapshot';
+import { warehouseControlRead } from '../upstream/warehouse-control-read';
+import { readReportingMetadata } from '../warehouse/reporting-context';
+import { warehouseCrawlerHours, warehouseCrawlerHourMetadata, warehouseCrawlerExpected, warehouseCrawlerCoverage } from '../upstream/warehouse-crawler-queries';
 
 const DAY = 86_400_000,
   HOUR = 3_600_000;
@@ -26,9 +36,46 @@ interface HourCounts extends CrawlerRequestCounts {
   mismatches: number;
   sensitive: number;
 }
+interface AnalysisAuthority {
+  authority: 'postgres' | 'clickhouse' | 'frozen';
+  revision: string;
+  installation_id: string;
+}
+async function readAnalysisAuthority(): Promise<AnalysisAuthority | undefined> {
+  if (!warehouseTransitionEnabled()) return;
+  const [authority] = await crawlerTransaction(tx =>
+    tx.query<AnalysisAuthority>(
+      'SELECT authority,revision::text,installation_id::text FROM liekan_warehouse_installation WHERE id=1',
+    ),
+  );
+  if (!authority || authority.authority !== (warehouseEnabled() ? 'clickhouse' : 'postgres'))
+    throw new WarehouseConflict('warehouse-authority-changed');
+  return authority;
+}
+async function analysisAuthorityIsCurrent(tx: AiTx, expected?: AnalysisAuthority) {
+  if (!expected) return true;
+  // The cutover takes an exclusive installation lock. Hold its shared lock
+  // through the result/failure write so a return-time check cannot come too late.
+  const [current] = await tx.query<AnalysisAuthority>(
+    'SELECT authority,revision::text,installation_id::text FROM liekan_warehouse_installation WHERE id=1 FOR SHARE',
+  );
+  return (
+    current?.authority === expected.authority &&
+    current.revision === expected.revision &&
+    current.installation_id === expected.installation_id
+  );
+}
 export async function recomputeCrawlerRisks(websiteId: string, now = Date.now()) {
-  return withPublishedRegistry(catalog =>
-    recomputeCrawlerRisksSnapshot(websiteId, now, catalog.version),
+  return withinWarehouseAuthority(() =>
+    withPublishedRegistry(async catalog =>
+      recomputeCrawlerRisksSnapshot(
+        websiteId,
+        now,
+        catalog.version,
+        undefined,
+        await readAnalysisAuthority(),
+      ),
+    ),
   );
 }
 async function analysisLeaseIsCurrent(tx: AiTx, workerId: string) {
@@ -43,9 +90,14 @@ async function recomputeCrawlerRisksSnapshot(
   now: number,
   catalogVersion: string,
   workerId?: string,
+  authority?: AnalysisAuthority,
 ) {
   const window = completeHourWindow(now);
-  const facts = await crawlerTransaction(
+  if (warehouseEnabled()) await crawlerTransaction(tx => tx.execute(
+    `INSERT INTO liekan_crawler_catalog_snapshot(website_id,snapshot_at,paths)
+      SELECT $1::uuid,date_trunc('day',now()),coalesce(jsonb_agg(path ORDER BY path),'[]'::jsonb) FROM liekan_catalog WHERE website_id=$1::uuid ON CONFLICT DO NOTHING`, websiteId,
+  ));
+  const facts = await (warehouseEnabled() ? warehouseCrawlerRead : crawlerTransaction)(
     async tx => {
       const [state] = await tx.query(
         'SELECT epoch,data_revision FROM liekan_log_state WHERE website_id=$1::uuid',
@@ -59,13 +111,13 @@ async function recomputeCrawlerRisksSnapshot(
         "SELECT computed_at,data_revision,window_end,quality->>'catalogVersion' AS catalog_version FROM liekan_crawler_analysis_state WHERE website_id=$1::uuid",
         websiteId,
       );
-      await tx.execute(
+      if (!warehouseEnabled()) await tx.execute(
         `INSERT INTO liekan_crawler_catalog_snapshot(website_id,snapshot_at,paths)
       SELECT $1::uuid,date_trunc('day',now()),coalesce(jsonb_agg(path ORDER BY path),'[]'::jsonb) FROM liekan_catalog WHERE website_id=$1::uuid
       ON CONFLICT DO NOTHING`,
         websiteId,
       );
-      const rows = await tx.query<HourCounts>(
+      const rows = warehouseEnabled() ? await warehouseCrawlerHours(tx,websiteId,window.endAt-14*DAY,window.endAt) as HourCounts[] : await tx.query<HourCounts>(
         `SELECT e.crawler_id AS "botId",date_trunc('hour',l.created_at) AS hour,${crawlerCountColumns},
       count(*) FILTER(WHERE verification='range_mismatch')::float8 AS mismatches,
       count(*) FILTER(WHERE path ~ '^/(\\.env($|[./])|\\.git($|/)|wp-config[.]php$)')::float8 AS sensitive,
@@ -82,7 +134,7 @@ async function recomputeCrawlerRisksSnapshot(
         window.endAt,
         'UTC',
       );
-      const hourMetadata = await tx.query(
+      const hourMetadata = warehouseEnabled() ? await warehouseCrawlerHourMetadata(websiteId,window.endAt-14*DAY,window.endAt) : await tx.query(
         `SELECT date_trunc('hour',l.created_at) AS hour,
         count(distinct coalesce(e.classification_version,'legacy'))::int AS classes,min(e.classification_version) AS classification,
         count(*) FILTER(WHERE e.classification_version IS NULL)::int AS legacy,
@@ -103,7 +155,7 @@ async function recomputeCrawlerRisksSnapshot(
         new Date(window.endAt),
       );
       const critical = configuration?.critical_paths || [];
-      const expected = await tx.query(
+      const expected = warehouseEnabled() ? await warehouseCrawlerExpected(tx,websiteId,window.endAt-DAY,window.endAt,critical) : await tx.query(
         `WITH expectations AS(
         SELECT value AS path,'exact' AS match,NULL::text AS bot_id,'allow' AS expected_access,NULL::timestamptz AS since,'critical' AS kind
           FROM jsonb_array_elements_text($4::jsonb)
@@ -133,8 +185,14 @@ async function recomputeCrawlerRisksSnapshot(
             new Date(window.endAt - 14 * DAY),
           )
         : [];
+      const [catalogNow] = await tx.query(
+        'SELECT paths FROM liekan_crawler_catalog_snapshot WHERE website_id=$1::uuid ORDER BY snapshot_at DESC LIMIT 1',
+        websiteId,
+      );
+      const oldCatalog = new Set<string>(snapshot[0]?.paths ?? []);
+      const commonCatalog = (catalogNow?.paths ?? []).filter((path:string) => oldCatalog.has(path));
       const coverageRows = snapshot.length
-        ? await tx.query(
+        ? warehouseEnabled() ? await warehouseCrawlerCoverage(websiteId,window.endAt-14*DAY,window.endAt,window.endAt-7*DAY,commonCatalog) : await tx.query(
             `SELECT e.crawler_id AS "botId",path,
       count(*) FILTER(WHERE created_at>=$4)::int AS current,count(*) FILTER(WHERE created_at<$4)::int AS previous
       ${crawlerBase} AND method='GET' AND status>=200 AND status<300 AND e.crawler_id IS NOT NULL GROUP BY 1,2`,
@@ -156,11 +214,8 @@ async function recomputeCrawlerRisksSnapshot(
       const currentQuality = snapshot.length
         ? await crawlerWindowQuality(tx, websiteId, window.endAt - 7 * DAY, window.endAt, 'UTC')
         : null;
-      const [catalogNow] = await tx.query(
-        'SELECT paths FROM liekan_crawler_catalog_snapshot WHERE website_id=$1::uuid ORDER BY snapshot_at DESC LIMIT 1',
-        websiteId,
-      );
       return {
+        warehouse: warehouseEnabled() ? await warehouseReportMetadata(websiteId) : null,
         state: state || { epoch: 1, data_revision: 0 },
         rows,
         quality,
@@ -357,6 +412,7 @@ async function recomputeCrawlerRisksSnapshot(
     }
   }
   const committed = await crawlerTransaction(async tx => {
+    if (!(await analysisAuthorityIsCurrent(tx, authority))) return false;
     if (!(await registryVersionIsCurrent(tx, catalogVersion))) return false;
     if (workerId && !(await analysisLeaseIsCurrent(tx, workerId))) return false;
     await tx.query('SELECT website_id FROM website WHERE website_id=$1::uuid FOR SHARE', websiteId);
@@ -366,9 +422,14 @@ async function recomputeCrawlerRisksSnapshot(
     );
     if (
       (live?.epoch ?? 1) !== facts.state.epoch ||
-      String(live?.data_revision ?? 0) !== String(facts.state.data_revision)
+      (!warehouseEnabled() && String(live?.data_revision ?? 0) !== String(facts.state.data_revision))
     )
       return false;
+    if (warehouseEnabled()) {
+      await tx.query('SELECT website_id FROM liekan_warehouse_site WHERE website_id=$1::uuid FOR SHARE',websiteId);
+      const current = await readReportingMetadata({read:(sql,params=[])=>tx.query(sql,...params)},websiteId);
+      if (!facts.warehouse || warehouseControlFingerprint(current)!==warehouseControlFingerprint(facts.warehouse)) return false;
+    }
     const workflowBefore = await tx.query(
       'SELECT * FROM liekan_crawler_finding WHERE website_id=$1::uuid FOR UPDATE',
       websiteId,
@@ -519,7 +580,7 @@ async function recomputeCrawlerRisksSnapshot(
       facts.state.epoch,
       facts.state.data_revision,
       new Date(window.endAt),
-      JSON.stringify({ ...facts.quality, catalogVersion }),
+      JSON.stringify({ ...facts.quality, catalogVersion, ...(facts.warehouse ? {warehouse:facts.warehouse.boundary,warehouseControl:warehouseControlFingerprint(facts.warehouse)} : {}) }),
     );
     if (workerId && !(await analysisLeaseIsCurrent(tx, workerId)))
       throw new Error('Crawler analysis lease expired before commit');
@@ -528,11 +589,17 @@ async function recomputeCrawlerRisksSnapshot(
   if (committed) analyticsCache.invalidate(websiteCacheTag(websiteId));
 }
 export async function processCrawlerAnalysis(workerId = randomUUID()) {
-  return withPublishedRegistry(catalog =>
-    processCrawlerAnalysisSnapshot(workerId, catalog.version),
+  return withinWarehouseAuthority(() =>
+    withPublishedRegistry(async catalog =>
+      processCrawlerAnalysisSnapshot(workerId, catalog.version, await readAnalysisAuthority()),
+    ),
   );
 }
-async function processCrawlerAnalysisSnapshot(workerId: string, catalogVersion: string) {
+async function processCrawlerAnalysisSnapshot(
+  workerId: string,
+  catalogVersion: string,
+  authority?: AnalysisAuthority,
+) {
   const candidate = await crawlerTransaction(async tx => {
     if (!(await acquireCrawlerLease(tx, 'analysis', workerId, 30))) return null;
     if (!(await acquireCrawlerLease(tx, 'analysis-rate', randomUUID(), 1.2))) {
@@ -553,10 +620,23 @@ async function processCrawlerAnalysisSnapshot(workerId: string, catalogVersion: 
     return row || null;
   });
   if (!candidate) return;
+  let renewal: Promise<unknown> | undefined;
+  const heartbeat = warehouseEnabled() ? setInterval(() => {
+    if (renewal) return;
+    renewal = crawlerTransaction(tx => tx.execute("UPDATE liekan_crawler_lease SET expires_at=clock_timestamp()+interval '30 seconds' WHERE name='analysis' AND owner=$1::uuid AND expires_at>clock_timestamp()",workerId))
+      .catch(()=>undefined).finally(()=>{renewal=undefined;});
+  },10000) : undefined;
   try {
-    await recomputeCrawlerRisksSnapshot(candidate.website_id, Date.now(), catalogVersion, workerId);
+    await recomputeCrawlerRisksSnapshot(
+      candidate.website_id,
+      Date.now(),
+      catalogVersion,
+      workerId,
+      authority,
+    );
   } catch {
     await crawlerTransaction(async tx => {
+      if (!(await analysisAuthorityIsCurrent(tx, authority))) return;
       if (!(await registryVersionIsCurrent(tx, catalogVersion))) return;
       if (!(await analysisLeaseIsCurrent(tx, workerId))) return;
       const [live] = await tx.query(
@@ -576,6 +656,17 @@ async function processCrawlerAnalysisSnapshot(workerId: string, catalogVersion: 
       );
     });
   } finally {
+    if (heartbeat) clearInterval(heartbeat);
+    await renewal;
     await crawlerTransaction(tx => releaseCrawlerLease(tx, 'analysis', workerId));
   }
+}
+
+function warehouseCrawlerRead<T>(work:(tx:AiTx)=>Promise<T>,_options?:unknown) {
+  return withinWarehouseReport(() => warehouseControlRead(work,{stable:(sql,values)=>{
+    const rows=values as Record<string,unknown>[];
+    if (/SELECT epoch,data_revision FROM liekan_log_state\b/.test(sql)) return rows.map(({data_revision:_data,...row})=>row);
+    if (/FROM liekan_ingest_batch\b/.test(sql)) return rows.map(row=>({...row,count:Number(row.count)>0}));
+    return rows;
+  }}));
 }

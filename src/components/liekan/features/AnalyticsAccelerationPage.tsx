@@ -56,7 +56,7 @@ export function AnalyticsAccelerationPage() {
   });
   const detailRead = useManualQuery<AnalysisStatusDto>({
     queryKey: ['analytics-acceleration-status', c.user.id, siteId],
-    enabled: !!siteId,
+    enabled: !!siteId && listRead.data?.supported !== false,
     queryFn: ({ signal }) => c.api.get(endpoint(siteId), undefined, signal),
   });
   useEffect(() => {
@@ -86,7 +86,7 @@ export function AnalyticsAccelerationPage() {
     const error = detailRead.error || listRead.error;
     if (error) failure(error);
   }, [detailRead.error, listRead.error]);
-  const active = !!detail?.builds.some(row => ['queued', 'running'].includes(row.status));
+  const active = !!detail?.builds?.some(row => ['queued', 'running'].includes(row.status));
   useEffect(() => {
     if (!authorized || restricted || !siteId || !active) return;
     const controller = new AbortController();
@@ -168,7 +168,11 @@ export function AnalyticsAccelerationPage() {
       {message && <Notice>{message}</Notice>}
       <Panel
         title={i18n.text('统计加速')}
-        subtitle={i18n.text('自动维护新增数据的汇总。历史范围由网站管理者启动构建。')}
+        subtitle={
+          list?.backend === 'clickhouse'
+            ? i18n.text('ClickHouse 已直接提供统计，无需构建旧汇总')
+            : i18n.text('自动维护新增数据的汇总。历史范围由网站管理者启动构建。')
+        }
       >
         <Body>
           <Select
@@ -189,8 +193,10 @@ export function AnalyticsAccelerationPage() {
           {cursor && <Button onClick={() => setCursor('')}>{i18n.text('返回第一页')}</Button>}
         </Body>
       </Panel>
-      {siteId && !detail && !error && <Notice>{i18n.text('正在读取加速状态')}</Notice>}
-      {authorized && !restricted && detail?.websiteId === siteId && (
+      {list?.supported !== false && siteId && !detail && !error && (
+        <Notice>{i18n.text('正在读取加速状态')}</Notice>
+      )}
+      {list?.supported !== false && authorized && !restricted && detail?.websiteId === siteId && (
         <>
           {detail.expansion && (!detail.expansion.path || !detail.expansion.visit) && (
             <Notice>{i18n.text('高基数扩展已暂停，未覆盖范围继续使用原始事实。')}</Notice>

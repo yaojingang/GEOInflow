@@ -1,18 +1,19 @@
-import { trafficGovernanceState } from './traffic-exclusions';
-import { getPublishedCatalog } from '../crawlers/published';
+import { warehouseEnabled } from '@/lib/liekan/warehouse/authority-routing';
 import { createHash } from 'node:crypto';
-import { diagnosticCoverage } from '../traffic-quality/diagnostics';
 import {
-  trafficPolicySchema,
-  trafficPreviewSchema,
   qualityRangeSchema,
   type TrafficPolicy,
+  trafficPolicySchema,
+  trafficPreviewSchema,
 } from '../contracts/traffic-quality';
-import { normalizeCollectionHostname, COLLECTION_RULE_VERSION } from './collection-quality';
+import { getPublishedCatalog } from '../crawlers/published';
+import { diagnosticCoverage } from '../traffic-quality/diagnostics';
 import { bumpAnalyticsRevision } from './analytics-revision';
+import { COLLECTION_RULE_VERSION, normalizeCollectionHostname } from './collection-quality';
 import { invalidateWebsiteAnalytics } from './query-cache';
-import { TRAFFIC_POLICY_VERSION } from './traffic-query';
 import { LiekanError, lockWritableWebsite, transaction, type WriteIdentity } from './server';
+import { trafficGovernanceState } from './traffic-exclusions';
+import { TRAFFIC_POLICY_VERSION } from './traffic-query';
 
 export function requireQualitySupport() {
   if (process.env.CLICKHOUSE_URL) throw new LiekanError('流量质量分析当前支持 PostgreSQL', 501);
@@ -76,7 +77,7 @@ export async function saveTrafficPolicy(
     const before = await getTrafficPolicy(websiteId, tx);
     if (proposed.expectedRevision !== undefined && proposed.expectedRevision !== before.revision)
       throw new LiekanError('统计策略已更新，请刷新后重新预览', 409);
-    if (proposed.allowedHostnames.length) {
+    if (proposed.allowedHostnames.length && process.env.LIEKAN_ANALYTICS_BACKEND !== 'clickhouse') {
       for (const row of await hostRepresentations(tx, websiteId)) {
         await tx.$executeRawUnsafe(
           `INSERT INTO liekan_collection_hostname(website_id,reported_hash,hostname) VALUES($1::uuid,$2,$3)
@@ -95,6 +96,12 @@ export async function saveTrafficPolicy(
       proposed.allowedHostnames,
     );
     const after = await getTrafficPolicy(websiteId, tx);
+    if (warehouseEnabled())
+      await tx.$executeRawUnsafe(
+        'UPDATE liekan_warehouse_site SET policy_revision=$2::bigint,updated_at=clock_timestamp() WHERE website_id=$1::uuid',
+        websiteId,
+        after.revision,
+      );
     await tx.$executeRawUnsafe(
       'INSERT INTO liekan_collection_policy_history(website_id,actor_id,before_policy,after_policy) VALUES($1::uuid,$2::uuid,$3::jsonb,$4::jsonb)',
       websiteId,
@@ -214,6 +221,13 @@ export async function previewTrafficPolicy(
   const range = parseQualityRange(
     new URLSearchParams(Object.entries(parsed.data.range).map(([k, v]) => [k, String(v)])),
   );
+  if (warehouseEnabled())
+    return (await import('./warehouse-traffic-quality')).warehousePreviewTrafficPolicy(
+      websiteId,
+      proposed,
+      range,
+      identity,
+    );
   return qualityReadTransaction(async tx => {
     await lockWritableWebsite(tx, websiteId, identity, 'share');
     const policy = await getTrafficPolicy(websiteId, tx);
@@ -233,6 +247,11 @@ export async function trafficQualityAudit(websiteId: string, parameters: URLSear
   if (process.env.CLICKHOUSE_URL)
     return { available: false, reason: '流量质量分析当前支持 PostgreSQL' };
   const range = parseQualityRange(parameters);
+  if (warehouseEnabled())
+    return (await import('./warehouse-traffic-quality')).warehouseTrafficQualityAudit(
+      websiteId,
+      range,
+    );
   return qualityReadTransaction(async tx => {
     const policy = await getTrafficPolicy(websiteId, tx);
     const values = bindings(websiteId, range);

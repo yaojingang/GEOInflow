@@ -25,6 +25,7 @@ import {
 } from './analytics-deadline';
 import { AnalyticsUnavailable } from './analytics-budget';
 import { withTrafficPolicy } from './traffic-query';
+import { warehouseEnabled } from '../warehouse/runtime';
 export { LiekanError } from './errors';
 const WEBSITE_ID_PATTERN =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
@@ -144,6 +145,7 @@ export async function sourceWebsite(
   )[0];
 }
 export async function reportSnapshot<T>(work: () => Promise<T>, deadline?: number): Promise<T> {
+  if(warehouseEnabled())return (await import('./warehouse-report-snapshot')).withinWarehouseReport(work);
   const snapshot = getQuerySnapshot();
   const schema = new URL(process.env.DATABASE_URL).searchParams.get('schema') || 'public';
   if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schema)) throw new LiekanError('数据库 schema 无效', 500);
@@ -194,7 +196,9 @@ export async function humanTotals(
   endDate: Date,
   timezone = 'UTC',
 ) {
-  const raw: unknown = await getWebsiteStats(websiteId, { startDate, endDate, timezone });
+  const raw: unknown = warehouseEnabled()
+    ? await (await import('./warehouse-browser-queries')).warehouseBrowserTotals(websiteId,startDate,endDate,timezone)
+    : await getWebsiteStats(websiteId, { startDate, endDate, timezone });
   const incompatible = () => new LiekanError('统计数据契约不兼容', 500);
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw incompatible();
   const totals = {} as {

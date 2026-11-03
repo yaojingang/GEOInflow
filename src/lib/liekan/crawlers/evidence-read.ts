@@ -1,38 +1,58 @@
-import { readTransactionBrowserPopulation } from '../upstream/browser-population';
-import { identityComplete, unavailableFields } from '../contracts/browser-population';
-import { noteBrowserPopulation } from '../upstream/cache-context';
-import { withPublishedRegistry } from '../upstream/crawler-registry-context';
-import { getPublishedCatalog } from './published';
-import { TRAFFIC_POLICY_VERSION } from '../upstream/traffic-query';
-import { evidenceCache } from '../upstream/evidence-cache';
-import { cancellableEvidence } from '../upstream/query-cancellation';
 import { createHash } from 'node:crypto';
-import { z } from 'zod';
-import {
-  evidenceQuerySchema,
-  reconciliationQuerySchema,
-  type EvidenceQuery,
-  type ReconciliationQuery,
-} from '../contracts/traffic-evidence';
+import { identityComplete, unavailableFields } from '../contracts/browser-population';
 import { CRAWLER_METRIC_VERSION, evidenceValue } from '../contracts/crawler-metrics';
-import { crawlerAiSql, unknownCrawlerSql } from '../rules/population';
-import { crawlerBase, crawlerWindowQuality } from './analysis';
-import { crawlerIdentitySql } from './metric-scope';
-import { crawlerOwnedBlock, crawlerOwnedMatch } from './execution';
-import { aiExecutor, type AiTx } from '../upstream/ai-db';
-import { getQuerySnapshot } from '../upstream/query-snapshot';
+import { EXPORT_MAX_BYTES, EXPORT_MAX_ROWS } from '../contracts/exports';
 import {
-  crawlerTransaction,
+  type EvidenceQuery,
+  evidenceQuerySchema,
+  type ReconciliationQuery,
+  reconciliationQuerySchema,
+} from '../contracts/traffic-evidence';
+import { eventSamplingRateSql } from '../log-ingestion/measurement';
+import { crawlerAiSql, unknownCrawlerSql } from '../rules/population';
+import { type AiTx, aiExecutor } from '../upstream/ai-db';
+import { AnalyticsUnavailable, analyticsGate } from '../upstream/analytics-budget';
+import { readTransactionBrowserPopulation } from '../upstream/browser-population';
+import { noteBrowserPopulation } from '../upstream/cache-context';
+import { normalizeCollectionHostname } from '../upstream/collection-quality';
+import {
   authorizeCrawler,
   type CrawlerActor,
+  crawlerTransaction,
 } from '../upstream/crawler-access';
+import { withPublishedRegistry } from '../upstream/crawler-registry-context';
 import { LiekanError } from '../upstream/errors';
-import { analyticsCache, analyticsCacheKey, websiteCacheTag } from '../upstream/query-cache';
-import { analyticsGate, AnalyticsUnavailable } from '../upstream/analytics-budget';
+import { evidenceCache } from '../upstream/evidence-cache';
 import { humanPathFromEncoded } from '../upstream/paths';
-import { normalizeCollectionHostname } from '../upstream/collection-quality';
-import { EXPORT_MAX_BYTES, EXPORT_MAX_ROWS } from '../contracts/exports';
-import { eventSamplingRateSql } from '../log-ingestion/measurement';
+import { analyticsCacheKey, websiteCacheTag } from '../upstream/query-cache';
+import { cancellableEvidence } from '../upstream/query-cancellation';
+import { getQuerySnapshot } from '../upstream/query-snapshot';
+import { TRAFFIC_POLICY_VERSION } from '../upstream/traffic-query';
+import { warehouseControlRead } from '../upstream/warehouse-control-read';
+import { warehouseEvidenceCatalog } from '../upstream/warehouse-evidence-catalog';
+import {
+  warehouseCrawlerEvidence,
+  warehouseEvidenceMeasurement,
+  warehouseEvidenceRead,
+  warehouseEvidenceSignal,
+  warehouseReconciliationFacts,
+} from '../upstream/warehouse-evidence-queries';
+import {
+  type WarehouseEvidenceRows,
+  warehouseEvidenceRows,
+  warehouseEvidenceSections,
+  withWarehouseEvidenceResources,
+} from '../upstream/warehouse-evidence-table';
+import {
+  warehouseControlFingerprint,
+  warehouseReportMetadata,
+  withinWarehouseReport,
+} from '../upstream/warehouse-report-snapshot';
+import { warehouseEnabled } from '../warehouse/authority-routing';
+import { crawlerBase, crawlerWindowQuality } from './analysis';
+import { crawlerOwnedBlock, crawlerOwnedMatch } from './execution';
+import { crawlerIdentitySql } from './metric-scope';
+import { getPublishedCatalog } from './published';
 
 export function parseEvidenceQuery(input: unknown, reconciliation = false, now = Date.now()) {
   const parsed = (reconciliation ? reconciliationQuerySchema : evidenceQuerySchema).safeParse(
@@ -124,12 +144,17 @@ export async function evidenceInputs(
       );
   if (p.sourceId && p.sourceId !== 'manual' && !sources.some(source => source.id === p.sourceId))
     throw new LiekanError('日志来源不存在', 404);
-  const catalog = browserOnly
-    ? []
-    : await tx.query<{ path: string; updatedAt: Date }>(
-        'SELECT path,updated_at AS "updatedAt" FROM liekan_catalog WHERE website_id=$1::uuid ORDER BY path',
-        websiteId,
-      );
+  const catalog =
+    browserOnly || warehouseEnabled()
+      ? []
+      : await tx.query<{ path: string; updatedAt: Date }>(
+          'SELECT path,updated_at AS "updatedAt" FROM liekan_catalog WHERE website_id=$1::uuid ORDER BY path',
+          websiteId,
+        );
+  const catalogSummary =
+    warehouseEnabled() && !browserOnly
+      ? await warehouseEvidenceCatalog(websiteId, warehouseEvidenceSignal())
+      : { hash: contentHash(catalog), count: catalog.length };
   const [policy] = await tx.query(
     'SELECT mode,revision::text,allowed_hostnames FROM liekan_collection_policy WHERE website_id=$1::uuid',
     websiteId,
@@ -166,13 +191,15 @@ export async function evidenceInputs(
   if (p.sourceId && p.sourceId !== 'manual') sourceArgs.push(p.sourceId);
   const [measurement] = browserOnly
     ? [{ requests: 0, versions: 0, samples: 0, intervals: 0, interval: null, intervalSamples: 0 }]
-    : await tx.query(
-        `SELECT count(*)::float8 AS requests,count(distinct e.measurement->>'sourceConfigVersion')::int AS versions,
+    : warehouseEnabled()
+      ? [await warehouseEvidenceMeasurement(websiteId, p)]
+      : await tx.query(
+          `SELECT count(*)::float8 AS requests,count(distinct e.measurement->>'sourceConfigVersion')::int AS versions,
     count(*) FILTER(WHERE e.measurement->>'sourceConfigVersion' IS NOT NULL)::float8 AS samples,
     count(distinct e.measurement->>'sourceIntervalVersion')::int AS intervals,min(e.measurement->>'sourceIntervalVersion') AS interval,
     count(*) FILTER(WHERE e.measurement->>'sourceIntervalVersion' IS NOT NULL)::float8 AS "intervalSamples" ${crawlerBase}${sourceCondition}`,
-        ...sourceArgs,
-      );
+          ...sourceArgs,
+        );
   const [repair] =
     'reportResource' in p && p.reportResource
       ? await tx.query(
@@ -181,12 +208,15 @@ export async function evidenceInputs(
         )
       : [];
   const baseline = {
-    catalog: contentHash(catalog),
+    catalog: catalogSummary.hash,
     registryVersion: getPublishedCatalog()?.version ?? null,
     populationVersion: TRAFFIC_POLICY_VERSION,
     policy: policy || { mode: 'standard', revision: '0' },
     epoch: state?.epoch ?? 1,
     metricVersion: CRAWLER_METRIC_VERSION,
+    ...(warehouseEnabled()
+      ? { warehouse: warehouseControlFingerprint(await warehouseReportMetadata(websiteId)) }
+      : {}),
     ...('reportResource' in p && p.reportResource
       ? { historyRepair: repair || { generation: null, revision: '0' } }
       : {}),
@@ -195,6 +225,7 @@ export async function evidenceInputs(
     access,
     sources,
     catalog,
+    catalogCount: catalogSummary.count,
     measurement,
     policy: baseline.policy,
     quality,
@@ -245,6 +276,7 @@ export async function readCrawlerEvidence(
   p: EvidenceQuery,
   input: EvidenceInputs,
 ) {
+  if (warehouseEnabled()) return warehouseCrawlerEvidence(tx, websiteId, p, input);
   if (p.view === 'summary') {
     const scope = evidenceScope(websiteId, p);
     const group =
@@ -375,6 +407,28 @@ export async function readReconciliation(
     dimension: 'path' as const,
     crawlerIdentityScope: 'all' as const,
   };
+  if (warehouseEnabled()) {
+    const data = await warehouseReconciliationFacts(websiteId, p, hostname, input, identityReady);
+    return {
+      meta: {
+        ...evidenceMeta(query, input),
+        population: 'catalog_page_requests',
+        hostname,
+        browserPopulation,
+      },
+      rows: [],
+      [warehouseEvidenceRows]: data.table,
+      browserTotals:
+        data.presence.connected && !data.unknownHosts
+          ? identityReady
+            ? data.browserTotals
+            : unavailableFields(data.browserTotals, ['uv', 'visits'])
+          : null,
+      state: data.catalogRows ? 'available' : 'missing',
+      reasonCode: data.catalogRows ? null : 'catalog_missing',
+      rawRequests: data.rawRequests,
+    };
+  }
   const scope = evidenceScope(websiteId, query, false);
   const logs = await tx.query(
     `SELECT l.path,count(*)::float8 AS requests,
@@ -537,7 +591,13 @@ async function queryEvidenceSnapshot<
   signal?: AbortSignal,
 ) {
   try {
-    const conditions = { ...p, page: 1, snapshot: undefined };
+    const conditions = {
+      ...p,
+      page: 1,
+      snapshot: undefined,
+      reasonsPage: undefined,
+      fieldCoveragePage: undefined,
+    };
     const revisions = await crawlerTransaction(async tx => {
       await authorizeCrawler(tx, actor, websiteId);
       const [log] = await tx.query(
@@ -560,39 +620,51 @@ async function queryEvidenceSnapshot<
         'SELECT epoch,first_received_at::text,last_received_at::text,pruned_before::text FROM liekan_observation_state WHERE website_id=$1::uuid',
         websiteId,
       );
-      return { log, browser, policy, catalog, observation };
+      return {
+        log,
+        browser,
+        policy,
+        catalog,
+        observation,
+        ...(warehouseEnabled() ? { warehouse: await warehouseReportMetadata(websiteId) } : {}),
+      };
     });
     const calculate = async (raw: AiTx, computeSignal?: AbortSignal) =>
-      cancellableEvidence(raw, computeSignal, async () => {
+      (warehouseEnabled()
+        ? (_tx: AiTx, signal: AbortSignal | undefined, work: () => Promise<any>) =>
+            warehouseEvidenceRead(work, signal)
+        : cancellableEvidence)(raw, computeSignal, async () => {
         const deadline = Date.now() + 59000;
         const checkCancellation = () => {
           if (computeSignal?.aborted) throw new LiekanError('统计读取已取消', 499);
         };
-        const tx: AiTx = {
-          queryPrepared: async (sql, ...args) => {
-            checkCancellation();
-            const left = deadline - Date.now();
-            if (left <= 0) throw new AnalyticsUnavailable();
-            await raw.execute(
-              `SET LOCAL statement_timeout TO '${Math.max(1, Math.floor(left))}ms'`,
-            );
-            if (!raw.queryPrepared) throw new Error('Prepared query executor unavailable');
-            return raw.queryPrepared(sql, ...args);
-          },
-          execute: async (sql, ...args) => {
-            checkCancellation();
-            return raw.execute(sql, ...args);
-          },
-          query: async (sql, ...args) => {
-            checkCancellation();
-            const left = deadline - Date.now();
-            if (left <= 0) throw new AnalyticsUnavailable();
-            await raw.execute(
-              `SET LOCAL statement_timeout TO '${Math.max(1, Math.floor(left))}ms'`,
-            );
-            return raw.query(sql, ...args);
-          },
-        };
+        const tx: AiTx = warehouseEnabled()
+          ? raw
+          : {
+              queryPrepared: async (sql, ...args) => {
+                checkCancellation();
+                const left = deadline - Date.now();
+                if (left <= 0) throw new AnalyticsUnavailable();
+                await raw.execute(
+                  `SET LOCAL statement_timeout TO '${Math.max(1, Math.floor(left))}ms'`,
+                );
+                if (!raw.queryPrepared) throw new Error('Prepared query executor unavailable');
+                return raw.queryPrepared(sql, ...args);
+              },
+              execute: async (sql, ...args) => {
+                checkCancellation();
+                return raw.execute(sql, ...args);
+              },
+              query: async (sql, ...args) => {
+                checkCancellation();
+                const left = deadline - Date.now();
+                if (left <= 0) throw new AnalyticsUnavailable();
+                await raw.execute(
+                  `SET LOCAL statement_timeout TO '${Math.max(1, Math.floor(left))}ms'`,
+                );
+                return raw.query(sql, ...args);
+              },
+            };
         const input = await evidenceInputs(
           tx,
           actor,
@@ -601,7 +673,18 @@ async function queryEvidenceSnapshot<
           kind === 'observations',
         );
         const result = await reader(tx, websiteId, conditions, input);
+        const table = result[warehouseEvidenceRows] as WarehouseEvidenceRows | undefined;
+        if (table) result.meta.total = await table.count(computeSignal);
+        const sections = result[warehouseEvidenceSections] as
+          | Record<string, WarehouseEvidenceRows>
+          | undefined;
+        if (sections) {
+          result.meta.sectionTotals = {};
+          for (const [name, section] of Object.entries(sections))
+            result.meta.sectionTotals[name] = await section.count(computeSignal);
+        }
         if (
+          !table &&
           result.rows &&
           kind !== 'report-evidence' &&
           !(kind.endsWith('evidence') && (!('view' in p) || p.view === 'matrix'))
@@ -626,10 +709,11 @@ async function queryEvidenceSnapshot<
             );
           });
         }
-        enforceEvidenceBudget(
-          result,
-          Math.max(result.rows?.length ?? 0, result.fieldCoverage?.length ?? 0),
-        );
+        if (!table && !sections)
+          enforceEvidenceBudget(
+            result,
+            Math.max(result.rows?.length ?? 0, result.fieldCoverage?.length ?? 0),
+          );
         const stableMeta = Object.fromEntries(
           [
             'metricVersion',
@@ -650,10 +734,26 @@ async function queryEvidenceSnapshot<
             .filter(key => result.meta[key] !== undefined)
             .map(key => [key, result.meta[key]]),
         );
-        const snapshot = contentHash({ ...result, meta: stableMeta });
+        const sectionHashes: Record<string, string> = {};
+        if (sections)
+          for (const [name, section] of Object.entries(sections))
+            sectionHashes[name] = await section.fingerprint(computeSignal);
+        const snapshot = warehouseEnabled()
+          ? contentHash({
+              version: 'warehouse-evidence-v3',
+              kind,
+              conditions,
+              result: { ...result, meta: stableMeta },
+              rows: table ? await table.fingerprint(computeSignal) : null,
+              sections: sectionHashes,
+              control: warehouseControlFingerprint(await warehouseReportMetadata(websiteId)),
+            })
+          : contentHash({ ...result, meta: stableMeta });
         return { ...result, meta: { ...result.meta, snapshot } };
       });
     const compute = (computeSignal?: AbortSignal) => {
+      if (warehouseEnabled())
+        return warehouseControlRead(tx => calculate(tx, computeSignal), { signal: computeSignal });
       const snapshot = getQuerySnapshot();
       return snapshot
         ? calculate(aiExecutor(snapshot), computeSignal)
@@ -667,7 +767,7 @@ async function queryEvidenceSnapshot<
     };
     const result = await (async () => {
       try {
-        return fresh
+        return fresh || warehouseEnabled()
           ? await compute(signal)
           : await evidenceCache.read(
               analyticsCacheKey(`traffic-evidence-identity-v1-${kind}`, {
@@ -701,7 +801,7 @@ async function queryEvidenceSnapshot<
         websiteId,
       );
       const catalog =
-        kind === 'observations'
+        kind === 'observations' || warehouseEnabled()
           ? []
           : await tx.query(
               'SELECT path,updated_at AS "updatedAt" FROM liekan_catalog WHERE website_id=$1::uuid ORDER BY path',
@@ -715,12 +815,15 @@ async function queryEvidenceSnapshot<
             )
           : [];
       const baseline = {
-        catalog: contentHash(catalog),
+        catalog: warehouseEnabled() ? result.meta.catalogBaseline : contentHash(catalog),
         registryVersion: getPublishedCatalog()?.version ?? null,
         populationVersion: TRAFFIC_POLICY_VERSION,
         policy: policy || { mode: 'standard', revision: '0' },
         epoch: state?.epoch ?? 1,
         metricVersion: CRAWLER_METRIC_VERSION,
+        ...(warehouseEnabled()
+          ? { warehouse: warehouseControlFingerprint(await warehouseReportMetadata(websiteId)) }
+          : {}),
         ...('reportResource' in conditions && conditions.reportResource
           ? { historyRepair: repair || { generation: null, revision: '0' } }
           : {}),
@@ -732,13 +835,50 @@ async function queryEvidenceSnapshot<
       noteBrowserPopulation(websiteId, result.meta.browserPopulation);
     const reset = !!p.snapshot && p.snapshot !== result.meta.snapshot;
     const page = reset ? 1 : p.page;
+    const table = result[warehouseEvidenceRows] as WarehouseEvidenceRows | undefined;
+    const sections = result[warehouseEvidenceSections] as
+      | Record<string, WarehouseEvidenceRows>
+      | undefined;
+    const sectionPages: Record<string, any[]> = {};
+    const sectionMetadata: Record<string, { page: number; total: number; pageSize: 20 }> = {};
+    if (sections)
+      for (const [name, section] of Object.entries(sections)) {
+        const sectionPage = reset
+          ? 1
+          : name === 'reasons'
+            ? ((p as { reasonsPage?: number }).reasonsPage ?? 1)
+            : name === 'fieldCoverage'
+              ? ((p as { fieldCoveragePage?: number }).fieldCoveragePage ?? 1)
+              : page;
+        const total = result.meta.sectionTotals[name];
+        sectionPages[name] =
+          (sectionPage - 1) * 20 >= total
+            ? []
+            : await section.page((sectionPage - 1) * 20, 20, signal);
+        sectionMetadata[name] = { page: sectionPage, total, pageSize: 20 };
+      }
+    const pageRows = table
+      ? (page - 1) * 20 >= result.meta.total
+        ? []
+        : await table.page((page - 1) * 20, 20, signal)
+      : undefined;
+    if (table || sections) await crawlerTransaction(tx => authorizeCrawler(tx, actor, websiteId));
     return {
       ...result,
-      rows:
-        fresh || (kind.endsWith('evidence') && (!('view' in p) || p.view === 'matrix'))
+      ...sectionPages,
+      rows: table
+        ? pageRows
+        : fresh || (kind.endsWith('evidence') && (!('view' in p) || p.view === 'matrix'))
           ? result.rows
           : result.rows.slice((page - 1) * 20, page * 20),
-      meta: { ...result.meta, page, pageSize: 20, total: result.rows.length, reset },
+      meta: {
+        ...result.meta,
+        page,
+        pageSize: 20,
+        total: table ? result.meta.total : result.rows.length,
+        reset,
+        ...(sections ? { sectionPages: sectionMetadata } : {}),
+      },
     };
   } catch (error) {
     if (
@@ -751,5 +891,11 @@ async function queryEvidenceSnapshot<
 }
 
 export const queryEvidence: typeof queryEvidenceSnapshot = (...args) => {
-  return withPublishedRegistry(() => queryEvidenceSnapshot(...args));
+  return withPublishedRegistry(() =>
+    warehouseEnabled()
+      ? withWarehouseEvidenceResources(() =>
+          withinWarehouseReport(() => queryEvidenceSnapshot(...args)),
+        )
+      : queryEvidenceSnapshot(...args),
+  );
 };

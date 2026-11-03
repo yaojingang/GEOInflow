@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import pg from 'pg';
+import { spawn } from 'node:child_process';
 import { DemoSeedError, seedOfficialDemo } from './liekan-demo.mjs';
 
 let client;
@@ -9,8 +10,19 @@ try {
   const schema = new URL(process.env.DATABASE_URL).searchParams.get('schema') || 'public';
   client = new pg.Client({ connectionString: process.env.DATABASE_URL });
   await client.connect();
-  const result = await seedOfficialDemo(client, { secret: process.env.APP_SECRET, schema });
-  console.log(JSON.stringify(result));
+  const hasWarehouse = (await client.query("SELECT to_regclass('public.liekan_warehouse_installation') AS name")).rows[0].name;
+  const installation = hasWarehouse ? (await client.query('SELECT authority FROM liekan_warehouse_installation WHERE id=1')).rows[0] : null;
+  if (installation) {
+    await client.end(); client = null;
+    await new Promise((done, reject) => {
+      const child = spawn(process.execPath, ['dist/liekan-warehouse-command.mjs', 'seed-demo'], {stdio:'inherit',env:process.env});
+      child.once('error', reject);
+      child.once('exit', code => code===0 ? done() : reject(new DemoSeedError('ClickHouse 示例导入未完成，可使用同一命令继续。')));
+    });
+  } else {
+    const result = await seedOfficialDemo(client, { secret: process.env.APP_SECRET, schema });
+    console.log(JSON.stringify(result));
+  }
 } catch (error) {
   console.error(
     error instanceof DemoSeedError

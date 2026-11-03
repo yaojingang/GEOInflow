@@ -7,6 +7,7 @@ import prisma, { getSchema } from '@/lib/prisma';
 import redis from '@/lib/redis';
 import { sanitizeSortFilters } from '@/lib/sort';
 import type { PageResult, QueryFilters } from '@/lib/types';
+import { warehouseIntakeEnabled } from '@/lib/liekan/warehouse/runtime';
 
 const WEBSITE_SORT_FIELDS = ['name', 'domain', 'createdAt'] as const;
 
@@ -206,12 +207,20 @@ export async function updateWebsite(
   websiteId: string,
   data: Prisma.WebsiteUpdateInput | Prisma.WebsiteUncheckedUpdateInput,
 ) {
-  const result = await prisma.transaction(async tx=>{
-    const before=await tx.website.findUnique({where:{id:websiteId}});
-    const updated=await tx.website.update({where:{id:websiteId},data});
-    if(before && (before.domain!==updated.domain || before.userId!==updated.userId || before.teamId!==updated.teamId)) {
-      await (await import('@/lib/liekan/upstream/lifecycle')).stopWebsiteSources(tx,websiteId);
-      await (await import('@/lib/liekan/upstream/ai-lifecycle')).clearAiWebsiteInTransaction(tx, websiteId);
+  const result = await prisma.transaction(async tx => {
+    const before = await tx.website.findUnique({ where: { id: websiteId } });
+    const updated = await tx.website.update({ where: { id: websiteId }, data });
+    if (
+      before &&
+      (before.domain !== updated.domain ||
+        before.userId !== updated.userId ||
+        before.teamId !== updated.teamId)
+    ) {
+      await (await import('@/lib/liekan/upstream/lifecycle')).stopWebsiteSources(tx, websiteId);
+      await (await import('@/lib/liekan/upstream/ai-lifecycle')).clearAiWebsiteInTransaction(
+        tx,
+        websiteId,
+      );
     }
     await bumpAnalyticsRevision(tx, 'website', websiteId);
     return updated;
@@ -223,6 +232,17 @@ export async function updateWebsite(
 export async function resetWebsite(websiteId: string, identity?: { userId: string }) {
   const { transaction } = prisma;
   const cloudMode = !!process.env.CLOUD_MODE;
+
+  if (warehouseIntakeEnabled()) {
+    await (await import('@/lib/liekan/upstream/warehouse-lifecycle')).deleteWarehouseStatistics(
+      websiteId,
+      'reset',
+      identity,
+    );
+    const data = await prisma.client.website.findUnique({ where: { id: websiteId } });
+    if (cloudMode) await redis.client.set(`website:${websiteId}`, data);
+    return data;
+  }
 
   return transaction(
     async tx => {
@@ -256,14 +276,32 @@ export async function resetWebsite(websiteId: string, identity?: { userId: strin
   });
 }
 
-export async function deleteWebsite(websiteId: string) {
+export async function deleteWebsite(websiteId: string, identity?: { userId: string }) {
   const { transaction } = prisma;
   const cloudMode = !!process.env.CLOUD_MODE;
 
+  if (warehouseIntakeEnabled()) {
+    const data = await prisma.client.website.findUnique({ where: { id: websiteId } });
+    await (await import('@/lib/liekan/upstream/warehouse-lifecycle')).deleteWarehouseStatistics(
+      websiteId,
+      'website',
+      identity,
+    );
+    if (cloudMode) await redis.client.del(`website:${websiteId}`);
+    return data;
+  }
+
   return transaction(
     async tx => {
-      await (await import('@/lib/liekan/upstream/lifecycle')).stopWebsiteSources(tx,websiteId,true);
-      await (await import('@/lib/liekan/upstream/ai-lifecycle')).clearAiWebsiteInTransaction(tx, websiteId);
+      await (await import('@/lib/liekan/upstream/lifecycle')).stopWebsiteSources(
+        tx,
+        websiteId,
+        true,
+      );
+      await (await import('@/lib/liekan/upstream/ai-lifecycle')).clearAiWebsiteInTransaction(
+        tx,
+        websiteId,
+      );
       await deleteWebsiteDependentData(tx, websiteId);
 
       await tx.report.deleteMany({

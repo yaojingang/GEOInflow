@@ -4856,5 +4856,8 @@
   "m_7b0c2d082ca3": "Metrics include only browser events with complete identity evidence. Review remaining collected events in Traffic quality.",
   "m_f266d09636ed": "No usable browser identity is available in this range. Check CLIENT_IP_HEADER and proxy header replacement; review historical gaps in Traffic quality.",
   "m_b92aacc02476": "Unconfirmed browser classification",
-  "m_6b7f6edbff2b": "Missing browser identity evidence"
+  "m_6b7f6edbff2b": "Missing browser identity evidence",
+  "m_55cf8750643a": "ClickHouse serves statistics directly. Legacy aggregate builds are no longer needed.",
+  "m_d4cb1de9e3bb": "Generating export file",
+  "m_b4201418fbdf": "CSV and JSON use summary data. ZIP exports the selected items. Download starts after the file is generated. Files exclude raw IPs and account credentials."
 }

@@ -1,3 +1,4 @@
+import { warehouseEnabled } from '../warehouse/authority-routing';
 import { getPostgresCountrySQL, getClickHouseCountrySQL } from '@/lib/country';
 import { checkAuth } from '@/lib/auth';
 import prisma from '@/lib/prisma';
@@ -24,7 +25,7 @@ export async function linkSources(request: Request, id: string, input: unknown) 
   bindCacheRequest(request, auth, parsed.data, async () => {
     const fresh = await checkAuth(request);
     return !!fresh?.user && fresh.user.id === auth.user.id && fresh.user.role === auth.user.role &&
-      !!(await loadShareEntity(ENTITY_TYPE.link, id));
+      !!(await loadShareEntity(ENTITY_TYPE.link, id)) && !!(await canViewLink(fresh,id));
   });
   const p = parsed.data;
   try {
@@ -33,9 +34,9 @@ export async function linkSources(request: Request, id: string, input: unknown) 
     throw new LiekanError('时区无效');
   }
   const filters = await getQueryFilters({ ...p, eventType: 3 }, id);
-  const db = process.env.CLICKHOUSE_URL ? clickhouse : prisma;
+  const db = process.env.CLICKHOUSE_URL || warehouseEnabled() ? clickhouse : prisma;
   const ctx: any = db.parseFilters({ ...filters, websiteId: id }, { joinSession: true });
-  const pg = !process.env.CLICKHOUSE_URL;
+  const pg = !process.env.CLICKHOUSE_URL && !warehouseEnabled();
   const selected = `SELECT website_event.referrer_domain AS source,${pg ? getPostgresCountrySQL('session.country') : getClickHouseCountrySQL('website_event.country')} AS country,COUNT(*) AS clicks FROM website_event ${ctx.cohortQuery} ${ctx.excludeBounceQuery} ${pg ? ctx.joinSessionQuery : ''} WHERE website_event.website_id=${pg ? '{{websiteId::uuid}}' : '{websiteId:UUID}'} AND website_event.event_type=3 AND website_event.created_at BETWEEN ${pg ? '{{startDate}} AND {{endDate}}' : '{startDate:DateTime64} AND {endDate:DateTime64}'} ${ctx.filterQuery} GROUP BY 1,2`;
   const params = { ...ctx.queryParams, offset: (p.page - 1) * 25 };
   const [total, rows] = await Promise.all([

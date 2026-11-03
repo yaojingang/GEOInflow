@@ -1,3 +1,5 @@
+import { warehouseTransitionEnabled, warehouseEnabled } from '../warehouse/authority-routing';
+import { AnalyticsUnavailable } from './analytics-budget';
 import { HISTORY_REPAIR_CAMPAIGN, HISTORY_REPAIR_ENGINE } from '../contracts/history-repair';
 import { getPublishedCatalog } from '../crawlers/published';
 import { CALENDAR_POLICY_VERSION } from '../contracts/calendar';
@@ -32,6 +34,13 @@ export interface AnalyticsVersions {
 export async function readAnalyticsVersions(tx: any, tags: string[]): Promise<AnalyticsVersions> {
   const ids = [...new Set(tags.map(tag => tag.split(':')[1]).filter(Boolean))].sort();
   if (!ids.length) return { strong: '[]', data: '[]' };
+  if (warehouseTransitionEnabled() && !warehouseEnabled()) {
+    const pending = await tx.$queryRawUnsafe(
+      `SELECT 1 FROM liekan_warehouse_deletion WHERE website_id=ANY($1::uuid[]) AND status NOT IN('active','reclaimed') LIMIT 1`,
+      ids,
+    );
+    if (pending.length) throw new AnalyticsUnavailable('网站数据操作正在完成，请稍后重试');
+  }
   // Read all resource types for these identifiers; native link/pixel statistics share the website API.
   const revisions = await tx.$queryRawUnsafe(
     `SELECT resource_type AS type,resource_id::text AS id,revision::text AS revision

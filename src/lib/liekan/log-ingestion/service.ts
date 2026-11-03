@@ -1,14 +1,13 @@
-import { collectionRepairScope } from '../upstream/history-repair-boundary';
-import { applyTrustedEdgeIdentity } from '../crawlers/request-verification';
-import { withPublishedRegistry } from '../upstream/crawler-registry-context';
-import { getPublishedCatalog } from '../crawlers/published';
-import { applyEdgeCapabilities } from './edge-observation';
-import { samplingAtReceipt } from './measurement';
-import { normalizeAutomaticWithGeography, persistLogGeography } from '../upstream/log-geography';
-import { randomUUID, createHmac, createHash } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { logPublicOrigin } from '../contracts/installation';
+import { healthSchema } from '../contracts/log-sources';
+import { getPublishedCatalog } from '../crawlers/published';
+import { applyTrustedEdgeIdentity } from '../crawlers/request-verification';
 import { getSettings } from '../store';
+import { withPublishedRegistry } from '../upstream/crawler-registry-context';
+import { collectionRepairScope } from '../upstream/history-repair-boundary';
+import { normalizeAutomaticWithGeography, persistLogGeography } from '../upstream/log-geography';
 import { invalidateWebsiteAnalytics } from '../upstream/query-cache';
 import {
   LiekanError,
@@ -17,20 +16,30 @@ import {
   transaction,
   type WriteIdentity,
 } from '../upstream/server';
+import { prepareWarehouseUpload, sendWarehouseUpload } from '../upstream/warehouse-log-ingestion';
+import { warehouseEnabled, warehouseIntakeEnabled } from '../warehouse/runtime';
 import {
+  prepareWarehouseCrawlerCoverage,
+  type WarehouseCrawlerCoverage,
+} from '../upstream/warehouse-crawler-coverage';
+import {
+  archiveCrawlerRules,
+  crawlerClassificationVersion,
+  persistCrawlerEvidence,
+} from './crawler-evidence';
+import { recordCrawlerCoverage } from './crawler-quality';
+import { applyEdgeCapabilities } from './edge-observation';
+import { samplingAtReceipt } from './measurement';
+import {
+  type AutomaticRecord,
   decodeUpload,
   hostname,
   normalizeAutomatic,
   stableUuid,
-  type AutomaticRecord,
 } from './protocol';
 import { enqueue, LOG_QUEUE, PROVIDER_QUEUE } from './queue';
 import { verificationSnapshots } from './ranges';
 import { newToken, tokenHash } from './secrets';
-import { healthSchema } from '../contracts/log-sources';
-import { recordCrawlerCoverage } from './crawler-quality';
-import { crawlerClassificationVersion, archiveCrawlerRules } from './crawler-evidence';
-import { persistCrawlerEvidence } from './crawler-evidence';
 
 export interface LogSource {
   id: string;
@@ -177,7 +186,7 @@ export async function listSources(websiteId: string) {
     (SELECT count(*)::int FROM liekan_ingest_batch b WHERE b.source_id=s.id AND b.state='pending') AS backlog,
     (SELECT count(*)::int FROM liekan_ingest_batch b WHERE b.source_id=s.id AND b.state='failed') AS failed,
     EXISTS(SELECT 1 FROM liekan_log_interval i WHERE i.source_id=s.id AND i.ends_at IS NULL) AS primary,
-    (s.provider_config IS NOT NULL AND (s.state='disconnected' OR s.credential_hash IS NULL)) AS \"cleanupPending\"
+    (s.provider_config IS NOT NULL AND (s.state='disconnected' OR s.credential_hash IS NULL)) AS "cleanupPending"
     FROM liekan_log_source s WHERE website_id=$1::uuid AND (state!='disconnected' OR provider_config IS NOT NULL) ORDER BY created_at DESC`,
     websiteId,
   );
@@ -220,7 +229,8 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
     .update(`${sourceId}:${upload.epoch}:${upload.digest}`)
     .digest('hex');
   const batchId = stableUuid(`${sourceId}:${upload.epoch}:${upload.batchId}`);
-  return transaction(async tx => {
+  const warehouse = warehouseIntakeEnabled();
+  const response = await transaction(async tx => {
     const live = await validateSource(tx, sourceId, token);
     if (upload.epoch !== live.epoch) throw new LiekanError('采集代次已更新，请同步配置', 409);
     const [interval] = await tx.$queryRawUnsafe(
@@ -256,14 +266,26 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
           live.source.health?.fieldCapabilities,
         );
     if (principal.source.provider_job_id === live.source.provider_job_id)
-      for (const record of parsed.records) applyTrustedEdgeIdentity(record, live.source, settings.crawlerRules);
+      for (const record of parsed.records)
+        applyTrustedEdgeIdentity(record, live.source, settings.crawlerRules);
     const old = (
       await tx.$queryRawUnsafe(
         'SELECT id,digest,valid,rejected,state,inserted,duplicates FROM liekan_ingest_batch WHERE id=$1::uuid',
         batchId,
       )
     )[0];
-    if (old) {
+    const queueState = warehouse
+      ? (
+          await tx.$queryRawUnsafe(
+            'SELECT queued FROM liekan_warehouse_upload WHERE batch_id=$1::uuid',
+            batchId,
+          )
+        )[0]
+      : undefined;
+    if (old && warehouse && old.state === 'pending' && !queueState)
+      throw new LiekanError('旧日志批次需要完成迁移后继续处理', 503);
+    if (old && old.digest !== digest) throw new LiekanError('同一批次标识的内容已改变', 409);
+    if (old && !(warehouse && queueState && !queueState.queued)) {
       if (old.digest !== digest) throw new LiekanError('同一批次标识的内容已改变', 409);
       return {
         requestBatchId: upload.batchId,
@@ -282,7 +304,7 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
         sourceId,
       )
     )[0];
-    if (ledger) {
+    if (ledger && !(warehouse && queueState && !queueState.queued)) {
       if (ledger.digest !== digest) throw new LiekanError('同一批次标识的内容已改变', 409);
       return {
         requestBatchId: upload.batchId,
@@ -309,6 +331,60 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
     const resetAt = live.resetAt ? +new Date(live.resetAt) : 0;
     const valid = parsed.records.filter(row => +new Date(row.time) >= resetAt);
     const rejected = parsed.rejected + parsed.records.length - valid.length;
+    if (warehouse) {
+      await prepareWarehouseUpload(tx, {
+        batchId,
+        websiteId: live.source.website_id,
+        sourceId,
+        sourceEpoch: live.epoch,
+        kind: 'automatic',
+        digest,
+        count: valid.length,
+        actorId: live.source.created_by,
+      });
+      const repairScope = await collectionRepairScope(tx, live.source.website_id);
+      await tx.$executeRawUnsafe(
+        `INSERT INTO liekan_import(id,website_id,digest,accepted,rejected,kind,source_id,inserted,repair_scope_id)
+        VALUES($1::uuid,$2::uuid,$3,0,$4,'automatic',$5::uuid,0,$6::uuid) ON CONFLICT(id) DO NOTHING`,
+        batchId,
+        live.source.website_id,
+        digest,
+        rejected,
+        sourceId,
+        repairScope,
+      );
+      await tx.$executeRawUnsafe(
+        `INSERT INTO liekan_ingest_batch(id,website_id,source_id,epoch,digest,payload,received,valid,rejected,errors,catalog_version,repair_scope_id)
+        VALUES($1::uuid,$2::uuid,$3::uuid,$4,$5,NULL,$6,$7,$8,$9::jsonb,$10::uuid,$11::uuid) ON CONFLICT(id) DO NOTHING`,
+        batchId,
+        live.source.website_id,
+        sourceId,
+        live.epoch,
+        digest,
+        parsed.received,
+        valid.length,
+        rejected,
+        JSON.stringify(parsed.errors),
+        getPublishedCatalog()?.version ?? null,
+        repairScope,
+      );
+      if (valid.length)
+        await tx.$executeRawUnsafe(
+          'UPDATE liekan_log_source SET last_received_at=clock_timestamp() WHERE id=$1::uuid',
+          sourceId,
+        );
+      return {
+        requestBatchId: upload.batchId,
+        epoch: live.epoch,
+        batchId,
+        received: parsed.received,
+        valid: valid.length,
+        rejected,
+        errors: parsed.errors,
+        duplicate: !!old,
+        warehouseDispatch: { batchId, websiteId: live.source.website_id, records: valid },
+      };
+    }
     await tx.$executeRawUnsafe(
       'INSERT INTO liekan_ingest_batch(id,website_id,source_id,epoch,digest,payload,received,valid,rejected,errors,catalog_version,repair_scope_id) VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6::jsonb,$7,$8,$9,$10::jsonb,$11::uuid,$12::uuid)',
       batchId,
@@ -322,7 +398,7 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
       rejected,
       JSON.stringify(parsed.errors),
       getPublishedCatalog()?.version ?? null,
-      await collectionRepairScope(tx,live.source.website_id),
+      await collectionRepairScope(tx, live.source.website_id),
     );
     await enqueue(tx, LOG_QUEUE, { batchId }, batchId);
     if (valid.length)
@@ -341,6 +417,12 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
       duplicate: false,
     };
   });
+  if ('warehouseDispatch' in response) {
+    const { warehouseDispatch, ...result } = response;
+    await sendWarehouseUpload(warehouseDispatch);
+    return result;
+  }
+  return response;
 }
 // Queue this worker's website batches before reserving connections. PostgreSQL source locks
 // serialize batches from the same source across worker processes.
@@ -356,6 +438,12 @@ async function withWebsiteBatchTurn(websiteId: string, work: () => Promise<void>
   }
 }
 export async function processBatch(batchId: string) {
+  if (
+    warehouseIntakeEnabled() &&
+    (await query('SELECT 1 FROM liekan_warehouse_upload WHERE batch_id=$1::uuid', uuid(batchId)))
+      .length
+  )
+    return;
   const first = (
     await query(
       'SELECT website_id,source_id,state FROM liekan_ingest_batch WHERE id=$1::uuid',
@@ -454,6 +542,44 @@ export async function collectorConnection(sourceId: string, token: string) {
 export async function heartbeat(sourceId: string, token: string, input: unknown) {
   const health = healthSchema.safeParse(input);
   if (!health.success) throw new LiekanError('健康状态无效');
+  let warehouseProof: WarehouseCrawlerCoverage;
+  const proof = health.data.coverage;
+  if (
+    warehouseEnabled() &&
+    proof &&
+    !health.data.gap &&
+    health.data.errorCode === 'none' &&
+    !health.data.pending
+  ) {
+    const initial = await transaction(async tx => {
+      const live = await validateSource(tx, sourceId, token, true, 'share');
+      const settings = await getSettings(live.source.website_id, tx);
+      return {
+        ...live,
+        version: crawlerClassificationVersion(settings.rules, settings.crawlerRules),
+      };
+    });
+    if (
+      initial.source.kind === 'server' &&
+      initial.source.state === 'active' &&
+      proof.epoch === initial.epoch &&
+      proof.endsAt <= Date.now() &&
+      proof.cursors.every(cursor => cursor.confirmed === cursor.read)
+    ) {
+      try {
+        warehouseProof = await prepareWarehouseCrawlerCoverage(
+          initial.source.website_id,
+          sourceId,
+          initial.epoch,
+          proof,
+          initial.version,
+        );
+      } catch {
+        // Collection health and gap reporting remain available during an
+        // analytics outage. No complete proof is published without CH evidence.
+      }
+    }
+  }
   return transaction(async tx => {
     const live = await validateSource(tx, sourceId, token, true);
     await tx.$executeRawUnsafe(
@@ -487,6 +613,7 @@ export async function heartbeat(sourceId: string, token: string, input: unknown)
       setting.rules,
       Date.now(),
       setting.crawlerRules,
+      warehouseProof,
     );
     return {
       version: 1,

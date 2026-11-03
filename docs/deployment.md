@@ -2,7 +2,9 @@
 
 [English](deployment.en.md) | **简体中文**
 
-推荐用仓库中的 `scripts/liekan-deploy.sh` 部署 GEOInflow。它负责构建当前源码、生成首次私有配置、执行迁移、检查健康并更新应用及后台处理服务。
+完整 ClickHouse 版本使用 `python3 scripts/liekan-warehouse-deploy.py --mode fresh` 新装；已有 PostgreSQL 实例使用 `--mode pg-transition`，然后完成历史迁移和切换。详见 [ClickHouse 安装、迁移与运行](warehouse.md)。应用更新继续使用该入口及原安装模式，不会重新建立已经结束的过渡同步。
+
+下文保留尚未启用 CH 的部署流程。已登记 CH 安装的实例缺少仓库运行配置时会拒绝启动，不能仅执行旧 Compose 文件更新。
 
 本文以单机 Docker Compose 为例。既有实例的大版本保护、地理数据与恢复细节见 [本地部署说明](local-deployment.md)。
 

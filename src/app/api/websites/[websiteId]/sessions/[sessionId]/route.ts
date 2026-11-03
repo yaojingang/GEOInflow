@@ -1,4 +1,5 @@
 import { nativeSnapshot } from '@/lib/liekan/upstream/native-snapshot';
+import { api } from '@/lib/liekan/http';
 import { identityUsable } from '@/lib/liekan/contracts/browser-population';
 import { withQueryCacheHeaders } from '@/lib/liekan/upstream/cache-context';
 import { isRelationalOnly } from '@/lib/db';
@@ -92,13 +93,13 @@ export async function DELETE(
     return unauthorized();
   }
 
-  const deletedSession = await deleteSession(websiteId, sessionId);
+  return api(async () => {
+    const deletedSession = await deleteSession(websiteId, sessionId, { userId: auth.user.id });
 
-  if (!deletedSession) {
-    return notFound();
-  }
+    if (!deletedSession) return notFound();
 
-  return ok();
+    return ok();
+  });
 }
 
 export async function GET(...args: Parameters<typeof getResponse>) {

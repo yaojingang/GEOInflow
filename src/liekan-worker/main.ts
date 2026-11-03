@@ -1,3 +1,8 @@
+import { withinWarehouseAuthority } from '../lib/liekan/warehouse/authority-routing';
+import { assertWarehouseStartup } from '../lib/liekan/warehouse/startup';
+import { WarehouseConflict } from '../lib/liekan/warehouse/control-db';
+import { closeWarehouseProcessResources } from '../lib/liekan/warehouse/process-resources';
+import { warehouseIntakeEnabled } from '../lib/liekan/warehouse/runtime';
 import {
   HISTORY_REPAIR_ENGINE,
   HISTORY_REPAIR_QUEUE,
@@ -31,6 +36,7 @@ import {
   CRAWLER_ANALYSIS_QUEUE,
   CRAWLER_CHECK_QUEUE,
   CRAWLER_CONTROL_QUEUE,
+  closeQueue,
 } from '../lib/liekan/log-ingestion/queue';
 import { reconcilePermissions } from '../lib/liekan/log-ingestion/maintenance';
 import { recoverBatches } from '../lib/liekan/log-ingestion/recovery';
@@ -62,6 +68,12 @@ const boss = new PgBoss({
 boss.on('error', () => console.error('Liekan worker queue unavailable'));
 let stopped = false,
   maintaining = false;
+const backgroundWork = new Set<Promise<unknown>>();
+function background(work: Promise<unknown>) {
+  const tracked = work.finally(() => backgroundWork.delete(tracked));
+  backgroundWork.add(tracked);
+  return tracked;
+}
 async function recordHealth() {
   await transaction(tx =>
     tx.$executeRawUnsafe(
@@ -83,9 +95,13 @@ async function reconcile() {
         HISTORY_REPAIR_ENGINE,
       );
       await tx.$executeRawUnsafe('DELETE FROM liekan_log_grant WHERE expires_at<now()');
-      await tx.$executeRawUnsafe(
-        "DELETE FROM liekan_geography_ingress WHERE bucket<now()-interval '90 days'",
-      );
+      // This is an analytical fact family. During/after warehouse installation
+      // PG retention must not bypass capture or the fact-writer fence. CH
+      // retention follows its own reference-aware policy.
+      if (!warehouseIntakeEnabled())
+        await tx.$executeRawUnsafe(
+          "DELETE FROM liekan_geography_ingress WHERE bucket<now()-interval '90 days'",
+        );
       await tx.$executeRawUnsafe(
         "DELETE FROM liekan_ingest_batch WHERE state!='pending' AND received_at<now()-interval '30 days'",
       );
@@ -113,18 +129,21 @@ async function reconcile() {
   }
 }
 async function main() {
+  await assertWarehouseStartup();
   if (process.argv.includes('--invalidate-crawler-workflow-once')) {
     console.log(JSON.stringify(await invalidateCrawlerWorkflowForRollback()));
     await prisma.client.$disconnect();
     return;
   }
   if (process.argv.includes('--prune-traffic-observations-once')) {
-    console.log(JSON.stringify(await pruneTrafficObservations()));
+    console.log(JSON.stringify(await withinWarehouseAuthority(() => pruneTrafficObservations())));
+    await Promise.all([closeWarehouseProcessResources(), closeQueue()]);
     await prisma.client.$disconnect();
     return;
   }
   if (process.argv.includes('--observe-browser-risk-once')) {
-    await processBrowserRisk();
+    await withinWarehouseAuthority(() => processBrowserRisk());
+    await Promise.all([closeWarehouseProcessResources(), closeQueue()]);
     await prisma.client.$disconnect();
     console.log('Browser risk observation batch completed');
     return;
@@ -182,7 +201,8 @@ async function main() {
     HISTORY_REPAIR_QUEUE,
     { localConcurrency: 1, batchSize: 1, pollingIntervalSeconds: 2 },
     async jobs => {
-      for (const job of jobs) await processHistoryRepairJob(job.data);
+      for (const job of jobs)
+        await withinWarehouseAuthority(() => processHistoryRepairJob(job.data));
     },
   );
   let repairing = false;
@@ -190,14 +210,14 @@ async function main() {
     if (repairing || stopped) return;
     repairing = true;
     try {
-      await reconcileHistoryRepairs();
+      await withinWarehouseAuthority(() => reconcileHistoryRepairs());
     } finally {
       repairing = false;
     }
   };
-  void repairMaintenance().catch(() => console.error('History repair maintenance unavailable'));
+  void background(repairMaintenance()).catch(() => console.error('History repair maintenance unavailable'));
   const repairTimer = setInterval(() => {
-    void repairMaintenance().catch(() => console.error('History repair maintenance unavailable'));
+    void background(repairMaintenance()).catch(() => console.error('History repair maintenance unavailable'));
   }, 60000);
   await boss.work<{ batchId: string }>(
     LOG_QUEUE,
@@ -260,7 +280,7 @@ async function main() {
     BROWSER_RISK_QUEUE,
     { batchSize: 1, localConcurrency: 1, pollingIntervalSeconds: 2 },
     async () => {
-      await processBrowserRisk();
+      await withinWarehouseAuthority(() => processBrowserRisk());
     },
   );
   const wakeBrowserRisk = () =>
@@ -275,9 +295,9 @@ async function main() {
         retryLimit: 2,
       },
     );
-  void wakeBrowserRisk().catch(() => {});
+  void background(wakeBrowserRisk()).catch(() => {});
   const browserRiskTimer = setInterval(() => {
-    void wakeBrowserRisk().catch(() => {});
+    void background(wakeBrowserRisk()).catch(() => {});
   }, 10000);
   const wakeCrawlers = async () => {
     for (const queue of [CRAWLER_ANALYSIS_QUEUE, CRAWLER_CHECK_QUEUE, CRAWLER_CONTROL_QUEUE].filter(
@@ -295,12 +315,12 @@ async function main() {
         },
       );
   };
-  void wakeCrawlers().catch(() => {});
+  void background(wakeCrawlers()).catch(() => {});
   const crawlerTimer = setInterval(() => {
-    void wakeCrawlers().catch(() => {});
+    void background(wakeCrawlers()).catch(() => {});
   }, 2000);
   await recordHealth();
-  void reconcile().catch(() => console.error('Liekan worker maintenance unavailable'));
+  void background(reconcile()).catch(() => console.error('Liekan worker maintenance unavailable'));
   if (!crawlerMaintenancePaused)
     await boss.send(
       RANGE_QUEUE,
@@ -329,7 +349,7 @@ async function main() {
   };
   await wakeDocuments();
   const documents = setInterval(() => {
-    void wakeDocuments().catch(() => {});
+    void background(wakeDocuments()).catch(() => {});
   }, 3600000);
   let checkingPermissions = false;
   let recovering = false;
@@ -342,9 +362,9 @@ async function main() {
       recovering = false;
     }
   };
-  void recovery().catch(() => {});
+  void background(recovery()).catch(() => {});
   const recoveryTimer = setInterval(() => {
-    void recovery().catch(() => {});
+    void background(recovery()).catch(() => {});
   }, 30000);
   const permissions = async () => {
     if (checkingPermissions || stopped) return;
@@ -355,9 +375,9 @@ async function main() {
       checkingPermissions = false;
     }
   };
-  void permissions().catch(() => {});
+  void background(permissions()).catch(() => {});
   const permissionTimer = setInterval(() => {
-    void permissions().catch(() => {});
+    void background(permissions()).catch(() => {});
   }, 15000);
   let cleaning = false;
   const cleanup = async () => {
@@ -366,7 +386,7 @@ async function main() {
     try {
       await cleanupExpiredAuthorizations(workerId);
       await maintainCrawlerRecords();
-      await pruneTrafficObservations().catch(() =>
+      await withinWarehouseAuthority(() => pruneTrafficObservations()).catch(() =>
         console.error('traffic_observation_retention_failed'),
       );
       await maintainGeography();
@@ -374,15 +394,15 @@ async function main() {
       cleaning = false;
     }
   };
-  void cleanup().catch(() => {});
+  void background(cleanup()).catch(() => {});
   const cleanupTimer = setInterval(() => {
-    void cleanup().catch(() => {});
+    void background(cleanup()).catch(() => {});
   }, 30000);
   const health = setInterval(() => {
-    void reconcile().catch(() => console.error('Liekan worker maintenance unavailable'));
+    void background(reconcile()).catch(() => console.error('Liekan worker maintenance unavailable'));
   }, 30000);
   const heartbeat = setInterval(() => {
-    void recordHealth().catch(() => {});
+    void background(recordHealth()).catch(() => {});
   }, 30000);
   const ranges = setInterval(() => {
     if (crawlerMaintenancePaused) return;
@@ -413,9 +433,11 @@ async function main() {
     clearInterval(crawlerTimer);
     clearInterval(browserRiskTimer);
     await boss.stop({ graceful: true, timeout: 30000 });
+    await Promise.allSettled([...backgroundWork]);
     await transaction(tx =>
       tx.$executeRawUnsafe('DELETE FROM liekan_worker_state WHERE id=$1', workerId),
     ).catch(() => {});
+    await Promise.all([closeWarehouseProcessResources(), closeQueue()]);
     await prisma.client.$disconnect();
   };
   process.on('SIGTERM', () => {
@@ -425,9 +447,11 @@ async function main() {
     void shutdown();
   });
 }
-main().catch(async () => {
-  console.error('Liekan worker startup failed');
+main().catch(async error => {
+  console.error(error instanceof WarehouseConflict ? error.code : 'Liekan worker startup failed');
   await boss.stop().catch(() => {});
+  await closeWarehouseProcessResources().catch(() => {});
+  await closeQueue().catch(() => {});
   await prisma.client.$disconnect();
   process.exitCode = 1;
 });
