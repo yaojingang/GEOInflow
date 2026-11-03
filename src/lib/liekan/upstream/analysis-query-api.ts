@@ -141,9 +141,46 @@ export async function analysisJobResponse(
   jobId: string,
   result = false,
 ) {
+  try {
+    return await readAnalysisJobResponse(request, websiteId, jobId, result);
+  } catch (error) {
+    const detail = error as {
+      code?: unknown;
+      cause?: { code?: unknown };
+      meta?: { code?: unknown; driverAdapterError?: { cause?: { originalCode?: unknown } } };
+    };
+    if (
+      ![
+        detail?.code,
+        detail?.cause?.code,
+        detail?.meta?.code,
+        detail?.meta?.driverAdapterError?.cause?.originalCode,
+      ].includes('55P03')
+    )
+      throw error;
+    // The transaction has rolled back. Keep the durable handle and retry authorization next time.
+    return Response.json(
+      {
+        error: {
+          message: '统计数据暂时不可读取，请稍后重试',
+          status: 503,
+          code: 'analysis-read-busy',
+        },
+      },
+      { status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '3' } },
+    );
+  }
+}
+
+async function readAnalysisJobResponse(
+  request: Request,
+  websiteId: string,
+  jobId: string,
+  result: boolean,
+) {
   const { authenticateCrawlerMaintenance } = await import('./crawler-maintenance');
   const { authorize } = await import('./server');
-  const { requestAnalysisQuery, readAnalysisQuery } = await import('./analysis-queries');
+  const { readAnalysisQuery } = await import('./analysis-queries');
   if (!z.uuid().safeParse(jobId).success) throw new LiekanError('统计任务标识无效', 400);
   const actor = await authenticateCrawlerMaintenance(request);
   const access = await authorize(request, websiteId);
