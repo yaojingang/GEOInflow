@@ -59,6 +59,12 @@ docker compose -f docker-compose.server.yml build --build-arg NPM_REGISTRY=https
 docker compose -f docker-compose.server.yml up -d
 ```
 
+If pulling the base image is restricted, point `BASE_IMAGE` at a mirror as well (no file edit needed):
+
+```sh
+docker compose -f docker-compose.server.yml build --build-arg BASE_IMAGE=docker.m.daocloud.io/library/node:22.23.4-alpine
+```
+
 Both paths produce the identical image and runtime configuration; copying the whole folder remains the default recommendation (the log server then needs no access to the repository or npm).
 
 ## Finding the log path and GID

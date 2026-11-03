@@ -59,6 +59,12 @@ docker compose -f docker-compose.server.yml build --build-arg NPM_REGISTRY=https
 docker compose -f docker-compose.server.yml up -d
 ```
 
+基础镜像拉取受限时，同样可以用构建参数指向镜像源（无需改动本文件）：
+
+```sh
+docker compose -f docker-compose.server.yml build --build-arg BASE_IMAGE=docker.m.daocloud.io/library/node:22.23.4-alpine
+```
+
 两种方式产出的镜像和运行配置完全一致；整目录拷贝仍是默认推荐方式（日志服务器无需访问代码仓库与 npm 源）。
 
 ## 如何确定日志路径和 GID
