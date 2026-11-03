@@ -67,5 +67,12 @@ yarn-error.log*
 # Signed collector assets are built artifacts; signing keys stay outside source.
 /public/liekan-agent/
 
+# Manual deployment kit: only generated bundles and runtime state stay out of git.
+/liekan-agent-deploy/agent.mjs
+/liekan-agent-deploy/container.mjs
+/liekan-agent-deploy/state/
+# The .env template ships with the kit despite the global .env* ignores above.
+!liekan-agent-deploy/.env.example
+
 # ZCode session-local working files (plans, scratch state) never enter the repo.
 /.zcode/

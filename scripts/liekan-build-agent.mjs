@@ -1,22 +1,25 @@
-import { build } from 'esbuild';
+import { execFileSync } from 'node:child_process';
 import {
   createHash,
-  generateKeyPairSync,
   createPrivateKey,
   createPublicKey,
+  generateKeyPairSync,
   sign,
 } from 'node:crypto';
-import { mkdir, readFile, writeFile, access, copyFile, rm } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { access, copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { build } from 'esbuild';
 import JSZip from 'jszip';
+
 const version = '22.23.4';
 const runtimes = {
   x64: 'b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406',
   arm64: 'f7a1e486dbc8b286847815b477d4fb5e9fb963ed4489c3e1588853d685f589f9',
 };
-const cache = resolve('outputs/agent-build-cache'),
-  output = resolve('public/liekan-agent');
+// Keep the working paths relative to the repository root: tar (GNU and bsdtar)
+// reads an absolute Windows path such as F:\... as a remote host specification.
+const cache = 'outputs/agent-build-cache',
+  output = 'public/liekan-agent';
 await mkdir(cache, { recursive: true });
 await mkdir(output, { recursive: true });
 let keyPath = process.env.LIEKAN_AGENT_SIGNING_KEY_FILE;
@@ -64,11 +67,13 @@ await copyFile('LICENSE', join(dockerContext, 'LICENSE'));
 for (const file of ['Dockerfile', 'docker-compose.yml'])
   await copyFile(`scripts/liekan-agent/${file}`, join(dockerContext, file));
 const dockerFiles = ['Dockerfile', 'docker-compose.yml', 'agent.mjs', 'container.mjs', 'LICENSE'];
+// GNU tar on Windows treats backslash separators as escape characters.
+const posix = path => path.replaceAll('\\', '/');
 execFileSync('tar', [
   '-czf',
-  join(output, 'agent-docker.tar.gz'),
+  posix(join(output, 'agent-docker.tar.gz')),
   '-C',
-  dockerContext,
+  posix(dockerContext),
   ...dockerFiles,
 ]);
 const dockerChecksum = createHash('sha256')
@@ -101,6 +106,24 @@ const manifest = {
     installerSha256: createHash('sha256').update(dockerInstaller).digest('hex'),
   },
 };
+// Refresh the standalone manual deployment folder; its static templates live in the repo.
+const deploy = resolve('liekan-agent-deploy');
+await copyFile(join(cache, 'agent.mjs'), join(deploy, 'agent.mjs'));
+await copyFile(join(dockerContext, 'container.mjs'), join(deploy, 'container.mjs'));
+const deployFiles = [
+  'Dockerfile',
+  'docker-compose.yml',
+  '.env.example',
+  'README.md',
+  'README.en.md',
+  'LICENSE',
+  'agent.mjs',
+  'container.mjs',
+];
+for (const file of deployFiles) await access(join(deploy, file));
+const rootLicense = await readFile('LICENSE');
+if (!(await readFile(join(deploy, 'LICENSE'))).equals(rootLicense))
+  throw new Error('liekan-agent-deploy/LICENSE differs from the project LICENSE');
 for (const [arch, expected] of Object.entries(runtimes)) {
   const name = `node-v${version}-linux-${arch}.tar.gz`,
     runtime = join(cache, name);
@@ -111,6 +134,9 @@ for (const [arch, expected] of Object.entries(runtimes)) {
       'curl',
       [
         '-fsS',
+        // Schannel cannot finish its revocation probe on restricted networks;
+        // the downloaded runtime is still pinned by its SHA-256 below.
+        ...(process.platform === 'win32' ? ['--ssl-no-revoke'] : []),
         '--retry',
         '4',
         '--retry-delay',
@@ -123,7 +149,7 @@ for (const [arch, expected] of Object.entries(runtimes)) {
         '300',
         `https://nodejs.org/download/release/v${version}/${name}`,
         '-o',
-        runtime,
+        posix(runtime),
       ],
       { stdio: 'inherit' },
     );
@@ -139,9 +165,9 @@ for (const [arch, expected] of Object.entries(runtimes)) {
   await mkdir(dir, { recursive: true });
   execFileSync('tar', [
     '-xzf',
-    runtime,
+    posix(runtime),
     '-C',
-    dir,
+    posix(dir),
     '--strip-components=1',
     `node-v${version}-linux-${arch}/bin/node`,
     `node-v${version}-linux-${arch}/LICENSE`,
@@ -151,9 +177,9 @@ for (const [arch, expected] of Object.entries(runtimes)) {
   const file = `agent-linux-${arch}.tar.gz`;
   execFileSync('tar', [
     '-czf',
-    join(output, file),
+    posix(join(output, file)),
     '-C',
-    dir,
+    posix(dir),
     'bin/node',
     'agent.mjs',
     'LICENSE',
@@ -177,3 +203,10 @@ await writeFile(join(output, 'manifest.sig'), sign(null, bytes, privateKey));
 await writeFile(join(output, 'manifest.pub'), publicKey);
 await writeFile(join(output, 'install.sh'), installer);
 console.log('Signed collector artifacts built for Docker and Linux x64/arm64.');
+console.log('Manual deployment folder liekan-agent-deploy/ SHA-256:');
+for (const file of deployFiles)
+  console.log(
+    `  ${createHash('sha256')
+      .update(await readFile(join(deploy, file)))
+      .digest('hex')}  ${file}`,
+  );
