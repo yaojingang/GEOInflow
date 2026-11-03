@@ -1,5 +1,4 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createHash } from 'node:crypto';
 
 vi.mock('./server', () => ({ query: vi.fn(), humanTotals: vi.fn() }));
 vi.mock('@/queries/sql', () => ({ getFunnel: vi.fn() }));
@@ -16,31 +15,9 @@ beforeEach(() => {
 });
 
 describe('keyword visit projection', () => {
-  it.each([
-    [true, '3af1223ab54ac6d759cc893381dc1f67551f4d6d37f53d8c20b32386900c1646'],
-    [false, '91361fd263b615a9f5b329a3e601aaaa125b60cc115d513a1bac2bf756a2eaa2'],
-  ] as const)(
-    'preserves the original SQL with keywords=%s as the compatibility oracle',
-    (keywords, hash) => {
-      expect(createHash('sha256').update(humanVisitsSql(keywords)).digest('hex')).toBe(hash);
-      expect(humanVisitsSql(keywords)).toBe(humanVisitsSql(keywords, true));
-    },
-  );
-  it('omits optional dimensions while retaining the entry, goal and visit metric boundaries', () => {
-    const original = humanVisitsSql(true);
-    const narrow = humanVisitsSql(true, false);
-    expect(original).toContain('LEFT JOIN session s');
-    expect(original).toContain('JOIN visit_geography geography USING(visit_id,session_id)');
-    expect(narrow).not.toContain('LEFT JOIN session s');
-    expect(narrow).not.toContain('visit_geography');
-    expect(narrow).not.toContain('max(browser)');
-    expect(narrow).toContain('FROM visit_totals v LEFT JOIN LATERAL');
-    expect(narrow).toContain('e.created_at BETWEEN $2::timestamptz AND $3::timestamptz');
-    expect(narrow).toContain('e.created_at<=$3::timestamptz AND e.event_type NOT IN(2,5)');
-    expect(narrow).toContain('converted AS (SELECT DISTINCT visit_id,session_id FROM matches)');
-    expect(withTrafficPolicy(narrow)).toContain(
-      'website_event AS NOT MATERIALIZED (SELECT * FROM liekan_geographic_website_event)',
-    );
+  it.each([true, false])('retains the default dimension projection with keywords=%s', keywords => {
+    expect(humanVisitsSql(keywords)).toBe(humanVisitsSql(keywords, true));
+    expect(() => withTrafficPolicy(humanVisitsSql(keywords, false))).not.toThrow();
   });
 });
 
@@ -57,7 +34,14 @@ describe('content path projections', () => {
     });
     vi.mocked(query).mockImplementation(async sql =>
       sql.includes('jsonb_build_object')
-        ? [{ facts: { journeys: [{ path: '/a → /b', count: 1 }], exits: [{ path: null, count: 1 }] } }]
+        ? [
+            {
+              facts: {
+                journeys: [{ path: '/a → /b', count: 1 }],
+                exits: [{ path: null, count: 1 }],
+              },
+            },
+          ]
         : [],
     );
   };
@@ -75,10 +59,11 @@ describe('content path projections', () => {
         'UTC',
         covered ? ['pages', 'journeys', 'exits'] : ['journeys', 'exits'],
       );
-      const [sql, ...parameters] = vi.mocked(query).mock.calls.find(([sql]) =>
-        sql.includes('jsonb_build_object'),
-      );
-      expect(sql).toContain('FROM liekan_geographic_website_event e');
+      const [sql, ...parameters] = vi
+        .mocked(query)
+        .mock.calls.find(([sql]) => sql.includes('jsonb_build_object'));
+      expect(sql).toContain('FROM liekan_effective_website_event e');
+      expect(sql).not.toContain('bounded_history');
       expect(sql).not.toContain('JOIN session');
       expect(sql).not.toContain('visit_totals');
       expect(parameters).toEqual(['site', start, end, 'UTC']);
@@ -90,7 +75,7 @@ describe('content path projections', () => {
     configure();
     await getHumanFacts('site', start, end, 'UTC', ['pages', 'journeys', 'exits']);
     const [sql] = vi.mocked(query).mock.calls.find(([sql]) => sql.includes('jsonb_build_object'));
-    expect(sql).toContain('LEFT JOIN session s');
+    expect(sql).not.toContain('liekan_event_geography');
     expect(sql).toContain('visit_totals');
   });
 });

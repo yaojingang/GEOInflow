@@ -1,4 +1,9 @@
-import { identityUsable, unavailableFields, type BrowserPopulation } from './browser-population';
+import {
+  identityEncodingChanged,
+  identityUsable,
+  unavailableFields,
+  type BrowserPopulation,
+} from './browser-population';
 import type { LiekanReport } from './report';
 
 export const identityUnavailableReason =
@@ -6,6 +11,8 @@ export const identityUnavailableReason =
 export const qualifiedBrowserReason = '仅统计身份信息完整的浏览事件；其余采集数据见流量质量。';
 export const qualifiedBrowserUnavailableReason =
   '当前范围缺少可用浏览身份。请核对可信入口 CLIENT_IP_HEADER 及代理覆盖配置；历史缺失数据见流量质量。';
+export const identityEncodingChangeReason =
+  '仅统计合格浏览事件；范围跨越匿名标识算法升级，UV 和会话可能重复计算同一访客。';
 
 /** Apply after report calculations so zero-coalescing never publishes a fabricated identity metric. */
 export function applyReportPopulation(
@@ -40,32 +47,96 @@ export function applyReportPopulation(
     '来源搜索词会话',
     'UTM 关键词会话',
     '关键词可用率',
+    '覆盖省份',
+    '海外国家/地区',
+    '有流量页面',
   ]);
   if (scoped) {
     cards.add('浏览量 PV');
     cards.add('浏览量（PV）');
   }
   if (identityUsable(population)) {
-    if (scoped && population.identity.status === 'partial')
+    const changedEncoding = identityEncodingChanged(population);
+    if (scoped && (population.identity.status === 'partial' || changedEncoding))
       report.cards = report.cards.map(card =>
         cards.has(card.key) || cards.has(card.label)
-          ? { ...card, detail: qualifiedBrowserReason }
+          ? {
+              ...card,
+              detail: changedEncoding ? identityEncodingChangeReason : qualifiedBrowserReason,
+              state:
+                changedEncoding &&
+                [
+                  '访客数 UV',
+                  '访客（UV）',
+                  '人类访客（UV）',
+                  '跳出率',
+                  '平均访问时长',
+                  '新访客占比',
+                ].includes(card.key)
+                  ? 'estimated'
+                  : card.state,
+            }
           : card,
       );
-    return report;
+  } else {
+    const reason = scoped ? qualifiedBrowserUnavailableReason : identityUnavailableReason;
+    if (scoped && report.states) report.states.human = 'unavailable';
+    report.cards = report.cards.map(card =>
+      cards.has(card.key) || cards.has(card.label)
+        ? { ...card, value: null, state: 'unavailable', detail: reason }
+        : card,
+    );
+    const tableFields: Record<string, string[]> = {
+      srcBody: ['sessions', 'share', 'bounceRate', 'conversionRate', 'trend'],
+      searchEngineBody: ['sessions', 'share', 'bounceRate', 'conversionRate', 'trend'],
+      keywordBody: ['sessions', 'bounces', 'conversions', 'share', 'bounceRate', 'conversionRate'],
+      cityBody: ['sessions', 'share', 'duration', 'bounceRate', 'conversionRate'],
+      envGrid: ['share'],
+      pgBody: ['uv', 'entries', 'duration', 'bounceRate', 'conversionRate'],
+      visitorPgBody: ['uv', 'entries', 'duration', 'bounceRate', 'conversionRate'],
+      visitorTopBody: ['uv', 'entries', 'duration', 'bounceRate', 'conversionRate'],
+      goalBody: ['convertedSessions', 'conversionRate', 'rate'],
+      journeyList: ['count'],
+    };
+    for (const [id, fields] of Object.entries(tableFields))
+      if (report.tables[id])
+        report.tables[id] = report.tables[id].map(row => unavailableFields(row, fields));
+    delete report.meta.geographyCoverage;
+    if (report.meta.geography?.cards) {
+      delete report.meta.geography.cards['TOP1 城市'];
+      delete report.meta.geography.cards['海外 TOP1'];
+    }
   }
-  const reason = scoped ? qualifiedBrowserUnavailableReason : identityUnavailableReason;
-  if (scoped && report.states) report.states.human = 'unavailable';
-  report.cards = report.cards.map(card =>
-    cards.has(card.key) || cards.has(card.label)
-      ? { ...card, value: null, state: 'unavailable', detail: reason }
-      : card,
-  );
-  const chartIds = new Set(['d3', 'h2', 'h3', 's1', 's2', 'se1', 'se2', 'g1', 'g2', 'f1', 'f2']);
+  const chartIds = new Set([
+    'd3',
+    'h2',
+    'h3',
+    's1',
+    's2',
+    'se1',
+    'se2',
+    'g1',
+    'g2',
+    'c1',
+    'f1',
+    'f2',
+  ]);
   for (const [id, chart] of Object.entries(report.charts)) {
-    if (id === 'h1' || chartIds.has(id)) {
+    const chartPopulation = ['h1', 'd1'].includes(id)
+      ? report.meta.trendPopulation || population
+      : population;
+    if (
+      id === 'd1' &&
+      !identityUsable(chartPopulation) &&
+      chartPopulation.metricScope === 'qualified-browser'
+    ) {
       chart.series = chart.series.map(series =>
-        !scoped && id === 'h1' && series.name === 'PV'
+        series.name === '浏览 PV' ? { ...series, values: series.values.map(() => null) } : series,
+      );
+    }
+    if (!identityUsable(chartPopulation) && (id === 'h1' || chartIds.has(id))) {
+      chart.series = chart.series.map(series =>
+        chartPopulation.metricScope !== 'qualified-browser' && id === 'h1' && series.name === 'PV'
           ? series
           : { ...series, values: series.values.map(() => null) },
       );
@@ -73,27 +144,6 @@ export function applyReportPopulation(
       if (chart.rows)
         chart.rows = chart.rows.map(row => unavailableFields(row, ['conversionRate']));
     }
-  }
-  const tableFields: Record<string, string[]> = {
-    srcBody: ['sessions', 'share', 'bounceRate', 'conversionRate', 'trend'],
-    searchEngineBody: ['sessions', 'share', 'bounceRate', 'conversionRate', 'trend'],
-    keywordBody: ['sessions', 'bounces', 'conversions', 'share', 'bounceRate', 'conversionRate'],
-    cityBody: ['sessions', 'share', 'duration', 'bounceRate', 'conversionRate'],
-    envGrid: ['share'],
-    pgBody: ['uv', 'entries', 'duration', 'bounceRate', 'conversionRate'],
-    visitorPgBody: ['uv', 'entries', 'duration', 'bounceRate', 'conversionRate'],
-    visitorTopBody: ['uv', 'entries', 'duration', 'bounceRate', 'conversionRate'],
-    goalBody: ['convertedSessions', 'conversionRate', 'rate'],
-    journeyList: ['count'],
-  };
-  for (const [id, fields] of Object.entries(tableFields))
-    if (report.tables[id])
-      report.tables[id] = report.tables[id].map(row => unavailableFields(row, fields));
-  // Coverage based on visit counts cannot describe an unidentified population.
-  delete report.meta.geographyCoverage;
-  if (report.meta.geography?.cards) {
-    delete report.meta.geography.cards['TOP1 城市'];
-    delete report.meta.geography.cards['海外 TOP1'];
   }
   return report;
 }

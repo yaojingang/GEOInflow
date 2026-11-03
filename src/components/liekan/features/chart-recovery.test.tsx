@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { Chart } from './Chart';
 const engine = vi.hoisted(() => ({ init: vi.fn(), renders: 0 }));
-vi.mock('echarts', () => ({ init: engine.init }));
+vi.mock('../chartRuntime', () => ({ loadEcharts: async () => ({ init: engine.init }) }));
 beforeEach(() => {
   engine.renders = 0;
   vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(320);

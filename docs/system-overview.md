@@ -2,7 +2,7 @@
 
 GEOInflow 为同一网站保存浏览器访问、服务器抓取日志和内容目录，并通过稳定的数据契约提供网站统计、AI 爬虫分析、内容观察和业务效果分析。
 
-工程基于 Umami v3.4.0，登记的上游提交、迁移与 UI 清单位于 [`config/liekan/upstream.json`](../config/liekan/upstream.json)。`Liekan` 是继续保留的工程与部署标识，产品显示名称为 GEOInflow。
+工程基于 Umami v3.4.1，登记的上游提交、迁移与 UI 清单位于 [`config/liekan/upstream.json`](../config/liekan/upstream.json)。`Liekan` 是继续保留的工程与部署标识，产品显示名称为 GEOInflow。
 
 ## 服务组成
 

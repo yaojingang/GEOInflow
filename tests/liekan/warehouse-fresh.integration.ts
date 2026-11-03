@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import pg from 'pg';
 import { testClickHouseURL } from './warehouse-test-target';
 import { checkPassword, hashPassword } from '../../src/lib/password';
@@ -11,11 +12,17 @@ import { createWarehouseClient } from '../../src/lib/liekan/warehouse/client';
 import { ControlDatabase } from '../../src/lib/liekan/warehouse/control-db';
 import { seedWarehouseDemo } from '../../src/lib/liekan/warehouse/demo';
 import { boundaryParameters, factRelation } from '../../src/lib/liekan/warehouse/read';
+import { factTables, identifier } from '../../src/lib/liekan/warehouse/catalog';
+import { warehouseDemoFamily } from '../../src/lib/liekan/warehouse/demo-mapping';
 
 assert.equal(process.env.WAREHOUSE_SCHEMA_TEST, 'isolated-round2');
 const stage = process.env.WAREHOUSE_FRESH_STAGE ?? 'install';
-assert.ok(['install', 'demo'].includes(stage));
-const directory = resolve('.local/ch-fresh-validation');
+assert.ok(['install', 'demo', 'restart'].includes(stage));
+const directory = resolve(process.env.WAREHOUSE_FRESH_DIRECTORY ?? '.local/ch-fresh-validation');
+assert.ok(
+  directory.startsWith(`${resolve('.local')}/`),
+  'fresh test output must stay within .local',
+);
 await mkdir(directory, { recursive: true, mode: 0o700 });
 const stateFile = `${directory}/state.json`;
 const state = await readFile(stateFile, 'utf8')
@@ -92,7 +99,7 @@ async function counts() {
     [site],
   );
   const result: Record<string, number> = {};
-  for (const family of ['session', 'website_event', 'liekan_log', 'liekan_crawler_evidence']) {
+  for (const { name: family } of factTables) {
     const [row] = await ch
       .query({
         query: `SELECT count() AS n FROM ${factRelation(family)}`,
@@ -158,7 +165,7 @@ try {
     };
     await save();
     console.log(JSON.stringify({ stage, ...state.steps.install }));
-  } else {
+  } else if (stage === 'demo') {
     assert.ok(state.steps.install?.passed, 'Run the install stage first');
     if (!state.steps.interrupted) {
       const stop = new AbortController();
@@ -179,23 +186,106 @@ try {
     });
     assert.ok(['created', 'existing'].includes(result.status));
     const manifest = JSON.parse(await readFile('scripts/liekan-demo-data/manifest.json', 'utf8'));
-    const expected = {
-      session: manifest.counts.session,
-      website_event: manifest.counts.event,
-      liekan_log: manifest.counts.log,
-      liekan_crawler_evidence: manifest.counts.log,
-    };
+    const format = await import(pathToFileURL(resolve('scripts/liekan-demo-format.mjs')).href);
+    const fixture = await import(pathToFileURL(resolve('scripts/liekan-demo.mjs')).href);
+    const expected: Record<string, number> = Object.fromEntries(
+      factTables.map(table => [table.name, 0]),
+    );
+    for (const [kind, spec] of Object.entries(format.demoSpecs) as [string, any][]) {
+      const family = warehouseDemoFamily(spec.table);
+      if (family) expected[family] = manifest.counts[kind];
+      else {
+        const [row] = await db.read<{ n: string }>(
+          `SELECT count(*)::text AS n FROM ${identifier(spec.table)}${spec.global ? '' : ' WHERE website_id=$1'}`,
+          spec.global ? [] : [manifest.websiteId],
+        );
+        assert.equal(Number(row.n), manifest.counts[kind], `complete demo metadata ${kind}`);
+      }
+    }
+    for await (const [kind, row] of fixture.readDemoRecords())
+      if (kind === 'session-data' && row.proof) expected.liekan_session_data_source++;
     assert.deepEqual(await counts(), expected);
+    const [boundary] = await db.read<any>(
+      'SELECT epoch,publication,deletion_revision FROM liekan_warehouse_site WHERE website_id=$1',
+      [manifest.websiteId],
+    );
+    const replayParents = await ch
+      .query({
+        query: `SELECT visit_id,groupUniqArray(session_id) AS sessions FROM ${factRelation('session_replay')} GROUP BY visit_id`,
+        query_params: boundaryParameters({
+          websiteId: manifest.websiteId,
+          epoch: boundary.epoch,
+          publication: boundary.publication,
+          deletionRevision: boundary.deletion_revision,
+        }),
+        format: 'JSONEachRow',
+      })
+      .then(result => result.json<{ visit_id: string; sessions: string[] }>());
+    const parentByVisit = new Map(replayParents.map(row => [row.visit_id, row.sessions]));
+    const bookmarkOwners = () =>
+      db.read<{
+        saved_replay_id: string;
+        visit_id: string;
+        session_id: string;
+        owner_website_id: string;
+      }>(
+        `SELECT s.saved_replay_id,s.visit_id,o.session_id,o.website_id AS owner_website_id
+      FROM session_replay_saved s LEFT JOIN liekan_warehouse_replay_bookmark_owner o USING(saved_replay_id)
+      WHERE s.website_id=$1 ORDER BY s.saved_replay_id,o.session_id`,
+        [manifest.websiteId],
+      );
+    const owners = await bookmarkOwners();
+    assert.equal(owners.length, manifest.counts['saved-replay']);
+    for (const owner of owners) {
+      assert.equal(owner.owner_website_id, manifest.websiteId);
+      assert.deepEqual(parentByVisit.get(owner.visit_id), [owner.session_id]);
+    }
     assert.equal((await seedWarehouseDemo(db, ch, { secret: state.secret })).status, 'existing');
     assert.deepEqual(await counts(), expected);
+    assert.deepEqual(await bookmarkOwners(), owners);
     const [website] = await db.read<any>(
       'SELECT w.name,w.domain,s.is_demo FROM website w JOIN liekan_setting s USING(website_id) WHERE w.website_id=$1',
       [manifest.websiteId],
     );
     assert.deepEqual(website, { name: manifest.name, domain: manifest.domain, is_demo: true });
-    state.steps.demo = { passed: true, resumed: true, counts: expected, pgFacts: 0 };
+    state.steps.demo = {
+      passed: true,
+      resumed: true,
+      counts: expected,
+      pgFacts: 0,
+      replayBookmarkOwners: owners.length,
+    };
     await save();
     console.log(JSON.stringify({ stage, ...state.steps.demo }));
+  } else {
+    assert.equal(
+      state.steps.demo?.passed,
+      true,
+      'complete the isolated demo before restart verification',
+    );
+    const site = 'b880cb21-e65a-4fdf-9c0e-3da5aed4e0fa';
+    const [before] = await db.read<any>('SELECT name FROM website WHERE website_id=$1', [site]);
+    const priorCounts = await counts();
+    await db.transaction(tx =>
+      tx.query('UPDATE website SET name=$2 WHERE website_id=$1', [
+        site,
+        'Customized isolated demo',
+      ]),
+    );
+    try {
+      environment.LIEKAN_SEED_DEMO = 'true';
+      await init('repeat-customized-demo');
+      const [after] = await db.read<any>('SELECT name FROM website WHERE website_id=$1', [site]);
+      assert.equal(after.name, 'Customized isolated demo');
+      assert.deepEqual(await counts(), priorCounts);
+      state.steps.restart = { passed: true, customizedDemoPreserved: true };
+      await save();
+      console.log(JSON.stringify({ stage, ...state.steps.restart }));
+    } finally {
+      await db.transaction(tx =>
+        tx.query('UPDATE website SET name=$2 WHERE website_id=$1', [site, before.name]),
+      );
+    }
   }
 } finally {
   await Promise.allSettled([admin.end(), db.close(), ch.close(), chAdmin.close()]);

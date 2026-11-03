@@ -109,7 +109,7 @@ beforeEach(() => {
     if (sql.includes('SELECT s.epoch')) return [{ epoch: 3n, siteNumber: 107 }];
     if (sql.includes('liekan_analysis_background_lease')) return [{ id: true }];
     if (sql.startsWith('SELECT 1 FROM liekan_analysis_query_consumer')) return [{ present: 1 }];
-    if (sql.startsWith("UPDATE liekan_analysis_query SET status='running'")) return [m.rows[0]];
+    if (sql.startsWith("UPDATE liekan_analysis_query q SET status='running'")) return [m.rows[0]];
     if (sql.includes('FROM liekan_analysis_query')) return m.rows;
     throw new Error(`Unexpected synthetic query: ${sql}`);
   });
@@ -160,6 +160,7 @@ it('publishes only the recomputed value and metadata after a stale input retry',
     acquired: true,
     value: undefined,
     retryDelivery: false,
+    wakeDashboardHead: false,
   });
   expect(m.execute).toHaveBeenCalledTimes(2);
   const published = m.write.mock.calls.find(([sql]) => sql.includes("SET status='ready'"));

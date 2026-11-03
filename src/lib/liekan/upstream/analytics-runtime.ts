@@ -26,6 +26,7 @@ import { randomUUID } from 'node:crypto';
 import { rememberAnalyticsHot, reserveWorkerComputation } from './analytics-hot';
 import {
   analyticsRemaining,
+  analyticsQueryFailure,
   primaryMetadataClient,
   timedAnalyticsClient,
   withinPrimaryMetadata,
@@ -48,7 +49,10 @@ async function joinFlight<T>(promise: Promise<T>, deadline: number) {
     return await Promise.race([
       promise,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new AnalyticsUnavailable()), analyticsRemaining(deadline));
+        timer = setTimeout(
+          () => reject(new AnalyticsUnavailable('统计查询超时，请缩小时间范围后重试', 5, 503)),
+          analyticsRemaining(deadline),
+        );
       }),
     ]);
   } finally {
@@ -203,22 +207,28 @@ export function installAnalyticsRuntime(
       const generatedAt = Date.now();
       const computeDeadline = Math.min(deadline, generatedAt + 60000);
       const remaining = () => analyticsRemaining(computeDeadline);
-      const value = await primary().$transaction(
-        async (transaction: any) => {
-          const tx = timedAnalyticsClient(transaction, computeDeadline);
-          await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${schema}"`);
-          await tx.$executeRawUnsafe('SET LOCAL jit=off');
-          // Ingestion can advance before snapshot acquisition; the result freshness check handles it.
-          if ((await readAnalyticsVersions(tx, tags)).strong !== expected.strong)
-            throw new RevisionChanged();
-          return withinQuerySnapshot(tx, load);
-        },
-        {
-          isolationLevel: 'RepeatableRead',
-          timeout: remaining(),
-          maxWait: Math.min(5000, remaining()),
-        },
-      );
+      let computing = false;
+      const value = await primary()
+        .$transaction(
+          async (transaction: any) => {
+            const tx = timedAnalyticsClient(transaction, computeDeadline);
+            await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${schema}"`);
+            await tx.$executeRawUnsafe('SET LOCAL jit=off');
+            // Ingestion can advance before snapshot acquisition; the result freshness check handles it.
+            if ((await readAnalyticsVersions(tx, tags)).strong !== expected.strong)
+              throw new RevisionChanged();
+            computing = true;
+            return withinQuerySnapshot(timedAnalyticsClient(tx, computeDeadline, true), load);
+          },
+          {
+            isolationLevel: 'RepeatableRead',
+            timeout: remaining(),
+            maxWait: Math.min(5000, remaining()),
+          },
+        )
+        .catch((error: unknown) => {
+          throw analyticsQueryFailure(error, computeDeadline, computing);
+        });
       const current = await versions(tags, true, computeDeadline, false);
       if (current.strong !== expected.strong) throw new RevisionChanged();
       // Ingestion advances independently of this immutable snapshot. Its TTL starts at completion;
@@ -422,12 +432,7 @@ export function installAnalyticsRuntime(
           if (error instanceof RevisionChanged && attempt === 0 && Date.now() < deadline) continue;
           if (error instanceof RevisionChanged)
             throw new AnalyticsUnavailable('统计配置已变更，请稍后重试');
-          if (
-            (error as any)?.code === 'P2028' ||
-            /statement timeout/.test(String((error as any)?.message))
-          )
-            throw new AnalyticsUnavailable('统计查询超时，请缩小时间范围后重试');
-          throw error;
+          throw analyticsQueryFailure(error, deadline, false);
         }
       }
       throw new AnalyticsUnavailable();

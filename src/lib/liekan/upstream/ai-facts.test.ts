@@ -1,18 +1,18 @@
 // @vitest-environment node
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import 'dotenv/config';
-import prisma, { getRawQueryClient } from '@/lib/prisma';
+import { performance } from 'node:perf_hooks';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@/generated/prisma/client';
-import { performance } from 'node:perf_hooks';
+import prisma, { getRawQueryClient } from '@/lib/prisma';
 import { prepareAiPrompt } from '../ai/prompt';
 import { aiTransaction } from './ai-db';
 import { buildAiFactsContext } from './ai-facts';
 import { disconnectAiFactsClient, getAiFactsClient } from './ai-facts-db';
-import { getLogFacts } from './logs';
 import { withLogStatisticsRead } from './ai-log-read-priority';
-import { humanTotals } from './server';
+import { getLogFacts } from './logs';
 import { withinQuerySnapshot } from './query-snapshot';
+import { humanTotals } from './server';
 import { TRAFFIC_POLICY_VERSION } from './traffic-query';
 
 // This public integration seam intentionally requires the named isolated acceptance database.
@@ -26,6 +26,21 @@ describe.skipIf(!enabled)('authorized AI facts snapshot (isolated test demo)', (
     import: 'd4000000-0000-4000-8000-000000000005',
   };
   let db: any;
+  const qualifyBrowserEvents = async (eventIds: readonly string[], withIdentity = true) => {
+    for (const eventId of eventIds) {
+      await db.query(
+        `INSERT INTO liekan_event_quality(event_id,website_id,classification,source,reasons,rule_version,range_status)
+         VALUES($1,$2,'browser','browser','{synthetic}','fixture-browser','missing') ON CONFLICT DO NOTHING`,
+        [eventId, ids.website],
+      );
+      if (withIdentity)
+        await db.query(
+          `INSERT INTO liekan_event_environment(event_id,website_id,scope,identity_version,identity_available)
+           VALUES($1,$2,'browser','fixture-trusted-browser',true) ON CONFLICT DO NOTHING`,
+          [eventId, ids.website],
+        );
+    }
+  };
   beforeAll(async () => {
     const databaseUrl = process.env.DATABASE_URL;
     if (!databaseUrl) throw new Error('The named isolated acceptance database is required');
@@ -83,6 +98,16 @@ describe.skipIf(!enabled)('authorized AI facts snapshot (isolated test demo)', (
       await db.end();
     }
   });
+  afterEach(async () => {
+    if (!db) return;
+    // Every scenario starts from the same two log observations, including after assertion failures.
+    for (const table of ['website_event', 'session', 'report'])
+      await db.query(`DELETE FROM ${table} WHERE website_id=$1`, [ids.website]);
+    await db.query(
+      "DELETE FROM liekan_log WHERE website_id=$1 AND id NOT IN ('test-demo-current','test-demo-previous')",
+      [ids.website],
+    );
+  });
   const input = {
     clientRequestId: 'd4000000-0000-4000-8000-000000000010',
     expectedConfigVersion: 1,
@@ -91,6 +116,72 @@ describe.skipIf(!enabled)('authorized AI facts snapshot (isolated test demo)', (
     endAt: '2026-10-03T23:59:59.999Z',
     timezone: 'UTC',
   };
+  it.each(['zh-CN', 'en-US'] as const)(
+    'fits real one-day %s facts in the custom-model budget',
+    async locale => {
+      const context = await buildAiFactsContext({
+        actor: { id: ids.user, role: 'user' },
+        conversationId: ids.conversation,
+        input: { ...input, startAt: '2026-10-02T00:00:00.000Z', endAt: '2026-10-02T23:59:59.999Z' },
+        signal: new AbortController().signal,
+      });
+      expect(context.facts).toHaveLength(6);
+      expect(context.population).toBeDefined();
+      expect(context.previousPopulation).toBeDefined();
+      for (const structuredOutput of [false, true]) {
+        const prepared = prepareAiPrompt({
+          locale,
+          context,
+          history: [],
+          structuredOutput,
+          question: locale === 'zh-CN' ? '今天浏览如何' : 'How was traffic today?',
+          connectionConfig: {
+            provider: 'custom',
+            protocol: 'openai-chat',
+            baseUrl: 'https://models.example.com/v1',
+            model: 'gpt-5.6-terra',
+          },
+        });
+        expect(prepared.inputBytes).toBeLessThanOrEqual(12697);
+        expect(prepared.contextSent.metrics).toEqual(context.metrics);
+        expect(prepared.contextSent.population).toEqual(context.population);
+        expect(prepared.contextSent.previousPopulation).toEqual(context.previousPopulation);
+        expect(prepared.contextSent.sourceStates).toEqual(context.sourceStates);
+        expect(prepared.contextSent.facts.map(fact => fact.id)).toEqual(
+          context.facts.map(fact => fact.id),
+        );
+        // Detail may be clipped under the documented budget; all aggregates stay exact.
+        for (const fact of prepared.contextSent.facts) {
+          const original = context.facts.find(value => value.id === fact.id);
+          const aggregates = (data: object) =>
+            Object.fromEntries(
+              Object.entries(data).filter(
+                ([key]) =>
+                  ![
+                    'rows',
+                    'paths',
+                    'samples',
+                    'omitted',
+                    'truncated',
+                    'samplesOmitted',
+                    'samplesTruncated',
+                  ].includes(key),
+              ),
+            );
+          expect(aggregates(fact.data)).toEqual(aggregates(original.data));
+          if ('rows' in fact.data || 'paths' in fact.data) {
+            const rows = 'rows' in fact.data ? fact.data.rows : fact.data.paths;
+            expect(fact.data.omitted).toBe(fact.data.total - rows.length);
+            expect(fact.data.truncated).toBe(fact.data.omitted > 0);
+          }
+          if (fact.id === 'log-errors') {
+            expect(fact.data.samplesOmitted).toBe(fact.data.sampleTotal - fact.data.samples.length);
+            expect(fact.data.samplesTruncated).toBe(fact.data.samplesOmitted > 0);
+          }
+        }
+      }
+    },
+  );
   it('prepares both browser periods within one shared five-second scan budget', async () => {
     const primary = getAiFactsClient();
     const original = primary.$transaction.bind(primary);
@@ -193,6 +284,7 @@ describe.skipIf(!enabled)('authorized AI facts snapshot (isolated test demo)', (
           'INSERT INTO website_event(event_id,website_id,session_id,visit_id,created_at,url_path,event_type) VALUES($1,$2,$3,$4,$5,$6,$7)',
           [uid(id), ids.website, uid(session), uid(visit), at, '/test-demo-boundary', type],
         );
+      await qualifyBrowserEvents(events.map(([id]) => uid(id)));
       const reference = await aiTransaction(tx =>
         withinQuerySnapshot(
           {
@@ -235,6 +327,49 @@ describe.skipIf(!enabled)('authorized AI facts snapshot (isolated test demo)', (
           ids.website,
         ]);
     }
+  });
+  it('requires browser classification and identity evidence before counting a collected pageview', async () => {
+    const session = 'd4000000-0000-4000-8000-000000005101';
+    const event = 'd4000000-0000-4000-8000-000000005102';
+    await db.query('INSERT INTO session(session_id,website_id) VALUES($1,$2)', [
+      session,
+      ids.website,
+    ]);
+    await db.query(
+      "INSERT INTO website_event(event_id,website_id,session_id,visit_id,created_at,url_path,event_type) VALUES($1,$2,$3,$3,'2026-10-02T10:00:00Z','/test-demo-evidence',1)",
+      [event, ids.website, session],
+    );
+    const read = () =>
+      buildAiFactsContext({
+        actor: { id: ids.user, role: 'user' },
+        conversationId: ids.conversation,
+        input,
+        signal: new AbortController().signal,
+      });
+    const summary = (context: Awaited<ReturnType<typeof read>>) =>
+      context.facts.find(fact => fact.id === 'summary')?.data;
+    const [received] = await db.query(
+      'SELECT count(*)::int AS n FROM liekan_raw_website_event WHERE website_id=$1',
+      [ids.website],
+    );
+    expect(received.n).toBe(1);
+    expect(summary(await read())).toMatchObject({
+      current: { pageviews: 0, visitors: 0, visits: 0 },
+    });
+    await qualifyBrowserEvents([event], false);
+    const unidentified = await read();
+    expect(unidentified.population.identity).toMatchObject({
+      status: 'unavailable',
+      eligiblePV: 1,
+      qualifiedPV: 0,
+    });
+    expect(summary(unidentified)).toMatchObject({
+      current: { pageviews: 0, visitors: null, visits: null },
+    });
+    await qualifyBrowserEvents([event]);
+    expect(summary(await read())).toMatchObject({
+      current: { pageviews: 1, visitors: 1, visits: 1 },
+    });
   });
   it('rejects invalid ranges and another actor through the public preparation seam', async () => {
     await expect(
@@ -389,6 +524,7 @@ describe.skipIf(!enabled)('authorized AI facts snapshot (isolated test demo)', (
           e.event,
         ],
       );
+    await qualifyBrowserEvents(events.map(event => event.id));
     for (const [n, name, parameters] of [
       [401, 'test-demo-path', { type: 'path', value: '/thanks' }],
       [402, 'test-demo-event alice@example.com', { type: 'event', value: 'signup' }],
@@ -588,7 +724,7 @@ describe.skipIf(!enabled)('authorized AI facts snapshot (isolated test demo)', (
       previousRequests: 4,
     });
     if (bots?.id === 'bots') {
-      expect(bots.data.rows).toHaveLength(24);
+      expect(bots.data.rows).toHaveLength(20);
       expect(bots.data.rows.find(row => row.name === 'test-demo-bot-25')).toMatchObject({
         requests: 1,
         previousRequests: 2,
@@ -605,7 +741,7 @@ describe.skipIf(!enabled)('authorized AI facts snapshot (isolated test demo)', (
     const pages = context.facts.find(f => f.id === 'pages');
     expect(pages?.data).toMatchObject({ total: 28, omitted: 8, truncated: true });
     if (pages?.id === 'pages') {
-      expect(pages.data.rows).toHaveLength(24);
+      expect(pages.data.rows).toHaveLength(20);
       expect(pages.data.rows.find(row => row.path === '/test-demo-bin/25')).toMatchObject({
         humanPageviews: null,
         previousHumanPageviews: null,

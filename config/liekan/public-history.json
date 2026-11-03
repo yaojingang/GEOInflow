@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "repository": "https://github.com/yaojingang/GEOInflow.git",
+  "mirrorRepository": "https://gitee.com/liekan/liekan-statistics.git",
+  "developmentRepository": "https://gitee.com/liekan/liekan-statistics-history.git",
+  "baseline": "9eb3aefc5a3fa8d4be8026fe468d6927cd017ed4",
+  "allowedRoots": [
+    "fa5de4cfe3b62632689cafca84148a7486e87bfd",
+    "5a877159c4a443491bd39057ad7af07e8462fd44"
+  ]
+}

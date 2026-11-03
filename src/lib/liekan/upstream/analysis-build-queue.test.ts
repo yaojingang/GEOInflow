@@ -10,6 +10,7 @@ const h = vi.hoisted(() => ({
   work: vi.fn(),
 }));
 vi.mock('./analysis-rollups-db', () => ({
+  analysisCapacity: async () => ({globalBytes:'0',siteBytes:'0',globalLimit:8*1024**3,siteLimit:1024**3}),
   analysisTransaction: async (work: any) =>
     work({
       $executeRawUnsafe: async () => {

@@ -22,3 +22,21 @@ it('fences old calendar results without changing raw data or eligibility revisio
     true,
   );
 });
+
+it('fences prior metric semantics while keeping source revisions unchanged', async () => {
+  const tx = { $queryRawUnsafe: vi.fn().mockResolvedValue([]) };
+  const current = await readAnalyticsVersions(tx, ['website:00000000-0000-4000-8000-000000000001']);
+  const fields = JSON.parse(current.strong);
+  expect(fields).toContain('analytics-read-v4');
+  const legacy = JSON.stringify(
+    fields.map((value: unknown) => (value === 'analytics-read-v4' ? 'analytics-read-v3' : value)),
+  );
+  expect(current.strong).not.toBe(legacy);
+  for (const format of [DASHBOARD_FORMAT, ANALYSIS_RESULT_FORMAT]) {
+    expect(analysisDigest([format, current.strong])).not.toBe(analysisDigest([format, legacy]));
+  }
+  expect(current.data).toBe('[]');
+  expect(tx.$queryRawUnsafe.mock.calls.every(([sql]) => !/UPDATE|INSERT|DELETE/.test(sql))).toBe(
+    true,
+  );
+});

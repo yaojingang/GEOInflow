@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { QueryCache, type CachedResult } from './query-cache';
 import { installAnalyticsRuntime } from './analytics-runtime';
 import { AnalyticsRedis } from './analytics-redis';
-import { analyticsGate, AnalyticsGate } from './analytics-budget';
+import { analyticsGate, AnalyticsGate, analyticsComputationGate } from './analytics-budget';
 import { getQuerySnapshot } from './query-snapshot';
 import {
   bindCacheRequest,
@@ -453,6 +453,61 @@ it('sets real SQL timeouts before execution and releases concurrency after the t
   await running;
   expect(gate.state.active).toBe(0);
 });
+it.each([
+  'metadata-acquisition',
+  'metadata-statements',
+  'compute-acquisition',
+  'early-statement',
+  'expired-transaction',
+  'expired-statement',
+  'expired-before-statement',
+])('preserves the runtime retry classification for %s', async phase => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(1000);
+  const cache = new QueryCache();
+  const failure = Object.assign(
+    new Error(
+      phase === 'expired-statement'
+        ? 'canceling statement due to statement timeout'
+        : 'Unable to start a transaction in the given time',
+    ),
+    phase === 'expired-statement' ? { code: 'P2010', meta: { code: '57014' } } : { code: 'P2028' },
+  );
+  const provider = () => ({
+    $transaction: async (work: (tx: unknown) => Promise<unknown>, options: any) => {
+      if (
+        phase === 'metadata-acquisition' ||
+        (phase === 'compute-acquisition' && options.isolationLevel === 'RepeatableRead')
+      )
+        throw failure;
+      return primary().$transaction(async tx => {
+        if (phase === 'metadata-statements') {
+          const query = tx.$queryRawUnsafe;
+          tx.$queryRawUnsafe = async (statement: string) => {
+            const result = await query(statement);
+            if (statement.includes('FROM liekan_analytics_revision')) vi.setSystemTime(6001);
+            return result;
+          };
+        }
+        return work(tx);
+      }, options);
+    },
+  });
+  installAnalyticsRuntime(cache, provider, disabled());
+  const load = vi.fn(async () => {
+    if (phase.startsWith('expired-')) vi.setSystemTime(61001);
+    if (phase === 'expired-before-statement') return getQuerySnapshot().$queryRawUnsafe('SELECT 1');
+    throw failure;
+  });
+  await expect(cache.read('runtime-timeout-' + phase, 30000, tags, load)).rejects.toMatchObject({
+    status: 503,
+    code: phase.startsWith('expired-') ? 'analysis-query-timeout' : 'liekan-error',
+  });
+  expect(load).toHaveBeenCalledTimes(
+    phase.startsWith('metadata-') || phase.endsWith('acquisition') ? 0 : 1,
+  );
+  expect(analyticsGate.state).toEqual({ active: 0, queued: 0 });
+});
 it.each(['leader', 'joined'])(
   'checks each consumer when the %s membership is removed during shared computation',
   async victim => {
@@ -502,6 +557,37 @@ it.each(['leader', 'joined'])(
     expect(currentCacheContext()).toBeUndefined();
   },
 );
+it('keeps a joined-reader wait timeout transient while the producer can still finish', async () => {
+  vi.useFakeTimers();
+  const cache = new QueryCache();
+  installAnalyticsRuntime(cache, primary, disabled());
+  let release!: () => void, started!: () => void;
+  const held = new Promise<void>(resolve => (release = resolve));
+  const entered = new Promise<void>(resolve => (started = resolve));
+  const load = vi.fn(async () => {
+    started();
+    await held;
+    return 7;
+  });
+  const producer = analyticsWorkerContext(id, { private: true }, () =>
+    cache.read('joined-wait', 30000, tags, load),
+  );
+  await entered;
+  try {
+    const waiting = analyticsWorkerContext(
+      id,
+      { private: true },
+      () => cache.read('joined-wait', 30000, tags, load),
+      { deadline: Date.now() + 30 },
+    ).catch(error => error);
+    await vi.advanceTimersByTimeAsync(30);
+    expect(await waiting).toMatchObject({ status: 503, code: 'liekan-error' });
+    expect(load).toHaveBeenCalledOnce();
+  } finally {
+    release();
+    expect((await producer).value).toBe(7);
+  }
+});
 it('coalesces manual refreshes across instances and applies the actor cooldown across instances', async () => {
   const redis = new MemoryRedis(''),
     first = new QueryCache(),
@@ -635,30 +721,36 @@ it('keeps dashboard computation independent of occupied heavy computation slots'
     await Promise.allSettled([...heavy, short]);
   }
 });
-it('keeps the dashboard computation slot bounded across concurrent requests', async () => {
+it('admits two dashboard computations and queues a third until a slot settles', async () => {
   const cache = new QueryCache();
   installAnalyticsRuntime(cache, primary, disabled());
-  let release!: () => void, began!: () => void;
-  const held = new Promise<void>(resolve => (release = resolve)),
-    started = new Promise<void>(resolve => (began = resolve));
+  const permit = { token: id, epoch: '1', lane: 'dashboard' as const };
+  const gate = await withinAnalysisPermit(permit, async () => analyticsComputationGate());
+  const releases: (() => void)[] = [];
   const run = (key: string, load: () => Promise<unknown>) =>
-    withinAnalysisPermit({ token: id, epoch: '1', lane: 'dashboard' }, () =>
-      cache.read(key, 30000, tags, load),
-    );
-  const first = run('dashboard-first', async () => {
-    began();
-    await held;
-    return 1;
-  });
-  await started;
-  const secondLoad = vi.fn(async () => 2),
-    second = run('dashboard-second', secondLoad);
+    withinAnalysisPermit(permit, () => cache.read(key, 30000, tags, load));
+  const first = run(
+    'dashboard-first',
+    () => new Promise(resolve => releases.push(() => resolve(1))),
+  );
+  const second = run(
+    'dashboard-second',
+    () => new Promise(resolve => releases.push(() => resolve(2))),
+  );
+  let third: Promise<unknown>;
+  const thirdLoad = vi.fn(async () => 3);
   try {
-    await new Promise(resolve => setTimeout(resolve, 50));
-    expect(secondLoad).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(releases).toHaveLength(2));
+    third = run('dashboard-third', thirdLoad);
+    await vi.waitFor(() => expect(gate.state).toEqual({ active: 2, queued: 1 }));
+    expect(thirdLoad).not.toHaveBeenCalled();
+    releases[0]();
+    await first;
+    await third;
+    expect(thirdLoad).toHaveBeenCalledOnce();
+    expect(gate.state).toEqual({ active: 1, queued: 0 });
   } finally {
-    release();
-    await Promise.allSettled([first, second]);
+    for (const release of releases) release();
+    await Promise.allSettled([first, second, third]);
   }
-  expect(secondLoad).toHaveBeenCalledOnce();
 });

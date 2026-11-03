@@ -1,6 +1,6 @@
 # GEOInflow
 
-**English** | [简体中文](README.zh-CN.md)
+**English** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
 Self-hosted web and AI crawler analytics for Generative Engine Optimization (GEO).
 
@@ -99,13 +99,13 @@ Log processing retains sources, classifications, and verification evidence. Anal
 
 ## Quick deployment
 
-Start Docker Engine / Docker Desktop and Docker Compose V2, and ensure that image and dependency download sources are reachable. After obtaining the source code, run this command from the project root:
+Start Docker Engine / Docker Desktop and Docker Compose V2, and ensure that image and dependency download sources are reachable. Source builds require at least **6 GiB total Docker memory**; **8 GiB or more and at least 2 CPUs** are recommended, with free memory reserved for compilation. Run `sh scripts/liekan-deploy.sh --check` to check the build floor. See [deployment requirements](docs/deployment.en.md#requirements) for runtime capacity. After obtaining the source code, run this command from the project root:
 
 ```sh
 sh scripts/liekan-deploy.sh
 ```
 
-The script generates a private `.env` and random secrets, builds the application image, runs migrations, and starts the application, log worker, analytics worker, PostgreSQL, and Redis. The default address is:
+The script generates a private `.env` and random secrets, builds the application image, runs migrations, imports the bundled official example on a fresh installation, and starts the application, log worker, analytics worker, PostgreSQL, and Redis. The default address is:
 
 ```text
 http://127.0.0.1:3002
@@ -113,15 +113,15 @@ http://127.0.0.1:3002
 
 For a fresh installation, the initial username is `admin` and the initial password is `liekan`. Change the password after signing in, then create a website using the ingestion guide. Upgrades preserve existing customized passwords and accounts.
 
-To try the bundled example after the application starts, run:
+Docker startup imports the complete sanitized official example after migrations. For manual development, run:
 
 ```sh
 docker compose -f docker-compose.liekan.yml exec app node scripts/liekan-seed-demo.mjs
 ```
 
-The example is named “猎看官网（示例数据）”. It initializes from the processed dataset included with the source. On first import, its timestamps are shifted to make the data convenient to explore. Repeated runs preserve existing data and deletion state. See the [default demo guide](docs/default-demo.md).
+The example is named “猎看官网（示例数据）”. The source and Docker image include its complete sanitized dataset, catalog, and checksum manifest, covering browser events, performance, revenue, heatmaps, replays, crawler evidence, content, and goals. On first import, its timestamps are shifted to make the data convenient to explore. Repeated runs preserve existing data and deletion state. See the [default demo guide](docs/default-demo.md).
 
-Production access requires a domain, HTTPS, and a trusted reverse proxy. Browser PV collection can continue without a trusted IP ingress, while identity metrics such as UV require reliable ingress evidence. Automatic log ingestion and optional AI analysis have separate configuration requirements.
+Production access requires a domain, HTTPS, and a trusted reverse proxy. Raw browser receipt remains observable without trusted IP ingress. Qualified browser metrics, including PV and UV, require usable identity evidence. Automatic log ingestion and optional AI analysis have separate configuration requirements.
 
 The [deployment guide](docs/deployment.en.md) covers services, configuration, proxies, backups, and upgrades. The [quick start](docs/getting-started.en.md) explains how to connect the first website.
 
@@ -139,13 +139,14 @@ Initial calculations, cache hits, and background updates have different costs. A
 - Browser tracking is cookieless by default. Optional recording, event properties, and business integrations use the data scope configured for each deployment.
 - AI analysis is disabled by default. When enabled, users choose model connections and website materials. See the [AI configuration guide](docs/ai.md) for the data sent to models.
 - GEO Weight is in Beta. It uses qualified AI content access from the most recent 30 complete calendar days, with a documented formula, evidence, and limitations. The [weight guide](docs/geo-weight.md) defines the fixed policy and applicable scope.
+- Optional [ClickHouse historical log analytics](docs/clickhouse-analytics.md) offloads verified historical aggregates while PostgreSQL retains source data and transactional state.
 - GEO extensions, supplemental journeys, complete exports, and analytics acceleration primarily target PostgreSQL. Retained ClickHouse, link, and pixel endpoints follow their existing protocols; support for each GEO extension must be checked separately.
 - Automatic server collection requires public HTTPS, an ingestion secret, and signed installation assets. Cloudflare integration also requires OAuth, permissions, and the relevant provider capabilities.
 - Search impressions, actual rankings, model-answer citations, training inclusion, and article completion rates require additional data. The detailed guides define the observations and scores this project provides.
 
 ## Development and maintenance
 
-Development uses Node.js **22.23.3**, pnpm **12.3.4**, and PostgreSQL. Prepare an independent database and private configuration using the [deployment guide](docs/deployment.en.md), then run the following commands. This example uses the separate development port `3302`:
+Development uses Node.js **22.23.4**, pnpm **12.3.4**, and PostgreSQL. Prepare an independent database and private configuration using the [deployment guide](docs/deployment.en.md), then run the following commands. This example uses the separate development port `3302`:
 
 ```sh
 pnpm install --frozen-lockfile

@@ -20,10 +20,10 @@ import {
 } from './cache-context';
 import {
   primaryMetadataClient,
+  analyticsQueryFailure,
   timedAnalyticsClient,
   analyticsRemaining,
 } from './analytics-deadline';
-import { AnalyticsUnavailable } from './analytics-budget';
 import { withTrafficPolicy } from './traffic-query';
 import { warehouseEnabled } from '../warehouse/runtime';
 export { LiekanError } from './errors';
@@ -149,18 +149,23 @@ export async function reportSnapshot<T>(work: () => Promise<T>, deadline?: numbe
   const snapshot = getQuerySnapshot();
   const schema = new URL(process.env.DATABASE_URL).searchParams.get('schema') || 'public';
   if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schema)) throw new LiekanError('数据库 schema 无效', 500);
+  let computing = false;
+  const compute = () => {
+    computing = true;
+    return work();
+  };
   try {
     if (snapshot)
       return await (deadline === undefined
-        ? work()
-        : withinQuerySnapshot(timedAnalyticsClient(snapshot, deadline), work));
+        ? compute()
+        : withinQuerySnapshot(timedAnalyticsClient(snapshot, deadline, true), compute));
     return await primary().$transaction(
       async tx => {
         await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${schema}"`);
         await tx.$executeRawUnsafe('SET LOCAL jit=off');
         return withinQuerySnapshot(
-          deadline === undefined ? tx : timedAnalyticsClient(tx, deadline),
-          work,
+          deadline === undefined ? tx : timedAnalyticsClient(tx, deadline, true),
+          compute,
         );
       },
       {
@@ -170,12 +175,7 @@ export async function reportSnapshot<T>(work: () => Promise<T>, deadline?: numbe
       },
     );
   } catch (error) {
-    if (
-      deadline !== undefined &&
-      ((error as any)?.code === 'P2028' ||
-        /statement timeout/.test(String((error as any)?.message)))
-    )
-      throw new AnalyticsUnavailable('统计查询超时，请缩小时间范围后重试');
+    if (deadline !== undefined) throw analyticsQueryFailure(error, deadline, computing);
     throw error;
   }
 }

@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { FeatureEntity } from '@/lib/liekan/contracts/features';
 import {
   type InstallationAction,
+  type InstallationIdentityObservation,
   type InstallationStatus,
   type InstallationStep,
   installationParams,
@@ -63,6 +64,132 @@ function tone(label: string) {
       : 'gray';
 }
 
+export function IdentityObservation({
+  observation,
+  deferred,
+  browserReceived,
+  configured,
+  timezone,
+}: {
+  observation: InstallationIdentityObservation;
+  deferred: boolean;
+  browserReceived: boolean;
+  configured: boolean;
+  timezone: string;
+}) {
+  const i18n = useLiekanI18n();
+  const label =
+    observation.status === 'demo'
+      ? i18n.text('示例数据不用于接入核验')
+      : observation.status === 'unsupported'
+        ? i18n.text('当前观测不支持')
+        : observation.status === 'temporarily_unavailable'
+          ? i18n.text('身份诊断暂不可用')
+          : observation.status === 'empty'
+            ? configured
+              ? i18n.text('已配置，等待采集核验')
+              : i18n.text('等待采集核验')
+            : observation.status === 'unknown'
+              ? i18n.text('身份覆盖未知')
+              : observation.smallSample
+                ? i18n.text('样本不足')
+                : observation.status === 'complete'
+                  ? i18n.text('已收到可用身份事件')
+                  : observation.status === 'partial'
+                    ? i18n.text('部分身份可用')
+                    : i18n.text('身份输入不足');
+  const formatDate = (at: number | string) =>
+    new Date(at).toLocaleString(i18n.locale, { timeZone: timezone });
+  return (
+    <div className={styles.checkRow}>
+      <div>
+        <strong>{i18n.text('最近接收的浏览身份')}</strong>
+        {deferred && (
+          <p className="muted">
+            {i18n.text('浏览接入检查已延后。实际接收情况独立展示，日志功能可继续使用。')}
+          </p>
+        )}
+        <p className="muted">{label}</p>
+        {observation.sampleCount !== null && (
+          <p className="muted">
+            {i18n.text('样本 {v0} 条 · 身份可用 {v1} 条 · 覆盖率 {v2}', [
+              observation.sampleCount.toLocaleString(i18n.locale),
+              observation.availableIdentityCount?.toLocaleString(i18n.locale),
+              observation.coverage === null
+                ? i18n.text('未知')
+                : new Intl.NumberFormat(i18n.locale, {
+                    style: 'percent',
+                    maximumFractionDigits: 1,
+                  }).format(observation.coverage),
+            ])}
+          </p>
+        )}
+        {!!observation.unknownIdentityCount && (
+          <p className="muted">
+            {i18n.text('{v0} 条样本缺少身份资格证据，覆盖率保持未知。', [
+              observation.unknownIdentityCount.toLocaleString(i18n.locale),
+            ])}
+          </p>
+        )}
+        {observation.smallSample && (
+          <p className="muted">
+            {i18n.text('当前少于 20 条样本，仅展示实际数量与覆盖，不据此判定代理故障。')}
+          </p>
+        )}
+        {observation.status === 'unavailable' && (
+          <p className="muted">
+            {i18n.text('样本已收到，当前身份输入不足。请核对可信入口、代理覆盖及请求头重写。')}
+          </p>
+        )}
+        {observation.status === 'partial' && (
+          <p className="muted">{i18n.text('请核对缺少身份输入的访问范围。')}</p>
+        )}
+        {observation.status === 'complete' && (
+          <p className="muted">
+            {i18n.text('样本中的身份可用；代理覆盖与源站访问限制仍需部署侧核验。')}
+          </p>
+        )}
+        {observation.status === 'empty' && browserReceived && (
+          <p className="muted">
+            {i18n.text('已有浏览记录；当前接收窗口、来源或证据范围内尚无可核验样本。')}
+          </p>
+        )}
+        {observation.reasons.includes('reception_fallback') && (
+          <p className="muted">
+            {i18n.text('部分样本使用原始采集判定的接收时间回退，缺失的身份资格证据保持未知。')}
+          </p>
+        )}
+        {observation.status === 'demo' && <p className="muted">{i18n.system(demoCopy)}</p>}
+        {observation.status === 'temporarily_unavailable' && (
+          <p className="muted">
+            {i18n.text(
+              '本次诊断未完成，覆盖率未知。原有接入设置与采集状态继续显示，可稍后重新检查。',
+            )}
+          </p>
+        )}
+        {observation.status === 'unsupported' && (
+          <p className="muted">
+            {i18n.text('当前数据库路径暂不支持身份观测，原有浏览采集与日志功能继续使用。')}
+          </p>
+        )}
+        <p className="field-help">
+          {i18n.text('接收窗口：{v0} 至 {v1}（结束时间不含在内）。', [
+            formatDate(observation.range.startAt),
+            formatDate(observation.range.endAt),
+          ])}{' '}
+          {i18n.text(
+            '分母为具有会话关联和原始接收证据的公开浏览 PV，包含旧版覆盖来源；正式统计资格单独计算。',
+          )}
+          {observation.lastReceivedAt && (
+            <> {i18n.text('最近接收：{v0}。', [formatDate(observation.lastReceivedAt)])}</>
+          )}
+        </p>
+      </div>
+      <Badge tone="gray">{deferred ? i18n.text('检查已延后') : label}</Badge>
+    </div>
+  );
+}
+
 export function InstallationEntry({ site, browser }: { site: FeatureEntity; browser: any }) {
   const i18n = useLiekanI18n();
   const c = useFeature();
@@ -80,7 +207,7 @@ export function InstallationEntry({ site, browser }: { site: FeatureEntity; brow
               <div>
                 <strong>
                   {status.progress.completedAt
-                    ? i18n.text('设置已完成')
+                    ? i18n.text('接入设置已保存')
                     : i18n.text('接入设置待完成')}
                 </strong>
                 <p className="muted">
@@ -209,7 +336,7 @@ export function Installation({
     const version = navigation.current.version;
     await action.run(
       () => c.api.post(`/liekan/websites/${site.id}/installation`, body),
-      body.action === 'finish' ? `「${site.name}」的接入设置已完成` : '接入进度已保存',
+      body.action === 'finish' ? `「${site.name}」的接入设置已保存` : '接入进度已保存',
     );
     if (next && active.current && version === navigation.current.version)
       navigate(next, 'method' in body ? body.method : method);
@@ -237,7 +364,7 @@ export function Installation({
     <div className={styles.receipts}>
       <div>
         <span className="muted">{i18n.text('浏览采集')}</span>
-        <Badge tone={tone(browserState)}>{browserState}</Badge>
+        <Badge tone={tone(browserState)}>{i18n.system(browserState)}</Badge>
         <p className="muted">
           {browserReceived
             ? i18n.text('{v0} 次页面访问{v1}', [
@@ -278,8 +405,17 @@ export function Installation({
             </p>
           )}
         </div>
-        <Badge tone={tone(browserState)}>{browserState}</Badge>
+        <Badge tone={tone(browserState)}>{i18n.system(browserState)}</Badge>
       </div>
+      {status.identityIngress?.observation && (
+        <IdentityObservation
+          observation={status.identityIngress.observation}
+          deferred={status.progress.browserCheckDeferred}
+          browserReceived={browserReceived}
+          configured={status.identityIngress.configured}
+          timezone={timezone}
+        />
+      )}
       <div className={styles.checkRow}>
         <div>
           <strong>{i18n.text('自动日志接入')}</strong>
@@ -392,7 +528,7 @@ export function Installation({
                   <Body>
                     <TrackingCode websiteId={site.id} />
                     <div className={styles.inlineStatus}>
-                      <Badge tone={tone(browserState)}>{browserState}</Badge>
+                      <Badge tone={tone(browserState)}>{i18n.system(browserState)}</Badge>
                       <Button disabled={checking} onClick={recheck}>
                         {i18n.text('检查安装结果（可选）')}
                       </Button>
@@ -704,7 +840,7 @@ export function Installation({
               <Panel
                 title={i18n.system(
                   status.progress.completedAt
-                    ? i18n.text('设置已完成')
+                    ? i18n.text('接入设置已保存')
                     : i18n.text('接入设置待完成'),
                 )}
                 subtitle={i18n.text('当前网站的安装、日志接入与检查入口。')}

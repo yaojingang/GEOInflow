@@ -528,6 +528,7 @@ export function LiekanPage({ resource }: { resource: Resource }) {
     if (report?.website)
       shell.setWebsite({
         ...report.website,
+        robotsRange: report.range,
         teamId: website?.teamId,
         demo: report.meta.demo,
       } as any);
@@ -537,13 +538,14 @@ export function LiekanPage({ resource }: { resource: Resource }) {
         name: website.name,
         domain: website.domain,
         siteNumber: website.siteNumber,
+        robotsRange: { startAt, endAt, timezone },
         teamId: website.teamId,
       } as any);
     if (report?.tables.botBody)
       shell.setBotCount(
         report.states.logs === 'not_connected' ? null : report.tables.botBody.length,
       );
-  }, [report, website, shell?.setWebsite, shell?.setBotCount]);
+  }, [report, website, startAt, endAt, timezone, shell?.setWebsite, shell?.setBotCount]);
   useEffect(() => {
     if (websiteMatchesHandle(report?.website, websiteId) && userId)
       queryClient.setQueryData(
@@ -820,34 +822,6 @@ export function LiekanPage({ resource }: { resource: Resource }) {
   const View = reportViews[resource];
   const headerActions = (
     <div data-liekan-owned-actions className={styles.headerActions}>
-      {(resource.startsWith('ai/') || resource === 'logs') && (
-        <label className="chip">
-          <span>{i18n.text('蜘蛛身份范围')}</span>
-          <select
-            aria-label={i18n.text('蜘蛛身份范围')}
-            value={
-              params.crawlerIdentityScope === 'verified_identity'
-                ? 'verified_identity'
-                : params.crawlerIdentityScope === 'verified_range'
-                  ? 'verified_range'
-                  : 'all'
-            }
-            onChange={event =>
-              updateView({
-                ...clearTablePages(tablePages),
-                crawlerIdentityScope: event.target.value === 'all' ? undefined : event.target.value,
-                page: undefined,
-                cursor: undefined,
-                seek: undefined,
-              })
-            }
-          >
-            <option value="all">{i18n.text('全部声明')}</option>
-            <option value="verified_identity">{i18n.text('已核验身份')}</option>
-            <option value="verified_range">{i18n.text('官方范围匹配')}</option>
-          </select>
-        </label>
-      )}
       <QuickRangeButtons
         variant="chip"
         activeToken={activeQuickDateRange(params)}
@@ -961,12 +935,15 @@ export function LiekanPage({ resource }: { resource: Resource }) {
       <div className={styles.analysisTools}>
         {report?.meta.snapshot && (
           <span>
-            {i18n.text('数据截至 {v0}，后台每 30 秒更新', [
+            {i18n.text('数据截至 {v0}，后台每 30 秒检查更新', [
               new Date(report.meta.snapshot.dataThrough).toLocaleString(i18n.locale, {
                 timeZone: report.range.timezone,
                 hour12: false,
               }),
             ])}
+            {report.meta.snapshot.updateError && (
+              <span role="status"> · {i18n.text('更新失败，当前显示上次读取的数据')}</span>
+            )}
           </span>
         )}
         {resource === 'logs' && (

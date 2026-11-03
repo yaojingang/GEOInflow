@@ -305,11 +305,16 @@ describe.skipIf(!enabled)('revenue event geography with actual PostgreSQL plans'
           `INSERT INTO website_event(event_id,website_id,session_id,visit_id,created_at,url_path,event_type,event_name)VALUES($1,$2,$3,$4,$5,$6,$7,'synthetic')`,
           [id, site, session, visit, at, path, kind],
         );
-        if (item.quality)
+        if (item.quality) {
+          await client.query(
+            "INSERT INTO liekan_event_environment(event_id,website_id,scope,identity_version,identity_available,browser)VALUES($1,$2,'browser','synthetic-fixture',true,'Chrome')",
+            [id, site],
+          );
           await client.query(
             "INSERT INTO liekan_event_quality(event_id,website_id,classification,source,reasons,rule_version,range_status)VALUES($1,$2,'browser','browser','{synthetic}','fixture','missing')",
             [id, site],
           );
+        }
       }
       if (item.geography)
         await client.query(

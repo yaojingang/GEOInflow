@@ -1,4 +1,5 @@
 import { identityIngressDiagnostic } from './upstream/identity-diagnostic';
+import { readInstallationObservation } from './upstream/installation-observation';
 import { crawlerAiSql } from './rules/population';
 import {
   type InstallationProgress,
@@ -30,8 +31,12 @@ function progressFromRow(row?: InstallationProgress): InstallationProgress {
       }
     : initialInstallationProgress();
 }
-export async function getInstallation(id: string, canManage: boolean): Promise<InstallationStatus> {
-  const [rows, logs, browser] = await Promise.all([
+export async function getInstallation(
+  id: string,
+  canManage: boolean,
+  observationIdentity?: WriteIdentity,
+): Promise<InstallationStatus> {
+  const [rows, logs, browser, availability, sources, observation] = await Promise.all([
     query<InstallationProgress>(progressQuery, id),
     warehouseEnabled()
       ? (await import('./upstream/warehouse-presence'))
@@ -47,11 +52,12 @@ export async function getInstallation(id: string, canManage: boolean): Promise<I
           id,
         ),
     collectionPresence(id),
+    getLogCapabilities(),
+    listSources(id),
+    observationIdentity ? readInstallationObservation(id, observationIdentity.userId) : undefined,
   ]);
-  const availability = await getLogCapabilities();
-  const sources = await listSources(id);
   return {
-    identityIngress: identityIngressDiagnostic(),
+    identityIngress: { ...identityIngressDiagnostic(), ...(observation ? { observation } : {}) },
     progress: progressFromRow(rows[0]),
     canManage,
     browser,

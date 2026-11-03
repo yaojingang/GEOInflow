@@ -25,7 +25,7 @@ vi.mock('@/lib/prisma', () => ({
 vi.mock('@/queries/sql', () => ({ getWebsiteStats: mocks.stats }));
 vi.mock('./page-report', () => ({ readPageReport: mocks.report }));
 
-import { authorize, humanTotals, lockWritableWebsite, query } from './server';
+import { authorize, humanTotals, lockWritableWebsite, query, reportSnapshot } from './server';
 import { GET as pageReport } from '@/app/api/liekan/websites/[websiteId]/page-report/route';
 import { api } from '@/lib/liekan/http';
 
@@ -41,6 +41,34 @@ beforeEach(() => {
   mocks.view.mockResolvedValue(true);
   mocks.update.mockResolvedValue(false);
 });
+it.each(['acquisition', 'early-statement', 'expired-budget'])(
+  'classifies report transaction failure from %s without blocking transient recovery',
+  async phase => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1000);
+    const unavailable = Object.assign(
+      new Error('Unable to start a transaction in the given time'),
+      { code: 'P2028' },
+    );
+    const work = vi.fn(async () => {
+      if (phase === 'expired-budget') clock.mockReturnValue(1101);
+      throw unavailable;
+    });
+    const transaction = vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => {
+      if (phase === 'acquisition') throw unavailable;
+      return callback({ $executeRawUnsafe: vi.fn() });
+    });
+    mocks.raw.mockReturnValue({ $transaction: transaction });
+    try {
+      await expect(reportSnapshot(work, 1100)).rejects.toMatchObject({
+        status: 503,
+        code: phase === 'expired-budget' ? 'analysis-query-timeout' : 'liekan-error',
+      });
+      expect(work).toHaveBeenCalledTimes(phase === 'acquisition' ? 0 : 1);
+    } finally {
+      clock.mockRestore();
+    }
+  },
+);
 describe('Liekan authenticated website boundary', () => {
   it('rechecks direct detail access without a cache result', async () => {
     mocks.auth.mockResolvedValue({ user: { id: 'reader', role: 'user' } });

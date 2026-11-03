@@ -25,9 +25,11 @@ import { HistoryRepairNotice } from './features/HistoryRepairNotice';
 import { ProductFooter } from './ProductFooter';
 import { WebsiteToolbar } from './WebsiteToolbar';
 import type { LiekanReport } from './types';
+import type { RobotsOverviewRange } from '@/lib/liekan/contracts/robots-overview';
+type ShellWebsite = LiekanReport['website'] & { robotsRange?: RobotsOverviewRange };
 
 const ShellContext = createContext<{
-  setWebsite: (website: LiekanReport['website']) => void;
+  setWebsite: (website: ShellWebsite) => void;
   setBotCount: (count: number) => void;
   websiteActionsTarget: HTMLDivElement;
 }>(null);
@@ -36,7 +38,7 @@ export function LiekanShell({ children, user }: { children: ReactNode; user: Fea
   const i18n = useLiekanI18n();
   const { pathname, websiteId, query } = useNavigation();
   const [width, setWidth] = useSidebarWidth();
-  const [website, setWebsite] = useState<LiekanReport['website']>(null);
+  const [website, setWebsite] = useState<ShellWebsite>(null);
   const [, setBotCount] = useState<number>(null);
   const isGeo = pathname.includes('/geo');
   const route = pathname.includes('/geo')
@@ -84,6 +86,8 @@ export function LiekanShell({ children, user }: { children: ReactNode; user: Fea
               <WebsiteToolbar
                 contextRef={setWebsiteContextTarget}
                 actionsRef={setWebsiteActionsTarget}
+                websiteId={site?.id}
+                range={currentWebsite?.robotsRange}
               />
             ) : (
               <div className={localeStyles.standalone}>

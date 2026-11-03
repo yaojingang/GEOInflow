@@ -1,3 +1,4 @@
+import { syncLegacyRobotsDraft } from './upstream/robots-draft';
 import { randomUUID } from 'node:crypto';
 import ipaddr from 'ipaddr.js';
 import { getPublishedCatalog } from './crawlers/published';
@@ -149,6 +150,7 @@ export async function saveSettings(id: string, body: any, identity?: WriteIdenti
   }
   const result = await transaction(async tx => {
     await lockWritableWebsite(tx, id, identity);
+    if (has('robots')) await syncLegacyRobotsDraft(tx, id, body.robots);
     const current = settingsFromRow((await tx.$queryRawUnsafe(settingsQuery, id))[0]);
     if (has('expectedRulesRevision') && body.expectedRulesRevision !== current.rulesRevision)
       throw new LiekanError('规则已被更新，请刷新后重试', 409);

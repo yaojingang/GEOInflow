@@ -66,7 +66,7 @@ mkdir "$temp/package"
 tar -xzf "$temp/agent-linux-$arch.tar.gz" -C "$temp/package" --no-same-owner
 [ -x "$temp/package/bin/node" ] && [ -f "$temp/package/agent.mjs" ] || fail '安装包不完整。'
 version=$($temp/package/bin/node -e 'process.stdout.write(process.versions.node)')
-[ "$version" = '22.23.3' ] || fail '运行时版本不匹配。'
+[ "$version" = '22.23.4' ] || fail '运行时版本不匹配。'
 mkdir -p /opt/liekan-agent/releases /etc/liekan-agent /var/lib/liekan-agent
 if [ "$mode" = install ];then
   source=$("$temp/package/bin/node" "$temp/package/agent.mjs" pair --url "$url" --code "$code" --log "$log" --directory /var/lib/liekan-agent) || fail '配对失败。请重新生成安装命令。'

@@ -922,6 +922,19 @@ function referenceChartOptions(id: string, chart: ChartData, locale: LiekanLocal
   }
 }
 
+/** Retain approved v5 geometry while using the patched chart runtime. */
+export function legacyChartOptions(option: any) {
+  const result = { richInheritPlainLabel: false, ...option };
+  for (const field of ['grid', 'xAxis', 'yAxis']) {
+    if (!option[field]) continue;
+    const defaults = field === 'grid' ? { outerBoundsMode: 'none' } : { nameMoveOverlap: false };
+    result[field] = Array.isArray(option[field])
+      ? option[field].map(entry => ({ ...defaults, ...entry }))
+      : { ...defaults, ...option[field] };
+  }
+  return result;
+}
+
 export function chartOptions(id: string, chart: ChartData, locale: LiekanLocale = 'zh-CN'): any {
   const crawlerLabel = (name: string, index: number) => {
     if (
@@ -950,5 +963,5 @@ export function chartOptions(id: string, chart: ChartData, locale: LiekanLocale 
   };
   const option = referenceChartOptions(id, displayChart, locale);
   if (id === 'a1') option.series = option.series.slice(0, chart.series.length);
-  return option;
+  return legacyChartOptions(option);
 }

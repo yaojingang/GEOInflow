@@ -952,10 +952,17 @@ describe.skipIf(!enabled)('history repair on an owned isolated PostgreSQL schema
   });
   it('keeps historical identity gaps unavailable in previews, days and export', async () => {
     const prepared = await finish(await scan());
-    expect(prepared.counts.beforePV).toBe('1');
+    // v5 PV counts qualified browsers. The observed legacy row retains missing identity evidence.
+    expect(prepared.counts.beforePV).toBe('0');
     expect(prepared.counts.beforeUV).toBeNull();
+    expect(prepared.preview.metricScope).toBe('qualified-browser');
     expect(prepared.preview.counts.beforeQualifiedUV).toBe('0');
     expect(prepared.preview.counts.beforeIdentityMissingPV).toBe('1');
+    const [observed] = await q<{ pv: string }[]>(
+      'SELECT count(*)::text AS pv FROM website_event WHERE website_id=$1::uuid AND event_type=1',
+      site,
+    );
+    expect(observed.pv).toBe('1');
     const detail = await getHistoryRepair(site, new URLSearchParams({ view: 'days' }), actor);
     expect(detail.days.items[0].beforeUV).toBeNull();
     expect(detail.days.items[0].beforeIdentityMissingPV).toBe('1');
@@ -977,7 +984,7 @@ describe.skipIf(!enabled)('history repair on an owned isolated PostgreSQL schema
     await execute(`UPDATE liekan_event_quality SET reasons=ARRAY['ua_bot'] WHERE event_id=$1::uuid`,first);
     await execute(`INSERT INTO liekan_collection_policy(website_id,mode,allowed_hostnames) VALUES($1::uuid,'standard',ARRAY['example.test'])`,site);
     const conflict = await event('2020-01-02Z');
-    await event('2020-01-03Z');
+    await event('2020-01-03Z', { classification: 'browser' });
     await proveFixtureIdentities();
     await execute(`UPDATE liekan_event_environment SET origin_hostname='other.test' WHERE event_id=$1::uuid`,conflict);
     await execute(`INSERT INTO liekan_traffic_exclusion(id,website_id,epoch,actor_id,state,base_revision,policy_revision,rule_version,window_end,received_cutoff,membership_digest,evidence,expires_at)

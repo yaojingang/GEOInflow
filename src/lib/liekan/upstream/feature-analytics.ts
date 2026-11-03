@@ -392,7 +392,7 @@ async function computeFeatureAnalytics(websiteId: string, p: any, filters: any) 
     };
   }
   const rows = await run(
-    `SELECT d.data_key AS name,d.string_value AS value,d.data_type AS "dataType",COUNT(DISTINCT s.session_id) AS sessions FROM session_data d JOIN selected s ON s.session_id=d.session_id WHERE d.website_id={{websiteId::uuid}} GROUP BY 1,2,3 ORDER BY sessions DESC,name,value LIMIT 100 OFFSET {{offset}}`,
+    `,property_visitors AS MATERIALIZED(SELECT DISTINCT session_id FROM selected),property_rows AS MATERIALIZED(SELECT data_key,string_value,data_type,session_id FROM session_data WHERE website_id={{websiteId::uuid}}) SELECT d.data_key AS name,d.string_value AS value,d.data_type AS "dataType",COUNT(DISTINCT d.session_id) AS sessions FROM property_rows d WHERE d.session_id IN(SELECT session_id FROM property_visitors) GROUP BY 1,2,3 ORDER BY sessions DESC,name,value LIMIT 100 OFFSET {{offset}}`,
     { offset: (p.page - 1) * 100 },
   );
   return { rows, page: p.page, pageSize: 100, more: rows.length === 100 };

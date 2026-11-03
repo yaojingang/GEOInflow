@@ -22,7 +22,7 @@ interface CacheContext {
   request?: Request;
   parameters?: Record<string, unknown>;
   versions?: Map<string, Promise<unknown>>;
-  reauthorize?: () => Promise<boolean>;
+  reauthorize?: (deadline?: number) => Promise<boolean>;
   prepared?: boolean;
   background?: boolean;
   workKind?: 'interactive' | 'preheat';
@@ -62,7 +62,7 @@ export function bindCacheRequest(
   request: Request,
   auth: any,
   parameters?: Record<string, unknown>,
-  reauthorize?: () => Promise<boolean>,
+  reauthorize?: (deadline?: number) => Promise<boolean>,
 ) {
   const context = contexts.getStore();
   if (!context) return;
@@ -154,7 +154,7 @@ export function analyticsWorkerContext<T>(
   work: () => Promise<T>,
   options?: {
     deadline?: number;
-    reauthorize?: () => Promise<boolean>;
+    reauthorize?: (deadline?: number) => Promise<boolean>;
     kind?: 'interactive' | 'preheat';
     refresh?: boolean;
   },
@@ -256,14 +256,19 @@ export async function withQueryCacheHeaders(
       .slice(0, 4)
       .map(({ ruleVersions, catalogVersions, identity, ...population }) => ({
         ...population,
-        identity: { ...identity, versions: identity.versions.slice(0, 4) },
+        identity: {
+          ...identity,
+          versions: identity.versions.slice(0, 4),
+          ...(identity.qualifiedVersions ? { qualifiedVersions: identity.qualifiedVersions.slice(0, 4) } : {}),
+        },
         ruleVersions: ruleVersions.slice(0, 4),
         catalogVersions: catalogVersions.slice(0, 4),
         versionSetsTruncated:
           population.versionSetsTruncated ||
           ruleVersions.length > 4 ||
           catalogVersions.length > 4 ||
-          identity.versions.length > 4,
+          identity.versions.length > 4 ||
+          (identity.qualifiedVersions?.length ?? 0) > 4,
       }));
     response.headers.set(
       'X-Liekan-Population',

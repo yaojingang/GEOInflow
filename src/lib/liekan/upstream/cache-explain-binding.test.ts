@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   heavyExplainBindingAllowed,
+  heavyExplainCoveragePassed,
   rememberHeavyExplainVersions,
 } from '../../../../scripts/liekan-cache-explain';
 import { ANALYSIS_ROLLUP_VERSION } from './analysis-rollups-model';
@@ -111,4 +112,12 @@ describe('same-snapshot metadata evidence registration', () => {
   it.each(['log', 'visit', 'all', 'UTC'])('permits the fixed rollup enum %s', value =>
     expect(heavyExplainBindingAllowed(value, allowed)).toBe(true),
   );
+});
+
+it('rejects an empty structured trend result in cache acceptance evidence', () => {
+  const functions = [{ name: 'trend', result: { rows: [], population: { identity: { status: 'unavailable' } } }, statements: [{ planId: 'plan' }] }];
+  const plans = [{ id: 'plan', plan: [{}] }];
+  expect(heavyExplainCoveragePassed(['trend'], functions as any, plans as any)).toBe(false);
+  functions[0].result.rows.push({ pageviews: 1 } as never);
+  expect(heavyExplainCoveragePassed(['trend'], functions as any, plans as any)).toBe(true);
 });

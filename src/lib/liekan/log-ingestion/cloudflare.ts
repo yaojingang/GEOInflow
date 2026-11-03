@@ -21,6 +21,7 @@ import { hostname } from './protocol';
 import { newToken, tokenHash, sealPlatformSecret, openPlatformSecret } from './secrets';
 import { enqueue, PROVIDER_QUEUE } from './queue';
 import { getLogCapabilities } from './capabilities';
+import { cloudflareRequest, cloudflareResponseError, cloudflareScopes } from './cloudflare-http';
 
 const CF_API = 'https://api.cloudflare.com/client/v4';
 const CF_AUTH = 'https://dash.cloudflare.com/oauth2';
@@ -56,6 +57,7 @@ function cookieValue(request: Request, id: string) {
 export async function beginCloudflare(websiteId: string, identity: WriteIdentity) {
   const capability = (await getLogCapabilities()).cloudflare;
   if (!capability.available) throw new LiekanError(capability.reason, 503);
+  const scope = cloudflareScopes();
   const state = newToken(),
     browser = newToken(),
     verifier = newToken(),
@@ -87,6 +89,7 @@ export async function beginCloudflare(websiteId: string, identity: WriteIdentity
     client_id: process.env.CLOUDFLARE_OAUTH_CLIENT_ID,
     redirect_uri: callbackUrl(),
     response_type: 'code',
+    scope,
     state,
     code_challenge: createHash('sha256').update(verifier).digest('base64url'),
     code_challenge_method: 'S256',
@@ -98,12 +101,12 @@ export async function beginCloudflare(websiteId: string, identity: WriteIdentity
   };
 }
 async function exchangeToken(parameters: Record<string, string>): Promise<Access> {
-  let response: Response;
-  try {
-    const basic = Buffer.from(
-      `${encodeURIComponent(process.env.CLOUDFLARE_OAUTH_CLIENT_ID)}:${encodeURIComponent(process.env.CLOUDFLARE_OAUTH_CLIENT_SECRET)}`,
-    ).toString('base64');
-    response = await fetch(`${CF_AUTH}/token`, {
+  const basic = Buffer.from(
+    `${encodeURIComponent(process.env.CLOUDFLARE_OAUTH_CLIENT_ID)}:${encodeURIComponent(process.env.CLOUDFLARE_OAUTH_CLIENT_SECRET)}`,
+  ).toString('base64');
+  const response = await cloudflareRequest(
+    `${CF_AUTH}/token`,
+    {
       method: 'POST',
       headers: {
         authorization: `Basic ${basic}`,
@@ -112,11 +115,9 @@ async function exchangeToken(parameters: Record<string, string>): Promise<Access
       body: new URLSearchParams(parameters),
       redirect: 'error',
       signal: AbortSignal.timeout(20000),
-    });
-  } catch {
-    throw new LiekanError('Cloudflare 授权服务暂时无法连接', 503);
-  }
-  if (!response.ok) throw new LiekanError('Cloudflare 授权已失效，请重新授权', 401);
+    },
+    'token',
+  );
   const data = await response.json();
   if (
     typeof data.access_token !== 'string' ||
@@ -142,9 +143,9 @@ async function revokeAccess(access: Access) {
     [access.accessToken, 'access_token'],
   ]) {
     if (!token) continue;
-    let response: Response;
-    try {
-      response = await fetch(`${CF_AUTH}/revoke`, {
+    await cloudflareRequest(
+      `${CF_AUTH}/revoke`,
+      {
         method: 'POST',
         headers: {
           authorization: `Basic ${basic}`,
@@ -153,11 +154,9 @@ async function revokeAccess(access: Access) {
         body: new URLSearchParams({ token, token_type_hint: hint }),
         redirect: 'error',
         signal: AbortSignal.timeout(20000),
-      });
-    } catch {
-      throw new LiekanError('Cloudflare 授权撤销暂时无法连接', 503);
-    }
-    if (!response.ok) throw new LiekanError('Cloudflare 授权撤销尚未完成', 503);
+      },
+      'revoke',
+    );
   }
 }
 export async function cloudflareApi<T = any>(
@@ -168,27 +167,20 @@ export async function cloudflareApi<T = any>(
 ): Promise<T> {
   if (!/^\/(zones|oauth)\//.test(path) || path.includes('..'))
     throw new LiekanError('供应商接口无效');
-  let response: Response;
-  try {
-    response = await fetch(`${CF_API}${path}`, {
+  const url = `${CF_API}${path}`;
+  const response = await cloudflareRequest(
+    url,
+    {
       method,
       headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
       ...(body ? { body: JSON.stringify(body) } : {}),
       redirect: 'error',
       signal: AbortSignal.timeout(20000),
-    });
-  } catch {
-    throw new LiekanError('Cloudflare 暂时无法连接', 503);
-  }
-  if (!response.ok)
-    throw new LiekanError(
-      response.status === 401 || response.status === 403
-        ? 'Cloudflare 权限不足或授权已失效'
-        : 'Cloudflare 日志配置暂时失败',
-      response.status === 401 || response.status === 403 ? 401 : 503,
-    );
+    },
+    'api',
+  );
   const data = await response.json();
-  if (!data.success) throw new LiekanError('Cloudflare 未接受日志配置，请检查权限和账户能力', 409);
+  if (!data.success) throw cloudflareResponseError(response, data, 'api', url);
   return data.result as T;
 }
 export async function matchingZones(access: Access, domain: string) {

@@ -35,7 +35,8 @@ export function languageHeaderGeometry() {
   if (control) {
     const selectedText = document.createElement('span');
     selectedText.setAttribute('aria-hidden', 'true');
-    selectedText.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;padding:0;margin:0';
+    selectedText.style.cssText =
+      'position:absolute;visibility:hidden;white-space:pre;padding:0;margin:0';
     selectedText.style.font = controlStyle.font;
     selectedText.style.letterSpacing = controlStyle.letterSpacing;
     selectedText.textContent = control.options[control.selectedIndex]?.text || '';
@@ -56,16 +57,33 @@ export function languageHeaderGeometry() {
         .map(element => ({
           label: element.textContent.trim(),
           rect: element.getBoundingClientRect(),
+          rail: element.closest('[data-toolbar-action-rail]'),
         }))
         .filter(control => control.rect.width > 0 && control.rect.height > 0)
     : [];
+  const scrollBounds = control => {
+    const rail = control.rail;
+    if (!rail || !groupRect || !['auto', 'scroll'].includes(getComputedStyle(rail).overflowX))
+      return null;
+    const rect = rail.getBoundingClientRect();
+    const left = control.rect.left - rect.left + rail.scrollLeft;
+    const right = control.rect.right - rect.left + rail.scrollLeft;
+    return rect.left >= groupRect.left - 1 &&
+      rect.right <= groupRect.right + 1 &&
+      left >= -1 &&
+      right <= rail.scrollWidth + 1
+      ? rect
+      : null;
+  };
   return {
     count: entries.length,
     visible: !!rect && rect.width > 0 && rect.height > 0,
     language: control?.value,
     languageTextWidth,
     languageTextSpace: control
-      ? control.clientWidth - parseFloat(controlStyle.paddingLeft) - parseFloat(controlStyle.paddingRight)
+      ? control.clientWidth -
+        parseFloat(controlStyle.paddingLeft) -
+        parseFloat(controlStyle.paddingRight)
       : undefined,
     left: rect?.left,
     right: rect?.right,
@@ -79,18 +97,28 @@ export function languageHeaderGeometry() {
     pickerNameScroll: pickerName?.scrollWidth,
     overlappingControls: picker
       ? controls
-          .filter(
-            ({ rect }) =>
-              rect.left < picker.right &&
-              rect.right > picker.left &&
+          .filter(control => {
+            const rect = control.rect,
+              rail = scrollBounds(control);
+            const left = rail ? Math.max(rect.left, rail.left) : rect.left;
+            const right = rail ? Math.min(rect.right, rail.right) : rect.right;
+            return (
+              right > left &&
+              left < picker.right &&
+              right > picker.left &&
               rect.top < picker.bottom &&
-              rect.bottom > picker.top,
-          )
+              rect.bottom > picker.top
+            );
+          })
           .map(control => control.label)
       : [],
     clippedControls: groupRect
       ? controls
-          .filter(({ rect }) => rect.left < groupRect.left - 1 || rect.right > groupRect.right + 1)
+          .filter(
+            control =>
+              !scrollBounds(control) &&
+              (control.rect.left < groupRect.left - 1 || control.rect.right > groupRect.right + 1),
+          )
           .map(control => control.label)
       : [],
     clippedModalContent: surfaceRect
@@ -514,7 +542,7 @@ export async function checkEnglishExperience({ browser, base, seed, token, parti
           { section: 'collection' },
           'wide',
         ],
-        ['website-settings', '管理蜘蛛白名单', '管理蜘蛛白名单', { section: 'collection' }],
+        ['website-settings', '管理蜘蛛', '管理蜘蛛', { section: 'collection' }],
         ['website-settings', '浏览流量质量', '浏览流量质量', { section: 'collection' }, 'wide'],
         ['website-settings', '转移网站', '转移网站所属空间', { section: 'danger' }],
         ['website-settings', '清空访问数据', '清空访问数据', { section: 'danger' }],

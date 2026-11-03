@@ -27,6 +27,8 @@ export function AccountTimezoneFields({
       <Select
         name="countryCode"
         label={i18n.text('国家或地区')}
+        aria-label={i18n.text('国家或地区')}
+        className="account-timezone-select"
         required
         value={country}
         options={[
@@ -51,6 +53,7 @@ export function AccountTimezoneFields({
         name="timezone"
         label={i18n.text('分析时区')}
         aria-label={i18n.text('分析时区')}
+        className="account-timezone-select"
         required
         value={zone}
         options={[

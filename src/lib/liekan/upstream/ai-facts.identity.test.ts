@@ -97,7 +97,9 @@ vi.mock('./server', () => ({
   },
 }));
 
+import { prepareAiPrompt } from '../ai/prompt';
 import { buildAiFactsContext } from './ai-facts';
+
 beforeEach(() => {
   fixture.current = 'partial';
   fixture.previous = 'complete';
@@ -125,6 +127,80 @@ async function goalFact() {
   return { context, row: goal.data.rows[0] };
 }
 describe('AI goal rates preserve identity availability', () => {
+  it.each([
+    ['zh-CN', false],
+    ['zh-CN', true],
+    ['en-US', false],
+    ['en-US', true],
+  ] as const)(
+    'fits a one-day %s analysis with structured=%s and real population metadata',
+    async (locale, structuredOutput) => {
+      const { context } = await goalFact();
+      const prepared = prepareAiPrompt({
+        context,
+        locale,
+        question: locale === 'zh-CN' ? '今天浏览如何' : 'How was traffic today?',
+        history: [],
+        structuredOutput,
+        connectionConfig: {
+          provider: 'custom',
+          protocol: 'openai-chat',
+          baseUrl: 'https://models.example.com/v1',
+          model: 'gpt-5.6-terra',
+        },
+      });
+      expect(prepared.inputBytes).toBeLessThanOrEqual(12697);
+      expect(prepared.contextSent.population).toEqual(context.population);
+      expect(prepared.contextSent.previousPopulation).toEqual(context.previousPopulation);
+      expect(prepared.contextSent.metrics).toEqual(context.metrics);
+      expect(prepared.contextSent.facts.map(fact => fact.id)).toEqual(
+        context.facts.map(fact => fact.id),
+      );
+    },
+  );
+  it('bounds observed version lists while retaining identity coverage and statistics', async () => {
+    const { context } = await goalFact();
+    for (const population of [context.population, context.previousPopulation]) {
+      population.identity.versions = Array.from(
+        { length: 32 },
+        (_, n) => `cookieless-trusted-input-v${n}`,
+      );
+      population.identity.qualifiedVersions = [...population.identity.versions];
+      population.ruleVersions = Array.from(
+        { length: 32 },
+        (_, n) => `traffic-quality-policy-test-v${n}`,
+      );
+      population.catalogVersions = Array.from(
+        { length: 32 },
+        (_, n) => `10000000-0000-4000-8000-${String(n).padStart(12, '0')}`,
+      );
+    }
+    const prepared = prepareAiPrompt({
+      context,
+      question: '今天浏览如何',
+      history: [],
+      connectionConfig: {
+        provider: 'custom',
+        protocol: 'openai-chat',
+        baseUrl: 'https://models.example.com/v1',
+        model: 'gpt-5.6-terra',
+      },
+    });
+    expect(prepared.inputBytes).toBeLessThanOrEqual(12697);
+    expect(prepared.contextSent.population.versionSetsTruncated).toBe(true);
+    for (const key of ['population', 'previousPopulation'] as const) {
+      expect(prepared.contextSent[key].identity).toMatchObject({
+        status: context[key].identity.status,
+        qualifiedPV: context[key].identity.qualifiedPV,
+        qualifiedVisitors: context[key].identity.qualifiedVisitors,
+        coverage: context[key].identity.coverage,
+      });
+      expect(context[key].identity.versions).toHaveLength(32);
+      expect(context[key].versionSetsTruncated).toBe(false);
+    }
+    expect(prepared.contextSent.metrics).toEqual(context.metrics);
+    expect(prepared.contextSent.facts).toEqual(context.facts);
+  });
   it.each([
     ['unavailable', 'complete'],
     ['partial', 'complete'],

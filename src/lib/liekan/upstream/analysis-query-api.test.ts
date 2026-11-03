@@ -8,19 +8,26 @@ const m = vi.hoisted(() => ({
   peek: vi.fn(),
   fast: vi.fn(),
   dispatch: vi.fn(),
+  process: vi.fn(),
   queue: vi.fn(),
+  refreshJob: vi.fn(),
 }));
 vi.mock('./crawler-maintenance', () => ({ authenticateCrawlerMaintenance: m.authenticate }));
 vi.mock('./server', () => ({ authorize: m.authorize }));
 vi.mock('../log-ingestion/queue', () => ({ getQueue: m.queue }));
 vi.mock('./analysis-queries', () => ({
   dispatchAnalysisQuery: m.dispatch,
+  processAnalysisQuery: m.process,
   requestAnalysisQuery: m.request,
   readAnalysisQuery: m.read,
 }));
-vi.mock('./dashboard-snapshots', () => ({ requestDashboardSnapshot: m.request }));
+vi.mock('./dashboard-snapshots', () => ({
+  requestDashboardSnapshot: m.request,
+  dashboardRefreshJobId: m.refreshJob,
+}));
 vi.mock('./page-report', () => ({ peekPageReport: m.peek }));
 vi.mock('./analysis-fast-read', () => ({ tryFastAnalysis: m.fast }));
+import * as viewers from './analysis-viewers';
 import {
   asyncAnalysisResponse,
   analysisJobResponse,
@@ -88,6 +95,83 @@ it('returns a published snapshot without running foreground aggregation', async 
   expect(response.headers.get('X-Liekan-Snapshot-State')).toBe('ready');
   expect(m.peek).not.toHaveBeenCalled();
   expect(m.fast).not.toHaveBeenCalled();
+  expect(m.dispatch).not.toHaveBeenCalled();
+});
+it('hands off a committed warm refresh while returning the published HTTP DTO', async () => {
+  const value = { meta: { canManage: false }, pageviews: 7 };
+  const published = {
+    ready: true,
+    value,
+    generatedAt: 1,
+    expiresAt: 2,
+    dataThrough: 1,
+    snapshotState: 'updating',
+  };
+  m.request.mockResolvedValue(published);
+  m.refreshJob.mockReturnValue(id);
+  const response = await asyncAnalysisResponse(request(), site, 'feature:page-report');
+  expect(response.status).toBe(200);
+  expect(m.refreshJob).toHaveBeenCalledWith(published);
+  expect(m.dispatch).toHaveBeenCalledWith(id, undefined);
+  expect(await response.json()).toEqual(value);
+  expect(JSON.stringify([...response.headers])).not.toContain(id);
+});
+it.each([false, true])(
+  'retains only a warm opaque refresh lease and preserves its response on retention failure: %s',
+  async fails => {
+    const viewer = '33333333-3333-4333-8333-333333333333';
+    const retain = vi
+      .spyOn(viewers, 'retainPublishedAnalysisViewer')
+      .mockImplementation(async () => {
+        expect(viewers.currentAnalysisViewer()).toBe(viewer);
+        if (fails) throw new Error('synthetic metadata unavailable');
+        return true;
+      });
+    const r = request();
+    r.headers.set('X-Liekan-View', viewer);
+    m.request.mockResolvedValue({
+      ready: true,
+      value: { pageviews: 7 },
+      generatedAt: 1,
+      expiresAt: 2,
+    });
+    m.refreshJob.mockReturnValue(id);
+    try {
+      const response = await asyncAnalysisResponse(r, site, 'feature:page-report');
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ pageviews: 7 });
+      expect(retain).toHaveBeenCalledWith(site, 'actor', id);
+      retain.mockClear();
+      m.refreshJob.mockReturnValue(undefined);
+      await asyncAnalysisResponse(r, site, 'feature:page-report');
+      expect(retain).not.toHaveBeenCalled();
+    } finally {
+      retain.mockRestore();
+    }
+  },
+);
+
+it('keeps a warm published response available when early handoff fails', async () => {
+  m.request.mockResolvedValue({
+    ready: true,
+    value: { pageviews: 7 },
+    generatedAt: 1,
+    expiresAt: 2,
+  });
+  m.refreshJob.mockReturnValue(id);
+  m.queue.mockRejectedValue(new Error('synthetic warm queue unavailable'));
+  const response = await asyncAnalysisResponse(request(), site, 'feature:page-report');
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ pageviews: 7 });
+  expect(m.queue).toHaveBeenCalledOnce();
+});
+it('rejects a warm read before requesting or handing off work when website authority fails', async () => {
+  m.authorize.mockRejectedValue(new Error('website access revoked'));
+  await expect(asyncAnalysisResponse(request(), site, 'feature:page-report')).rejects.toThrow(
+    'website access revoked',
+  );
+  expect(m.request).not.toHaveBeenCalled();
+  expect(m.dispatch).not.toHaveBeenCalled();
 });
 it('keeps a ready status separate from fetching the result and rejects malformed job IDs', async () => {
   m.read.mockResolvedValue({ ready: false, analysisJob: { id, status: 'ready' } });
@@ -97,6 +181,44 @@ it('keeps a ready status separate from fetching the result and rejects malformed
   });
   expect(m.read).toHaveBeenCalledTimes(1);
 });
+it.each([false, true])(
+  'returns retry guidance for a polling lock timeout, result=%s',
+  async result => {
+    const failure = {
+      code: 'P2010',
+      meta: {
+        driverAdapterError: { cause: { originalCode: '55P03', originalMessage: 'private query' } },
+      },
+    };
+    m.read.mockRejectedValue(failure);
+    const response = await analysisJobResponse(request(), site, id, result);
+    expect(response.status).toBe(503);
+    expect(response.headers.get('Retry-After')).toBe('3');
+    expect(response.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(await response.json()).toEqual({
+      error: {
+        status: 503,
+        code: 'analysis-read-busy',
+        message: '统计数据暂时不可读取，请稍后重试',
+      },
+    });
+    expect(m.request).not.toHaveBeenCalled();
+  },
+);
+it.each([{ code: '55P03' }, { meta: { code: '55P03' } }, { cause: { code: '55P03' } }])(
+  'recognizes supported PostgreSQL lock error envelopes: %j',
+  async failure => {
+    m.read.mockRejectedValue(failure);
+    expect((await analysisJobResponse(request(), site, id)).status).toBe(503);
+  },
+);
+it.each([{ status: 403 }, { code: '57014' }, { code: '23505' }, new Error('unknown failure')])(
+  'preserves non-lock failures: %j',
+  async failure => {
+    m.read.mockRejectedValue(failure);
+    await expect(analysisJobResponse(request(), site, id)).rejects.toBe(failure);
+  },
+);
 it('preserves link and pixel synchronous routing', () => {
   for (const eventType of [3, 4])
     expect(
@@ -147,26 +269,90 @@ it('retains the durable handle when immediate queue handoff is unavailable', asy
   expect((await response.json()).analysisJob.id).toBe(id);
 });
 
-it('returns a committed handle when queue setup is stalled and coalesces handoff retries', async () => {
-  vi.useFakeTimers();
-  let release: (value?: any) => void;
-  m.queue.mockImplementation(
-    () =>
-      new Promise(resolve => {
-        release = resolve;
-      }),
-  );
-  try {
-    const first = asyncAnalysisResponse(request(), site, 'feature:page-report');
-    await vi.advanceTimersByTimeAsync(151);
-    expect((await first).status).toBe(202);
-    const second = asyncAnalysisResponse(request(), site, 'feature:page-report');
-    await vi.advanceTimersByTimeAsync(151);
-    expect((await second).status).toBe(202);
-    expect(m.queue).toHaveBeenCalledTimes(1);
-  } finally {
-    release?.();
-    await vi.advanceTimersByTimeAsync(0);
-    vi.useRealTimers();
-  }
+it.each([false, true])(
+  'returns committed data when queue setup stalls and coalesces warm=%s handoffs',
+  async warm => {
+    vi.useFakeTimers();
+    if (warm) {
+      m.request.mockResolvedValue({
+        ready: true,
+        value: { pageviews: 7 },
+        generatedAt: 1,
+        expiresAt: 2,
+      });
+      m.refreshJob.mockReturnValue(id);
+    }
+    let release: (value?: any) => void;
+    m.queue.mockImplementation(
+      () =>
+        new Promise(resolve => {
+          release = resolve;
+        }),
+    );
+    try {
+      const first = asyncAnalysisResponse(request(), site, 'feature:page-report');
+      await vi.advanceTimersByTimeAsync(151);
+      expect((await first).status).toBe(warm ? 200 : 202);
+      const second = asyncAnalysisResponse(request(), site, 'feature:page-report');
+      await vi.advanceTimersByTimeAsync(151);
+      expect((await second).status).toBe(warm ? 200 : 202);
+      expect(m.queue).toHaveBeenCalledTimes(1);
+    } finally {
+      release?.();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  },
+);
+
+it('returns a newly published foreground report through the existing job result projection', async () => {
+  const r = request();
+  r.headers.set('X-Liekan-View', '33333333-3333-4333-8333-333333333333');
+  m.process.mockResolvedValue({ acquired: true, value: undefined });
+  m.read.mockResolvedValue({ ready: true, value: { pageviews: 7 }, generatedAt: 1, expiresAt: 2 });
+  const response = await asyncAnalysisResponse(r, site, 'feature:page-report');
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ pageviews: 7 });
+  expect(response.headers.get('X-Liekan-Read-Path')).toBe('foreground');
+  expect(m.process).toHaveBeenCalledWith(id, { firstPage: true });
+  expect(m.dispatch).not.toHaveBeenCalled();
+});
+it('hands off the same task when a bounded foreground read defers', async () => {
+  const r = request();
+  r.headers.set('X-Liekan-View', '33333333-3333-4333-8333-333333333333');
+  m.process.mockResolvedValue({ acquired: true, value: new Error('defer') });
+  expect((await asyncAnalysisResponse(r, site, 'feature:page-report')).status).toBe(202);
+  expect(m.dispatch).toHaveBeenCalledWith(id, undefined);
+  expect(m.read).not.toHaveBeenCalled();
+});
+it('rejects an invalid viewer identifier before registering any task', async () => {
+  const r = request();
+  r.headers.set('X-Liekan-View', 'invalid');
+  await expect(asyncAnalysisResponse(r, site, 'feature:page-report')).rejects.toMatchObject({
+    status: 400,
+  });
+  expect(m.request).not.toHaveBeenCalled();
+});
+
+
+it.each([['LIEKAN_ANALYTICS_BACKEND', 'clickhouse'], ['LIEKAN_WAREHOUSE_TRANSITION', 'true']])(
+  'keeps direct routing active with %s=%s',
+  (name, value) => {
+    vi.stubEnv(name, value);
+    expect(analysisAsyncRequested(request())).toBe(false);
+  },
+);
+
+it('authorizes old task handles before retiring them under ClickHouse authority', async () => {
+  vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+  await expect(analysisJobResponse(request(), site, id)).rejects.toMatchObject({
+    status: 410,
+    code: 'analysis-query-upgraded',
+  });
+  expect(m.authenticate).toHaveBeenCalledOnce();
+  expect(m.authorize).toHaveBeenCalledOnce();
+  expect(m.read).not.toHaveBeenCalled();
+  m.authorize.mockRejectedValue(new Error('website authority revoked'));
+  await expect(analysisJobResponse(request(), site, id)).rejects.toThrow('website authority revoked');
+  expect(m.read).not.toHaveBeenCalled();
 });

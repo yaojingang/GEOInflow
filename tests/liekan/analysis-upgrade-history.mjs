@@ -194,8 +194,10 @@ async function populationProof(client, schema, ids, history) {
     await client.query(`SET LOCAL search_path TO ${quote(schema)}`);
     await client.query('SELECT website_id FROM website WHERE website_id=$1 FOR UPDATE', [ids.site]);
     const { rows } = await client.query(
-      `SELECT event_id::text,liekan_browser AS browser,liekan_identity_available AS qualified
-       FROM liekan_geographic_website_event WHERE website_id=$1 ORDER BY created_at,event_id`,
+      `SELECT e.event_id::text,env.browser,coalesce(env.scope='browser' AND env.identity_available,false) AS qualified
+       FROM liekan_observed_browser_event e
+       LEFT JOIN liekan_event_environment env ON env.website_id=e.website_id AND env.event_id=e.event_id
+       WHERE e.website_id=$1 ORDER BY e.created_at,e.event_id`,
       [ids.site],
     );
     assert.equal(rows.length, 2);
@@ -203,6 +205,12 @@ async function populationProof(client, schema, ids, history) {
     assert.equal(rows[0].qualified, history === 'main42');
     assert.equal(rows[1].browser, null);
     assert.equal(rows[1].qualified, false);
+    const qualifiedIds = async () => (await client.query(
+      'SELECT event_id::text FROM liekan_geographic_website_event WHERE website_id=$1 ORDER BY created_at,event_id',
+      [ids.site],
+    )).rows.map(row => row.event_id);
+    assert.deepEqual(await qualifiedIds(), history === 'main42' ? [ids.events[0]] : []);
+
     const revision = async () =>
       (
         await client.query(
@@ -232,6 +240,7 @@ async function populationProof(client, schema, ids, history) {
       before.fingerprint,
       'Environment must dirty the covered visit',
     );
+    assert.deepEqual(await qualifiedIds(), history === 'main42' ? ids.events : [ids.events[1]]);
     const after = { revision: await revision(), fingerprint: await fingerprint() };
     await client.query('INSERT INTO liekan_traffic_governance(website_id,revision)VALUES($1,0)', [
       ids.site,

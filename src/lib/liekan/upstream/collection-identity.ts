@@ -2,8 +2,9 @@ import { conflictsWithCollectionHosts, type CollectionAdmission } from './collec
 import { uuid } from '@/lib/crypto';
 import type { IpEvidence } from '@/lib/ip';
 import type { CollectionQuality } from './collection-quality';
+import { CURRENT_BROWSER_IDENTITY_VERSION } from '../contracts/browser-population';
 
-export const COLLECTION_IDENTITY_VERSION = 'cookieless-trusted-input-v3';
+export const COLLECTION_IDENTITY_VERSION = CURRENT_BROWSER_IDENTITY_VERSION;
 export type CollectionIdentityScope =
   | 'browser'
   | 'browser_unresolved'
@@ -64,14 +65,14 @@ export function collectionIdentity(input: {
             : 'browser_unresolved';
   // Unresolved storage keys are never counted as qualified visitor identities.
   const ip = quality.source === 'browser' && !trusted ? '' : input.ip;
-  const values = [websiteId, ip, userAgent, salt, distinctId ?? ''];
+  const values = [scope, websiteId, ip ?? '', userAgent ?? '', salt, distinctId ?? ''];
   return {
     scope,
     available: scope === 'browser',
     version: COLLECTION_IDENTITY_VERSION,
     hostname: quality.hostname,
     classification: quality.classification,
-    sessionId: scope === 'browser' ? uuid(...values) : uuid('liekan-source-v2:', scope, ...values),
+    sessionId: uuid('liekan-collection-v4:', JSON.stringify(values)),
     browser: input.browser?.slice(0, 20) || null,
     os: input.os?.slice(0, 20) || null,
     device: input.device?.slice(0, 20) || null,

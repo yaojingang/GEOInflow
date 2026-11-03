@@ -14,8 +14,30 @@ import {
 } from '../../src/lib/liekan/warehouse/migration-archive';
 import { sealMigrationClone } from '../../src/lib/liekan/warehouse/migration-snapshot';
 import { MigrationSource } from '../../src/lib/liekan/warehouse/migration-source';
+import {
+  previousSourceFingerprint,
+  sourceFingerprint,
+} from '../../src/lib/liekan/warehouse/catalog';
 
 assert.equal(process.env.WAREHOUSE_SCHEMA_TEST, 'isolated-round2');
+const sourceSchema = process.env.WAREHOUSE_MIGRATION_SOURCE_SCHEMA ?? 'legacy056';
+assert.ok(['legacy056', 'main070'].includes(sourceSchema));
+const mainSourceMigrations = [
+  '057_storage_retention.sql',
+  '058_storage_physical_measurements.sql',
+  '059_completed_job_retention_guard.sql',
+  '060_completed_job_policy_ownership.sql',
+  '061_storage_candidate_queue_identity.sql',
+  '062_dashboard_attempt_fingerprint.sql',
+  '063_dashboard_import_dependencies.sql',
+  '064_dashboard_metadata_dependencies.sql',
+  '065_dashboard_semantic_metadata.sql',
+  '066_foreground_analysis_reads.sql',
+  '067_robots_management.sql',
+  '068_optional_analytics_engine.sql',
+  '069_report_fragments.sql',
+  '070_analytics_input_summary.sql',
+];
 const stamp = Date.now(),
   run = `warehouse_migration_${stamp}`,
   clone = `liekan_snapshot_test_${stamp}`;
@@ -48,6 +70,23 @@ try {
   await admin.query(`CREATE DATABASE "${run}" TEMPLATE liekan_ch_catalog_20261103`);
   await admin.query(`CREATE DATABASE "${clone}" TEMPLATE liekan_ch_catalog_20261103`);
   await fixture.connect();
+  if (sourceSchema === 'main070') {
+    for (const file of mainSourceMigrations) {
+      const sql = await readFile(`db/liekan/migrations/${file}`, 'utf8');
+      await fixture.query('BEGIN');
+      try {
+        await fixture.query(sql);
+        await fixture.query('INSERT INTO liekan_migration(name,checksum) VALUES($1,$2)', [
+          file,
+          createHash('sha256').update(sql).digest('hex'),
+        ]);
+        await fixture.query('COMMIT');
+      } catch (error) {
+        await fixture.query('ROLLBACK');
+        throw error;
+      }
+    }
+  }
   for (const file of (await readdir('db/liekan/migrations'))
     .filter(f => /^\d{3}_.*\.sql$/.test(f) && Number(f.slice(0, 3)) >= 57)
     .sort()) {
@@ -127,6 +166,15 @@ try {
     /warehouse-source-clone-is-immutable/,
   );
   await source.connect();
+  assert.equal(
+    sealed.descriptor.sourceFingerprint,
+    sourceSchema === 'main070' ? sourceFingerprint : previousSourceFingerprint,
+  );
+  assert.deepEqual(await source.inspect(), {
+    tables: sourceSchema === 'main070' ? 156 : 138,
+    errors: [],
+    compatible: true,
+  });
   assert.deepEqual(await source.sealedSnapshot(), sealed);
   cases.push({
     name: 'persistent clone binds archive/schema/boundary and rejects both update and truncate even on an already open privileged connection',
@@ -164,9 +212,42 @@ try {
   await chAdmin.command({ query: `CREATE DATABASE "${run}"` });
   await initializeWarehouse(ch);
   const pages = new MigrationPages(db, ch),
-    migration = await pages.register(sealed.descriptor.snapshotId, sealed.digest, { [site]: '0' });
+    migration = await pages.register(
+      sealed.descriptor.snapshotId,
+      sealed.digest,
+      { [site]: '0' },
+      undefined,
+      sealed.descriptor.sourceFingerprint,
+    );
   const runner = new MigrationRunner(db, ch, source),
     id = migration.migration_id;
+  assert.equal(
+    (
+      await pages.register(
+        sealed.descriptor.snapshotId,
+        sealed.digest,
+        { [site]: '0' },
+        id,
+        sealed.descriptor.sourceFingerprint,
+      )
+    ).migration_id,
+    id,
+  );
+  await assert.rejects(
+    () =>
+      pages.register(
+        sealed.descriptor.snapshotId,
+        sealed.digest,
+        { [site]: '0' },
+        id,
+        sourceSchema === 'main070' ? previousSourceFingerprint : sourceFingerprint,
+      ),
+    /warehouse-source-snapshot-changed/,
+  );
+  cases.push({
+    name: `${sourceSchema} sealed source resumes with its original contract and rejects switching to another accepted contract`,
+    status: 'pass',
+  });
   const originalInsert = ch.insert.bind(ch);
   let partial = false;
   ch.insert = (async (args: any) => {
@@ -294,7 +375,7 @@ try {
   ]);
   await writeFile(
     `.local/ch-implementation/${run}.json`,
-    JSON.stringify({ run, clone, cases, fullUpgradeValidated: false }, null, 2),
+    JSON.stringify({ run, clone, sourceSchema, cases, fullUpgradeValidated: false }, null, 2),
     { mode: 0o600 },
   );
   console.log(

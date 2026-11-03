@@ -6,9 +6,98 @@ import {
   dashboardWindow,
   defaultDashboardRange,
   dashboardWarmRanges,
+  canAdvanceDashboardClock,
 } from './dashboard-snapshot-model';
 import { analysisDigest, analysisQueryParameters } from './analysis-query-model';
 const now = +new Date('2026-10-24T10:07:30+08:00');
+it.each(['overview', 'human/overview', 'ai/overview', 'ai/bots', 'ai/pages', 'ai/preference'])(
+  'can advance unchanged %s facts within the same local day',
+  resource => {
+    const parameters = {
+      resource,
+      startAt: +new Date('2026-10-23T00:00:00+08:00'),
+      endAt: +new Date('2026-10-25T00:00:00+08:00'),
+      timezone: 'Asia/Shanghai',
+      ...(resource.startsWith('ai/') ? { crawlerMetricsVersion: 1 } : {}),
+    };
+    expect(canAdvanceDashboardClock('feature:page-report', parameters, now, now + 30000)).toBe(
+      true,
+    );
+    expect(
+      canAdvanceDashboardClock(
+        'feature:page-report',
+        parameters,
+        now,
+        +new Date('2026-10-25T00:00:00+08:00'),
+      ),
+    ).toBe(false);
+    expect(canAdvanceDashboardClock('native:stats', parameters, now, now + 30000)).toBe(false);
+  },
+);
+it.each(['ai/overview', 'ai/bots'])(
+  'retains %s daily averages at non-midnight elapsed-day boundaries',
+  resource => {
+    const parameters = {
+      resource,
+      startAt: now - 86400000 + 15000,
+      endAt: now + 3600000,
+      timezone: 'Asia/Shanghai',
+      crawlerMetricsVersion: 1,
+    };
+    expect(canAdvanceDashboardClock('feature:page-report', parameters, now, now + 30000)).toBe(
+      false,
+    );
+    expect(canAdvanceDashboardClock('feature:page-report', parameters, now, now + 10000)).toBe(
+      true,
+    );
+  },
+);
+it('preserves fixed AI ends and unknown resources when considering clock advancement', () => {
+  for (const resource of ['ai/overview', 'ai/bots', 'ai/pages', 'ai/preference', 'human/sources'])
+    expect(
+      canAdvanceDashboardClock(
+        'feature:page-report',
+        {
+          resource,
+          startAt: now - 86400000,
+          endAt: now - 1,
+          timezone: 'UTC',
+          crawlerMetricsVersion: 1,
+        },
+        now,
+        now + 30000,
+      ),
+    ).toBe(false);
+});
+it.each(['ai/overview', 'ai/bots', 'ai/pages', 'ai/preference'])(
+  'keeps legacy inclusive %s outside no-input reuse',
+  resource => {
+    expect(
+      canAdvanceDashboardClock(
+        'feature:page-report',
+        {
+          resource,
+          startAt: +new Date('2026-10-23T00:00:00Z'),
+          endAt: now + 3600000,
+          timezone: 'UTC',
+        },
+        now,
+        now + 30000,
+      ),
+    ).toBe(false);
+  },
+);
+it('keeps natural-day averages across a 23-hour DST day', () => {
+  const parameters = {
+    resource: 'ai/overview',
+    startAt: +new Date('2026-03-08T05:00:00Z'),
+    endAt: +new Date('2026-03-10T04:00:00Z'),
+    timezone: 'America/New_York',
+    crawlerMetricsVersion: 1,
+  };
+  const at = +new Date('2026-03-09T16:00:00Z');
+  expect(canAdvanceDashboardClock('feature:page-report', parameters, at, at + 30000)).toBe(true);
+});
 it.each([
   ['UTC', '2026-10-01T00:00Z', '2026-10-25T08:55:14.457Z'],
   ['Asia/Shanghai', '2026-09-30T16:00Z', '2026-10-25T08:55:14.457Z'],
@@ -198,7 +287,6 @@ it.each(['Asia/Shanghai', 'America/New_York', 'UTC'])(
         const expected = featureDateRange(dateRange, timezone);
         expect(ranges[i]).toEqual({ startAt: expected.startAt, endAt: expected.endAt });
       }
-
     }
   },
 );

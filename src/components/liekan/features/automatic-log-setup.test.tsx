@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { AutomaticLogSetup } from './AutomaticLogSetup';
+import { LiekanLocaleContext } from '@/lib/liekan/i18n/client';
 const mocks = vi.hoisted(() => ({
   api: { get: vi.fn(), post: vi.fn(), put: vi.fn(), del: vi.fn() },
   notify: vi.fn(),
@@ -13,6 +14,42 @@ vi.mock('./context', () => ({ useFeature: () => mocks }));
 const site = '5b4c0de0-6c47-5b51-8f53-11e5e8c79001';
 const refresh = vi.fn().mockResolvedValue({});
 const status: any = { capabilities: { server: true, cloudflare: true }, sources: [] };
+it.each([
+  ['zh-CN', 'provider-not-entitled', /尚未启用.*Logpush/],
+  ['en-US', 'provider-not-entitled', /has not enabled.*Logpush/],
+  ['zh-CN', 'provider-permission-denied', /缺少日志管理权限/],
+  ['en-US', 'provider-permission-denied', /missing log management permissions/],
+] as const)(
+  'explains %s %s without misleading authorization-expired advice',
+  (locale, errorCode, message) => {
+    render(
+      <LiekanLocaleContext.Provider value={locale}>
+        <AutomaticLogSetup
+          websiteId={site}
+          method="cloudflare"
+          manage
+          refresh={refresh}
+          status={{
+            ...status,
+            sources: [
+              {
+                id: 'source',
+                kind: 'cloudflare',
+                domain: 'example.com',
+                state: 'paused',
+                primary: false,
+                errorCode,
+                health: {},
+              },
+            ],
+          }}
+        />
+      </LiekanLocaleContext.Provider>,
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(message);
+    expect(screen.getByRole('alert')).not.toHaveTextContent('授权或网站配置已变更');
+  },
+);
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.query = {};

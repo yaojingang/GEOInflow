@@ -314,7 +314,7 @@ describe.skipIf(!enabled)(
         )[0].definition;
       const before = { journal: await journal(), facts: await facts(), view: await view() };
       const original = before.journal.find(row => row.name === migration);
-      expect(before.journal).toHaveLength(57);
+      expect(before.journal.map(row => row.name)).toEqual(Object.keys(JSON.parse(await readFile('config/liekan/migrations.json', 'utf8'))).sort());
       expect(original.checksum).toBe(checksum);
       expect(before.facts.rows).toBe(1);
       const retained = before.journal.filter(row => row.name !== migration);
@@ -406,7 +406,7 @@ describe.skipIf(!enabled)(
         expect(resumed.code).toBe(0);
         expect(resumed.stdout).toContain(`Liekan migration applied: ${migration}`);
         const applied = await journal();
-        expect(applied).toHaveLength(57);
+        expect(applied).toHaveLength(before.journal.length);
         expect(applied.filter(row => row.name !== migration)).toEqual(retained);
         expect(applied.find(row => row.name === migration).checksum).toBe(checksum);
         const repeated = await start('idempotent').done;

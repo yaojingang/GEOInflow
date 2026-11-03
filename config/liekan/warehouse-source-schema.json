@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "sourceMigration": "056_qualified_browser_metrics.sql",
+  "version": 2,
+  "sourceMigration": "070_analytics_input_summary.sql",
   "tables": [
     {
       "name": "_prisma_migrations",
@@ -1402,6 +1402,11 @@
           "name": "updated_at",
           "type": "timestamp with time zone",
           "nullable": false
+        },
+        {
+          "name": "gc_started_at",
+          "type": "timestamp with time zone",
+          "nullable": true
         }
       ],
       "transition": "Keep source untouched until every consumer is cut over; no historical copy of disposable derived data."
@@ -1873,6 +1878,11 @@
           "name": "updated_at",
           "type": "timestamp with time zone",
           "nullable": false
+        },
+        {
+          "name": "fast_attempted_at",
+          "type": "timestamp with time zone",
+          "nullable": true
         }
       ],
       "transition": "Preserve referenced audit/business results; expire temporary query handles explicitly. New long results use streaming chunks."
@@ -1896,9 +1906,68 @@
           "name": "joined_at",
           "type": "timestamp with time zone",
           "nullable": false
+        },
+        {
+          "name": "managed",
+          "type": "boolean",
+          "nullable": false
         }
       ],
       "transition": "Preserve referenced result delivery leases until consumer expiry; never copy an unusable old handle as ready."
+    },
+    {
+      "name": "liekan_analysis_query_viewer",
+      "ownership": "postgres",
+      "primaryKey": ["job_id", "actor_id", "viewer_id"],
+      "columns": [
+        {
+          "name": "job_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "actor_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "viewer_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "lease_until",
+          "type": "timestamp with time zone",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "liekan_analysis_read_lease",
+      "ownership": "postgres",
+      "primaryKey": ["slot"],
+      "columns": [
+        {
+          "name": "slot",
+          "type": "smallint",
+          "nullable": false
+        },
+        {
+          "name": "token",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "epoch",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "lease_until",
+          "type": "timestamp with time zone",
+          "nullable": true
+        }
+      ]
     },
     {
       "name": "liekan_analysis_site",
@@ -2107,6 +2176,525 @@
         {
           "name": "slot",
           "type": "smallint",
+          "nullable": false
+        }
+      ],
+      "transition": "Keep source untouched until every consumer is cut over; no historical copy of disposable derived data."
+    },
+    {
+      "name": "liekan_analytics_engine",
+      "ownership": "postgres",
+      "primaryKey": ["id"],
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "installation_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "enabled",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "syncing",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "capture",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "epoch",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "actor_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "connection_hash",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "checked_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "version",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "gc_cursor",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "maintenance_turn",
+          "type": "smallint",
+          "nullable": false
+        },
+        {
+          "name": "healthy",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "worker_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "error_code",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "locale",
+          "type": "text",
+          "nullable": false
+        }
+      ],
+      "transition": "Preserve legacy optional-engine control, publication and pending cleanup evidence in PostgreSQL; never resume its fact copy under warehouse authority."
+    },
+    {
+      "name": "liekan_analytics_engine_dirty",
+      "ownership": "postgres",
+      "primaryKey": ["website_id", "bucket", "shard"],
+      "columns": [
+        {
+          "name": "website_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "bucket",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "shard",
+          "type": "smallint",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "pending",
+          "type": "boolean",
+          "nullable": false
+        }
+      ],
+      "transition": "Preserve legacy optional-engine control, publication and pending cleanup evidence in PostgreSQL; never resume its fact copy under warehouse authority."
+    },
+    {
+      "name": "liekan_analytics_engine_generation",
+      "ownership": "postgres",
+      "primaryKey": ["id"],
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "website_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "retired_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        }
+      ],
+      "transition": "Preserve legacy optional-engine control, publication and pending cleanup evidence in PostgreSQL; never resume its fact copy under warehouse authority."
+    },
+    {
+      "name": "liekan_analytics_engine_operation",
+      "ownership": "postgres",
+      "primaryKey": ["request_id"],
+      "columns": [
+        {
+          "name": "request_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "actor_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "request_hash",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "action",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "locale",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        }
+      ],
+      "transition": "Preserve legacy optional-engine control, publication and pending cleanup evidence in PostgreSQL; never resume its fact copy under warehouse authority."
+    },
+    {
+      "name": "liekan_analytics_engine_site",
+      "ownership": "postgres",
+      "primaryKey": ["website_id"],
+      "columns": [
+        {
+          "name": "website_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "epoch",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "history_cursor",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "history_start",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "history_end",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "discovered_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "purge_token",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "purge_until",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "seen_versions",
+          "type": "jsonb",
+          "nullable": true
+        },
+        {
+          "name": "control_epoch",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "served_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "targets",
+          "type": "text[]",
+          "nullable": false
+        },
+        {
+          "name": "pending_targets",
+          "type": "text[]",
+          "nullable": false
+        },
+        {
+          "name": "sweep_targets",
+          "type": "text[]",
+          "nullable": false
+        },
+        {
+          "name": "purge_through",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "purge_checked_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "purge_pending",
+          "type": "boolean",
+          "nullable": false
+        }
+      ],
+      "transition": "Preserve legacy optional-engine control, publication and pending cleanup evidence in PostgreSQL; never resume its fact copy under warehouse authority."
+    },
+    {
+      "name": "liekan_analytics_engine_unit",
+      "ownership": "postgres",
+      "primaryKey": ["website_id", "bucket"],
+      "columns": [
+        {
+          "name": "website_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "bucket",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "generation",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "active_epoch",
+          "type": "bigint",
+          "nullable": true
+        },
+        {
+          "name": "versions",
+          "type": "jsonb",
+          "nullable": true
+        },
+        {
+          "name": "fingerprint",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "row_count",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "checksum",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "published_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "verified_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "candidate",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "candidate_versions",
+          "type": "jsonb",
+          "nullable": true
+        },
+        {
+          "name": "candidate_fingerprint",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "candidate_epoch",
+          "type": "bigint",
+          "nullable": true
+        },
+        {
+          "name": "candidate_control_revision",
+          "type": "bigint",
+          "nullable": true
+        },
+        {
+          "name": "candidate_checksum",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "cursor_time",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "cursor_id",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "copied",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "chunk",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "lease_token",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "lease_until",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "attempts",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "retry_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "error_code",
+          "type": "text",
+          "nullable": true
+        }
+      ],
+      "transition": "Preserve legacy optional-engine control, publication and pending cleanup evidence in PostgreSQL; never resume its fact copy under warehouse authority."
+    },
+    {
+      "name": "liekan_analytics_input_state",
+      "ownership": "retire",
+      "primaryKey": ["website_id", "epoch"],
+      "columns": [
+        {
+          "name": "website_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "epoch",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "generation",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "ready",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "source",
+          "type": "smallint",
+          "nullable": false
+        },
+        {
+          "name": "cursor_family",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "cursor_bucket",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "cursor_shard",
+          "type": "smallint",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        }
+      ],
+      "transition": "Keep source untouched until every consumer is cut over; no historical copy of disposable derived data."
+    },
+    {
+      "name": "liekan_analytics_input_summary",
+      "ownership": "retire",
+      "primaryKey": ["website_id", "epoch", "source", "family", "day", "shard"],
+      "columns": [
+        {
+          "name": "website_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "epoch",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "source",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "family",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "day",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "shard",
+          "type": "smallint",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "bigint",
           "nullable": false
         }
       ],
@@ -4333,6 +4921,11 @@
           "name": "error_code",
           "type": "text",
           "nullable": true
+        },
+        {
+          "name": "attempt_fingerprint",
+          "type": "text",
+          "nullable": true
         }
       ],
       "transition": "Keep source untouched until every consumer is cut over; no historical copy of disposable derived data."
@@ -6385,6 +6978,385 @@
       "transition": "Keep the old queue identity for transition drain; warehouse queue installation has a separate broker topic identity."
     },
     {
+      "name": "liekan_report_fragment",
+      "ownership": "retire",
+      "primaryKey": ["website_id", "query_key"],
+      "columns": [
+        {
+          "name": "website_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "query_key",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "epoch",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "namespace",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "fingerprint",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "dependency_end",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "result",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "result_bytes",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "generated_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "last_read_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        }
+      ],
+      "transition": "Keep source untouched until every consumer is cut over; no historical copy of disposable derived data."
+    },
+    {
+      "name": "liekan_robots_deployment",
+      "ownership": "postgres",
+      "primaryKey": ["id"],
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "website_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "actor_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "agent_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "context",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "hostname",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "expected_hash",
+          "type": "character varying(64)",
+          "nullable": false
+        },
+        {
+          "name": "target_hash",
+          "type": "character varying(64)",
+          "nullable": false
+        },
+        {
+          "name": "before_content",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "content",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "rollback_of",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "lease_until",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "applied_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "verify_after",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "verify_deadline",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "verified_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "error_code",
+          "type": "text",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "name": "liekan_robots_snapshot",
+      "ownership": "postgres",
+      "primaryKey": ["id"],
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "website_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "content",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "hostname",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "status",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "digest",
+          "type": "character varying(64)",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "liekan_robots_state",
+      "ownership": "postgres",
+      "primaryKey": ["website_id"],
+      "columns": [
+        {
+          "name": "website_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "draft",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "monitor",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "interval_minutes",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "monitor_actor",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "context",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "hostname",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "next_check",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "check_lease",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "checking_until",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "observed_content",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "observed_hostname",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "observed_status",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "observed_hash",
+          "type": "character varying(64)",
+          "nullable": true
+        },
+        {
+          "name": "checked_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "last_read_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "last_error",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "change_pending",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "agent_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "agent_enabled",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "credential_hash",
+          "type": "character varying(64)",
+          "nullable": true
+        },
+        {
+          "name": "agent_actor",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "agent_context",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "agent_seen_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "agent_content",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "agent_hash",
+          "type": "character varying(64)",
+          "nullable": true
+        },
+        {
+          "name": "target_path",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "pair_hash",
+          "type": "character varying(64)",
+          "nullable": true
+        },
+        {
+          "name": "pair_expires",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "pair_actor",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "pair_context",
+          "type": "text",
+          "nullable": true
+        }
+      ]
+    },
+    {
       "name": "liekan_session_data_source",
       "ownership": "clickhouse",
       "primaryKey": ["website_id", "session_id", "data_key"],
@@ -6584,6 +7556,269 @@
           "name": "rules_migration_snapshot",
           "type": "jsonb",
           "nullable": true
+        }
+      ]
+    },
+    {
+      "name": "liekan_storage_candidate",
+      "ownership": "postgres",
+      "primaryKey": ["run_id", "kind", "queue_name", "record_id"],
+      "columns": [
+        {
+          "name": "run_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "record_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "queue_name",
+          "type": "text",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "liekan_storage_cleanup",
+      "ownership": "postgres",
+      "primaryKey": ["id"],
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "scope_key",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "website_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "actor_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "locale",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "policy_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "epoch",
+          "type": "bigint",
+          "nullable": true
+        },
+        {
+          "name": "ownership",
+          "type": "jsonb",
+          "nullable": true
+        },
+        {
+          "name": "conditions",
+          "type": "jsonb",
+          "nullable": false
+        },
+        {
+          "name": "request_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "request_hash",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "candidate_count",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "protected_count",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "estimated_bytes",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "rows_deleted",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "generations_deleted",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "jobs_deleted",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "released_bytes",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "started_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "completed_at",
+          "type": "timestamp with time zone",
+          "nullable": true
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "error_code",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "physical_bytes_before",
+          "type": "bigint",
+          "nullable": true
+        },
+        {
+          "name": "physical_bytes_after",
+          "type": "bigint",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "name": "liekan_storage_operation",
+      "ownership": "postgres",
+      "primaryKey": ["request_id"],
+      "columns": [
+        {
+          "name": "request_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "scope_key",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "actor_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "action",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "request_hash",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "response",
+          "type": "jsonb",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "liekan_storage_policy",
+      "ownership": "postgres",
+      "primaryKey": ["scope_key"],
+      "columns": [
+        {
+          "name": "scope_key",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "website_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "actor_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "settings",
+          "type": "jsonb",
+          "nullable": false
+        },
+        {
+          "name": "next_check_at",
+          "type": "timestamp with time zone",
+          "nullable": false
+        },
+        {
+          "name": "last_daily",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "nullable": false
         }
       ]
     },
@@ -7827,5 +9062,36 @@
         }
       ]
     }
-  ]
+  ],
+  "previousSchema": {
+    "version": 1,
+    "sourceMigration": "056_qualified_browser_metrics.sql",
+    "fingerprint": "02c662582ce25d5e208476327961fdf4920ff76e9819aea8f55c0f3ed22c9458",
+    "absentTables": [
+      "liekan_storage_policy",
+      "liekan_storage_cleanup",
+      "liekan_storage_candidate",
+      "liekan_storage_operation",
+      "liekan_analysis_read_lease",
+      "liekan_analysis_query_viewer",
+      "liekan_robots_state",
+      "liekan_robots_snapshot",
+      "liekan_robots_deployment",
+      "liekan_analytics_engine",
+      "liekan_analytics_engine_site",
+      "liekan_analytics_engine_dirty",
+      "liekan_analytics_engine_unit",
+      "liekan_analytics_engine_generation",
+      "liekan_analytics_engine_operation",
+      "liekan_report_fragment",
+      "liekan_analytics_input_summary",
+      "liekan_analytics_input_state"
+    ],
+    "absentColumns": {
+      "liekan_analysis_generation": ["gc_started_at"],
+      "liekan_dashboard_snapshot": ["attempt_fingerprint"],
+      "liekan_analysis_query": ["fast_attempted_at"],
+      "liekan_analysis_query_consumer": ["managed"]
+    }
+  }
 }

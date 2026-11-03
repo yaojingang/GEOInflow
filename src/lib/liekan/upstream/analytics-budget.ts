@@ -11,8 +11,9 @@ export const AnalyticsUnavailable = processSingleton(
         message = '统计正在更新，请稍后重试',
         public retryAfter = 5,
         status = 503,
+        code = 'liekan-error',
       ) {
-        super(message, status);
+        super(message, status, code);
       }
     },
 );
@@ -72,7 +73,7 @@ export const analyticsGate = processSingleton(
 );
 const dashboardGate = processSingleton(
   'analytics-dashboard-computation-gate',
-  () => new AnalyticsGate(1),
+  () => new AnalyticsGate(2),
 );
 
 /** Match the database permits with bounded process-local computation slots. */

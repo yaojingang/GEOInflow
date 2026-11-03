@@ -124,11 +124,7 @@ export const pageReportParts = {
   },
 } as const;
 
-const dashboardSnapshotSchema = z.object({
-  dataThrough: z.number(),
-  state: z.enum(['ready', 'updating']),
-  intervalMs: z.number(),
-});
+const dashboardSnapshotSchema = liekanReportSchema.shape.meta.shape.snapshot.unwrap();
 export const pageReportSchema = liekanReportSchema.extend({
   resource: reportQuery.shape.resource,
   charts: z.record(z.string(), liekanReportSchema.shape.charts.shape.d1),

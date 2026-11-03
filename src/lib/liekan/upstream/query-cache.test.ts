@@ -1,5 +1,8 @@
+import { getPublishedCatalog } from '../crawlers/published';
+import { geographyVersion } from '../contracts/geography';
+import { GEOGRAPHY_ANCHOR_VERSION } from '../geography/evidence';
 import { describe, expect, it, vi } from 'vitest';
-import { analyticsCacheKey, QueryCache } from './query-cache';
+import { analyticsCacheKey, analyticsInfrastructureKey, QueryCache } from './query-cache';
 import { Decimal } from '@prisma/client/runtime/client';
 
 describe('derived statistics cache', () => {
@@ -140,4 +143,19 @@ describe('derived statistics cache', () => {
     await old;
     expect((await cache.read('a', 1000, ['site'], async () => 3)).value).toBe(2);
   });
+});
+
+it('never restores results cached before the current metric semantics', async () => {
+  const namespace = 'page-report-v10';
+  const input = { websiteId: 'site', startAt: 0, endAt: 1000 };
+  const legacyKey = analyticsInfrastructureKey(
+    `${namespace}:${getPublishedCatalog()?.version || 'bundled'}:${geographyVersion}:${GEOGRAPHY_ANCHOR_VERSION}`,
+    input,
+  );
+  const cache = new QueryCache();
+  await cache.read(legacyKey, 30000, [], async () => ({ pv: 0 }));
+  const load = vi.fn(async () => ({ pv: null }));
+  const actual = await cache.read(analyticsCacheKey(namespace, input), 30000, [], load);
+  expect(actual.value.pv).toBeNull();
+  expect(load).toHaveBeenCalledOnce();
 });

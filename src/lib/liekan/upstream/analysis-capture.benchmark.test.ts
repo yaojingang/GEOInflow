@@ -600,11 +600,12 @@ it.skipIf(!enabled)(
           arm: 0,
           capture: false,
           scope: fixtures[4].website,
-          online: 20,
+          online: 10,
           batch: 1,
           calibration: true,
         });
-        for (const candidate of [{ online: 20, batch: 1 }]) {
+        // The disabled baseline must sustain the same offered work used by all four arms.
+        for (const candidate of [{ online: 10, batch: 1 }]) {
           const calibration = await paced(
             fixtures[4],
             candidate.online,

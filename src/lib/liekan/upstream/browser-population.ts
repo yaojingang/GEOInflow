@@ -56,7 +56,7 @@ export function populationFromRow(row: any, range: BrowserPopulation['range']): 
     reliable = Number(row.qualifiedEvents);
   const eligiblePV = Number(row.eligiblePV),
     qualifiedPV = Number(row.qualifiedPV);
-  const sets = [row.identityVersions || [], row.ruleVersions || [], row.catalogVersions || []];
+  const sets = [row.identityVersions || [], row.ruleVersions || [], row.catalogVersions || [], row.qualifiedIdentityVersions || []];
   return {
     populationVersion: TRAFFIC_POLICY_VERSION,
     ...(row.metricScope === 'qualified-browser' && row.resourceKind === 'website'
@@ -97,6 +97,7 @@ export function populationFromRow(row: any, range: BrowserPopulation['range']): 
       qualifiedVisitors: Number(row.qualifiedVisitors),
       coverage: eligiblePV ? qualifiedPV / eligiblePV : null,
       versions: sets[0].slice(0, versionLimit),
+      qualifiedVersions: sets[3].slice(0, versionLimit),
     },
     ruleVersions: sets[1].slice(0, versionLimit),
     catalogVersions: sets[2].slice(0, versionLimit),
@@ -196,6 +197,7 @@ export async function readBrowserPopulation(
       LEFT JOIN liekan_event_environment env ON env.website_id=e.website_id AND env.event_id=e.event_id
       LEFT JOIN liekan_reporting_event_quality q ON q.website_id=e.website_id AND q.event_id=e.event_id
       LEFT JOIN liekan_browser_identity qualified ON qualified.website_id=e.website_id AND qualified.event_id=e.event_id
+        AND EXISTS(SELECT 1 FROM session present WHERE present.session_id=e.session_id AND present.website_id=e.website_id)
       WHERE e.website_id=$1::uuid AND ${options.halfOpen ? 'e.created_at >= $2::timestamptz AND e.created_at < $3::timestamptz' : 'e.created_at BETWEEN $2::timestamptz AND $3::timestamptz'}
     ) SELECT
       ${browserPopulationMetadataSql},'qualified-browser' AS "metricScope",
@@ -204,6 +206,7 @@ export async function readBrowserPopulation(
       COUNT(*) FILTER(WHERE event_type IN(1,3,4) AND liekan_identity_available)::float8 AS "qualifiedPV",
       COUNT(DISTINCT session_id) FILTER(WHERE event_type IN(1,3,4) AND liekan_identity_available)::float8 AS "qualifiedVisitors",
       ARRAY(SELECT DISTINCT identity_version FROM population WHERE identity_version IS NOT NULL ORDER BY 1 LIMIT 33) AS "identityVersions",
+      ARRAY(SELECT DISTINCT identity_version FROM population WHERE identity_version IS NOT NULL AND liekan_identity_available AND event_type IN(1,3,4) ORDER BY 1 LIMIT 33) AS "qualifiedIdentityVersions",
       ARRAY(SELECT DISTINCT rule_version FROM population WHERE rule_version IS NOT NULL ORDER BY 1 LIMIT 33) AS "ruleVersions",
       ARRAY(SELECT DISTINCT catalog_version::text FROM population WHERE catalog_version IS NOT NULL ORDER BY 1 LIMIT 33) AS "catalogVersions"
       FROM population`,

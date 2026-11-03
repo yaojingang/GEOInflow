@@ -27,6 +27,8 @@ describe('normalized preheating parameters', () => {
         JSON.stringify([...stored.slice(0, 7), 'unknown-calendar-version']),
       ),
     ).toBeUndefined();
+    expect(analyticsHotCatalogVersion(JSON.stringify([...stored.slice(0, 7), 'unknown-read-version', stored[8]]))).toBeUndefined();
+    expect(analyticsHotCatalogVersion(JSON.stringify([...stored.slice(0, 8), 'unknown-calendar-version']))).toBeUndefined();
     expect(stored[1]).toBe('history-repair-v1.2');
     expect(
       analyticsHotCatalogVersion(

@@ -16,6 +16,7 @@ import { downloadFile } from '../data';
 import { pageLink } from '../PageLink';
 import { Badge, Button, Definition, LiekanDialog, Notice, Select, Table, Tabs } from './ui';
 import { CrawlerPoliciesPanel } from './CrawlerPoliciesPanel';
+import { RobotsManagementPanel } from './RobotsManagementPanel';
 
 const labels = {
   training: 'AI 训练',
@@ -109,6 +110,7 @@ export function CrawlerDialog({
     [exportMatch, setExportMatch] = useState<'exact' | 'prefix'>('exact'),
     [rate, setRate] = useState('10'),
     [burst, setBurst] = useState('20');
+  const [robotsVisited, setRobotsVisited] = useState(false);
   const criticalDirtyRef = useRef(false);
   const [workflowKey, setWorkflowKey] = useState<string | null>(null);
   const [pendingOnly, setPendingOnly] = useState(false);
@@ -302,7 +304,10 @@ export function CrawlerDialog({
     >
       <Tabs
         active={tab}
-        onChange={setTab}
+        onChange={next => {
+          if (next === 'robots') setRobotsVisited(true);
+          setTab(next);
+        }}
         items={[
           ['detail', i18n.text('蜘蛛详情')],
           ['evidence', i18n.text('身份与响应')],
@@ -310,6 +315,7 @@ export function CrawlerDialog({
           ['outcomes', i18n.text('业务效果')],
           ['risk', i18n.text('风险证据')],
           ['checks', i18n.text('公开页面检查')],
+          ['robots', i18n.text('robots.txt 管理')],
           ['control', i18n.text('访问策略与导出')],
         ]}
       />
@@ -799,6 +805,11 @@ export function CrawlerDialog({
                 </Button>
               </form>
             </>
+          )}
+          {(tab === 'robots' || robotsVisited) && (
+            <div hidden={tab !== 'robots'}>
+              <RobotsManagementPanel key={websiteId} websiteId={websiteId} />
+            </div>
           )}
           {tab === 'checks' && (
             <>

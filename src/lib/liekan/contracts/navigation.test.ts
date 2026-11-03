@@ -249,7 +249,10 @@ describe('navigation task boundaries', () => {
     }
   });
   it('assigns every supplemental and GEO page to a scope and an accessible parent', () => {
-    expect(featurePages).toHaveLength(72);
+    expect(featurePages).toHaveLength(73);
+    expect(navigationFor({ page: 'admin-analytics-engine' })).toMatchObject({
+      scope: 'admin',
+    });
     expect(Object.keys(geoPaths)).toHaveLength(13);
     for (const page of [...featurePages.map(page => page.id), ...Object.keys(geoPaths)]) {
       expect(pageNavigation[page], page).toBeDefined();

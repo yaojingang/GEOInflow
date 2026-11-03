@@ -52,6 +52,7 @@ import { Skeleton } from '../DataLoading';
 import { ManagementDrawer } from '../ManagementDrawer';
 import { CrawlerHandoffs } from './CrawlerHandoffs';
 import { CrawlerDialog } from './CrawlerDialog';
+import { RobotsManagementPanel } from './RobotsManagementPanel';
 import { managementLabels } from '@/lib/liekan/contracts/management';
 import { Chart } from './Chart';
 import { useAction, useData, useFeature } from './context';
@@ -1174,7 +1175,7 @@ function WebsiteSettings() {
                 >
                   <Body>
                     <p className="muted">
-                      {i18n.text('robots.txt 保存后可下载，由网站管理员部署到目标网站。')}
+                      {i18n.text('robots.txt 支持线上读取、定时监控、编辑及授权发布。')}
                     </p>
                     <div className="form-actions">
                       {collectionActions.slice(2).map(item => (
@@ -1260,6 +1261,14 @@ function WebsiteSettings() {
               websiteDomain={site.domain}
               onClose={() => setDrawer('')}
             />
+          ) : drawer === 'robots.txt 编辑' ? (
+            <LiekanDialog
+              title={i18n.text('robots.txt 管理')}
+              size="wide"
+              onClose={() => setDrawer('')}
+            >
+              <RobotsManagementPanel key={site.id} websiteId={site.id} />
+            </LiekanDialog>
           ) : drawer === 'traffic-quality' ? (
             <TrafficQuality key={site.id} canManage={manage} onClose={() => setDrawer('')} />
           ) : collectionActions.includes(drawer) ? (
@@ -1491,7 +1500,7 @@ function RecorderSettings() {
                       ['moderate', i18n.text('标准：遮蔽输入内容')],
                     ]}
                     localizeLabels
-                    defaultValue={config.maskLevel || 'moderate'}
+                    defaultValue={config.maskLevel || 'strict'}
                     disabled={!manage}
                   />
                   <Select

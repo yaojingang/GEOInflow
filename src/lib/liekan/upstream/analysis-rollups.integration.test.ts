@@ -1,10 +1,14 @@
-import { withinQuerySnapshot } from './query-snapshot';
+import { getQuerySnapshot, withinQuerySnapshot } from './query-snapshot';
 // @vitest-environment node
 import { createHash, randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { HISTORY_REPAIR_ENGINE } from '../contracts/history-repair';
 import type { AnalysisBuildDto, AnalysisLogInput } from './analysis-rollups-model';
+import { ANALYSIS_ROLLUP_VERSION } from './analysis-rollups-model';
+import { TRAFFIC_POLICY_VERSION } from './traffic-query';
+import { CRAWLER_POPULATION_VERSION } from '../rules/population';
+import { staticRequestExtensionPattern } from './log-content-boundary';
 let api: typeof import('./analysis-rollups');
 let db: typeof import('./analysis-rollups-db');
 let prisma: typeof import('@/lib/prisma').default;
@@ -73,10 +77,26 @@ async function finish(value: AnalysisBuildDto) {
   }
   throw new Error('Bounded worker did not finish');
 }
+async function shortLogBuild(start: Date, end: Date) {
+  const id = randomUUID();
+  await execute(
+    `INSERT INTO liekan_analysis_build(id,website_id,actor_id,epoch,family,unit_seconds,range_start,range_end,timezone,locale,request_id,request_hash,status,work_total)
+   SELECT $1::uuid,$2::uuid,$3::uuid,epoch,'log',300,$4,$5,'UTC','en-US',$1::uuid,'today-short-recovery','queued',$6::bigint
+   FROM liekan_analysis_site WHERE website_id=$2::uuid`,
+    id,
+    site,
+    actor.userId,
+    start,
+    end,
+    Math.ceil((+end - +start) / 300000),
+  );
+  return { id } as AnalysisBuildDto;
+}
 async function log(
   at: string,
   options: {
     path?: string;
+    status?: number;
     selfCheck?: boolean;
     verification?: string;
     ai?: boolean | null;
@@ -87,7 +107,7 @@ async function log(
   const id = randomUUID();
   await execute(
     `INSERT INTO liekan_log(id,website_id,import_id,created_at,path,method,status,bytes,ip_masked,ip_hash,user_agent,location,bot,vendor,bot_type,verification,ai_eligible,recognition_state)
-   VALUES($1,$2::uuid,$3::uuid,$4::timestamptz,$5,'GET',200,0,'','',$6,'',$7,'OpenAI','训练',$8,$9::boolean,$10)`,
+   VALUES($1,$2::uuid,$3::uuid,$4::timestamptz,$5,'GET',$11,0,'','',$6,'',$7,'OpenAI','训练',$8,$9::boolean,$10)`,
     id,
     site,
     imported,
@@ -98,6 +118,7 @@ async function log(
     options.verification || 'verified_range',
     options.ai === undefined ? true : options.ai,
     options.state === undefined ? 'recognized' : options.state,
+    options.status ?? 200,
   );
   return id;
 }
@@ -191,6 +212,211 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
       site,
     );
   });
+  it('preserves the existing five-minute trend labels through a historical midnight fold', async () => {
+    await log('2009-11-01T03:00:30Z');
+    await log('2009-11-01T03:01:30Z');
+    const rows = await api.readAnalysisLogSeries({
+      ...input(), startDate: new Date('2009-11-01T03:00Z'), endDate: new Date('2009-11-01T04:00Z'),
+      timezone: 'America/Goose_Bay', grain: 'day',
+    });
+    expect(rows).toEqual([{ day: '2009-11-01', bot: 'GPTBot', type: '训练', count: 2, aiRequests: 2 }]);
+  });
+  it('keeps crawler context exact across raw gaps, covered visits and late identity corrections', async () => {
+    await event('2026-01-01T00:01:00Z');
+    await event('2026-01-01T00:10:00Z', { type: 2 });
+    await event('2026-01-01T01:20:00Z', { visit: randomUUID() });
+    const changed = await event('2026-01-01T01:30:00Z');
+    const missing = await event('2026-01-01T01:31:00Z');
+    await execute('UPDATE liekan_event_environment SET identity_available=false WHERE event_id=$1::uuid', missing);
+    await event('2026-01-01T01:40:00Z', { type: 5 });
+    const { getHumanFacts } = await import('./analytics');
+    const { reportSnapshot } = await import('./server');
+    const ranges = [
+      [from, new Date(+from + 7200000)],
+      [new Date(+from + 1234567), new Date(+from + 6543210)],
+      [from, new Date('2026-01-01T01:30:00Z')],
+    ];
+    const verify = async () => {
+      for (const [starts, ends] of ranges) {
+        const expected = await reportSnapshot(() => getHumanFacts(site, starts, ends, 'Asia/Shanghai', ['daily']));
+        const actual = await reportSnapshot(() => getHumanFacts(site, starts, ends, 'Asia/Shanghai', ['daily'], undefined, { crawlerContext: true }));
+        expect(actual.totals).toEqual(expected.totals);
+        expect(actual.population).toEqual(expected.population);
+        expect(actual.daily.map(row => row.day)).toEqual(expected.daily.map(row => row.day));
+      }
+    };
+    await verify();
+    await finish(await build(from, new Date(+from + 3600000)));
+    await verify();
+    await finish(await build(from, new Date(+from + 7200000)));
+    await verify();
+    await execute('UPDATE liekan_event_environment SET identity_available=false WHERE event_id=$1::uuid', changed);
+    await verify();
+  });
+  it.each([
+    ['Asia/Kolkata', '2026-01-01T18:40:00Z'],
+    ['Asia/Kathmandu', '2026-01-01T18:20:00Z'],
+    ['Australia/Lord_Howe', '2026-06-01T13:40:00Z'],
+    ['America/Goose_Bay', '2009-11-01T03:10:00Z'],
+  ])('keeps crawler local date labels across covered UTC hours in %s', async (timezone, at) => {
+    await event(at);
+    const hour = new Date(Math.floor(+new Date(at) / 3600000) * 3600000);
+    const starts = new Date(+hour - 86400000), ends = new Date(+hour + 86400000);
+    const { getHumanFacts } = await import('./analytics');
+    const { reportSnapshot } = await import('./server');
+    const expected = await reportSnapshot(() => getHumanFacts(site, starts, ends, timezone, ['daily']));
+    await finish(await api.createAnalysisBuild(site, actor, {
+      startDate: hour, endDate: new Date(+hour + 3600000), timezone, locale: 'zh-CN', requestId: randomUUID(),
+    }));
+    const actual = await reportSnapshot(() => getHumanFacts(site, starts, ends, timezone, ['daily'], undefined, { crawlerContext: true }));
+    expect(actual.totals).toEqual(expected.totals);
+    expect(actual.daily.map(row => row.day)).toEqual(expected.daily.map(row => row.day));
+  });
+  it('shares crawler context with exact content preference page facts', async () => {
+    await event('2026-01-01T00:01:00Z');
+    await event('2026-01-01T00:02:00Z');
+    await event('2026-01-01T01:03:00Z', { type: 2 });
+    const { getHumanFacts } = await import('./analytics');
+    const { reportSnapshot } = await import('./server');
+    const expected = await reportSnapshot(() => getHumanFacts(site, from, until, 'Asia/Shanghai', ['pages']));
+    const factual: string[] = [];
+    const actual = await reportSnapshot(() => {
+      const snapshot = getQuerySnapshot();
+      return withinQuerySnapshot({
+        $executeRawUnsafe: (sql, ...values) => snapshot.$executeRawUnsafe(sql, ...values),
+        $queryRawUnsafe: async (sql, ...values) => {
+          const rows = await snapshot.$queryRawUnsafe(sql, ...values) as any[];
+          if (rows[0] && ['facts', 'pageviews', 'qualifiedVisitors'].some(key => Object.hasOwn(rows[0], key))) factual.push(sql);
+          return rows;
+        },
+      }, () => getHumanFacts(site, from, until, 'Asia/Shanghai', ['pages'], undefined, { crawlerContext: true }));
+    });
+    expect(actual.pages).toEqual(expected.pages);
+    expect(actual.totals).toEqual(expected.totals);
+    expect(actual.population).toEqual(expected.population);
+    expect(factual).toHaveLength(2);
+  });
+  it('reads crawler date labels, real totals and population in one factual statement', async () => {
+    await event('2026-01-01T00:01:00Z');
+    await event('2026-01-02T00:02:00Z', { visit: randomUUID() });
+    const unknown = await event('2026-01-02T00:03:00Z');
+    await execute('UPDATE liekan_event_environment SET identity_available=false WHERE event_id=$1::uuid', unknown);
+    const { getHumanFacts } = await import('./analytics');
+    const { reportSnapshot } = await import('./server');
+    const expected = await reportSnapshot(() => getHumanFacts(site, from, until, 'Asia/Shanghai', ['daily']));
+    const factual: string[] = [];
+    const actual = await reportSnapshot(() => {
+      const snapshot = getQuerySnapshot();
+      return withinQuerySnapshot({
+        $executeRawUnsafe: (sql, ...values) => snapshot.$executeRawUnsafe(sql, ...values),
+        $queryRawUnsafe: async (sql, ...values) => {
+          const rows = await snapshot.$queryRawUnsafe(sql, ...values) as any[];
+          if (rows[0] && ['facts', 'pageviews', 'qualifiedVisitors'].some(key => Object.hasOwn(rows[0], key))) factual.push(sql);
+          return rows;
+        },
+      }, () => Reflect.apply(getHumanFacts, undefined, [site, from, until, 'Asia/Shanghai', ['daily'], undefined, { crawlerContext: true }]));
+    });
+    expect(actual.totals).toEqual(expected.totals);
+    expect(actual.daily.map(row => row.day)).toEqual(expected.daily.map(row => row.day));
+    expect(actual.population.identity).toMatchObject({ eligiblePV: 3, qualifiedPV: 2, status: 'partial' });
+    expect(factual.length).toBeGreaterThan(0);
+    expect(factual).toHaveLength(1);
+  });
+  it('recovers a capacity-limited automatic unit after space returns without replacing its receipt', async () => {
+    const start = new Date(Math.floor((Date.now() - 7200000) / 3600000) * 3600000);
+    await log(new Date(+start + 60000).toISOString());
+    await api.reconcileAnalysisRollups();
+    const [unit] = await q<{ id: string }[]>(
+      "SELECT id FROM liekan_analysis_build WHERE website_id=$1::uuid AND actor_id IS NULL AND request_hash='live' ORDER BY range_start DESC LIMIT 1",
+      site,
+    );
+    expect(unit).toBeDefined();
+    await execute(
+      "UPDATE liekan_analysis_build SET status='capacity_limited',error_code='analysis-capacity-limited',attempts=1,next_attempt_at=clock_timestamp()-interval '1 second' WHERE id=$1::uuid",
+      unit.id,
+    );
+    await execute(
+      'UPDATE liekan_analysis_site SET derived_bytes=1073741824 WHERE website_id=$1::uuid',
+      site,
+    );
+    await api.reconcileAnalysisRollups();
+    expect(
+      (await q('SELECT status FROM liekan_analysis_build WHERE id=$1::uuid', unit.id))[0].status,
+    ).toBe('capacity_limited');
+    await execute(
+      'UPDATE liekan_analysis_site SET derived_bytes=0 WHERE website_id=$1::uuid',
+      site,
+    );
+    await api.reconcileAnalysisRollups();
+    expect(
+      (
+        await q(
+          'SELECT status,attempts,error_code FROM liekan_analysis_build WHERE id=$1::uuid',
+          unit.id,
+        )
+      )[0],
+    ).toMatchObject({ status: 'queued', attempts: 0, error_code: null });
+    expect(
+      (
+        await q(
+          "SELECT count(*)::int AS n FROM liekan_analysis_build WHERE website_id=$1::uuid AND request_hash='live' AND range_start=$2",
+          site,
+          start,
+        )
+      )[0].n,
+    ).toBe(1);
+    await finish({ id: unit.id } as AnalysisBuildDto);
+  });
+  it('restores recent uncovered capacity work ahead of an old discovery cursor and skips covered receipts', async () => {
+    const start = new Date(Math.floor((Date.now() - 6 * 3600000) / 3600000) * 3600000);
+    await log(new Date(+start + 60000).toISOString());
+    const recent = randomUUID(),
+      covered = randomUUID(),
+      old = randomUUID();
+    await execute(
+      `INSERT INTO liekan_analysis_manifest(website_id,epoch,family,bucket,bucket_end,generation,fingerprint,versions,row_count,path_complete)
+      SELECT $1::uuid,1,'log',at,at+interval '5 minutes',gen_random_uuid(),liekan_analysis_fingerprint($1::uuid,1,'log',at,at+interval '5 minutes'),
+       liekan_analysis_versions($1::uuid,$3,$4,$5),0,true
+      FROM (SELECT $2::timestamptz+interval '2 hours'+n*interval '5 minutes' AS at FROM generate_series(0,31) n) leaves`,
+      site,
+      start,
+      ANALYSIS_ROLLUP_VERSION,
+      TRAFFIC_POLICY_VERSION,
+      CRAWLER_POPULATION_VERSION,
+    );
+    for (const [id, at, status] of [
+      [recent, start, 'capacity_limited'],
+      [covered, new Date(+start + 7200000), 'capacity_limited'],
+      [old, from, 'queued'],
+    ] as const) {
+      await execute(
+        `INSERT INTO liekan_analysis_build(id,website_id,epoch,family,unit_seconds,range_start,range_end,timezone,locale,request_id,request_hash,status,work_total,error_code)
+       VALUES($1::uuid,$2::uuid,1,'log',300,$3,$4,'UTC','zh-CN',$1::uuid,'live',$5,1,'analysis-capacity-limited')`,
+        id,
+        site,
+        at,
+        new Date(+at + 300000),
+        status,
+      );
+    }
+    await execute(
+      `UPDATE liekan_analysis_site SET discovery_cursors='{"finite-log":"2026-02-01T00:00:00.000Z","stale-log":"2026-02-01T00:00:00.000Z"}'::jsonb WHERE website_id=$1::uuid`,
+      site,
+    );
+    await api.reconcileAnalysisRollups();
+    expect(
+      (await q('SELECT status,checkpoint FROM liekan_analysis_build WHERE id=$1::uuid', recent))[0],
+    ).toEqual({ status: 'queued', checkpoint: {} });
+    expect(
+      (await q('SELECT status FROM liekan_analysis_build WHERE id=$1::uuid', covered))[0].status,
+    ).toBe('capacity_limited');
+    const { processAnalysisBuild } = await import('./analysis-build-queue');
+    const result = await processAnalysisBuild('', 'incremental', { shouldStop: () => false });
+    expect(result.completedUnits).toBeGreaterThan(0);
+    expect(
+      (await q('SELECT status FROM liekan_analysis_build WHERE id=$1::uuid', recent))[0].status,
+    ).toBe('completed');
+  });
   it('starts trusted sites live with uncovered history and explicit unsupported-filter fallbacks', async () => {
     const status = await api.getAnalysisStatus(site, actor);
     expect(status.mode).toBe('live');
@@ -218,6 +444,174 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
     ).toBeNull();
     expect(await api.readAnalysisLogRollup(input({ filters: { search: 'secret' } }))).toBeNull();
     await expect(api.getAnalysisStatus(site, other)).rejects.toMatchObject({ status: 403 });
+  });
+  it.each([
+    ['failed', 'management'],
+    ['capacity_limited', 'management'],
+    ['failed', 'reconciliation'],
+    ['capacity_limited', 'reconciliation'],
+  ])(
+    'releases an unreachable %s checkpoint after an epoch change through %s',
+    async (status, transition) => {
+      const { previewGenerations, collectGenerationBatch } = await import(
+        './storage-generation-gc'
+      );
+      const { lockWritableWebsite } = await import('./server');
+      await log('2026-01-01T00:01:00Z');
+      await finish(await build(from, new Date(+from + 3600000)));
+      const before = withoutCoverage(await api.readAnalysisLogRollup(input()));
+      const interrupted = await build(from, new Date(+from + 3600000));
+      const generation = randomUUID();
+      await execute(
+        "INSERT INTO liekan_analysis_generation(website_id,generation,estimated_bytes,updated_at) VALUES($1::uuid,$2::uuid,17,'2026-01-01')",
+        site,
+        generation,
+      );
+      await execute(
+        'UPDATE liekan_analysis_site SET derived_bytes=derived_bytes+17 WHERE website_id=$1::uuid',
+        site,
+      );
+      await execute(
+        "UPDATE liekan_analysis_build SET status=$2,checkpoint=checkpoint||jsonb_build_object('generation',$3::text) WHERE id=$1::uuid",
+        interrupted.id,
+        status,
+        generation,
+      );
+      const cutoff = new Date(Date.now() + 3600000);
+      expect(
+        (await db.analysisTransaction(tx => previewGenerations(tx, site, cutoff))).candidateCount,
+      ).toBe(0);
+      if (transition === 'management') {
+        await api.actionAnalysisBuild(site, actor, { action: 'disable', requestId: randomUUID() });
+      } else {
+        await execute(
+          "UPDATE liekan_analysis_site SET mode='disabled',epoch=epoch+1 WHERE website_id=$1::uuid",
+          site,
+        );
+        await api.reconcileAnalysisRollups();
+      }
+      expect(
+        (await q('SELECT status FROM liekan_analysis_build WHERE id=$1::uuid', interrupted.id))[0]
+          .status,
+      ).toBe('invalidated');
+      await api.actionAnalysisBuild(site, actor, { action: 'enable', requestId: randomUUID() });
+      const collected = await db.analysisTransaction(async tx => {
+        await lockWritableWebsite(tx, site, actor);
+        await tx.$queryRawUnsafe(
+          'SELECT website_id FROM liekan_analysis_site WHERE website_id=$1::uuid FOR UPDATE',
+          site,
+        );
+        return collectGenerationBatch(tx, site, cutoff);
+      });
+      expect(collected.generationsDeleted).toBe(1);
+      expect(
+        await q(
+          'SELECT generation FROM liekan_analysis_generation WHERE website_id=$1::uuid AND generation=$2::uuid',
+          site,
+          generation,
+        ),
+      ).toHaveLength(0);
+      expect(
+        (
+          await q(
+            'SELECT count(*)::int AS n FROM liekan_analysis_manifest WHERE website_id=$1::uuid',
+            site,
+          )
+        )[0].n,
+      ).toBeGreaterThan(0);
+      expect(withoutCoverage(await api.readAnalysisLogRollup(input()))).toEqual(before);
+    },
+  );
+  it('indexes disjoint uncovered gaps without scanning the covered middle', async () => {
+    await log('2026-01-01T00:03:00Z');
+    await log('2026-01-01T00:08:00Z');
+    const window = {
+      ...input(),
+      startDate: new Date('2025-12-31T00:00Z'),
+      endDate: new Date('2026-01-02T00:00Z'),
+      grain: 'hour' as const,
+    };
+    const raw = await api.readAnalysisLogSeries(window);
+    await finish(await shortLogBuild(from, new Date(+from + 3600000)));
+    const rawScans: any[] = [];
+    const actual = await db.analysisTransaction(async tx => {
+      await tx.$executeRawUnsafe('SET LOCAL enable_seqscan=off');
+      return withinQuerySnapshot(
+        new Proxy(tx, {
+          get(target, key) {
+            if (key !== '$queryRawUnsafe') return Reflect.get(target, key);
+            return async (statement: string, ...values: unknown[]) => {
+              if (statement.includes('reporting_bounds AS MATERIALIZED')) {
+                const [row] = await target.$queryRawUnsafe<any[]>(
+                  `EXPLAIN(ANALYZE,FORMAT JSON) ${statement}`,
+                  ...values,
+                );
+                const visit = (node: any) => {
+                  if (node['Relation Name'] === 'liekan_log') rawScans.push(node);
+                  for (const child of node.Plans || []) visit(child);
+                };
+                visit(row['QUERY PLAN'][0].Plan);
+              }
+              return target.$queryRawUnsafe(statement, ...values);
+            };
+          },
+        }),
+        () => api.readAnalysisLogSeries(window),
+      );
+    });
+    expect(actual).toEqual(raw);
+    expect(actual.reduce((sum, row) => sum + row.count, 0)).toBe(2);
+    expect(rawScans.length).toBeGreaterThan(0);
+    expect(rawScans.every(node => !node['Actual Rows'] && !node['Rows Removed by Filter'])).toBe(
+      true,
+    );
+  });
+  it('preserves cursor versions and prior-period form metrics across covered and raw populations', async () => {
+    const first = await log('2026-01-01T00:03:00Z');
+    const second = await log('2026-01-01T01:03:00Z', { verification: 'verified_dns' });
+    const excluded = await log('2026-01-01T01:04:00Z', { selfCheck: true });
+    for (const [id, version] of [
+      [first, 'rules-a'],
+      [second, 'rules-z'],
+      [excluded, 'excluded'],
+    ])
+      await execute(
+        `INSERT INTO liekan_crawler_evidence(website_id,log_id,classification_version) VALUES($1::uuid,$2,$3)`,
+        site,
+        id,
+        version,
+      );
+    await log('2026-01-01T01:05:00Z', { ai: null, state: null });
+    const { getLogFacts } = await import('./logs');
+    const read = () =>
+      getLogFacts(
+        site,
+        new Date('2026-01-01T01:00Z'),
+        new Date('2026-01-01T02:00Z'),
+        'UTC',
+        1,
+        '',
+        '',
+        '',
+        'after',
+        ['summary', 'bots', 'previousBots', 'recent'],
+        { crawlerIdentityScope: 'all', crawlerMetricsVersion: 1, resource: 'ai/bots' },
+      );
+    const raw = await read();
+    await finish(await shortLogBuild(from, new Date(+from + 7200000)));
+    expect(await read()).toEqual(raw);
+    expect(
+      (await api.readAnalysisLogRollup(input({ fields: ['classificationSet'] }))).classificationSet,
+    ).toBe('rules-a,rules-z');
+    expect(
+      (
+        await api.readAnalysisLogRollup(
+          input({ fields: ['classificationSet'], crawlerIdentityScope: 'verified_range' }),
+        )
+      ).classificationSet,
+    ).toBe('rules-a');
+    expect(raw.previousBots[0].requests).toBe(1);
+    expect(raw.recent).toHaveLength(2);
   });
   it('matches exact raw log populations, encoded paths and all verification scopes', async () => {
     await log('2026-01-01T00:03:00Z');
@@ -282,6 +676,145 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
       (await api.readAnalysisLogRollup(input({ crawlerIdentityScope: 'verified_range' }))).summary
         .requests,
     ).toBe(2);
+  });
+  it('keeps today static errors, case/path/query boundaries and import time exact through partial v4 coverage', async () => {
+    const end = new Date('2026-01-01T00:15:00.123Z');
+    const paths = [
+      '/app.css',
+      '/app.CSS?x=1',
+      '/app.js#hash',
+      '/app.js/guide',
+      '/index.js-extra',
+      '/report.pdf',
+      '/data.json',
+      '/asset.SvG',
+      '/nested.css/path',
+      '/x?file=app.js',
+    ];
+    for (const [index, path] of paths.entries())
+      await log(`2026-01-01T00:0${Math.floor(index / 2)}:00Z`, {
+        path,
+        status: index === 0 ? 400 : 200,
+        selfCheck: index === 4,
+        verification: index === 6 ? 'unverified' : 'verified_range',
+      });
+    await log('2026-01-01T00:05:00Z', { path: '/edge' });
+    await log('2026-01-01T00:15:00.123Z', { path: '/inclusive', status: 503 });
+    await log('2026-01-01T00:15:00.124Z', { path: '/outside', status: 500 });
+    await log('2025-12-31T23:59:59.999Z', { path: '/imported-today-event-yesterday' });
+    await execute(
+      "UPDATE liekan_import SET imported_at='2026-01-01T00:06Z',accepted=91 WHERE id=$1::uuid",
+      imported,
+    );
+    const todayInput = { websiteId: site, startDate: from, endDate: end };
+    const raw = await api.readAnalysisLogToday({ ...todayInput, allowRawOnly: true });
+    expect(raw).toMatchObject({
+      requests: 7,
+      abnormal: 2,
+      coverage: { manifests: 0, rawFallback: true },
+    });
+    await finish(await shortLogBuild(from, new Date('2026-01-01T00:05Z')));
+    const partial = await api.readAnalysisLogToday(todayInput);
+    expect(partial).toMatchObject({ requests: raw.requests, abnormal: raw.abnormal });
+    expect(partial.coverage.manifests).toBeGreaterThan(0);
+    const { getLogToday } = await import('./logs');
+    expect(await getLogToday(site, from, end)).toEqual({ requests: 7, abnormal: 2, accepted: 91 });
+    await finish(await shortLogBuild(new Date('2026-01-01T00:05Z'), new Date('2026-01-01T00:15Z')));
+    expect(await api.readAnalysisLogToday(todayInput)).toMatchObject({ requests: 7, abnormal: 2 });
+    for (const [startDate, endDate] of [
+      [from, new Date('2026-01-01T00:05Z')],
+      [new Date('2026-01-01T00:05Z'), new Date('2026-01-01T00:05Z')],
+      [new Date('2026-01-01T00:00:00.001Z'), new Date('2026-01-01T00:15:00.122Z')],
+    ]) {
+      const value = { websiteId: site, startDate, endDate };
+      const expected = await api.readAnalysisLogToday({ ...value, allowRawOnly: true });
+      expect(await api.readAnalysisLogToday(value)).toMatchObject({
+        requests: expected.requests,
+        abnormal: expected.abnormal,
+      });
+    }
+    const dimensions = await q<{ missing: bigint; variants: bigint }[]>(
+      "SELECT count(*) FILTER(WHERE NOT(dimensions ? 'staticResource')) AS missing,count(DISTINCT dimensions->'staticResource') AS variants FROM liekan_analysis_log WHERE website_id=$1::uuid",
+      site,
+    );
+    expect(dimensions[0]).toEqual({ missing: 0n, variants: 2n });
+  });
+  it('rejects the old global coverage vector for both families and reuses one pinned metadata read', async () => {
+    await log('2026-01-01T00:01Z', { path: '/style.CSS', status: 404 });
+    await event('2026-01-01T00:01Z');
+    await finish(await build(from, new Date('2026-01-01T01:00Z')));
+    await execute(
+      `UPDATE liekan_analysis_manifest SET versions=jsonb_set(versions,'{engine}','"analysis-rollups-v3"') WHERE website_id=$1::uuid`,
+      site,
+    );
+    const value = { websiteId: site, startDate: from, endDate: new Date('2026-01-01T01:00Z') };
+    expect(await api.readAnalysisLogToday(value)).toMatchObject({
+      requests: 0,
+      abnormal: 1,
+      coverage: { manifests: 0, rawFallback: true },
+    });
+    expect(await api.readAnalysisVisitTotals(value)).toBeNull();
+    let metadataReads = 0;
+    await db.analysisTransaction(
+      tx =>
+        withinQuerySnapshot(
+          {
+            $executeRawUnsafe: (statement: string, ...values: unknown[]) =>
+              tx.$executeRawUnsafe(statement, ...values),
+            $queryRawUnsafe: (statement: string, ...values: unknown[]) => {
+              if (statement.startsWith('SELECT liekan_analysis_versions')) metadataReads++;
+              return tx.$queryRawUnsafe(statement, ...values);
+            },
+          },
+          async () => {
+            await api.readAnalysisLogToday(value);
+            await api.readAnalysisLogToday(value);
+            await api.readAnalysisVisitTotals(value);
+          },
+        ),
+      'RepeatableRead',
+    );
+    expect(metadataReads).toBe(1);
+    await finish(await build(from, new Date('2026-01-01T01:00Z')));
+    expect(await api.readAnalysisLogToday(value)).toMatchObject({ requests: 0, abnormal: 1 });
+    expect(await api.readAnalysisVisitTotals(value)).not.toBeNull();
+  });
+  it('invalidates today coverage for late, corrected and deleted logs, mode and epoch changes', async () => {
+    const end = new Date('2026-01-01T01:00Z');
+    const id = await log('2026-01-01T00:01Z', { path: '/style.css', status: 404 });
+    await finish(await build(from, end));
+    const value = { websiteId: site, startDate: from, endDate: end };
+    const check = async (requests: number, abnormal: number) => {
+      expect(await api.readAnalysisLogToday(value)).toMatchObject({ requests, abnormal });
+      expect(await api.readAnalysisLogToday({ ...value, allowRawOnly: true })).toMatchObject({
+        requests,
+        abnormal,
+      });
+    };
+    await check(0, 1);
+    await log('2026-01-01T00:02Z', { path: '/late' });
+    await check(1, 1);
+    await execute(
+      "UPDATE liekan_log SET path='/corrected',status=200 WHERE website_id=$1::uuid AND id=$2",
+      site,
+      id,
+    );
+    await check(2, 0);
+    await execute('DELETE FROM liekan_log WHERE website_id=$1::uuid AND id=$2', site, id);
+    await check(1, 0);
+    await finish(await build(from, end));
+    await execute(
+      "UPDATE liekan_analysis_site SET mode='disabled' WHERE website_id=$1::uuid",
+      site,
+    );
+    expect((await api.readAnalysisLogToday(value)).coverage.manifests).toBe(0);
+    await check(1, 0);
+    await execute(
+      "UPDATE liekan_analysis_site SET mode='live',epoch=epoch+1 WHERE website_id=$1::uuid",
+      site,
+    );
+    expect((await api.readAnalysisLogToday(value)).coverage.manifests).toBe(0);
+    await check(1, 0);
   });
   it('merges visitor/visit IDs, custom events and fractional duration across hours and days', async () => {
     await event('2026-01-01T23:59:59.900Z');
@@ -633,10 +1166,21 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
     expect(oldWindow.coverage.rawFallback).toBe(false);
   });
   it('bounds reporting joins and archived identity expansion after source eligibility without changing repaired facts', async () => {
+    const legacyLogDimensionsSql =
+      db.analysisLogDimensionsSql(`(SELECT identity->>'productForm' FROM liekan_crawler_registry_version v
+   CROSS JOIN LATERAL jsonb_array_elements(v.payload->'identities') identity
+   WHERE v.version=l.reporting_catalog_version AND identity->>'id'=l.reporting_crawler_id LIMIT 1)`);
     try {
-      expect(createHash('sha256').update(db.logDimensionsSql).digest('hex')).toBe(
-        'fd88430e483bf16cdded464f0233a5ca30b1c500e456cc5105617ebd6602ca61',
-      );
+      expect(
+        createHash('sha256')
+          .update(
+            legacyLogDimensionsSql.replace(
+              ` 'staticResource',l.path ~* '${staticRequestExtensionPattern}',\n`,
+              '',
+            ),
+          )
+          .digest('hex'),
+      ).toBe('fd88430e483bf16cdded464f0233a5ca30b1c500e456cc5105617ebd6602ca61');
       const source = randomUUID(),
         version = randomUUID(),
         secondVersion = randomUUID(),
@@ -688,15 +1232,19 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
       );
       await log('2026-01-01T00:00:30Z', { path: '/eligible-manual' });
       await log('2026-01-01T00:03Z', { path: '/excluded-manual' });
-      await execute(
-        `INSERT INTO liekan_crawler_evidence(website_id,log_id,crawler_id,catalog_version,classification_version)
+      // Match collector batch bounds while retaining the complete large query fixture.
+      for (let offset = 0; offset < 4500; offset += 500)
+        await execute(
+          `INSERT INTO liekan_crawler_evidence(website_id,log_id,crawler_id,catalog_version,classification_version)
        SELECT website_id,id,CASE path WHEN '/encoded%2F0' THEN 'gptbot' WHEN '/encoded%2F1' THEN 'alternate' WHEN '/encoded%2F2' THEN 'missing' ELSE NULL END,
        CASE WHEN path='/encoded%2F3' THEN NULL WHEN method='HEAD' THEN $2::uuid ELSE $3::uuid END,'archived-fixture'
-       FROM liekan_log WHERE website_id=$1::uuid AND created_at='2026-01-01T00:02Z'`,
-        site,
-        version,
-        secondVersion,
-      );
+       FROM liekan_log WHERE website_id=$1::uuid AND created_at='2026-01-01T00:02Z' ORDER BY id LIMIT $4::int OFFSET $5::int`,
+          site,
+          version,
+          secondVersion,
+          500,
+          offset,
+        );
       const [repair] = await q<{ id: string }[]>(
         "SELECT min(id) AS id FROM liekan_log WHERE website_id=$1::uuid AND created_at='2026-01-01T00:02Z' AND path='/encoded%2F0'",
         site,
@@ -722,13 +1270,19 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
       );
       const end = new Date('2026-01-01T01:00Z');
       const oracle = await q(
-        `SELECT * FROM(SELECT ${db.logDimensionsSql} AS dimensions,count(*)::text AS requests,min(l.created_at) AS first_at,max(l.created_at) AS last_at
+        `SELECT * FROM(SELECT ${legacyLogDimensionsSql} AS dimensions,count(*)::text AS requests,min(l.created_at) AS first_at,max(l.created_at) AS last_at
        FROM liekan_reporting_log l WHERE l.website_id=$1::uuid AND l.created_at>=$2 AND l.created_at<$3 GROUP BY 1) oracle ORDER BY dimensions::text`,
         site,
         from,
         end,
       );
       const raw = await api.readAnalysisLogRollup(input({ endDate: end }));
+      const rawToday = await api.readAnalysisLogToday({
+        websiteId: site,
+        startDate: from,
+        endDate: end,
+        allowRawOnly: true,
+      });
       expect(raw.summary.requests).toBe(4002);
       let savedPlan: any;
       const original = db.analysisTransaction;
@@ -786,6 +1340,12 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
         for (const child of node.Plans || []) walk(child);
       };
       expect(savedPlan).toBeDefined();
+      expect(
+        await api.readAnalysisLogToday({ websiteId: site, startDate: from, endDate: end }),
+      ).toMatchObject({
+        requests: rawToday.requests,
+        abnormal: rawToday.abnormal,
+      });
       walk(savedPlan.Plan);
       const evidence = nodes.filter(node => node['Relation Name'] === 'liekan_crawler_evidence');
       expect(evidence.length).toBeGreaterThan(0);
@@ -873,7 +1433,7 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
     expect(empty.summary.requests).toBe(0);
     expect(empty.coverage.manifests).toBe(0);
   });
-  it('meters only new marker rows and reclaims obsolete epochs after seven idle days', async () => {
+  it('meters new marker rows and preserves published epoch references while pruning obsolete markers', async () => {
     const id = await log('2026-01-01T00:01:00Z');
     const [before] = await q<{ bytes: string }[]>(
       'SELECT sum(bytes)::text AS bytes FROM liekan_analysis_meter WHERE website_id=$1::uuid',
@@ -899,7 +1459,8 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
       (SELECT count(*) FROM liekan_analysis_manifest m JOIN liekan_analysis_site s USING(website_id) WHERE m.website_id=$1::uuid AND m.epoch<>s.epoch) AS manifests`,
       site,
     );
-    expect(obsolete).toEqual({ dirty: 0n, manifests: 0n });
+    expect(obsolete.dirty).toBe(0n);
+    expect(obsolete.manifests).toBeGreaterThan(0n);
     expect((await api.readAnalysisLogRollup(input())).summary.requests).toBe(1);
   });
   it('matches native SQL for missing session metadata and raw city aliases', async () => {
@@ -922,7 +1483,12 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
         JSON.stringify(value, (_, v) => (typeof v === 'bigint' ? Number(v) : v)),
       );
       if (result?.population) {
-        expect(['complete', 'empty']).toContain(result.population.identity.status);
+        expect(['complete', 'empty', 'partial']).toContain(result.population.identity.status);
+        if (result.population.identity.status === 'partial')
+          expect(result.population).toMatchObject({
+            metricScope: 'qualified-browser',
+            identity: { eligiblePV: 2, qualifiedPV: 1, qualifiedVisitors: 1 },
+          });
         const { population: _population, ...counts } = result;
         return counts;
       }
@@ -2573,6 +3139,56 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
         )
       )[0].n,
     ).toBeGreaterThan(30n);
+  });
+  it('prioritizes current closed log and visit units within a site while old recovery remains queued', async () => {
+    const { pumpAnalysisBuilds } = await import('./analysis-build-queue');
+    const now = Date.now(),
+      closedLog = Math.floor((now - 60000) / 300000) * 300000,
+      closedVisit = Math.floor((now - 60000) / 3600000) * 3600000;
+    const old = randomUUID(),
+      recentLog = randomUUID(),
+      recentVisit = randomUUID();
+    for (const [id, family, unit, start, order] of [
+      [old, 'log', 300, +from, 0],
+      [recentLog, 'log', 300, closedLog - 300000, 1],
+      [recentVisit, 'visit', 3600, closedVisit - 3600000, 2],
+    ] as const)
+      await execute(
+        `INSERT INTO liekan_analysis_build(id,website_id,epoch,family,unit_seconds,range_start,range_end,timezone,locale,request_id,request_hash,status,work_total,updated_at)
+      VALUES($1::uuid,$2::uuid,1,$3,$4,$5,$6,'UTC','en-US',$1::uuid,'current-unit-priority','queued',1,timestamptz '1960-01-01Z'+$7::int*interval '1 second')`,
+        id,
+        site,
+        family,
+        unit,
+        new Date(start),
+        new Date(start + unit * 1000),
+        order,
+      );
+    const selected = async () => {
+      const ids: string[] = [];
+      await pumpAnalysisBuilds({
+        send: async (_queue: string, data: { id: string }) => {
+          ids.push(data.id);
+          return randomUUID();
+        },
+      } as any);
+      const owned = new Set<string>([old, recentLog, recentVisit]);
+      return ids.filter(id => owned.has(id));
+    };
+    // Both recent families belong to the same incremental lane. The newer completed boundary wins.
+    const first = (await selected())[0];
+    expect([recentLog, recentVisit]).toContain(first);
+    await api.runOneAnalysisWorkUnit(first);
+    const second = (await selected())[0];
+    expect(second).toBe(first === recentLog ? recentVisit : recentLog);
+    await api.runOneAnalysisWorkUnit(second);
+    expect((await selected())[0]).toBe(old);
+    const [state] = await q<{ status: string }[]>(
+      'SELECT status FROM liekan_analysis_build WHERE id=$1::uuid',
+      old,
+    );
+    expect(state.status).toBe('queued');
+    await api.actionAnalysisBuild(site, actor, { action: 'disable', requestId: randomUUID() });
   });
   it('dispatches both kinds when eight incremental sites have continuously pending work', async () => {
     await build(from, new Date(+from + 3600000));

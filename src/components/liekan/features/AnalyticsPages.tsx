@@ -2554,16 +2554,13 @@ function Compare() {
     scope = useScope();
   const size = c.range.endAt - c.range.startAt + 1;
   const day = calendarDayRange(c.range.startAt, c.range.timezone);
-  const previous = day.startAt === c.range.startAt && day.endAt === c.range.endAt
-    ? shiftCalendarRange(c.range.startAt, c.range.endAt, -1, c.range.timezone)
-    : {startAt: Math.max(0, c.range.startAt - size), endAt: c.range.startAt - 1};
+  const previous =
+    day.startAt === c.range.startAt && day.endAt === c.range.endAt
+      ? shiftCalendarRange(c.range.startAt, c.range.endAt, -1, c.range.timezone)
+      : { startAt: Math.max(0, c.range.startAt - size), endAt: c.range.startAt - 1 };
   const [comparison, setComparison] = useState(previous),
     [open, setOpen] = useState(false);
-  useEffect(
-    () =>
-      setComparison(previous),
-    [c.range.startAt, c.range.endAt, c.range.timezone],
-  );
+  useEffect(() => setComparison(previous), [c.range.startAt, c.range.endAt, c.range.timezone]);
   const query = useData(
     ['compare-rich', comparison],
     async signal => {
@@ -2614,7 +2611,16 @@ function Compare() {
           ? i18n.text('新增')
           : '0%';
   const rate = (r: any) => (r?.visits ? (r.bounces / r.visits) * 100 : null);
-  const channels = new Map<string, { label: SourceDisplay; current: number; previous: number }>();
+  const views = (r: any) =>
+    r?.population?.metricScope === 'qualified-browser' && !identityUsable(r.population)
+      ? null
+      : r?.pageviews;
+  const currentUsable = identityUsable(d?.sources?.population || d?.current?.population);
+  const previousUsable = identityUsable(d?.oldSources?.population || d?.previous?.population);
+  const channels = new Map<
+    string,
+    { label: SourceDisplay; current: number | null; previous: number | null }
+  >();
   for (const [rows, period] of [
     [d?.sources?.rows || [], 'current'],
     [d?.oldSources?.rows || [], 'previous'],
@@ -2623,7 +2629,12 @@ function Compare() {
       const generated = classifyEntrySourceForDisplay({ referrer: row.referrer });
       const label = generated.sourceLabel ? generated : { source: row.referrer };
       const key = JSON.stringify([label.source, generated.sourceLabel ?? null]);
-      if (!channels.has(key)) channels.set(key, { label, current: 0, previous: 0 });
+      if (!channels.has(key))
+        channels.set(key, {
+          label,
+          current: currentUsable ? 0 : null,
+          previous: previousUsable ? 0 : null,
+        });
       channels.get(key)[period] =
         row.visitors == null || channels.get(key)[period] === null
           ? null
@@ -2635,12 +2646,14 @@ function Compare() {
       c.range.startAt,
       c.range.endAt,
       c.range.timezone,
+      d?.currentSeries?.population || d?.current?.population,
     ),
     second = relativeDaySeries(
       d?.previousSeries?.sessions || [],
       comparison.startAt,
       comparison.endAt,
       c.range.timezone,
+      d?.previousSeries?.population || d?.previous?.population,
     );
   const count = Math.max(first.length, second.length);
   return (
@@ -2671,10 +2684,8 @@ function Compare() {
             ],
             [
               i18n.text('页面访问'),
-              d ? n(d.current.pageviews) : null,
-              d
-                ? i18n.text('较对照期 {v0}', [change(d.current.pageviews, d.previous.pageviews)])
-                : '',
+              d ? n(views(d.current)) : null,
+              d ? i18n.text('较对照期 {v0}', [change(views(d.current), views(d.previous))]) : '',
             ],
             [
               i18n.text('跳出率'),
@@ -2804,6 +2815,7 @@ function Annotations() {
     c.range.startAt,
     c.range.endAt,
     c.range.timezone,
+    chart.data?.population?.metricScope === 'qualified-browser' ? chart.data.population : undefined,
   );
   const firstDay = new Date(
     `${formatInTimeZone(c.range.startAt, c.range.timezone, 'yyyy-MM-dd')}T00:00:00Z`,

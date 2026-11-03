@@ -168,7 +168,7 @@ export function ReferenceChart({
     loadEcharts()
       .then(echarts => {
         if (disposed || !container.current) return;
-        instance = echarts.init(container.current);
+        instance = echarts.init(container.current, 'v5');
         const places = report?.meta?.geography?.charts?.[id];
         const displayChart =
           places && i18n.locale === 'en-US'

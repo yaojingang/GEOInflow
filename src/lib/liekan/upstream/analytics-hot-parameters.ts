@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { CALENDAR_POLICY_VERSION } from '../contracts/calendar';
+import { ANALYTICS_READ_VERSION } from './analytics-revision';
 import * as schemas from '@/lib/analytics-schema';
 import { EVENT_COLUMNS, SESSION_COLUMNS } from '@/lib/constants';
 import { filterParams, withDateRange } from '@/lib/schema';
@@ -53,7 +54,9 @@ export function analyticsHotCatalogVersion(strongVersion: string): string | unde
     const version = JSON.parse(strongVersion);
     if (!Array.isArray(version)) return undefined;
     if (
-      (version.length === 7 || (version.length === 8 && version[7] === CALENDAR_POLICY_VERSION)) &&
+      (version.length === 7 ||
+        (version.length === 8 && version[7] === CALENDAR_POLICY_VERSION) ||
+        (version.length === 9 && version[7] === ANALYTICS_READ_VERSION && version[8] === CALENDAR_POLICY_VERSION)) &&
       ['history-repair-v1.1', 'history-repair-v1.2'].includes(version[1]) &&
       z.uuid().safeParse(version[3]).success
     )

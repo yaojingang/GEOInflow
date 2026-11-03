@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { reviewLifecycle } from './log-lifecycle-review';
 import { randomUUID } from 'node:crypto';
+import { gzipSync } from 'node:zlib';
+import { POST as receiveLogBatch } from '../../src/app/api/liekan/log-sources/[sourceId]/batches/route';
 import prisma from '../../src/lib/prisma';
 import { transaction, query } from '../../src/lib/liekan/upstream/server';
 import {
@@ -14,6 +16,8 @@ import {
 } from '../../src/lib/liekan/log-ingestion/service';
 import { getQueue, LOG_QUEUE } from '../../src/lib/liekan/log-ingestion/queue';
 import { recoverBatches } from '../../src/lib/liekan/log-ingestion/recovery';
+import { maintainProvider } from '../../src/lib/liekan/log-ingestion/provider';
+import { openPlatformSecret } from '../../src/lib/liekan/log-ingestion/secrets';
 import { importLogs } from '../../src/lib/liekan/store';
 import { resetLiekanStatistics, stopWebsiteSources } from '../../src/lib/liekan/upstream/lifecycle';
 import {
@@ -230,6 +234,37 @@ assert.equal(
   'rfc3339ns',
 );
 let job: any;
+let createAttempts = 0;
+const destinationStatuses: number[] = [];
+async function pushCloudflare(destination: string, text: string, authorization?: string | null) {
+  const endpoint = new URL(destination);
+  const headers = new Headers({ 'content-encoding': 'gzip' });
+  for (const [key, value] of endpoint.searchParams)
+    if (key.startsWith('header_')) headers.set(key.slice(7), value);
+  if (authorization === null) headers.delete('authorization');
+  else if (authorization !== undefined) headers.set('authorization', authorization);
+  const sourceId = endpoint.pathname.split('/').at(-2);
+  assert.ok(sourceId);
+  return receiveLogBatch(
+    new Request(`${endpoint.origin}${endpoint.pathname}`, {
+      method: 'POST',
+      headers,
+      body: new Uint8Array(gzipSync(text)),
+    }),
+    { params: Promise.resolve({ sourceId }) },
+  );
+}
+async function logCounts() {
+  return (
+    await query(
+      `SELECT (SELECT count(*)::int FROM liekan_ingest_batch) AS batches,
+        (SELECT count(*)::int FROM liekan_import) AS imports,
+        (SELECT count(*)::int FROM liekan_log) AS logs,
+        (SELECT count(*)::int FROM liekan_jobs.job WHERE name=$1) AS queued`,
+      LOG_QUEUE,
+    )
+  )[0];
+}
 globalThis.fetch = (async (url, init: any) => {
   const path = String(url);
   if (path.endsWith('/revoke')) return new Response(null, { status: 200 });
@@ -244,14 +279,36 @@ globalThis.fetch = (async (url, init: any) => {
       success: true,
       result: [{ id: 'a'.repeat(32), name: 'example.com', status: 'active' }],
     });
+  if (path.endsWith('/logpush/datasets/http_requests/fields'))
+    return Response.json({ success: true, result: {} });
   if (path.includes('/logpush/jobs')) {
     if (init?.method === 'POST') {
-      job = { id: 19, ...JSON.parse(init.body) };
+      const definition = JSON.parse(init.body);
+      createAttempts++;
+      // Exercise a failed destination check, then retry with the configured credential.
+      const probe = await pushCloudflare(
+        definition.destination_conf,
+        '{"content":"test"}',
+        createAttempts === 1 ? `Bearer ${'A'.repeat(43)}` : undefined,
+      );
+      destinationStatuses.push(probe.status);
+      if (!probe.ok)
+        return Response.json(
+          { success: false, errors: [{ code: 1002, message: 'error validating destination' }] },
+          { status: 400 },
+        );
+      assert.deepEqual(await probe.json(), { test: true });
+      job = { id: 19, ...definition };
       mutations.push(job);
       return Response.json({ success: true, result: job });
     }
     if (init?.method === 'PUT') {
       const changes = JSON.parse(init.body);
+      if (changes.destination_conf) {
+        const probe = await pushCloudflare(changes.destination_conf, '{"content":"tests"}');
+        assert.equal(probe.status, 200);
+        assert.deepEqual(await probe.json(), { test: true });
+      }
       Object.assign(job, changes);
       mutations.push(changes);
       return Response.json({ success: true, result: job });
@@ -300,8 +357,62 @@ try {
     identity,
     request,
   );
-  await maintainCloudflare(confirmed.sourceId, 'configure');
+  const beforeCounts = await logCounts();
+  const beforeSource = (
+    await query('SELECT * FROM liekan_log_source WHERE id=$1::uuid', confirmed.sourceId)
+  )[0];
+  const workerId = randomUUID();
+  await assert.rejects(
+    maintainProvider(confirmed.sourceId, 'configure', workerId),
+    /Provider temporarily unavailable/,
+  );
+  const failedSource = (
+    await query('SELECT * FROM liekan_log_source WHERE id=$1::uuid', confirmed.sourceId)
+  )[0];
+  assert.equal(failedSource.state, 'configuring');
+  assert.equal(failedSource.error_code, 'provider-unavailable');
+  assert.equal(failedSource.credential_hash, beforeSource.credential_hash);
+  const beforeProvider = JSON.parse(
+    openPlatformSecret(beforeSource.provider_config, confirmed.sourceId),
+  );
+  const failedProvider = JSON.parse(
+    openPlatformSecret(failedSource.provider_config, confirmed.sourceId),
+  );
+  for (const key of ['accessToken', 'receiverToken', 'zoneId'])
+    assert.ok(failedProvider[key] === beforeProvider[key]);
+  assert.equal(failedSource.provider_job_id, null);
+  assert.equal(failedSource.provider_lease, null);
+  assert.equal(failedSource.last_test_at, null);
+  assert.equal(job, undefined);
+  await maintainProvider(confirmed.sourceId, 'configure', workerId);
+  assert.deepEqual(destinationStatuses, [401, 200]);
+  assert.equal(createAttempts, 2);
   assert.equal(job.enabled, true);
+  const destination = job.destination_conf;
+  const legacyProbe = await pushCloudflare(destination, ' \r\n { "content": "tests" } \r\n');
+  assert.equal(legacyProbe.status, 200);
+  assert.deepEqual(await legacyProbe.json(), { test: true });
+  assert.equal((await pushCloudflare(destination, '{"content":"test"}', null)).status, 401);
+  assert.equal(
+    (await pushCloudflare(destination, '{"content":"test","RayID":"fixture"}')).status,
+    400,
+  );
+  assert.equal(
+    (await pushCloudflare(destination, '{"content":"test"}\n{"content":"tests"}')).status,
+    400,
+  );
+  const activeSource = (
+    await query('SELECT * FROM liekan_log_source WHERE id=$1::uuid', confirmed.sourceId)
+  )[0];
+  assert.equal(activeSource.state, 'active');
+  assert.equal(activeSource.error_code, null);
+  assert.equal(activeSource.credential_hash, beforeSource.credential_hash);
+  assert.equal(activeSource.provider_job_id, '19');
+  assert.equal(activeSource.provider_lease, null);
+  assert.ok(activeSource.last_test_at);
+  assert.equal(activeSource.last_received_at, null);
+  assert.equal(activeSource.last_processed_at, null);
+  assert.deepEqual(await logCounts(), beforeCounts);
   assert.equal(
     (
       await query(
@@ -311,9 +422,66 @@ try {
     )[0].n,
     1,
   );
+  const cloudflareEvent = JSON.stringify({
+    ClientIP: '192.0.2.20',
+    ClientRequestHost: 'example.com',
+    ClientRequestMethod: 'GET',
+    ClientRequestURI: '/cloudflare?secret=removed',
+    ClientRequestUserAgent: 'GPTBot',
+    EdgeResponseStatus: 200,
+    EdgeResponseBodyBytes: 25,
+    EdgeStartTimestamp: new Date(Date.now() + 2000).toISOString(),
+    RayID: 'integration-ray',
+    ClientRequestSource: 'eyeball',
+  });
+  const response = await pushCloudflare(destination, cloudflareEvent);
+  assert.equal(response.status, 200);
+  const received: any = await response.json();
+  assert.equal(received.valid, 1);
+  assert.equal(received.rejected, 0);
+  await processBatch(received.batchId);
+  const repeated = await pushCloudflare(destination, cloudflareEvent);
+  assert.equal(repeated.status, 200);
+  assert.equal((await repeated.json()).duplicate, true);
+  const rebatched = await pushCloudflare(destination, `${cloudflareEvent}\n${cloudflareEvent}`);
+  assert.equal(rebatched.status, 200);
+  const rebatchedAck: any = await rebatched.json();
+  assert.equal(rebatchedAck.valid, 2);
+  await processBatch(rebatchedAck.batchId);
+  assert.equal(
+    (
+      await query(
+        'SELECT duplicates FROM liekan_ingest_batch WHERE id=$1::uuid',
+        rebatchedAck.batchId,
+      )
+    )[0].duplicates,
+    2,
+  );
+  assert.equal(
+    (
+      await query(
+        'SELECT count(*)::int AS n FROM liekan_log WHERE source_id=$1::uuid',
+        confirmed.sourceId,
+      )
+    )[0].n,
+    1,
+  );
+  const processedSource = (
+    await query(
+      'SELECT last_received_at,last_processed_at FROM liekan_log_source WHERE id=$1::uuid',
+      confirmed.sourceId,
+    )
+  )[0];
+  assert.ok(processedSource.last_received_at);
+  assert.ok(processedSource.last_processed_at);
   await manageSource(websiteId, confirmed.sourceId, { action: 'pause' }, identity);
   await maintainCloudflare(confirmed.sourceId, 'health');
   assert.equal(job.enabled, false);
+  await manageSource(websiteId, confirmed.sourceId, { action: 'select' }, identity);
+  await maintainProvider(confirmed.sourceId, 'configure', workerId);
+  assert.equal(job.enabled, true);
+  assert.equal(job.id, 19);
+  assert.equal(createAttempts, 2);
   await transaction(tx => stopWebsiteSources(tx, websiteId));
   await maintainCloudflare(confirmed.sourceId, 'disconnect');
   assert.equal(
@@ -366,5 +534,5 @@ assert.equal(
 await (await getQueue()).stop();
 await prisma.client.$disconnect();
 console.log(
-  'PASS: isolated migrations and vendor bootstrap; durable ACK, privacy, case/rebatch dedup, conflicts, interval policy, reset fencing, scoped credentials, OAuth binding and owned Logpush lifecycle, bounded burst quota and import index.',
+  'PASS: isolated migrations and vendor bootstrap; durable ACK, privacy, case/rebatch dedup, conflicts, interval policy, reset fencing, scoped credentials, OAuth binding, authenticated gzip destination probes, provider retry and owned Logpush lifecycle, bounded burst quota and import index.',
 );

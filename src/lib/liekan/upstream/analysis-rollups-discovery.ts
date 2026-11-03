@@ -6,6 +6,7 @@ import {
 } from './analysis-rollups-model';
 import { TRAFFIC_POLICY_VERSION } from './traffic-query';
 import { CRAWLER_POPULATION_VERSION } from '../rules/population';
+import { storageHistorySiteAllowedSql } from './storage-capacity';
 
 const phases = ['finite-log', 'finite-visit', 'stale-log', 'stale-visit', 'hour-log'] as const;
 type Phase = (typeof phases)[number];
@@ -108,6 +109,47 @@ async function cursor(tx: AnalysisTx, site: Site, phase: Phase, value?: Date) {
   );
   if (iso) site.discovery_cursors[phase] = iso;
   else delete site.discovery_cursors[phase];
+}
+
+/** Restore recent interrupted work independently of the historical discovery cursor. */
+async function resumeCapacity(tx: AnalysisTx, site: Site) {
+  let resumed = 0;
+  for (const family of ['log', 'visit']) {
+    if (family === 'visit' && !site.visit_expansion) continue;
+    const [candidate] = await tx.$queryRawUnsafe<{ id: string }[]>(
+      `WITH checked AS MATERIALIZED(
+        SELECT m.* FROM liekan_analysis_manifest m WHERE m.website_id=$1::uuid AND m.epoch=$2::bigint
+         AND m.family=$3 AND m.versions=$4::jsonb
+         AND m.fingerprint=liekan_analysis_fingerprint(m.website_id,m.epoch,m.family,m.bucket,m.bucket_end)
+       ), coverage AS(
+        SELECT range_agg(tstzrange(m.bucket,m.bucket_end,'[)')) AS low,
+         range_agg(tstzrange(m.bucket,m.bucket_end,'[)')) FILTER(WHERE ${analysisPathCoverageSql('m')}) AS paths FROM checked m
+       ) SELECT b.id FROM liekan_analysis_build b JOIN liekan_analysis_site s USING(website_id) CROSS JOIN coverage
+       WHERE b.website_id=$1::uuid AND b.epoch=$2::bigint AND s.epoch=b.epoch AND s.mode='live'
+       AND b.actor_id IS NULL AND NOT b.automatic_history AND b.family=$3
+       AND b.status='capacity_limited' AND b.error_code='analysis-capacity-limited'
+       AND b.next_attempt_at<=clock_timestamp() AND ${storageHistorySiteAllowedSql}
+       AND (b.checkpoint->>'generation' IS NULL OR EXISTS(SELECT 1 FROM liekan_analysis_generation g
+         WHERE g.website_id=b.website_id AND g.generation::text=b.checkpoint->>'generation' AND g.gc_started_at IS NULL))
+       AND NOT EXISTS(SELECT 1 FROM liekan_analysis_build active WHERE active.website_id=b.website_id AND active.epoch=b.epoch
+         AND active.actor_id IS NULL AND NOT active.automatic_history AND active.family IN(b.family,'both')
+         AND active.status IN('queued','running','paused') AND active.range_start<b.range_end AND active.range_end>b.range_start)
+       AND NOT (tstzmultirange(tstzrange(greatest(b.range_start,coalesce((b.checkpoint->>'hour')::timestamptz,b.range_start)),b.range_end,'[)'))
+         <@ coalesce(CASE WHEN b.family='log' AND b.unit_seconds=3600 AND s.path_expansion THEN coverage.paths ELSE coverage.low END, '{}'::tstzmultirange))
+       ORDER BY b.range_end DESC,b.updated_at,b.id LIMIT 1 FOR UPDATE OF b SKIP LOCKED`,
+      site.website_id,
+      String(site.epoch),
+      family,
+      JSON.stringify(site.versions),
+    );
+    if (!candidate) continue;
+    resumed += await tx.$executeRawUnsafe(
+      `UPDATE liekan_analysis_build SET status='queued',attempts=0,error_code=NULL,lease_token=NULL,lease_until=NULL,
+       next_attempt_at=clock_timestamp(),revision=revision+1,updated_at=clock_timestamp() WHERE id=$1::uuid AND status='capacity_limited'`,
+      candidate.id,
+    );
+  }
+  return resumed;
 }
 async function leaves(
   tx: AnalysisTx,
@@ -272,8 +314,8 @@ async function hours(tx: AnalysisTx, site: Site, queue: RecoveryWriter, lane: 'h
   return queued;
 }
 
-/** Eight sites × five phases × two bounded lanes: at most 80 enqueue attempts. */
-export async function discoverAnalysisRollups(queue: RecoveryWriter) {
+/** Eight sites × five phases × two lanes, plus two interrupted receipts per site. */
+export async function discoverAnalysisRollups(queue: RecoveryWriter, recoverCapacity = false) {
   const visited: string[] = [];
   let queued = 0;
   for (let count = 0; count < 8; count++) {
@@ -290,7 +332,7 @@ export async function discoverAnalysisRollups(queue: RecoveryWriter) {
         CRAWLER_POPULATION_VERSION,
       );
       if (!site) return null;
-      let found = 0;
+      let found = recoverCapacity ? await resumeCapacity(tx, site) : 0;
       // Each phase probes the newest 32 rows and independently advances 32 backlog rows.
       // A terminal head conflict cannot suppress the persistent backlog lane.
       for (const lane of ['head', 'backlog'] as const) {

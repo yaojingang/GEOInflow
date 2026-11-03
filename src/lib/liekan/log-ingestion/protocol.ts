@@ -218,7 +218,10 @@ export async function decodeUpload(request: Request, kind: 'server' | 'cloudflar
     if (lines.length > MAX_RECORDS || lines.some(line => Buffer.byteLength(line) > MAX_LINE_BYTES))
       throw new LiekanError('日志行数或长度超出上限', 413);
     const events = lines.map(line => JSON.parse(line));
-    if (events.length === 1 && JSON.stringify(events[0]) === '{"content":"tests"}')
+    if (
+      events.length === 1 &&
+      ['{"content":"test"}', '{"content":"tests"}'].includes(JSON.stringify(events[0]))
+    )
       return { test: true, events: [], epoch: 0, batchId: '', digest: '' };
     if (events.some(e => !e || typeof e !== 'object' || 'content' in e))
       throw new LiekanError('日志格式无效');

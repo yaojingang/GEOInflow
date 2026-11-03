@@ -1,3 +1,4 @@
+import { populationFromRow } from '../upstream/browser-population';
 import { describe, it, expect } from 'vitest';
 import {
   completedObservationDate,
@@ -92,4 +93,40 @@ describe('Liekan analysis boundaries', () => {
       ],
     });
   });
+});
+
+it('preserves missing comparison coverage without converting it to empty days', () => {
+  const range = {
+    startAt: Date.parse('2026-01-09T00:00:00Z'),
+    endAt: Date.parse('2026-01-09T23:59:59Z'),
+    timezone: 'UTC',
+  };
+  const missing = populationFromRow(
+    {
+      resourceKind: 'website',
+      metricScope: 'qualified-browser',
+      eligibleEvents: 5,
+      qualifiedEvents: 0,
+      eligiblePV: 5,
+      qualifiedPV: 0,
+      qualifiedVisitors: 0,
+    },
+    range,
+  );
+  expect(relativeDaySeries([], range.startAt, range.endAt, range.timezone, missing)).toEqual([
+    null,
+  ]);
+  const empty = populationFromRow(
+    {
+      resourceKind: 'website',
+      metricScope: 'qualified-browser',
+      eligibleEvents: 0,
+      qualifiedEvents: 0,
+      eligiblePV: 0,
+      qualifiedPV: 0,
+      qualifiedVisitors: 0,
+    },
+    range,
+  );
+  expect(relativeDaySeries([], range.startAt, range.endAt, range.timezone, empty)).toEqual([0]);
 });

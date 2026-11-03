@@ -49,6 +49,7 @@ import { refreshDocumentSources } from '../lib/liekan/upstream/crawler-maintenan
 import { DOCUMENT_JOB_SECONDS } from '../lib/liekan/crawlers/document-sources';
 import { processCrawlerAnalysis } from '../lib/liekan/crawlers/worker';
 import { processCrawlerCheck } from '../lib/liekan/crawler-control/diagnostics';
+import { processRobotsManagement } from '../lib/liekan/upstream/robots-management';
 import { maintainCrawlerRecords } from '../lib/liekan/crawler-control/retention';
 import { processCrawlerDeployment } from '../lib/liekan/crawler-control/deployments';
 
@@ -215,9 +216,13 @@ async function main() {
       repairing = false;
     }
   };
-  void background(repairMaintenance()).catch(() => console.error('History repair maintenance unavailable'));
+  void background(repairMaintenance()).catch(() =>
+    console.error('History repair maintenance unavailable'),
+  );
   const repairTimer = setInterval(() => {
-    void background(repairMaintenance()).catch(() => console.error('History repair maintenance unavailable'));
+    void background(repairMaintenance()).catch(() =>
+      console.error('History repair maintenance unavailable'),
+    );
   }, 60000);
   await boss.work<{ batchId: string }>(
     LOG_QUEUE,
@@ -319,6 +324,17 @@ async function main() {
   const crawlerTimer = setInterval(() => {
     void background(wakeCrawlers()).catch(() => {});
   }, 2000);
+  let robotsPending: Promise<void> | undefined;
+  const wakeRobots = () => {
+    if (stopped || robotsPending) return;
+    robotsPending = processRobotsManagement()
+      .catch(() => console.error('Robots management maintenance unavailable'))
+      .finally(() => {
+        robotsPending = undefined;
+      });
+  };
+  wakeRobots();
+  const robotsTimer = setInterval(wakeRobots, 2000);
   await recordHealth();
   void background(reconcile()).catch(() => console.error('Liekan worker maintenance unavailable'));
   if (!crawlerMaintenancePaused)
@@ -399,7 +415,9 @@ async function main() {
     void background(cleanup()).catch(() => {});
   }, 30000);
   const health = setInterval(() => {
-    void background(reconcile()).catch(() => console.error('Liekan worker maintenance unavailable'));
+    void background(reconcile()).catch(() =>
+      console.error('Liekan worker maintenance unavailable'),
+    );
   }, 30000);
   const heartbeat = setInterval(() => {
     void background(recordHealth()).catch(() => {});
@@ -431,9 +449,11 @@ async function main() {
     clearInterval(ranges);
     clearInterval(documents);
     clearInterval(crawlerTimer);
+    clearInterval(robotsTimer);
     clearInterval(browserRiskTimer);
     await boss.stop({ graceful: true, timeout: 30000 });
     await Promise.allSettled([...backgroundWork]);
+    await robotsPending;
     await transaction(tx =>
       tx.$executeRawUnsafe('DELETE FROM liekan_worker_state WHERE id=$1', workerId),
     ).catch(() => {});

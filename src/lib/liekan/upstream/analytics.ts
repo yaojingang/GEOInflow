@@ -1,6 +1,8 @@
 import { applyHumanFactsPopulation } from '../contracts/population-results';
 import { identityUsable, unavailableFields } from '../contracts/browser-population';
-import { readBrowserPopulation } from './browser-population';
+import { applyNativePopulation, readBrowserPopulation } from './browser-population';
+import { readAnalysisVisitContext } from './analysis-rollups';
+import { noteBrowserPopulation } from './cache-context';
 import { nativeSnapshot } from './native-snapshot';
 import { funnelParametersSchema } from '@/lib/analytics-schema';
 import { getPostgresCountrySQL, getPostgresRegionSQL } from '@/lib/country';
@@ -9,6 +11,7 @@ import { classifyEntrySource, classifyEntrySourceForDisplay } from '../contracts
 import { humanTotals, query, LiekanError } from './server';
 import { readBrowserDetailFacts } from './browser-detail-facts';
 import { warehouseEnabled } from '../warehouse/runtime';
+import { boundedBrowserEventsSql } from './bounded-browser-events';
 
 export { classifyEntrySource } from '../contracts/sources';
 
@@ -57,27 +60,31 @@ export function sourceFacts(rows: any[]) {
 }
 
 // All knowledge of upstream storage and metric semantics is confined here.
-export function humanVisitsSql(keywords = false, dimensions = true) {
-  return `WITH events AS (SELECT e.event_id,e.website_id,e.session_id,e.visit_id,e.created_at,e.event_type,e.url_path,e.event_name,e.referrer_domain,e.utm_source,e.utm_medium,e.utm_campaign${dimensions ? ',s.country AS country,s.region AS region,s.city AS city,s.browser AS browser,s.os AS os,s.device AS device' : ''} FROM website_event e${dimensions ? '\n  LEFT JOIN session s ON s.session_id=e.session_id AND s.website_id=e.website_id' : ''}
-  WHERE e.website_id=$1::uuid AND e.created_at BETWEEN $2::timestamptz AND $3::timestamptz AND e.event_type != 5 AND $4::text IS NOT NULL),
-${dimensions ? 'visit_geography AS (SELECT DISTINCT ON (visit_id,session_id) visit_id,session_id,country,region,city FROM events WHERE event_type NOT IN(2,5) ORDER BY visit_id,session_id,created_at,event_id),\n' : ''}visit_totals AS (SELECT visit_id,session_id,count(*) FILTER(WHERE event_type NOT IN(2,5))::int AS pv,
+export function humanVisitsSql(
+  keywords = false,
+  dimensions = true,
+  projection?: { geography: boolean; environment: boolean; entry?: boolean },
+) {
+  const geography = dimensions && (projection?.geography ?? true);
+  const environment = dimensions && (projection?.environment ?? true);
+  const entry = keywords || projection?.entry !== false;
+  return `WITH ${boundedBrowserEventsSql(
+    'e.website_id=$1::uuid AND e.created_at BETWEEN $2::timestamptz AND $3::timestamptz AND e.event_type != 5 AND $4::text IS NOT NULL',
+    { geography, environment, ...(entry ? { entryBefore: '$3::timestamptz' } : {}) },
+  )}, events AS MATERIALIZED (SELECT e.*${geography ? ',e.liekan_country AS country,e.liekan_region AS region,e.liekan_city AS city' : ''}${environment ? ',e.liekan_browser AS browser,e.liekan_os AS os,e.liekan_device AS device' : ''} FROM bounded_events e),
+${geography ? 'visit_geography AS (SELECT DISTINCT ON (visit_id,session_id) visit_id,session_id,country,region,city FROM events WHERE event_type NOT IN(2,5) ORDER BY visit_id,session_id,created_at,event_id),\n' : ''}visit_totals AS (SELECT visit_id,session_id,count(*) FILTER(WHERE event_type NOT IN(2,5))::int AS pv,
   bool_or(event_type=2)::int AS custom, min(created_at) FILTER(WHERE event_type NOT IN(2,5)) AS started,
-  extract(epoch FROM max(created_at) FILTER(WHERE event_type NOT IN(2,5))-min(created_at) FILTER(WHERE event_type NOT IN(2,5)))::float AS duration${dimensions ? ',\n  max(browser) AS browser,max(os) AS os,max(device) AS device' : ''}
+  extract(epoch FROM max(created_at) FILTER(WHERE event_type NOT IN(2,5))-min(created_at) FILTER(WHERE event_type NOT IN(2,5)))::float AS duration${environment ? ',\n  max(browser) AS browser,max(os) AS os,max(device) AS device' : ''}
   FROM events GROUP BY visit_id,session_id HAVING count(*) FILTER(WHERE event_type NOT IN(2,5))>0),
-visits AS (SELECT v.*${dimensions ? ',geography.country,geography.region,geography.city' : ''},entry.referrer_domain AS referrer,entry.utm_source AS "utmSource",entry.utm_medium AS "utmMedium",entry.utm_campaign AS "utmCampaign"${keywords ? ' ,entry.referrer_path AS "referrerPath",entry.referrer_query AS "referrerQuery",entry.utm_term AS "utmTerm"' : ''}
-  FROM visit_totals v${dimensions ? ' JOIN visit_geography geography USING(visit_id,session_id)' : ''} LEFT JOIN LATERAL (
-    SELECT e.referrer_domain,e.utm_source,e.utm_medium,e.utm_campaign${keywords ? ',e.referrer_path,e.referrer_query,e.utm_term' : ''} FROM website_event e
-    WHERE e.website_id=$1::uuid AND e.visit_id=v.visit_id AND e.session_id=v.session_id
-      AND e.created_at<=$3::timestamptz AND e.event_type NOT IN(2,5)
-    ORDER BY e.created_at,e.event_id LIMIT 1
-  ) entry ON true),
+visits AS (SELECT v.*${geography ? ',geography.country,geography.region,geography.city' : ''}${entry ? ',entry.referrer_domain AS referrer,entry.utm_source AS "utmSource",entry.utm_medium AS "utmMedium",entry.utm_campaign AS "utmCampaign"' : ''}${keywords ? ' ,entry.referrer_path AS "referrerPath",entry.referrer_query AS "referrerQuery",entry.utm_term AS "utmTerm"' : ''}
+  FROM visit_totals v${geography ? ' JOIN visit_geography geography USING(visit_id,session_id)' : ''}${entry ? ' LEFT JOIN bounded_entry entry ON entry.website_id=$1::uuid AND entry.visit_id=v.visit_id AND entry.session_id=v.session_id' : ''}),
 definitions AS (SELECT report_id,name,parameters FROM report WHERE website_id=$1::uuid AND type='goal'),
 matches AS (SELECT DISTINCT d.report_id,e.event_id,e.created_at,e.visit_id,e.session_id FROM definitions d JOIN events e ON
   ((d.parameters->>'type'='path' AND e.event_type=1 AND CASE WHEN (left(d.parameters->>'value',1)='*' OR right(d.parameters->>'value',1)='*') THEN e.url_path LIKE regexp_replace(regexp_replace(d.parameters->>'value','^[*]','%'),'[*]$','%') ELSE e.url_path=d.parameters->>'value' END) OR
    (d.parameters->>'type'!='path' AND e.event_type=2 AND CASE WHEN (left(d.parameters->>'value',1)='*' OR right(d.parameters->>'value',1)='*') THEN e.event_name LIKE regexp_replace(regexp_replace(d.parameters->>'value','^[*]','%'),'[*]$','%') ELSE e.event_name=d.parameters->>'value' END))),
 converted AS (SELECT DISTINCT visit_id,session_id FROM matches)`;
 }
-const cte = humanVisitsSql();
+const countProjection = { geography: false, environment: false, entry: false };
 
 export const visitMetrics = `count(*)::int AS sessions, sum(v.pv)::int AS pv,
   avg(v.duration)::float AS duration, count(*) FILTER(WHERE v.pv=1 AND v.custom=0)::int AS bounces,
@@ -165,6 +172,7 @@ export async function getHumanFacts(
   timezone: string,
   fields?: readonly HumanFact[],
   geographyReadLimit?: { rows: number; bytes: number },
+  projection?: { crawlerContext?: boolean },
 ) {
   const args: unknown[] = [id, start, end, timezone];
   const selected = new Set(fields);
@@ -183,28 +191,44 @@ export async function getHumanFacts(
     journeys: `, paths AS (SELECT visit_id,(array_agg(url_path ORDER BY created_at,event_id))[1:6] AS path FROM events WHERE event_type=1 GROUP BY visit_id) SELECT array_to_string(path,' → ') AS path,count(*)::int AS count FROM paths GROUP BY 1 ORDER BY count DESC,path LIMIT 6`,
     exits: `, lasts AS (SELECT DISTINCT ON(visit_id,session_id) url_path AS path FROM events WHERE event_type=1 ORDER BY visit_id,session_id,created_at DESC,event_id DESC) SELECT path,count(*)::int AS count FROM lasts GROUP BY 1 ORDER BY count DESC,path LIMIT 1`,
     dailySources: ` SELECT to_char(started AT TIME ZONE $4,'YYYY-MM-DD') AS day,referrer,"utmSource","utmMedium","utmCampaign",count(*)::int AS count FROM visits GROUP BY 1,2,3,4,5 ORDER BY 1,2,3,4,5`,
-    newVisitors: ` SELECT count(distinct v.session_id)::int AS count FROM visits v JOIN session s ON s.session_id=v.session_id AND s.website_id=$1::uuid WHERE s.created_at BETWEEN $2 AND $3`,
+    // Qualified visits already prove session presence. Physical creation time also keeps
+    // the policy wrapper from shadowing the cohort's physical session reads with a CTE.
+    newVisitors: ` SELECT count(distinct v.session_id)::int AS count FROM visits v JOIN (TABLE session) s ON s.session_id=v.session_id AND s.website_id=$1::uuid WHERE s.created_at BETWEEN $2 AND $3`,
     dailyConversions: ` SELECT to_char(created_at AT TIME ZONE $4,'YYYY-MM-DD') AS day,count(distinct event_id)::int AS count FROM matches GROUP BY 1 ORDER BY 1`,
   };
-  const detail = await readBrowserDetailFacts(
-    id,
-    start,
-    end,
-    timezone,
-    Object.keys(statements).filter(key => needs(key as HumanFact)),
-    { geographyReadLimit },
+  // Crawler pages consume date labels and exact presence; detailed daily metrics retain their own reader.
+  const context =
+    !warehouseEnabled() &&
+    projection?.crawlerContext &&
+    fields &&
+    fields.every(field => field === 'daily' || field === 'pages')
+      ? await readAnalysisVisitContext({ websiteId: id, startDate: start, endDate: end, timezone })
+      : null;
+  if (context) noteBrowserPopulation(id, context.population);
+  const detailFields = Object.keys(statements).filter(
+    key => needs(key as HumanFact) && !(context && key === 'daily'),
   );
+  const detailed = await readBrowserDetailFacts(id, start, end, timezone, detailFields, {
+    geographyReadLimit,
+  });
+  const detail = context
+    ? {
+        ...detailed,
+        ...(selected.has('daily') ? { daily: context.dates.map(day => ({ day })) } : {}),
+      }
+    : detailed;
   const remaining = Object.entries(statements).filter(
     ([key]) => needs(key as HumanFact) && !Object.hasOwn(detail || {}, key),
   );
   // Path projections share one eligible scan with the original date and identity boundaries.
   const currentCte =
     remaining.length && remaining.every(([key]) => key === 'journeys' || key === 'exits')
-      ? `WITH events AS MATERIALIZED (SELECT e.event_id,e.session_id,e.visit_id,e.created_at,e.event_type,e.url_path
-         FROM liekan_geographic_website_event e
-         WHERE e.website_id=$1::uuid AND e.created_at BETWEEN $2::timestamptz AND $3::timestamptz
-          AND e.event_type != 5 AND $4::text IS NOT NULL)`
-      : cte;
+      ? `WITH ${boundedBrowserEventsSql('e.website_id=$1::uuid AND e.created_at BETWEEN $2::timestamptz AND $3::timestamptz AND e.event_type != 5 AND $4::text IS NOT NULL')}, events AS MATERIALIZED (SELECT e.event_id,e.session_id,e.visit_id,e.created_at,e.event_type,e.url_path FROM bounded_events e)`
+      : humanVisitsSql(false, true, {
+          geography: remaining.some(([key]) => key === 'geo'),
+          environment: remaining.some(([key]) => key === 'environment'),
+          entry: remaining.some(([key]) => key === 'sources' || key === 'dailySources'),
+        });
   const projections = remaining.map(([key, tail]) => {
     const select = tail.trimStart().startsWith(',') ? 'WITH ' + tail.trimStart().slice(1) : tail;
     if (key === 'geo' && geographyReadLimit) {
@@ -215,11 +239,17 @@ export async function getHumanFacts(
   if (geographyReadLimit && needs('geo') && !detail?.geo)
     args.push(geographyReadLimit.rows, geographyReadLimit.bytes);
   const [totals, definitions, current, previousSources, previousGoals] = await Promise.all([
-    humanTotals(id, start, end, timezone),
-    warehouseEnabled() ? (await import('./warehouse-report-snapshot')).warehouseReportMetadata(id).then(m=>m.reports) : query(
-      "SELECT report_id AS id,name,type,parameters FROM report WHERE website_id=$1::uuid AND type IN('goal','funnel') ORDER BY created_at LIMIT 100",
-      id,
-    ),
+    context
+      ? Promise.resolve(
+          applyNativePopulation([context.totals], 'getWebsiteStats', context.population)[0],
+        )
+      : humanTotals(id, start, end, timezone),
+    warehouseEnabled()
+      ? (await import('./warehouse-report-snapshot')).warehouseReportMetadata(id).then(m => m.reports)
+      : query(
+          "SELECT report_id AS id,name,type,parameters FROM report WHERE website_id=$1::uuid AND type IN('goal','funnel') ORDER BY created_at LIMIT 100",
+          id,
+        ),
     projections.length
       ? query(currentCte + ` SELECT jsonb_build_object(${projections.join(',')}) AS facts`, ...args)
       : Promise.resolve([]),
@@ -244,7 +274,7 @@ export async function getHumanFacts(
               }),
             );
           return query(
-            cte +
+            humanVisitsSql(false, false) +
               ` SELECT v.referrer,v."utmSource",v."utmMedium",v."utmCampaign",count(*)::int AS sessions,count(*) FILTER(WHERE cv.visit_id IS NOT NULL)::int AS conversions FROM visits v ${convertedJoin} GROUP BY 1,2,3,4`,
             id,
             previousStart,
@@ -262,7 +292,7 @@ export async function getHumanFacts(
           ]);
           if (previous) return previous.goals.map(({ id, count }) => ({ id, count }));
           return query(
-            cte +
+            humanVisitsSql(false, false, countProjection) +
               ` SELECT report_id AS id,count(distinct event_id)::int AS count FROM matches GROUP BY 1`,
             id,
             previousStart,
@@ -363,7 +393,7 @@ export async function getHumanConversions(id: string, start: Date, end: Date, ti
   return (
     (
       await query(
-        `${cte} SELECT count(distinct event_id)::int AS count FROM matches`,
+        `${humanVisitsSql(false, false, countProjection)} SELECT count(distinct event_id)::int AS count FROM matches`,
         id,
         start,
         end,
@@ -381,12 +411,23 @@ export async function getHumanDays(
 ) {
   return nativeSnapshot(async () => {
     const detail = await readBrowserDetailFacts(id, start, end, timezone, ['daily'], { hour });
-    const rows = detail?.daily ?? (await query(cte + humanBinsSql(hour), id, start, end, timezone));
+    const rows =
+      detail?.daily ??
+      (await query(
+        humanVisitsSql(false, false, countProjection) + humanBinsSql(hour),
+        id,
+        start,
+        end,
+        timezone,
+      ));
     const population = await readBrowserPopulation(id, start, end, timezone);
-    return identityUsable(population)
-      ? rows
-      : rows.map(row =>
-          unavailableFields(row, ['uv', 'sessions', 'duration', 'bounces', 'conversions']),
-        );
+    return {
+      population,
+      rows: identityUsable(population)
+        ? rows
+        : rows.map(row =>
+            unavailableFields(row, ['uv', 'sessions', 'duration', 'bounces', 'conversions']),
+          ),
+    };
   });
 }

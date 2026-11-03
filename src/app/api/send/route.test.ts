@@ -139,13 +139,9 @@ function makeComputedSessionId(
   const createdAt = new Date(timestamp * 1000);
   const sessionSalt = getSalt(process.env.SALT_ROTATION || 'month', createdAt);
 
-  return uuid(
-    sourceId,
-    defaultClientInfo.ip,
-    defaultClientInfo.userAgent,
-    sessionSalt,
-    distinctId ?? '',
-  );
+  return uuid('liekan-collection-v4:', JSON.stringify([
+    'browser', sourceId, defaultClientInfo.ip, defaultClientInfo.userAgent, sessionSalt, distinctId ?? '',
+  ]));
 }
 
 beforeEach(() => {
@@ -164,6 +160,25 @@ beforeEach(() => {
   saveSessionDataMock.mockResolvedValue(undefined as any);
   saveSessionLinkMock.mockResolvedValue(undefined as any);
   updateSessionMock.mockResolvedValue(undefined as any);
+});
+
+test('collector redacts direct-submitted URL and referrer secrets while preserving UTM', async () => {
+  const response = await callPOST({
+    type: 'event',
+    payload: {
+      website: WEBSITE_ID,
+      url: 'https://example.com/landing?token=private-url-secret&utm_source=google#access_token=private-fragment',
+      referrer: 'https://search.example.com/?email=private%40example.com&q=analytics',
+    },
+  });
+  expect(response.status).toBe(200);
+  const saved = saveEventMock.mock.calls[0][0];
+  expect(JSON.stringify(saved)).not.toMatch(
+    /private-url-secret|private-fragment|private%40example/,
+  );
+  expect(new URLSearchParams(saved.urlQuery).get('token')).toBe('[redacted]');
+  expect(saved.utmSource).toBe('google');
+  expect(new URLSearchParams(saved.referrerQuery).get('q')).toBe('analytics');
 });
 
 describe('parseRequest error handling', () => {
@@ -967,4 +982,36 @@ describe('error handling', () => {
     });
     consoleLog.mockRestore();
   });
+});
+
+
+test('accepts a legacy signed tracker token and starts the recomputed versioned visit', async () => {
+  const timestamp = 1704067200;
+  const oldSession = uuid(
+    WEBSITE_ID,
+    defaultClientInfo.ip,
+    defaultClientInfo.userAgent,
+    getSalt('month', new Date(timestamp * 1000)),
+    '',
+  );
+  const token = createToken(
+    {
+      type: CACHE_TOKEN_TYPE,
+      websiteId: WEBSITE_ID,
+      sessionId: oldSession,
+      visitId: 'legacy-visit',
+      iat: Math.floor(Date.now() / 1000),
+    },
+    secret(),
+  );
+  const response = await callPOST(
+    { type: 'event', payload: { website: WEBSITE_ID, url: '/', timestamp } },
+    { headers: { 'x-umami-cache': token } },
+  );
+  expect(response.status).toBe(200);
+  const body = await response.json();
+  expect(body.sessionId).toBe(makeComputedSessionId(WEBSITE_ID, timestamp));
+  expect(body.sessionId).not.toBe(oldSession);
+  expect(body.visitId).not.toBe('legacy-visit');
+  expect(saveEventMock.mock.calls[0][0].sessionId).toBe(body.sessionId);
 });

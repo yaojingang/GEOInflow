@@ -15,6 +15,33 @@ export const SOURCE_VERSION = source.version;
 export const sourceTables = source.tables as SourceTable[];
 export const factTables = sourceTables.filter(t => t.ownership === 'clickhouse');
 export const sourceFingerprint = createHash('sha256').update(JSON.stringify(source)).digest('hex');
+// Main's 057–070 migrations add only PostgreSQL metadata and rebuildable state.
+// A sealed 056 clone cannot be altered. Keep its exact contract for resumable
+// migrations; do not allow arbitrary subsets of the newly registered metadata.
+const previous = source.previousSchema;
+export const previousSourceTables = sourceTables
+  .filter(table => !previous.absentTables.includes(table.name))
+  .map(table => ({
+    ...table,
+    columns: table.columns.filter(
+      column => !(previous.absentColumns[table.name] ?? []).includes(column.name),
+    ),
+  }));
+export const previousSourceFingerprint = previous.fingerprint;
+const reconstructed = {
+  version: previous.version,
+  sourceMigration: previous.sourceMigration,
+  tables: previousSourceTables,
+};
+if (
+  createHash('sha256').update(JSON.stringify(reconstructed)).digest('hex') !==
+  previousSourceFingerprint
+)
+  throw new Error('warehouse-previous-source-contract-changed');
+
+export function supportedSourceFingerprint(fingerprint: string): boolean {
+  return fingerprint === sourceFingerprint || fingerprint === previousSourceFingerprint;
+}
 
 export function identifier(value: string): string {
   if (!/^[a-z_][a-z0-9_]*$/.test(value)) throw new Error('Invalid warehouse identifier');
@@ -31,11 +58,11 @@ export type ActualTable = Pick<SourceTable, 'name' | 'primaryKey' | 'columns'>;
 
 // Fail closed: a new source table/column needs an explicit disposition before migration.
 // Extensions must be placed in a separate schema; they are not silently skipped.
-export function schemaDifferences(actual: ActualTable[]): string[] {
+function differences(actual: ActualTable[], expectedTables: SourceTable[]): string[] {
   const errors: string[] = [];
   const byName = new Map(actual.map(t => [t.name, t]));
   if (byName.size !== actual.length) errors.push('Duplicate table names');
-  for (const expected of sourceTables) {
+  for (const expected of expectedTables) {
     const table = byName.get(expected.name);
     if (!table) {
       errors.push(`Missing table: ${expected.name}`);
@@ -57,6 +84,17 @@ export function schemaDifferences(actual: ActualTable[]): string[] {
   }
   for (const name of byName.keys()) errors.push(`Unmapped table: ${name}`);
   return errors;
+}
+
+export function schemaFingerprint(actual: ActualTable[]): string | null {
+  if (!differences(actual, sourceTables).length) return sourceFingerprint;
+  if (!differences(actual, previousSourceTables).length) return previousSourceFingerprint;
+  return null;
+}
+
+export function schemaDifferences(actual: ActualTable[]): string[] {
+  if (schemaFingerprint(actual)) return [];
+  return differences(actual, sourceTables);
 }
 
 export const sourceCatalogSQL = `

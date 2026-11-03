@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { factTable, factTables, identifier, schemaDifferences, sourceTables } from './catalog';
+import {
+  factTable,
+  factTables,
+  identifier,
+  previousSourceFingerprint,
+  previousSourceTables,
+  schemaDifferences,
+  schemaFingerprint,
+  sourceFingerprint,
+  sourceTables,
+  supportedSourceFingerprint,
+} from './catalog';
 import { exportColumns, recordKey, rowDigest, validateWireRow } from './codec';
 import { clickhouseType, warehouseDDL } from './schema';
 
@@ -15,7 +26,7 @@ const receipt = {
 
 describe('complete historical source contract', () => {
   it('accounts for every table and rejects schema drift without exposing row values', () => {
-    expect(sourceTables).toHaveLength(138);
+    expect(sourceTables).toHaveLength(156);
     expect(factTables).toHaveLength(26);
     expect(schemaDifferences(sourceTables)).toEqual([]);
     const changed = structuredClone(sourceTables);
@@ -32,6 +43,44 @@ describe('complete historical source contract', () => {
     );
     expect(() => factTable('user')).toThrow('Unregistered fact family');
     expect(() => identifier('x;DROP TABLE x')).toThrow('Invalid warehouse identifier');
+  });
+
+  it('accepts complete source generations and preserves sealed 056 migration identity', () => {
+    expect(previousSourceTables).toHaveLength(138);
+    expect(previousSourceFingerprint).toBe(
+      '02c662582ce25d5e208476327961fdf4920ff76e9819aea8f55c0f3ed22c9458',
+    );
+    expect(schemaFingerprint(previousSourceTables)).toBe(previousSourceFingerprint);
+    expect(schemaFingerprint(sourceTables)).toBe(sourceFingerprint);
+    expect(supportedSourceFingerprint(previousSourceFingerprint)).toBe(true);
+    expect(supportedSourceFingerprint('0'.repeat(64))).toBe(false);
+    expect(previousSourceTables.filter(t => t.ownership === 'clickhouse')).toEqual(factTables);
+    const partial = sourceTables.filter(t => t.name !== 'liekan_robots_deployment');
+    expect(schemaDifferences(partial)).toContain('Missing table: liekan_robots_deployment');
+    const oldWithNewColumn = structuredClone(previousSourceTables);
+    oldWithNewColumn
+      .find(t => t.name === 'liekan_analysis_generation')
+      .columns.push({
+        name: 'gc_started_at',
+        type: 'timestamp with time zone',
+        nullable: true,
+      });
+    expect(schemaFingerprint(oldWithNewColumn)).toBeNull();
+    const changed = structuredClone(sourceTables);
+    changed.find(t => t.name === 'liekan_storage_candidate').primaryKey = [
+      'run_id',
+      'kind',
+      'record_id',
+    ];
+    expect(schemaDifferences(changed)).toContain('Primary key changed: liekan_storage_candidate');
+    for (const name of [
+      'liekan_robots_state',
+      'liekan_robots_deployment',
+      'liekan_analytics_engine_site',
+      'liekan_storage_cleanup',
+    ])
+      expect(sourceTables.find(t => t.name === name).ownership).toBe('postgres');
+    expect(sourceTables.find(t => t.name === 'liekan_report_fragment').ownership).toBe('retire');
   });
 
   it('preserves nullable evidence, microseconds and column order in checksums', () => {

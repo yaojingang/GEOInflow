@@ -102,7 +102,7 @@ describe('buildReport serialization slicing', () => {
     });
     mocks.settings.mockResolvedValue({ isDemo: false, rules: [], robots: '' });
     mocks.plotLogs.mockResolvedValue([]);
-    mocks.humanDays.mockResolvedValue([]);
+    mocks.humanDays.mockResolvedValue({ rows: [] });
     mocks.months.mockResolvedValue([]);
     mocks.conversions.mockResolvedValue({ goals: [] });
   });

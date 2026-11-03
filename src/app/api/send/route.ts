@@ -34,6 +34,7 @@ import { badRequest, forbidden, json, serverError } from '@/lib/response';
 import { anyObjectParam, urlOrPathParam } from '@/lib/schema';
 import { safeDecodeURI, safeDecodeURIComponent } from '@/lib/url';
 import { getLink, getPixel } from '@/queries/prisma';
+import { sanitizeCollectionUrl } from '@/tracker/privacy';
 import {
   createSession,
   saveEvent,
@@ -317,7 +318,7 @@ async function collect(request: Request) {
       if (identity) await writer.identity(websiteId, identity);
       if (type === COLLECTION_TYPE.event) {
         const base = hostname ? `https://${hostname}` : 'https://localhost';
-        const currentUrl = new URL(url, base);
+        const currentUrl = new URL(sanitizeCollectionUrl(url, base));
 
         let urlPath =
           currentUrl.pathname === '/undefined' ? '' : currentUrl.pathname + currentUrl.hash;
@@ -360,7 +361,9 @@ async function collect(request: Request) {
             }
           }
           // Resolve path-only referrers against the event's domain, not the localhost fallback
-          const referrerUrl = new URL(referrer, eventDomain ? `https://${eventDomain}` : base);
+          const referrerUrl = new URL(
+            sanitizeCollectionUrl(referrer, eventDomain ? `https://${eventDomain}` : base),
+          );
 
           referrerPath = referrerUrl.pathname;
           referrerQuery = referrerUrl.search.substring(1);

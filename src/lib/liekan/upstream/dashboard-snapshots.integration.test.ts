@@ -1,6 +1,8 @@
 // @vitest-environment node
 import { randomUUID } from 'node:crypto';
+import { writeFile } from 'node:fs/promises';
 import { PgBoss } from 'pg-boss';
+import { Client } from 'pg';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   requestDashboardSnapshot,
@@ -18,10 +20,29 @@ import {
 } from './analysis-queries';
 import { bootstrapAnalysisHistory } from './analysis-rollups-worker';
 import { analysisCapacity, analysisTransaction } from './analysis-rollups-db';
+import * as rollupDatabase from './analysis-rollups-db';
 import { withPublishedRegistry } from './crawler-registry-context';
 import { withAnalysisPermit } from './analysis-background';
 import { ANALYSIS_QUERY_QUEUE } from './analysis-query-model';
+import { pageReportParts } from '../contracts/page-report';
+import { AnalyticsUnavailable } from './analytics-budget';
 
+const warmResources = [
+  'overview',
+  'human/overview',
+  ...Object.keys(pageReportParts).filter(
+    resource => !['overview', 'human/overview', 'logs', 'human/keywords'].includes(resource),
+  ),
+];
+
+const withBlockedLane = (
+  kind: Parameters<typeof withAnalysisPermit>[0],
+  work: () => Promise<unknown>,
+) =>
+  withAnalysisPermit(kind, async () => {
+    if (kind === 'dashboard') await withAnalysisPermit(kind, work);
+    else await work();
+  });
 const enabled = process.env.LIEKAN_ANALYSIS_ROLLUPS_TEST === '1';
 const actor = { id: randomUUID(), role: 'user' };
 const sites: string[] = [];
@@ -91,6 +112,43 @@ async function finish(id: string) {
   );
   expect(row).toEqual({ status: 'ready', error_code: null });
 }
+async function aiLogs(times: number[], path = '/synthetic-ai-snapshot') {
+  const imported = randomUUID();
+  await sql(
+    'INSERT INTO liekan_import(id,website_id,digest,accepted,rejected) VALUES($1::uuid,$2::uuid,$1,$3,0)',
+    imported,
+    site,
+    times.length,
+  );
+  const ids: string[] = [];
+  for (const at of times) {
+    const id = randomUUID();
+    await sql(
+      `INSERT INTO liekan_log(id,website_id,import_id,created_at,path,method,status,bytes,ip_masked,ip_hash,user_agent,location,bot,vendor,bot_type,verification,ai_eligible,recognition_state)
+       VALUES($1,$2::uuid,$3::uuid,$4,$5,'GET',200,0,'','','GPTBot/fixture','','GPTBot','OpenAI','训练','unverified',true,'recognized')`,
+      id,
+      site,
+      imported,
+      new Date(at),
+      path,
+    );
+    ids.push(id);
+  }
+  return ids;
+}
+function aiSnapshotNow() {
+  let now = Math.ceil(Date.now() / 30000) * 30000 + 5000;
+  if (Math.floor(now / 86400000) !== Math.floor((now + 31000) / 86400000)) now += 30000;
+  return now;
+}
+async function expectAiProducerClock(jobId: string, through: number) {
+  const [timing] = await q(
+    `SELECT pending_through,last_read_at,clock_timestamp() AS database_now
+     FROM liekan_dashboard_snapshot WHERE job_id=$1::uuid`,
+    jobId,
+  );
+  expect(+new Date(timing.pending_through), JSON.stringify(timing)).toBe(through);
+}
 describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () => {
   afterEach(() => vi.restoreAllMocks());
   beforeAll(async () => {
@@ -131,6 +189,875 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     for (const id of sites) await sql('DELETE FROM website WHERE website_id=$1::uuid', id);
     await sql('DELETE FROM "user" WHERE user_id=$1::uuid', actor.id);
   });
+  it('coalesces simultaneous cold dashboard producers across authorized actors', async () => {
+    const readers = [
+      actor,
+      ...Array.from({ length: 4 }, () => ({ id: randomUUID(), role: 'admin' })),
+    ];
+    try {
+      for (const reader of readers.slice(1))
+        await sql(
+          `INSERT INTO "user"(user_id,username,password,role) VALUES($1::uuid,$1,'synthetic','admin')`,
+          reader.id,
+        );
+      const pending = await Promise.all(
+        readers.map(reader =>
+          withPublishedRegistry(() => requestDashboardSnapshot(site, reader, 'native:stats', p)),
+        ),
+      );
+      expect(pending.every(result => !result.ready)).toBe(true);
+      expect(
+        new Set(pending.map(result => (result.ready ? null : result.analysisJob.id))).size,
+      ).toBe(1);
+      const [count] = await q(
+        `SELECT count(*)::int AS n FROM liekan_analysis_query WHERE website_id=$1::uuid`,
+        site,
+      );
+      expect(count.n).toBe(1);
+      const [consumers] = await q(
+        `SELECT count(*)::int AS n FROM liekan_analysis_query_consumer c JOIN liekan_analysis_query q ON q.id=c.job_id WHERE q.website_id=$1::uuid`,
+        site,
+      );
+      expect(consumers.n).toBe(5);
+    } finally {
+      await sql('DELETE FROM liekan_analysis_query WHERE website_id=$1::uuid', site);
+      for (const reader of readers.slice(1))
+        await sql('DELETE FROM "user" WHERE user_id=$1::uuid', reader.id);
+    }
+  });
+  it.each(['same', 'other'])(
+    'reuses a cold producer that finishes between snapshot read and registration: %s actor',
+    async kind => {
+      const first = await read();
+      if (first.ready) throw new Error('expected a cold task');
+      const reader = kind === 'same' ? actor : { id: randomUUID(), role: 'admin' };
+      if (kind === 'other')
+        await sql(
+          `INSERT INTO "user"(user_id,username,password,role) VALUES($1::uuid,$1,'synthetic','admin')`,
+          reader.id,
+        );
+      const original = rollupDatabase.analysisTransaction;
+      let completed = false;
+      const spy = vi.spyOn(rollupDatabase, 'analysisTransaction').mockImplementation((async (
+        work: any,
+        level: any,
+      ) => {
+        let stale = false;
+        const result = await original(
+          tx =>
+            work(
+              new Proxy(tx, {
+                get(target, key) {
+                  if (key !== '$queryRawUnsafe') return Reflect.get(target, key);
+                  return async (statement: string, ...values: unknown[]) => {
+                    const rows = await target.$queryRawUnsafe(statement, ...values);
+                    if (
+                      !completed &&
+                      statement.includes('UPDATE liekan_dashboard_snapshot SET actor_id=')
+                    )
+                      stale = true;
+                    return rows;
+                  };
+                },
+              }),
+            ),
+          level,
+        );
+        if (stale && !completed) {
+          completed = true;
+          await finish(first.analysisJob.id);
+        }
+        return result;
+      }) as any);
+      try {
+        const second = await withPublishedRegistry(() =>
+          requestDashboardSnapshot(site, reader, 'native:stats', p),
+        );
+        expect(completed).toBe(true);
+        expect(second.ready).toBe(true);
+        expect(
+          (
+            await q(
+              'SELECT count(*)::int AS n FROM liekan_analysis_query WHERE website_id=$1::uuid',
+              site,
+            )
+          )[0].n,
+        ).toBe(1);
+      } finally {
+        spy.mockRestore();
+        if (kind === 'other') await sql('DELETE FROM "user" WHERE user_id=$1::uuid', reader.id);
+      }
+    },
+  );
+  it('stops automatic replacement of exhausted work until its input changes or a reader retries', async () => {
+    const pending = await read();
+    if (pending.ready === true) throw new Error('expected cold dashboard');
+    await sql(
+      "UPDATE liekan_analysis_query SET status='failed',attempts=4,queued_at=clock_timestamp()-interval '10 seconds',error_code='analysis-query-timeout' WHERE id=$1::uuid",
+      pending.analysisJob.id,
+    );
+    await sql(
+      "UPDATE liekan_dashboard_snapshot SET next_refresh_at=clock_timestamp()-interval '1 second' WHERE website_id=$1::uuid",
+      site,
+    );
+    await pumpDashboardSnapshots();
+    expect(
+      (
+        await q(
+          'SELECT count(*)::int AS n FROM liekan_analysis_query WHERE website_id=$1::uuid',
+          site,
+        )
+      )[0].n,
+    ).toBe(1);
+    await expect(read()).rejects.toMatchObject({ code: 'analysis-compute-blocked', status: 503 });
+    await sql('DELETE FROM liekan_analysis_query WHERE id=$1::uuid', pending.analysisJob.id);
+    await expect(read()).rejects.toMatchObject({ code: 'analysis-compute-blocked', status: 503 });
+    const retried = await read({ refresh: '1' });
+    expect(retried.ready).toBe(false);
+    if (retried.ready === false) expect(retried.analysisJob.id).not.toBe(pending.analysisJob.id);
+  });
+  it('retries transient failures after a bounded cooldown without requiring a data mutation', async () => {
+    const pending = await read();
+    if (pending.ready === true) throw new Error('expected cold dashboard');
+    await sql(
+      "UPDATE liekan_analysis_query SET status='failed',attempts=4,queued_at=clock_timestamp()-interval '10 seconds',error_code='analysis-compute-failed' WHERE id=$1::uuid",
+      pending.analysisJob.id,
+    );
+    await expect(read()).rejects.toMatchObject({ code: 'analysis-retry-deferred' });
+    await sql(
+      "UPDATE liekan_analysis_query SET updated_at=clock_timestamp()-interval '6 minutes' WHERE id=$1::uuid",
+      pending.analysisJob.id,
+    );
+    const next = await read();
+    if (next.ready === true) throw new Error('expected retried dashboard');
+    expect(next.analysisJob.id).not.toBe(pending.analysisJob.id);
+  });
+  it.each(['authority', 'publication', 'computation-budget'])(
+    'retains the retry policy for a failure during %s',
+    async phase => {
+      const pending = await read();
+      if (pending.ready) throw new Error('expected a cold dashboard');
+      const transaction = rollupDatabase.analysisTransaction;
+      const execution = await import('./analysis-query-execution');
+      const acquireError = Object.assign(
+        new Error('Unable to start a transaction in the given time'),
+        {
+          code: 'P2028',
+        },
+      );
+      let authorityChecks = 0;
+      const run = vi.spyOn(execution, 'executeAnalysisQuery').mockImplementation(async () => {
+        if (phase === 'computation-budget')
+          throw new AnalyticsUnavailable(
+            'Synthetic query budget exhausted',
+            5,
+            503,
+            'analysis-query-timeout',
+          );
+        return { pageviews: 1, visitors: 1 };
+      });
+      const intercepted = vi
+        .spyOn(rollupDatabase, 'analysisTransaction')
+        .mockImplementation((work, isolation) =>
+          transaction(
+            tx =>
+              work(
+                new Proxy(tx, {
+                  get(target, property) {
+                    if (property !== '$queryRawUnsafe' && property !== '$executeRawUnsafe')
+                      return Reflect.get(target, property);
+                    return async (statement: string, ...values: unknown[]) => {
+                      if (
+                        phase === 'authority' &&
+                        statement.includes('FROM website') &&
+                        statement.includes('FOR SHARE')
+                      ) {
+                        authorityChecks++;
+                        throw acquireError;
+                      }
+                      if (
+                        phase === 'publication' &&
+                        statement.includes("SET status='ready',result=")
+                      )
+                        throw acquireError;
+                      return target[property](statement, ...values);
+                    };
+                  },
+                }),
+              ),
+            isolation,
+          ),
+        );
+      try {
+        for (let attempt = 0; attempt < 4; attempt++) {
+          await sql(
+            'UPDATE liekan_analysis_query SET next_attempt_at=clock_timestamp() WHERE id=$1::uuid',
+            pending.analysisJob.id,
+          );
+          expect((await processAnalysisQuery(pending.analysisJob.id)).acquired).toBe(true);
+        }
+      } finally {
+        intercepted.mockRestore();
+        run.mockRestore();
+      }
+      const [failure] = await q(
+        'SELECT status,attempts,error_code FROM liekan_analysis_query WHERE id=$1::uuid',
+        pending.analysisJob.id,
+      );
+      expect(failure.status).toBe('failed');
+      expect(failure.attempts).toBe(4);
+      if (phase === 'computation-budget') {
+        expect(failure.error_code).toBe('analysis-query-timeout');
+        await expect(read()).rejects.toMatchObject({ code: 'analysis-compute-blocked' });
+      } else {
+        if (phase === 'authority') expect(authorityChecks).toBe(4);
+        expect(failure.error_code).toBe('analysis-compute-failed');
+        await expect(read()).rejects.toMatchObject({ code: 'analysis-retry-deferred' });
+        await sql(
+          "UPDATE liekan_analysis_query SET updated_at=clock_timestamp()-interval '6 minutes',queued_at=clock_timestamp()-interval '10 seconds' WHERE id=$1::uuid",
+          pending.analysisJob.id,
+        );
+        const retried = await read();
+        if (retried.ready) throw new Error('expected a new computation after cooldown');
+        expect(retried.analysisJob.id).not.toBe(pending.analysisJob.id);
+      }
+    },
+  );
+  it('holds website authority before locking an unchanged clock publication', async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const parameters = { ...p, resource: 'overview', chartPeriod: '30d' };
+    const initial = await withPublishedRegistry(() =>
+      requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+    );
+    if (initial.ready) throw new Error('expected a cold overview');
+    await finish(initial.analysisJob.id);
+    clock.mockReturnValue(now + 31000);
+    const transaction = rollupDatabase.analysisTransaction;
+    const observer = new Client({ connectionString: process.env.DATABASE_URL });
+    await observer.connect();
+    const schema = new URL(process.env.DATABASE_URL).searchParams.get('schema');
+    let inspected = false;
+    vi.spyOn(rollupDatabase, 'analysisTransaction').mockImplementation((work, isolation) =>
+      transaction(
+        tx =>
+          work(
+            new Proxy(tx, {
+              get(target, property) {
+                if (property !== '$queryRawUnsafe') return Reflect.get(target, property);
+                return async (statement: string, ...values: unknown[]) => {
+                  if (
+                    !inspected &&
+                    statement.startsWith('SELECT * FROM liekan_dashboard_snapshot') &&
+                    statement.endsWith('FOR UPDATE')
+                  ) {
+                    inspected = true;
+                    await observer.query('BEGIN');
+                    try {
+                      await observer.query(`SET LOCAL search_path TO "${schema}"`);
+                      await expect(
+                        observer.query(
+                          'SELECT website_id FROM website WHERE website_id=$1::uuid FOR UPDATE NOWAIT',
+                          [site],
+                        ),
+                      ).rejects.toMatchObject({ code: '55P03' });
+                    } finally {
+                      await observer.query('ROLLBACK');
+                    }
+                  }
+                  return target.$queryRawUnsafe(statement, ...values);
+                };
+              },
+            }),
+          ),
+        isolation,
+      ),
+    );
+    try {
+      const reused = await withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+      );
+      expect(reused.ready).toBe(true);
+      expect(inspected).toBe(true);
+    } finally {
+      await observer.end();
+    }
+  });
+  it('retains deterministic failure evidence when expiry maintenance runs before the next snapshot check', async () => {
+    const pending = await read();
+    if (pending.ready) throw new Error('expected cold dashboard');
+    await sql(
+      "UPDATE liekan_analysis_query SET status='failed',attempts=4,error_code='analysis-query-timeout',queued_at=clock_timestamp()-interval '1 day',retention_until=clock_timestamp()-interval '1 second' WHERE id=$1::uuid",
+      pending.analysisJob.id,
+    );
+    await pumpAnalysisQueries({ send: vi.fn(), update: vi.fn() } as any);
+    expect(
+      await q('SELECT id FROM liekan_analysis_query WHERE id=$1::uuid', pending.analysisJob.id),
+    ).toHaveLength(0);
+    await expect(read()).rejects.toMatchObject({ code: 'analysis-compute-blocked' });
+  });
+  it('joins a concurrent explicit retry when the failed-task marker has already changed', async () => {
+    const pending = await read();
+    if (pending.ready) throw new Error('expected cold dashboard');
+    await sql(
+      "UPDATE liekan_analysis_query SET status='failed',attempts=4,queued_at=clock_timestamp()-interval '10 seconds',error_code='analysis-query-timeout' WHERE id=$1::uuid",
+      pending.analysisJob.id,
+    );
+    const transaction = rollupDatabase.analysisTransaction;
+    let retried: Awaited<ReturnType<typeof read>>;
+    let intercepted = false;
+    vi.spyOn(rollupDatabase, 'analysisTransaction').mockImplementation(async callback =>
+      transaction(async tx =>
+        callback(
+          new Proxy(tx, {
+            get(target, property) {
+              if (property !== '$executeRawUnsafe') return Reflect.get(target, property);
+              return async (statement: string, ...values: unknown[]) => {
+                if (
+                  !intercepted &&
+                  statement.includes("SET error_code='dashboard-compute-failed'")
+                ) {
+                  intercepted = true;
+                  retried = await read({ refresh: '1' });
+                }
+                return target.$executeRawUnsafe(statement, ...values);
+              };
+            },
+          }),
+        ),
+      ),
+    );
+    const joined = await read();
+    expect(intercepted).toBe(true);
+    expect(retried).toMatchObject({ ready: false });
+    expect(joined).toMatchObject({ ready: false });
+    if (!joined.ready && !retried.ready) expect(joined.analysisJob.id).toBe(retried.analysisJob.id);
+  });
+  it('preserves a deterministic first-attempt failure after the last reader leaves', async () => {
+    const pending = await read();
+    if (pending.ready) throw new Error('expected cold dashboard');
+    await sql(
+      "UPDATE liekan_analysis_query SET status='failed',attempts=1,error_code='analysis-count-overflow' WHERE id=$1::uuid",
+      pending.analysisJob.id,
+    );
+    await sql(
+      "UPDATE liekan_dashboard_snapshot SET last_read_at=clock_timestamp()-interval '1 day',next_refresh_at=clock_timestamp()-interval '1 second' WHERE website_id=$1::uuid",
+      site,
+    );
+    await pumpDashboardSnapshots();
+    expect(
+      (
+        await q(
+          'SELECT error_code FROM liekan_analysis_query WHERE id=$1::uuid',
+          pending.analysisJob.id,
+        )
+      )[0].error_code,
+    ).toBe('analysis-count-overflow');
+    await expect(read()).rejects.toMatchObject({ code: 'analysis-compute-blocked' });
+    expect(
+      (
+        await q(
+          'SELECT count(*)::int AS n FROM liekan_analysis_query WHERE website_id=$1::uuid',
+          site,
+        )
+      )[0].n,
+    ).toBe(1);
+  });
+  it('reuses unchanged overview facts across a new clock window and still observes late input', async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const parameters = { ...p, resource: 'overview', chartPeriod: '30d' };
+    const request = () =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+      );
+    const pending = await request();
+    if (pending.ready === true) throw new Error('expected cold overview');
+    await finish(pending.analysisJob.id);
+    clock.mockReturnValue(now + 31000);
+    const reused = await request();
+    expect(reused.ready).toBe(true);
+    expect(
+      (
+        await q(
+          'SELECT count(*)::int AS n FROM liekan_analysis_query WHERE website_id=$1::uuid',
+          site,
+        )
+      )[0].n,
+    ).toBe(1);
+    if (reused.ready)
+      expect(reused.value.meta.snapshot.dataThrough).toBeGreaterThan(
+        Math.floor(now / 30000) * 30000,
+      );
+    await event('2026-01-01T02:00Z');
+    await request();
+    expect(
+      (
+        await q(
+          'SELECT count(*)::int AS n FROM liekan_analysis_query WHERE website_id=$1::uuid',
+          site,
+        )
+      )[0].n,
+    ).toBe(2);
+  });
+  it.each([
+    ['ai/overview', 'zh-CN'],
+    ['ai/bots', 'en-US'],
+    ['ai/pages', 'zh-CN'],
+    ['ai/preference', 'en-US'],
+  ] as const)(
+    'reuses unchanged %s with the same public projection as recomputation in %s',
+    async (resource, locale) => {
+      const now = aiSnapshotNow();
+      const today = Math.floor(now / 86400000) * 86400000;
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+      const [log] = await aiLogs([now - 60000]);
+      await event(new Date(now - 60000).toISOString());
+      await sql(
+        `INSERT INTO liekan_catalog(website_id,path,title,content_type,content_updated_at)
+         VALUES($1::uuid,'/synthetic-ai-snapshot','Snapshot page','article',$2)`,
+        site,
+        new Date(now - 2 * 3600000),
+      );
+      const parameters = {
+        startAt: today - 2 * 86400000,
+        endAt: today + 86400000,
+        resource,
+        chartPeriod: '30d',
+        timezone: 'UTC',
+        crawlerMetricsVersion: 1,
+      };
+      const request = (refresh = false) =>
+        withPublishedRegistry(() =>
+          requestDashboardSnapshot(
+            site,
+            actor,
+            'feature:page-report',
+            { ...parameters, ...(refresh ? { refresh: '1' } : {}) },
+            locale,
+          ),
+        );
+      const initial = await request();
+      if (initial.ready) throw new Error('expected a cold AI page');
+      await finish(initial.analysisJob.id);
+      const before = await request();
+      if (!before.ready) throw new Error('expected a published AI page');
+      clock.mockReturnValue(now + 31000);
+      const reused = await request();
+      if (!reused.ready) throw new Error('expected a reused AI page');
+      const nextEnd = Math.floor((now + 31000) / 30000) * 30000;
+      expect(reused.value.range.endAt).toBe(nextEnd);
+      expect(reused.value.meta.snapshot).toMatchObject({ dataThrough: nextEnd, state: 'ready' });
+      expect(
+        await q('SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid', site),
+      ).toHaveLength(1);
+      if (reused.value.meta.population)
+        expect(reused.value.meta.population.range.endAt).toBe(nextEnd);
+      const [saved] = await q(
+        'SELECT result FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
+        site,
+      );
+      if (['ai/overview', 'ai/preference'].includes(resource))
+        expect(saved.result.populations.length).toBeGreaterThan(0);
+      expect(saved.result.populations.every(population => population.range.endAt === nextEnd)).toBe(
+        true,
+      );
+      if (['ai/bots', 'ai/pages'].includes(resource)) {
+        expect(reused.value.meta.crawlerEvidenceView.query.endAt).toBe(nextEnd);
+        expect(reused.value.meta.crawlerEvidenceView.snapshot).not.toBe(
+          before.value.meta.crawlerEvidenceView.snapshot,
+        );
+      }
+      const forced = await request(true);
+      if (forced.ready) throw new Error('expected an explicit recomputation');
+      await expectAiProducerClock(forced.analysisJob.id, nextEnd);
+      await finish(forced.analysisJob.id);
+      const recomputed = await request();
+      if (!recomputed.ready) throw new Error('expected a recomputed AI page');
+      const content = (value: any) => {
+        const copy = structuredClone(value);
+        delete copy.meta.generatedAt;
+        delete copy.meta.expiresAt;
+        return copy;
+      };
+      if (process.env.LIEKAN_ANALYSIS_ROLLUPS_OUTPUT)
+        await writeFile(
+          `${process.env.LIEKAN_ANALYSIS_ROLLUPS_OUTPUT}/snapshot-reuse-${resource.replace('/', '-')}.json`,
+          JSON.stringify(
+            { reused: content(reused.value), recomputed: content(recomputed.value) },
+            null,
+            2,
+          ),
+          { mode: 0o600 },
+        );
+      expect(content(reused.value)).toEqual(content(recomputed.value));
+      await sql('UPDATE liekan_log SET status=201 WHERE website_id=$1::uuid AND id=$2', site, log);
+      clock.mockReturnValue(now + 62000);
+      expect(await request()).toMatchObject({ ready: true, snapshotState: 'updating' });
+      expect(
+        await q('SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid', site),
+      ).toHaveLength(3);
+    },
+  );
+  it('recomputes bot trends when the moving previous interval admits an existing historical log', async () => {
+    const now = aiSnapshotNow();
+    const today = Math.floor(now / 86400000) * 86400000;
+    const oldEnd = Math.floor(now / 30000) * 30000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const startAt = today - 86400000;
+    await aiLogs([now - 60000, 2 * startAt - oldEnd - 10000]);
+    const parameters = {
+      startAt,
+      endAt: today + 86400000,
+      resource: 'ai/bots',
+      timezone: 'UTC',
+      crawlerMetricsVersion: 1,
+    };
+    const request = () =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+      );
+    const pending = await request();
+    if (pending.ready) throw new Error('expected cold bots');
+    await finish(pending.analysisJob.id);
+    const before = await request();
+    if (!before.ready) throw new Error('expected published bots');
+    expect(before.value.tables.botBody[0].trend).toBeNull();
+    clock.mockReturnValue(now + 31000);
+    await request();
+    const jobs = await q(
+      'SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid ORDER BY sequence',
+      site,
+    );
+    expect(jobs).toHaveLength(2);
+    await expectAiProducerClock(jobs[1].id, Math.floor((now + 31000) / 30000) * 30000);
+    await finish(jobs[1].id);
+    const after = await request();
+    if (!after.ready) throw new Error('expected recomputed bots');
+    expect(after.value.tables.botBody[0].trend).toBe(0);
+  });
+  it('recomputes page freshness when elapsed content age crosses a displayed day', async () => {
+    const now = aiSnapshotNow();
+    const today = Math.floor(now / 86400000) * 86400000;
+    const oldEnd = Math.floor(now / 30000) * 30000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    await aiLogs([now - 60000]);
+    await sql(
+      `INSERT INTO liekan_catalog(website_id,path,title,content_type,content_updated_at)
+       VALUES($1::uuid,'/synthetic-ai-snapshot','Fresh page','article',$2)`,
+      site,
+      new Date(oldEnd - 86400000 + 15000),
+    );
+    const parameters = {
+      startAt: today - 86400000,
+      endAt: today + 86400000,
+      resource: 'ai/pages',
+      timezone: 'UTC',
+      crawlerMetricsVersion: 1,
+    };
+    const request = () =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+      );
+    const pending = await request();
+    if (pending.ready) throw new Error('expected cold pages');
+    await finish(pending.analysisJob.id);
+    const before = await request();
+    if (!before.ready) throw new Error('expected published pages');
+    expect(before.value.tables.apBody[0].freshness).toBe('0 天');
+    clock.mockReturnValue(now + 31000);
+    await request();
+    const jobs = await q(
+      'SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid ORDER BY sequence',
+      site,
+    );
+    expect(jobs).toHaveLength(2);
+    await expectAiProducerClock(jobs[1].id, Math.floor((now + 31000) / 30000) * 30000);
+    await finish(jobs[1].id);
+    const after = await request();
+    if (!after.ready) throw new Error('expected recomputed pages');
+    expect(after.value.tables.apBody[0].freshness).toBe('1 天');
+  });
+  it('attaches advanced crawler evidence with the fingerprint transaction and its repeatable snapshot', async () => {
+    const now = aiSnapshotNow();
+    const today = Math.floor(now / 86400000) * 86400000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    await aiLogs([now - 60000]);
+    const parameters = {
+      startAt: today,
+      endAt: today + 86400000,
+      resource: 'ai/bots',
+      timezone: 'UTC',
+      crawlerMetricsVersion: 1,
+    };
+    const request = () =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+      );
+    const pending = await request();
+    if (pending.ready) throw new Error('expected cold bots');
+    await finish(pending.analysisJob.id);
+    const transaction = rollupDatabase.analysisTransaction;
+    let fingerprintTransaction: object | undefined;
+    let evidenceTransaction: object | undefined;
+    vi.spyOn(rollupDatabase, 'analysisTransaction').mockImplementation((work, isolation) =>
+      transaction(
+        tx =>
+          work(
+            new Proxy(tx, {
+              get(target, property) {
+                if (property !== '$queryRawUnsafe') return Reflect.get(target, property);
+                return async (statement: string, ...values: unknown[]) => {
+                  if (statement.includes('SELECT liekan_dashboard_fingerprint'))
+                    fingerprintTransaction = tx;
+                  if (statement.startsWith('SELECT path,updated_at AS "updatedAt"')) {
+                    evidenceTransaction = tx;
+                    expect(isolation).toBe('RepeatableRead');
+                  }
+                  return target.$queryRawUnsafe(statement, ...values);
+                };
+              },
+            }),
+          ),
+        isolation,
+      ),
+    );
+    clock.mockReturnValue(now + 31000);
+    const reused = await request();
+    expect(reused.ready).toBe(true);
+    expect(evidenceTransaction).toBeDefined();
+    expect(evidenceTransaction).toBe(fingerprintTransaction);
+  });
+  it('falls back to normal admission when an unchanged-clock transaction loses a serialization race', async () => {
+    const now = aiSnapshotNow();
+    const today = Math.floor(now / 86400000) * 86400000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const parameters = {
+      startAt: today,
+      endAt: today + 86400000,
+      resource: 'ai/bots',
+      timezone: 'UTC',
+      crawlerMetricsVersion: 1,
+    };
+    const request = () =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+      );
+    const pending = await request();
+    if (pending.ready) throw new Error('expected cold bots');
+    await finish(pending.analysisJob.id);
+    const transaction = rollupDatabase.analysisTransaction;
+    let rejected = false;
+    vi.spyOn(rollupDatabase, 'analysisTransaction').mockImplementation((work, isolation) => {
+      if (!rejected && isolation === 'RepeatableRead') {
+        rejected = true;
+        return Promise.reject(
+          Object.assign(new Error('synthetic concurrent publication'), { code: 'P2034' }),
+        );
+      }
+      return transaction(work, isolation);
+    });
+    clock.mockReturnValue(now + 31000);
+    expect(await request()).toMatchObject({ ready: true, snapshotState: 'updating' });
+    expect(rejected).toBe(true);
+    expect(
+      await q('SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid', site),
+    ).toHaveLength(2);
+  });
+  it('invalidates a reused overview when import metadata changes without new logs', async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const parameters = { ...p, resource: 'overview', chartPeriod: '30d' };
+    const request = () =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+      );
+    const pending = await request();
+    if (pending.ready === true) throw new Error('expected cold overview');
+    await finish(pending.analysisJob.id);
+    await sql(
+      'INSERT INTO liekan_import(id,website_id,digest,accepted,rejected) VALUES($1::uuid,$2::uuid,$1,1,0)',
+      randomUUID(),
+      site,
+    );
+    clock.mockReturnValue(now + 31000);
+    const stale = await request();
+    expect(stale.ready).toBe(true);
+    const jobs = await q(
+      'SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid ORDER BY sequence',
+      site,
+    );
+    expect(jobs).toHaveLength(2);
+    await finish(jobs[1].id);
+    const next = await request();
+    if (!next.ready) throw new Error('expected a published overview');
+    expect(next.value.meta.latestImportAt).not.toBeNull();
+  });
+  it('projects a reused live overview and its population evidence identically to a new computation', async () => {
+    const now = Math.ceil(Date.now() / 3600000) * 3600000 + 300000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const startAt = Math.floor(now / 86400000) * 86400000;
+    await event(new Date(now - 60000).toISOString());
+    const parameters = {
+      startAt,
+      endAt: startAt + 86400000 - 1,
+      timezone: 'UTC',
+      resource: 'overview',
+      chartPeriod: 'today',
+    };
+    const request = (refresh = false) =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', {
+          ...parameters,
+          ...(refresh ? { refresh: '1' } : {}),
+        }),
+      );
+    const pending = await request();
+    if (pending.ready) throw new Error('expected cold overview');
+    await finish(pending.analysisJob.id);
+    clock.mockReturnValue(now + 31000);
+    const reused = await request();
+    if (!reused.ready) throw new Error('expected reused overview');
+    const nextEnd = Math.floor((now + 31000) / 30000) * 30000 - 1;
+    expect(reused.value.range.endAt).toBe(nextEnd);
+    expect(reused.value.meta.population.range.endAt).toBe(nextEnd);
+    expect(reused.value.meta.trendPopulation.range.endAt).toBe(nextEnd);
+    const [snapshot] = await q(
+      'SELECT result FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
+      site,
+    );
+    expect(snapshot.result.populations.length).toBeGreaterThan(0);
+    expect(
+      snapshot.result.populations.every(population => population.range.endAt === nextEnd),
+    ).toBe(true);
+    const forced = await request(true);
+    if (forced.ready) throw new Error('expected explicit fresh computation');
+    await finish(forced.analysisJob.id);
+    const recomputed = await request();
+    if (!recomputed.ready) throw new Error('expected published result');
+    const content = (value: any) => {
+      const copy = structuredClone(value);
+      delete copy.meta.generatedAt;
+      delete copy.meta.expiresAt;
+      return copy;
+    };
+    expect(content(reused.value)).toEqual(content(recomputed.value));
+  });
+  it('observes a log exactly at the next inclusive today cutoff', async () => {
+    const now = Math.floor(Date.now() / 30000) * 30000 + 5000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const midnight = Math.floor(now / 86400000) * 86400000;
+    const imported = randomUUID();
+    await sql(
+      'INSERT INTO liekan_import(id,website_id,digest,accepted,rejected) VALUES($1::uuid,$2::uuid,$1,1,0)',
+      imported,
+      site,
+    );
+    const parameters = {
+      startAt: midnight,
+      endAt: midnight + 86400000 - 1,
+      timezone: 'UTC',
+      resource: 'overview',
+      chartPeriod: 'today',
+    };
+    const request = () =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+      );
+    const initial = await request();
+    if (initial.ready) throw new Error('expected cold overview');
+    await finish(initial.analysisJob.id);
+    const cutoff = Math.floor((now + 31000) / 30000) * 30000;
+    await sql(
+      `INSERT INTO liekan_log(id,website_id,import_id,created_at,path,method,status,bytes,ip_masked,ip_hash,user_agent,location,bot,vendor,bot_type,verification)
+      VALUES($1,$2::uuid,$3::uuid,$4,'/boundary','GET',200,10,'','synthetic','Synthetic fixture','','','','','unknown')`,
+      randomUUID(),
+      site,
+      imported,
+      new Date(cutoff),
+    );
+    clock.mockReturnValue(now + 31000);
+    await request();
+    const jobs = await q(
+      'SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid ORDER BY sequence',
+      site,
+    );
+    expect(jobs).toHaveLength(2);
+    await finish(jobs[1].id);
+    const result = await request();
+    if (!result.ready) throw new Error('expected published overview');
+    expect(result.value.cards.find(card => card.label === '今日总请求')?.value).toBe(1);
+  });
+  it('reuses a published overview through operational connection heartbeats', async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const source = randomUUID();
+    await sql(
+      "INSERT INTO liekan_log_source(id,website_id,kind,domain,created_by,state) VALUES($1::uuid,$2::uuid,'server','snapshot.invalid',$3::uuid,'active')",
+      source,
+      site,
+      actor.id,
+    );
+    const parameters = { ...p, resource: 'overview', chartPeriod: '30d' };
+    const request = () =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+      );
+    const pending = await request();
+    if (pending.ready) throw new Error('expected cold overview');
+    await finish(pending.analysisJob.id);
+    await sql(
+      'UPDATE liekan_log_source SET last_permission_check_at=clock_timestamp(),last_heartbeat_at=clock_timestamp(),provider_lease=$2::uuid WHERE id=$1::uuid',
+      source,
+      randomUUID(),
+    );
+    clock.mockReturnValue(now + 31000);
+    expect((await request()).ready).toBe(true);
+    expect(
+      await q('SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid', site),
+    ).toHaveLength(1);
+    await sql("UPDATE liekan_log_source SET state='disconnected' WHERE id=$1::uuid", source);
+    clock.mockReturnValue(now + 62000);
+    await request();
+    expect(
+      await q('SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid', site),
+    ).toHaveLength(2);
+    await sql('DELETE FROM liekan_log_source WHERE id=$1::uuid', source);
+  });
+  it.each(['risk processing', 'log connection'])(
+    'invalidates an unchanged overview after %s metadata changes',
+    async kind => {
+      const now = Date.now();
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+      const parameters = { ...p, resource: 'overview', chartPeriod: '30d' };
+      const request = () =>
+        withPublishedRegistry(() =>
+          requestDashboardSnapshot(site, actor, 'feature:page-report', parameters),
+        );
+      const pending = await request();
+      if (pending.ready) throw new Error('expected cold overview');
+      await finish(pending.analysisJob.id);
+      if (kind === 'risk processing') {
+        await sql(
+          "INSERT INTO liekan_browser_risk_state(website_id,epoch,next_window,rule_version) SELECT website_id,epoch,clock_timestamp(),'fixture' FROM liekan_analysis_site WHERE website_id=$1::uuid ON CONFLICT(website_id) DO UPDATE SET computed_at=clock_timestamp()",
+          site,
+        );
+      } else {
+        await sql(
+          "INSERT INTO liekan_log_source(id,website_id,kind,domain,created_by,state) VALUES($1::uuid,$2::uuid,'server','snapshot.invalid',$3::uuid,'active')",
+          randomUUID(),
+          site,
+          actor.id,
+        );
+      }
+      clock.mockReturnValue(now + 31000);
+      expect((await request()).ready).toBe(true);
+      expect(
+        await q('SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid', site),
+      ).toHaveLength(2);
+      await sql('DELETE FROM liekan_log_source WHERE website_id=$1::uuid', site);
+    },
+  );
   it('keeps unviewed prewarming off the foreground dashboard permit', async () => {
     const seed = await withPublishedRegistry(() =>
       requestDashboardSnapshot(site, actor, 'native:stats', p, 'zh-CN', false),
@@ -187,7 +1114,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     );
     expect(promoted).toMatchObject({ attempts: 0, due: true, fenced: true });
     expect(+new Date(promoted.pending_through)).toBe(midnight + 120000);
-    expect(+new Date(promoted.dependency_end)).toBe(midnight + 120000);
+    expect(+new Date(promoted.dependency_end)).toBe(midnight + 120001);
     clock.mockRestore();
     await finish(seed.analysisJob.id);
     expect(await readSeed(true)).toMatchObject({ ready: true });
@@ -247,6 +1174,12 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     expect(await read()).toMatchObject({ ready: true, value: { pageviews: 1 } });
   });
   it('parks an idle failed dashboard instead of starting another retry batch', async () => {
+    // Earlier cases keep their publications; this maintenance scenario owns the current website.
+    await sql(
+      "UPDATE liekan_dashboard_snapshot SET next_refresh_at='9999-12-31' WHERE actor_id=$2::uuid AND website_id<>$1::uuid",
+      site,
+      actor.id,
+    );
     const pending = await read();
     if (pending.ready === true) throw new Error('expected cold dashboard');
     await sql(
@@ -410,7 +1343,11 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
       site,
     );
     const seeded: any[] = [];
-    for (let pass = 0; pass < 3; pass++) {
+    for (
+      let pass = 0;
+      pass < warmResources.length + warmResources.indexOf('ai/pages') + 1;
+      pass++
+    ) {
       await seedDashboardSnapshots();
       const [task] = await q(
         "SELECT id,parameters FROM liekan_analysis_query WHERE website_id=$1::uuid AND status='queued'",
@@ -422,14 +1359,14 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     }
     const ranges = dashboardWarmRanges('Asia/Shanghai', captured);
     for (let index = 0; index < 2; index++) {
-      expect(seeded[index]).toMatchObject({
+      expect(seeded.filter(parameters => parameters.resource === 'ai/pages')[index]).toMatchObject({
         resource: 'ai/pages',
         startAt: ranges[index].startAt,
         endAt: ranges[index].endAt + 1,
       });
     }
     const [before] = await q(
-      "SELECT query_key,generated_at FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND parameters->>'startAt'=$2",
+      "SELECT query_key,generated_at FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND parameters->>'startAt'=$2 AND parameters->>'resource'='ai/pages'",
       site,
       String(ranges[1].startAt),
     );
@@ -490,7 +1427,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
         )
       )[0],
     ).toBeDefined();
-  });
+  }, 20000);
   it('parks unviewed old selections and resumes their correction fence on a reader return', async () => {
     await sql("UPDATE liekan_analysis_site SET mode='disabled' WHERE website_id<>$1::uuid", site);
     const first = await read();
@@ -520,7 +1457,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     await finish(resumed.analysisJob.id);
     expect(await read()).toMatchObject({ ready: true, value: { pageviews: 2 } });
   });
-  it('replaces unviewed prior-day seeds with midnight Today and seven-day selections', async () => {
+  it('replaces unviewed prior-day seeds with the new day overview selections', async () => {
     await sql("UPDATE liekan_analysis_site SET mode='disabled' WHERE website_id<>$1::uuid", site);
     const { dashboardWarmRanges } = await import('./dashboard-snapshot-model');
     const captured =
@@ -535,19 +1472,19 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
       );
       await finish(task.id);
     }
-    clock.mockReturnValue(captured + 2 * 60000);
+    clock.mockReturnValue(captured + 7 * 60000);
     const after = dashboardWarmRanges('Asia/Shanghai');
     expect(after[1].startAt).toBe(before[1].startAt + 86400000);
-    for (const range of after.slice(0, 2)) {
+    for (const resource of ['overview', 'human/overview']) {
       await seedDashboardSnapshots();
       const [task] = await q(
         "SELECT id,parameters FROM liekan_analysis_query WHERE website_id=$1::uuid AND status='queued'",
         site,
       );
       expect(task?.parameters).toMatchObject({
-        resource: 'ai/pages',
-        startAt: range.startAt,
-        endAt: range.endAt + 1,
+        resource,
+        startAt: after[0].startAt,
+        endAt: after[0].endAt,
       });
       await finish(task.id);
     }
@@ -556,7 +1493,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
         await q(
           "SELECT count(*)::int AS n FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND parameters->>'startAt'=$2",
           site,
-          String(before[1].startAt),
+          String(before[0].startAt),
         )
       )[0].n,
     ).toBe(0);
@@ -645,7 +1582,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     ).toBe(200);
     await finish(foreground.analysisJob.id);
   });
-  it('alternates cold prewarming with correction of an existing idle common publication', async () => {
+  it('keeps cold prewarming and correction of an existing idle common publication independent', async () => {
     await sql("UPDATE liekan_analysis_site SET mode='disabled' WHERE website_id<>$1::uuid", site);
     const captured = Date.now();
     vi.spyOn(Date, 'now').mockReturnValue(captured);
@@ -655,7 +1592,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
       site,
     );
     await finish(seed.id);
-    const delivered: number[] = [];
+    const delivered: string[] = [];
     for (let pass = 0; pass < 2; pass++) {
       // Model separate maintenance passes outside the existing five-second refresh cooldown.
       await sql(
@@ -672,12 +1609,14 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
         "SELECT id,parameters FROM liekan_analysis_query WHERE website_id=$1::uuid AND status='queued'",
         site,
       );
-      expect(tasks).toHaveLength(1);
-      delivered.push(tasks[0].parameters.startAt);
-      await finish(tasks[0].id);
+      expect(tasks).toHaveLength(2);
+      for (const task of tasks) {
+        delivered.push(task.parameters.resource);
+        await finish(task.id);
+      }
     }
-    expect(delivered).toContain(seed.parameters.startAt);
-    expect(delivered.some(start => start !== seed.parameters.startAt)).toBe(true);
+    expect(delivered).toContain(seed.parameters.resource);
+    expect(delivered.some(resource => resource !== seed.parameters.resource)).toBe(true);
   });
   it('follows an updated heavy publication to completion on pages without live polling', async () => {
     const now = Date.now();
@@ -717,26 +1656,30 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     );
     const { dashboardWarmRanges } = await import('./dashboard-snapshot-model');
     const ranges = dashboardWarmRanges('Asia/Shanghai');
-    for (const range of ranges) {
-      await seedDashboardSnapshots();
-      const [cold] = await q(
-        "SELECT * FROM liekan_analysis_query WHERE website_id=$1::uuid AND status='queued'",
-        site,
-      );
-      expect(cold?.parameters).toMatchObject({
-        resource: 'ai/pages',
-        startAt: range.startAt,
-        endAt: range.endAt + 1,
-        crawlerIdentityScope: 'all',
-        crawlerMetricsVersion: 1,
-      });
-      await finish(cold.id);
+    for (const [index, range] of ranges.entries()) {
+      for (const resource of warmResources) {
+        await seedDashboardSnapshots();
+        const [cold] = await q(
+          "SELECT * FROM liekan_analysis_query WHERE website_id=$1::uuid AND status='queued'",
+          site,
+        );
+        expect(cold?.parameters).toMatchObject({
+          resource,
+          chartPeriod: ['today', '7d', '30d'][index],
+          startAt: range.startAt,
+          endAt: range.endAt + (resource.startsWith('ai/') ? 1 : 0),
+          ...(resource.startsWith('ai/')
+            ? { crawlerIdentityScope: 'all', crawlerMetricsVersion: 1 }
+            : {}),
+        });
+        await finish(cold.id);
+      }
     }
     const publications = await q(
       'SELECT parameters,last_read_at,result FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
       site,
     );
-    expect(publications).toHaveLength(3);
+    expect(publications).toHaveLength(warmResources.length * 3);
     expect(publications.every(row => +new Date(row.last_read_at) === 0 && row.result != null)).toBe(
       true,
     );
@@ -754,7 +1697,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
         }),
       ),
     ).toMatchObject({ ready: true });
-  });
+  }, 20000);
   it('reads a historical publication after transient task expiry without creating new computations', async () => {
     const first = await read();
     if (first.ready === true) throw new Error('fixture already published');
@@ -777,34 +1720,40 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
       )[0].n,
     ).toBe(1);
   });
-  it('keeps the published result readable while a late event is rebuilt and atomically replaces it', async () => {
+  it('invalidates an earlier publication when late qualified evidence changes the strong version', async () => {
     const first = await read();
     if (first.ready === true) throw new Error('fixture already published');
     await finish(first.analysisJob.id);
-    await event('2026-01-01T01:02Z', false);
-    await sql(
-      "UPDATE liekan_dashboard_snapshot SET job_id=NULL,next_refresh_at=clock_timestamp()-interval '1 second' WHERE website_id=$1::uuid",
-      site,
-    );
-    const old = await read();
-    expect(old).toMatchObject({ ready: true, value: { pageviews: 1, visitors: 1 } });
-    // A distinct five-second refresh round is allowed without waiting in real time.
+    expect(await read()).toMatchObject({ ready: true, value: { pageviews: 1, visitors: 1 } });
+    await event('2026-01-01T01:02Z', true);
+    const updated = await read();
+    expect(updated.ready).toBe(false);
+    expect(updated).not.toHaveProperty('previousResult');
+    if (updated.ready === true) throw new Error('expected revised publication');
+    expect(updated.analysisJob.id).not.toBe(first.analysisJob.id);
+    await finish(updated.analysisJob.id);
+    expect(await read()).toMatchObject({ ready: true, value: { pageviews: 2, visitors: 1 } });
+  });
+  it('retains qualified publication metrics while exposing missing identity observations', async () => {
+    const first = await read();
+    if (first.ready === true) throw new Error('expected cold fixture');
+    await finish(first.analysisJob.id);
+    await event('2026-01-01T01:04Z', false);
     await sql(
       "UPDATE liekan_analysis_query SET queued_at=clock_timestamp()-interval '10 seconds' WHERE id=$1::uuid",
       first.analysisJob.id,
     );
-    await pumpDashboardSnapshots();
-    const [pending] = await q(
-      'SELECT job_id FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
-      site,
-    );
-    expect(pending.job_id).toEqual(expect.any(String));
-    expect(await read()).toMatchObject({ ready: false, previousResult: { pageviews: 1 } });
-    await finish(pending.job_id);
-    expect(await read()).toMatchObject({
-      ready: true,
-      snapshotState: 'ready',
-      value: { pageviews: 2 },
+    const refreshed = await read({ refresh: '1' });
+    if (refreshed.ready === true) throw new Error('expected refreshed fixture');
+    await finish(refreshed.analysisJob.id);
+    const actual = await read();
+    expect(actual).toMatchObject({ ready: true, value: { pageviews: 1, visitors: 1 } });
+    if (actual.ready !== true) throw new Error('expected published fixture');
+    expect(actual.value.population.identity).toMatchObject({
+      status: 'partial',
+      eligiblePV: 2,
+      qualifiedPV: 1,
+      qualifiedVisitors: 1,
     });
   });
   it('publishes newly collected current-day events on the next thirty-second window', async () => {
@@ -818,7 +1767,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     if (first.ready === true) throw new Error('expected cold fixture');
     await finish(first.analysisJob.id);
     expect(await current()).toMatchObject({ ready: true, value: { pageviews: 1 } });
-    await event(new Date(boundary).toISOString(), false);
+    await event(new Date(boundary).toISOString(), true);
     clock.mockReturnValue(now + 30000);
     const next = await current();
     expect(next).toMatchObject({ ready: true, snapshotState: 'updating', value: { pageviews: 1 } });
@@ -828,7 +1777,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     );
     expect(producer.job_id).toBeTruthy();
     await finish(producer.job_id);
-    expect(await current()).toMatchObject({ ready: true, value: { pageviews: 2, visitors: null } });
+    expect(await current()).toMatchObject({ ready: true, value: { pageviews: 2, visitors: 1 } });
   });
   it('reuses a captured retention window and corrects late facts before the next window gets a new key', async context => {
     const actualNow = Date.now(),
@@ -981,18 +1930,18 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
       await q('SELECT query_key FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid', site),
     ).toHaveLength(0);
   });
-  it('recomputes an explicitly refreshed historical publication with its previous result retained', async () => {
+  it('recomputes an explicitly refreshed historical publication after late evidence invalidates the prior revision', async () => {
     const first = await read();
     if (first.ready === true) throw new Error('expected cold fixture');
     await finish(first.analysisJob.id);
-    await event('2026-01-01T01:03Z', false);
+    await event('2026-01-01T01:03Z', true);
     await sql(
       "UPDATE liekan_analysis_query SET queued_at=clock_timestamp()-interval '10 seconds' WHERE id=$1::uuid",
       first.analysisJob.id,
     );
     const refreshed = await read({ refresh: '1' });
     if (refreshed.ready === true) throw new Error('expected explicit computation');
-    expect(refreshed.previousResult).toMatchObject({ pageviews: 1 });
+    expect(refreshed).not.toHaveProperty('previousResult');
     await finish(refreshed.analysisJob.id);
     expect(await read()).toMatchObject({ ready: true, value: { pageviews: 2 } });
   });
@@ -1107,37 +2056,34 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
       await boss.start();
       try {
         await pumpAnalysisQueries(boss);
-        await withAnalysisPermit(
-          kind === 'native-heavy' ? 'interactive' : 'dashboard',
-          async () => {
-            const [delivery] = await boss.fetch<{ id: string }>(ANALYSIS_QUERY_QUEUE, {
-              includeMetadata: true,
-            });
-            expect(delivery.data.id).toBe(key);
-            if (kind === 'active-seed') {
-              expect(delivery.priority).toBe(0);
-              const joined = await read();
-              expect(joined).toMatchObject({ ready: false, analysisJob: { id: key } });
-            }
-            expect(delivery.retryLimit).toBe(10);
-            await expect(processAnalysisQueryDelivery(delivery, boss)).resolves.toBeUndefined();
-            expect(await boss.complete(ANALYSIS_QUERY_QUEUE, delivery)).toMatchObject({
-              affected: 0,
-            });
-            const [waiting] = await boss.findJobs(ANALYSIS_QUERY_QUEUE, { key, queued: true });
-            expect(waiting).toMatchObject({ state: 'retry', priority: 0, retryLimit: 10 });
-            // A stale settlement preserves a later foreground promotion of the waiting delivery.
-            await boss.update(ANALYSIS_QUERY_QUEUE, undefined, { id: delivery.id, priority: 10 });
-            await processAnalysisQueryDelivery(delivery, boss);
-            const [promoted] = await boss.findJobs(ANALYSIS_QUERY_QUEUE, { key, queued: true });
-            expect(promoted).toMatchObject({ state: 'retry', priority: 10, retryCount: 0 });
-            const [queued] = await q(
-              'SELECT status,attempts FROM liekan_analysis_query WHERE id=$1::uuid',
-              key,
-            );
-            expect(queued).toEqual({ status: 'queued', attempts: 0 });
-          },
-        );
+        await withBlockedLane(kind === 'native-heavy' ? 'interactive' : 'dashboard', async () => {
+          const [delivery] = await boss.fetch<{ id: string }>(ANALYSIS_QUERY_QUEUE, {
+            includeMetadata: true,
+          });
+          expect(delivery.data.id).toBe(key);
+          if (kind === 'active-seed') {
+            expect(delivery.priority).toBe(0);
+            const joined = await read();
+            expect(joined).toMatchObject({ ready: false, analysisJob: { id: key } });
+          }
+          expect(delivery.retryLimit).toBe(10);
+          await expect(processAnalysisQueryDelivery(delivery, boss)).resolves.toBeUndefined();
+          expect(await boss.complete(ANALYSIS_QUERY_QUEUE, delivery)).toMatchObject({
+            affected: 0,
+          });
+          const [waiting] = await boss.findJobs(ANALYSIS_QUERY_QUEUE, { key, queued: true });
+          expect(waiting).toMatchObject({ state: 'retry', priority: 0, retryLimit: 10 });
+          // A stale settlement preserves a later foreground promotion of the waiting delivery.
+          await boss.update(ANALYSIS_QUERY_QUEUE, undefined, { id: delivery.id, priority: 10 });
+          await processAnalysisQueryDelivery(delivery, boss);
+          const [promoted] = await boss.findJobs(ANALYSIS_QUERY_QUEUE, { key, queued: true });
+          expect(promoted).toMatchObject({ state: 'retry', priority: 10, retryCount: 0 });
+          const [queued] = await q(
+            'SELECT status,attempts FROM liekan_analysis_query WHERE id=$1::uuid',
+            key,
+          );
+          expect(queued).toEqual({ status: 'queued', attempts: 0 });
+        });
         let redelivery: any;
         await vi.waitFor(
           async () => {
@@ -1208,7 +2154,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
         if (heavy.ready === true) throw new Error('expected cold heavy fairness task');
         taskIds.push(heavy.analysisJob.id);
         await pumpAnalysisQueries(boss);
-        const held = await withAnalysisPermit(heldLane, async () => {
+        const held = await withBlockedLane(heldLane, async () => {
           await boss.work<{ id: string }>(
             ANALYSIS_QUERY_QUEUE,
             { localConcurrency: 2, batchSize: 1, pollingIntervalSeconds: 1 },
@@ -1264,19 +2210,16 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
       }
     },
   );
-  it('includes changes received while a candidate was waiting for execution', async () => {
+  it('rejects a stale candidate when qualified evidence changes before execution', async () => {
     const first = await read();
     if (first.ready === true) throw new Error('fixture already published');
-    await event('2026-01-01T01:03Z', false);
-    await finish(first.analysisJob.id);
-    const [row] = await q(
-      'SELECT result,job_id,error_code FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
-      site,
-    );
-    expect(row.job_id).toBeNull();
-    expect(row.error_code).toBeNull();
-    expect(row.result).not.toBeNull();
-    expect(await read()).toMatchObject({ ready: true, value: { pageviews: 2 } });
+    await event('2026-01-01T01:03Z', true);
+    await expect(finish(first.analysisJob.id)).rejects.toMatchObject({ status: 410 });
+    const current = await read();
+    if (current.ready === true) throw new Error('expected current revision task');
+    expect(current.analysisJob.id).not.toBe(first.analysisJob.id);
+    await finish(current.analysisJob.id);
+    expect(await read()).toMatchObject({ ready: true, value: { pageviews: 2, visitors: 1 } });
   });
   it('checks current website authority before returning a durable result', async () => {
     const first = await read();
@@ -1437,7 +2380,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
         site,
         new Date(at(-10000)),
       );
-      await event(at(-10000), false);
+      await event(at(-10000), true);
       const pin = async () =>
         (
           await q(
@@ -1555,6 +2498,124 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     expect(published.n).toBe(1);
     expect(await read()).toMatchObject({ ready: true, value: { pageviews: 1 } });
   });
+  it('keeps foreground authority available during retained-history boundary reads', async () => {
+    const transaction = rollupDatabase.analysisTransaction;
+    const observer = new Client({ connectionString: process.env.DATABASE_URL });
+    await observer.connect();
+    const schema = new URL(process.env.DATABASE_URL).searchParams.get('schema');
+    let inspected = false;
+    vi.spyOn(rollupDatabase, 'analysisTransaction').mockImplementation((work, isolation) =>
+      transaction(
+        tx =>
+          work(
+            new Proxy(tx, {
+              get(target, property) {
+                if (property !== '$queryRawUnsafe') return Reflect.get(target, property);
+                return async (statement: string, ...values: unknown[]) => {
+                  if (statement.includes('SELECT min(at) AS starts,max(at) AS ends')) {
+                    inspected = true;
+                    await observer.query('BEGIN');
+                    try {
+                      await observer.query(`SET LOCAL search_path TO "${schema}"`);
+                      const authority = await observer.query(
+                        'SELECT website_id FROM liekan_analysis_site WHERE website_id=$1::uuid FOR SHARE NOWAIT',
+                        [site],
+                      );
+                      expect(authority.rowCount).toBe(1);
+                    } finally {
+                      await observer.query('ROLLBACK');
+                    }
+                  }
+                  return target.$queryRawUnsafe(statement, ...values);
+                };
+              },
+            }),
+          ),
+        isolation,
+      ),
+    );
+    try {
+      await bootstrapAnalysisHistory(Date.now(), site);
+      expect(inspected).toBe(true);
+      expect(
+        await q('SELECT id FROM liekan_analysis_build WHERE website_id=$1::uuid', site),
+      ).toHaveLength(1);
+    } finally {
+      await observer.end();
+    }
+  });
+  it.each(['epoch', 'mode', 'deleted'])(
+    'rechecks %s after an unlocked retained-history boundary read',
+    async change => {
+      const transaction = rollupDatabase.analysisTransaction;
+      let changed = false;
+      const spy = vi
+        .spyOn(rollupDatabase, 'analysisTransaction')
+        .mockImplementation((work, isolation) =>
+          transaction(
+            tx =>
+              work(
+                new Proxy(tx, {
+                  get(target, property) {
+                    if (property !== '$queryRawUnsafe') return Reflect.get(target, property);
+                    return async (statement: string, ...values: unknown[]) => {
+                      const rows = await target.$queryRawUnsafe(statement, ...values);
+                      if (
+                        !changed &&
+                        statement.includes('SELECT min(at) AS starts,max(at) AS ends')
+                      ) {
+                        changed = true;
+                        if (change === 'epoch')
+                          await sql(
+                            'UPDATE liekan_analysis_site SET epoch=epoch+1 WHERE website_id=$1::uuid',
+                            site,
+                          );
+                        else if (change === 'mode')
+                          await sql(
+                            "UPDATE liekan_analysis_site SET mode='disabled' WHERE website_id=$1::uuid",
+                            site,
+                          );
+                        else
+                          await sql(
+                            'UPDATE website SET deleted_at=clock_timestamp() WHERE website_id=$1::uuid',
+                            site,
+                          );
+                      }
+                      return rows;
+                    };
+                  },
+                }),
+              ),
+            isolation,
+          ),
+        );
+      await bootstrapAnalysisHistory(Date.now(), site);
+      expect(changed).toBe(true);
+      expect(
+        await q('SELECT id FROM liekan_analysis_build WHERE website_id=$1::uuid', site),
+      ).toHaveLength(0);
+      expect(
+        (
+          await q('SELECT archive_epoch FROM liekan_analysis_site WHERE website_id=$1::uuid', site)
+        )[0].archive_epoch,
+      ).toBeNull();
+      spy.mockRestore();
+      if (change === 'epoch') {
+        await bootstrapAnalysisHistory(Date.now(), site);
+        expect(
+          (
+            await q(
+              'SELECT epoch,archive_epoch FROM liekan_analysis_site WHERE website_id=$1::uuid',
+              site,
+            )
+          )[0],
+        ).toMatchObject({ epoch: 2n, archive_epoch: 2n });
+        expect(
+          await q('SELECT id FROM liekan_analysis_build WHERE website_id=$1::uuid', site),
+        ).toHaveLength(1);
+      }
+    },
+  );
   it('automatically registers the retained history once per site epoch', async () => {
     await bootstrapAnalysisHistory(Date.now(), site);
     const [state] = await q(

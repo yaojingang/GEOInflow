@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+export const CURRENT_BROWSER_IDENTITY_VERSION = 'cookieless-trusted-input-v4';
+
 export const browserPopulationSchema = z.object({
   resourceId: z.string().optional(),
   populationVersion: z.string(),
@@ -29,6 +31,7 @@ export const browserPopulationSchema = z.object({
     qualifiedVisitors: z.number().int().nonnegative().nullable(),
     coverage: z.number().min(0).max(1).nullable(),
     versions: z.array(z.string()),
+    qualifiedVersions: z.array(z.string()).optional(),
   }),
   ruleVersions: z.array(z.string()),
   catalogVersions: z.array(z.string()),
@@ -41,6 +44,14 @@ export const browserPopulationSchema = z.object({
   }),
 });
 export type BrowserPopulation = z.infer<typeof browserPopulationSchema>;
+
+export function identityEncodingChanged(population?: BrowserPopulation | null): boolean {
+  const versions = population?.identity.qualifiedVersions || [];
+  return (
+    versions.includes(CURRENT_BROWSER_IDENTITY_VERSION) &&
+    versions.some(version => version !== CURRENT_BROWSER_IDENTITY_VERSION)
+  );
+}
 
 /** Cross-source comparisons require coverage of the complete browser population. */
 export function identityComplete(population?: BrowserPopulation | null): boolean {

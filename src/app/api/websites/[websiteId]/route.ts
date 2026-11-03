@@ -1,3 +1,4 @@
+import { LiekanError } from '@/lib/liekan/upstream/server';
 import { captureShareCalendar } from '@/lib/liekan/upstream/share-calendar';
 import { api } from '@/lib/liekan/http';
 import type { Prisma } from '@/generated/prisma/client';
@@ -5,7 +6,15 @@ import { ENTITY_TYPE } from '@/lib/constants';
 import { uuid } from '@/lib/crypto';
 import { getRecorderConfig, getRecorderEnabled } from '@/lib/recorder';
 import { parseRequest } from '@/lib/request';
-import { badRequest, json, ok, serverError, unauthorized } from '@/lib/response';
+import {
+  badRequest,
+  forbidden,
+  json,
+  notFound,
+  ok,
+  serverError,
+  unauthorized,
+} from '@/lib/response';
 import { canDeleteWebsite, canUpdateWebsite, canViewSharedWebsite } from '@/permissions';
 import {
   createShare,
@@ -125,7 +134,17 @@ export async function DELETE(
   }
 
   return api(async () => {
-    await deleteWebsite(websiteId, { userId: auth.user.id });
+    try {
+      await deleteWebsite(websiteId, { userId: auth.user.id });
+    } catch (error) {
+      if (error instanceof LiekanError) {
+        if (error.status === 403) return forbidden();
+        if (error.status === 401) return unauthorized();
+        if (error.status === 404) return notFound();
+      }
+      throw error;
+    }
+
     return ok();
   });
 }

@@ -2196,6 +2196,66 @@
   max-width: 900px;
   margin: 0 auto;
 }
+:global([data-liekan-features] .field:has(.account-timezone-select)) {
+  align-content: start;
+}
+:global([data-liekan-features].account-timezone-setup .account-timezone-content) {
+  max-width: 760px;
+  padding: 32px;
+}
+:global([data-liekan-features] .account-timezone-toolbar) {
+  display: flex;
+  justify-content: flex-end;
+}
+:global([data-liekan-features] .account-timezone-toolbar select) {
+  width: auto;
+  min-width: 132px;
+}
+:global([data-liekan-features].account-timezone-setup .panel-head) {
+  padding: 24px 24px 20px;
+}
+:global([data-liekan-features].account-timezone-setup .panel-head h2) {
+  font-size: 18px;
+  letter-spacing: 0;
+}
+:global([data-liekan-features].account-timezone-setup .panel-head p) {
+  margin-top: 6px;
+  color: var(--sub);
+  font-size: 13px;
+  line-height: 1.7;
+}
+:global([data-liekan-features].account-timezone-setup .field) {
+  gap: 8px;
+  font-size: 13px;
+}
+:global([data-liekan-features].account-timezone-setup .account-timezone-select) {
+  min-height: 44px;
+  font-size: 14px;
+}
+:global([data-liekan-features].account-timezone-setup .field-help) {
+  font-size: 12px;
+  line-height: 1.7;
+}
+:global([data-liekan-features].account-timezone-setup .form-actions .btn) {
+  min-height: 44px;
+  padding: 10px 18px;
+  font-size: 14px;
+}
+@media (max-width: 640px) {
+  :global([data-liekan-features].account-timezone-setup .account-timezone-content) {
+    padding: 20px 16px;
+  }
+  :global([data-liekan-features].account-timezone-setup .panel-head) {
+    padding: 20px 16px 16px;
+  }
+  :global([data-liekan-features].account-timezone-setup .form-grid) {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 20px;
+  }
+  :global([data-liekan-features].account-timezone-setup .account-timezone-select) {
+    font-size: 16px;
+  }
+}
 @media (max-width: 900px) {
   :global([data-liekan-features] .context-select select) {
     min-height: 40px;

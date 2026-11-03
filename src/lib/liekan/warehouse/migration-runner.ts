@@ -79,13 +79,18 @@ export class MigrationRunner {
     if (!inspection.compatible)
       throw new Error(`warehouse-source-schema-incompatible:${inspection.errors.join(';')}`);
     const sealed = await this.source.sealedSnapshot();
-    const [migration] = await this.db.read<{ source_identity: string; source_snapshot: string }>(
-      'SELECT source_identity,source_snapshot FROM liekan_warehouse_migration WHERE migration_id=$1',
+    const [migration] = await this.db.read<{
+      source_identity: string;
+      source_snapshot: string;
+      source_fingerprint: string;
+    }>(
+      'SELECT source_identity,source_snapshot,source_fingerprint FROM liekan_warehouse_migration WHERE migration_id=$1',
       [id],
     );
     if (
       migration?.source_identity !== sealed.descriptor.snapshotId ||
-      migration.source_snapshot !== sealed.digest
+      migration.source_snapshot !== sealed.digest ||
+      migration.source_fingerprint !== sealed.descriptor.sourceFingerprint
     )
       throw new WarehouseConflict('warehouse-source-snapshot-changed');
     const lease = await this.claim(id);

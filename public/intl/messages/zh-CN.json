@@ -441,6 +441,8 @@
     "forbidden": "禁止访问",
     "go-to-settings": "去设置",
     "incorrect-username-password": "用户名或密码不正确。",
+    "login-throttled": "登录尝试过于频繁，请稍后重试。",
+    "login-unavailable": "登录暂时不可用，请稍后重试。",
     "invalid-domain": "无效域名",
     "invalid-value": "无效值",
     "min-password-length": "密码最短长度为 {n} 个字符",

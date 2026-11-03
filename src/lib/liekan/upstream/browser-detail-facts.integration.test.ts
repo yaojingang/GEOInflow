@@ -48,6 +48,7 @@ async function event(
     country?: string;
     referrer?: string;
     excluded?: boolean;
+    available?: boolean;
   } = {},
 ) {
   const id = randomUUID(),
@@ -80,10 +81,11 @@ async function event(
     );
     await tx.$executeRawUnsafe(
       `INSERT INTO liekan_event_environment(event_id,website_id,scope,identity_version,identity_available,browser,os,device)
-     VALUES($1::uuid,$2::uuid,'browser','detail-fixture',true,$3,'event-os','event-device')`,
+     VALUES($1::uuid,$2::uuid,'browser','detail-fixture',$4,$3,'event-os','event-device')`,
       id,
       site,
       options.browser || 'Firefox',
+      options.available !== false,
     );
     await tx.$executeRawUnsafe(
       `INSERT INTO liekan_event_geography(event_id,website_id,country,region,city,source,trust,ip_family,precision,reason,rule_version,country_basis,processed_at)
@@ -95,7 +97,7 @@ async function event(
   });
   return id;
 }
-async function build(from = start, until = end) {
+async function build(from = start, until = end, chunkSize = 2) {
   const job = await rollups.createAnalysisBuild(site, actor, {
     startDate: from,
     endDate: until,
@@ -106,7 +108,7 @@ async function build(from = start, until = end) {
   await execute(
     `UPDATE liekan_analysis_build SET family='visit',checkpoint=$2::jsonb,work_total=extract(epoch FROM range_end-range_start)::bigint/3600 WHERE id=$1::uuid`,
     job.id,
-    JSON.stringify({ hour: from.toISOString(), family: 'visit', chunkSize: 2 }),
+    JSON.stringify({ hour: from.toISOString(), family: 'visit', chunkSize }),
   );
   for (let i = 0; i < 150; i++) {
     const [row] = await q(
@@ -171,6 +173,228 @@ describe.skipIf(!enabled)('exact persisted browser detail facts', () => {
     await execute('DELETE FROM "user" WHERE user_id=$1::uuid', actor.userId);
     const { default: prisma } = await import('@/lib/prisma');
     await prisma.client.$disconnect();
+  });
+  it('joins the first-entry projection once for multiple uncovered visits', async () => {
+    await event('2026-01-01T23:01Z', '/covered');
+    await event('2026-01-02T01:00Z', '/a', { session: secondSession, referrer: 'google.com' });
+    await event('2026-01-02T01:01Z', '/b', { visit: randomUUID(), referrer: 'example.org' });
+    await event('2026-01-02T01:02Z', '/c', { visit: randomUUID(), referrer: 'another.test' });
+    const expected = pick(await facts());
+    await build(start, new Date('2026-01-02T00:00Z'));
+    const scans: any[] = [];
+    const actual = await server.reportSnapshot(async () => {
+      const tx = getQuerySnapshot();
+      // Small fixtures still prove that the entry relation permits one shared hash scan.
+      await tx.$executeRawUnsafe('SET LOCAL enable_nestloop=off');
+      return withinQuerySnapshot(
+        {
+          $executeRawUnsafe: (statement, ...values) => tx.$executeRawUnsafe(statement, ...values),
+          $queryRawUnsafe: async (statement, ...values) => {
+            if (statement.includes('detail_entries AS MATERIALIZED')) {
+              const [row] = (await tx.$queryRawUnsafe(
+                'EXPLAIN(ANALYZE,FORMAT JSON) ' + statement,
+                ...values,
+              )) as any[];
+              const walk = (node: any) => {
+                if (node['CTE Name'] === 'bounded_entry') scans.push(node);
+                for (const child of node.Plans || []) walk(child);
+              };
+              walk(row['QUERY PLAN'][0].Plan);
+            }
+            return tx.$queryRawUnsafe(statement, ...values);
+          },
+        },
+        () => facts(),
+      );
+    });
+    expect(pick(actual)).toEqual(expected);
+    expect(scans.length).toBeGreaterThan(0);
+    expect(scans.every(node => node['Actual Loops'] <= 1)).toBe(true);
+  });
+  it.each(['daily', 'overview', 'conversions'])(
+    'omits unused raw source projections for %s while preserving exact facts',
+    async kind => {
+      await event('2026-01-01T22:30Z', '/entry', { referrer: 'google.com' });
+      await event('2026-01-01T23:01Z', '/first');
+      await event('2026-01-02T00:10Z', '/signup', { type: 2, name: 'signup' });
+      await event('2026-01-02T01:00Z', '/second', { session: secondSession });
+      await event('2026-01-02T02:00Z', '/inclusive', { session: secondSession });
+      await event('2026-01-02T02:00:00.001Z', '/outside', { session: secondSession });
+      await event('2026-01-02T01:10Z', '/excluded', { excluded: true });
+      const expected = await facts();
+      const plans: any[] = [],
+        entryReads: any[] = [],
+        geographyReads: any[] = [];
+      const actual = await server.reportSnapshot(() => {
+        const tx = getQuerySnapshot();
+        return withinQuerySnapshot(
+          {
+            $executeRawUnsafe: (statement, ...values) => tx.$executeRawUnsafe(statement, ...values),
+            $queryRawUnsafe: async (statement, ...values) => {
+              if (statement.includes('visit_totals AS')) {
+                const [row] = (await tx.$queryRawUnsafe(
+                  'EXPLAIN(ANALYZE,FORMAT JSON) ' + statement,
+                  ...values,
+                )) as any[];
+                const plan = row['QUERY PLAN'][0];
+                plans.push(plan);
+                const walk = (node: any) => {
+                  if (
+                    node['Actual Loops'] > 0 &&
+                    ['bounded_entry', 'bounded_history', 'bounded_history_candidates'].includes(
+                      node['CTE Name'],
+                    )
+                  )
+                    entryReads.push(node);
+                  if (
+                    node['Actual Loops'] > 0 &&
+                    node['Relation Name'] === 'liekan_event_geography'
+                  )
+                    geographyReads.push(node);
+                  for (const child of node.Plans || []) walk(child);
+                };
+                walk(plan.Plan);
+              }
+              return tx.$queryRawUnsafe(statement, ...values);
+            },
+          },
+          () =>
+            kind === 'daily'
+              ? analytics.getHumanDays(site, start, end, 'UTC')
+              : kind === 'conversions'
+                ? analytics.getHumanConversions(site, start, end, 'UTC')
+                : analytics.getHumanFacts(site, start, end, 'UTC', [
+                    'environment',
+                    'heatmap',
+                    'newVisitors',
+                  ]),
+        );
+      });
+      if (kind === 'daily') expect((actual as any).rows).toEqual(expected.daily);
+      else if (kind === 'conversions') expect(actual).toBe(1);
+      else
+        for (const key of ['environment', 'heatmap', 'newVisitors'])
+          expect((actual as any)[key]).toEqual(expected[key]);
+      expect(plans.length).toBeGreaterThan(0);
+      await writeFile(
+        `${process.env.LIEKAN_ANALYSIS_ROLLUPS_OUTPUT}/raw-projection-${kind}-plan.json`,
+        JSON.stringify(plans),
+        { mode: 0o600 },
+      );
+      expect(entryReads).toHaveLength(0);
+      expect(geographyReads).toHaveLength(0);
+    },
+  );
+  it('reads qualified raw metrics once while retaining unknown population evidence', async () => {
+    await event('2026-01-01T23:01Z', '/first');
+    await event('2026-01-02T01:00Z', '/second', { session: secondSession });
+    await event('2026-01-02T01:30Z', '/unknown', { session: secondSession, available: false });
+    await event('2026-01-02T02:00Z', '/inclusive', { session: secondSession });
+    const scans: any[] = [];
+    const input = { websiteId: site, startDate: start, endDate: end, allowRawOnly: true };
+    const totals = await server.reportSnapshot(() => {
+      const tx = getQuerySnapshot();
+      return withinQuerySnapshot(
+        {
+          $executeRawUnsafe: (statement, ...values) => tx.$executeRawUnsafe(statement, ...values),
+          $queryRawUnsafe: async (statement, ...values) => {
+            if (
+              statement.includes('raw_scope AS MATERIALIZED') &&
+              statement.includes('count(DISTINCT visit_id)')
+            ) {
+              const [row] = (await tx.$queryRawUnsafe(
+                'EXPLAIN(ANALYZE,FORMAT JSON) ' + statement,
+                ...values,
+              )) as any[];
+              const walk = (node: any) => {
+                if (node['CTE Name'] === 'bounded_keys' && node['Actual Loops'] > 0)
+                  scans.push(node);
+                for (const child of node.Plans || []) walk(child);
+              };
+              walk(row['QUERY PLAN'][0].Plan);
+            }
+            return tx.$queryRawUnsafe(statement, ...values);
+          },
+        },
+        () => rollups.readAnalysisVisitTotals(input),
+      );
+    });
+    expect(totals).toMatchObject({ pageviews: 3, visitors: 2, visits: 2 });
+    expect(scans.length).toBeGreaterThan(0);
+    expect(scans).toHaveLength(1);
+    await build(start, new Date('2026-01-02T00:00Z'));
+    const population = await rollups.readAnalysisVisitPopulation(input);
+    expect(population?.identity).toMatchObject({
+      eligiblePV: 4,
+      qualifiedPV: 3,
+      status: 'partial',
+    });
+    expect(await rollups.readAnalysisVisitTotals(input)).toEqual(totals);
+  });
+  it('reads identity population without expanding geography for uncovered visits', async () => {
+    await event('2026-01-01T23:01Z', '/covered');
+    await event('2026-01-02T01:00Z', '/raw', { session: secondSession });
+    await build(start, new Date('2026-01-02T00:00Z'));
+    const geography: any[] = [];
+    const population = await server.reportSnapshot(() => {
+      const tx = getQuerySnapshot();
+      return withinQuerySnapshot(
+        {
+          $executeRawUnsafe: (statement, ...values) => tx.$executeRawUnsafe(statement, ...values),
+          $queryRawUnsafe: async (statement, ...values) => {
+            if (statement.includes('population_facts AS MATERIALIZED')) {
+              const [row] = (await tx.$queryRawUnsafe(
+                'EXPLAIN(ANALYZE,FORMAT JSON) ' + statement,
+                ...values,
+              )) as any[];
+              const walk = (node: any) => {
+                if (node['Relation Name'] === 'liekan_event_geography') geography.push(node);
+                for (const child of node.Plans || []) walk(child);
+              };
+              walk(row['QUERY PLAN'][0].Plan);
+            }
+            return tx.$queryRawUnsafe(statement, ...values);
+          },
+        },
+        () =>
+          rollups.readAnalysisVisitPopulation({ websiteId: site, startDate: start, endDate: end }),
+      );
+    });
+    expect(population?.identity).toMatchObject({
+      eligiblePV: 2,
+      qualifiedPV: 2,
+      qualifiedVisitors: 2,
+    });
+    expect(geography.every(node => node['Actual Loops'] === 0)).toBe(true);
+  });
+  it('keeps qualified detail events within the observed batch cursor when missing identities precede them', async () => {
+    await event('2026-01-01T23:00Z', '/missing-one', { available: false });
+    await event('2026-01-01T23:01Z', '/missing-two', { available: false });
+    await execute(
+      `WITH missing AS (INSERT INTO website_event(event_id,website_id,session_id,visit_id,created_at,event_type,url_path,hostname)
+      SELECT gen_random_uuid(),$1::uuid,$2::uuid,$2::uuid,timestamptz '2026-01-01T23:00:01Z'+n*interval '1 millisecond',1,'/missing-batch','detail.invalid'
+      FROM generate_series(1,1998) n RETURNING event_id,website_id)
+      INSERT INTO liekan_event_quality(event_id,website_id,classification,source,reasons,rule_version,range_status,hostname)
+      SELECT event_id,website_id,'browser','browser','{}','detail-fixture','missing','detail.invalid' FROM missing`,
+      site,
+      session,
+    );
+    await event('2026-01-01T23:02Z', '/qualified');
+    const expected = pick(await facts());
+    expect(expected.daily.reduce((sum, day) => sum + Number(day.pv), 0)).toBe(1);
+    await build(start, end, 2000);
+    expect(
+      (
+        await q(
+          `SELECT coalesce(sum(v.pageviews),0)::int AS pv FROM liekan_analysis_browser_visit v WHERE v.website_id=$1 AND EXISTS(SELECT 1 FROM liekan_analysis_manifest m WHERE m.website_id=v.website_id AND m.generation=v.generation AND m.family='visit')`,
+          site,
+        )
+      )[0].pv,
+    ).toBe(1);
+    expect(pick(await facts())).toEqual(expected);
+    expect(
+      await rollups.readAnalysisVisitTotals({ websiteId: site, startDate: start, endDate: end }),
+    ).toMatchObject({ pageviews: 1, visitors: 1 });
   });
   it('matches the original raw contract across chunks, buckets, days, identities, entry and dwell', async () => {
     await event('2026-01-01T22:59:00Z', '/entry', { referrer: 'google.com' });

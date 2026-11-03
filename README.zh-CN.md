@@ -1,6 +1,6 @@
 # GEOInflow
 
-[English](README.md) | **简体中文**
+[English](README.md) | **简体中文** | [日本語](README.ja.md)
 
 面向 GEO 的自托管网站与 AI 爬虫分析系统。
 
@@ -97,13 +97,13 @@ flowchart LR
 
 ## 快速部署
 
-准备已启动的 Docker Engine / Docker Desktop、Docker Compose V2，以及可访问镜像和依赖下载源的网络。在取得源码并进入项目根目录后执行：
+准备已启动的 Docker Engine / Docker Desktop、Docker Compose V2，以及可访问镜像和依赖下载源的网络。源码构建要求 Docker 总内存至少 **6 GiB**，建议 **8 GiB 或以上、2 个 CPU 或以上**，并预留空闲内存。可先运行 `sh scripts/liekan-deploy.sh --check`；运行容量说明见 [部署指南](docs/deployment.md#环境要求)。在取得源码并进入项目根目录后执行：
 
 ```sh
 sh scripts/liekan-deploy.sh
 ```
 
-脚本会生成私有 `.env` 与随机密钥，构建应用镜像，执行迁移并启动应用、日志后台、统计后台、PostgreSQL 和 Redis。默认访问：
+脚本会生成私有 `.env` 与随机密钥，构建应用镜像，执行迁移，首次安装时自动导入完整官方示例，并启动应用、日志后台、统计后台、PostgreSQL 和 Redis。默认访问：
 
 ```text
 http://127.0.0.1:3002
@@ -111,15 +111,15 @@ http://127.0.0.1:3002
 
 首次安装的初始账号为 `admin`，初始密码为 `liekan`。登录后修改密码，再按接入指南创建网站。已有自定义密码和账号在升级时保留。
 
-如需体验内置示例，待应用启动后执行：
+Docker 首次启动在迁移后自动导入官方示例。手动开发时可执行：
 
 ```sh
 docker compose -f docker-compose.liekan.yml exec app node scripts/liekan-seed-demo.mjs
 ```
 
-示例名称为“猎看官网（示例数据）”。它从随源码提供的已处理数据包初始化，首次导入平移时间便于查看，重复运行保留已有数据和删除状态。详情见 [默认示例说明](docs/default-demo.md)。
+示例名称为“猎看官网（示例数据）”。源码与镜像携带完整脱敏数据包、目录和校验清单，覆盖浏览、性能、收益、热力图、回放、抓取证据、内容和目标；首次导入平移时间便于查看，重复运行保留已有数据与删除、清空状态。详情见 [默认示例说明](docs/default-demo.md)。
 
-生产访问需配置域名、HTTPS 与可信反向代理。浏览 PV 可以在缺少可信 IP 入口时继续采集，UV 等身份指标需要可靠的入口证据。自动日志接入和可选 AI 分析各有独立配置要求。
+生产访问需配置域名、HTTPS 与可信反向代理。原始浏览接收情况在缺少可信 IP 入口时仍可观察；正式合格浏览 PV、UV 等指标需要可用的身份证据。自动日志接入和可选 AI 分析各有独立配置要求。
 
 [部署指南](docs/deployment.md)包含服务结构、配置、代理、备份和升级步骤；[快速开始](docs/getting-started.md)说明如何完成第一个网站的数据接入。
 
@@ -137,13 +137,14 @@ docker compose -f docker-compose.liekan.yml exec app node scripts/liekan-seed-de
 - 浏览采集默认采用无 Cookie 方式；可选录制、事件属性及业务接入需按自己的数据范围配置。
 - AI 分析默认关闭，启用后由用户选择模型连接与网站资料，数据发送范围见 [AI 配置器](docs/ai.md)。
 - GEO 权重为 Beta，基于最近 30 个完整自然日内具备既定证据的 AI 内容访问计算，提供公式、依据和限制。[权重说明](docs/geo-weight.md)列出固定政策与适用范围。
+- 可选 [ClickHouse 历史日志分析](docs/clickhouse-analytics.md) 承担已验证的历史聚合，PostgreSQL 继续保存原始数据和事务状态。
 - GEO 扩展、补充旅程、完整导出及统计加速主要面向 PostgreSQL。保留的 ClickHouse、链接和像素入口按各自已有协议工作，不能据此推定全部 GEO 扩展均已支持。
 - 服务器自动采集需要公网 HTTPS、接收密钥与已签名安装资产；Cloudflare 接入另需 OAuth、权限与相应产品能力。
 - 搜索曝光、实际排名、模型回答引用、训练入库和正文完成率需要额外数据。当前项目提供的观察与评分范围见详细文档。
 
 ## 开发与维护
 
-开发环境使用 Node.js **22.23.3**、pnpm **12.3.4** 和 PostgreSQL。先按 [部署指南](docs/deployment.md)准备自己的数据库与私有配置，再运行（以下使用独立开发端口 `3302`）：
+开发环境使用 Node.js **22.23.4**、pnpm **12.3.4** 和 PostgreSQL。先按 [部署指南](docs/deployment.md)准备自己的数据库与私有配置，再运行（以下使用独立开发端口 `3302`）：
 
 ```sh
 pnpm install --frozen-lockfile

@@ -1,15 +1,17 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
 import { fromZonedTime } from 'date-fns-tz';
+import { useEffect, useRef, useState } from 'react';
 import type {
   AnalysisBuildDto,
   AnalysisStatusDto,
   AnalysisWebsiteList,
 } from '@/lib/liekan/contracts/analysis-acceleration';
-import { useLiekanI18n } from '@/lib/liekan/i18n/client';
 import { useManualQuery, useManualRefresh } from '@/lib/liekan/contracts/manual-refresh';
+import { useLiekanI18n } from '@/lib/liekan/i18n/client';
 import { useFeature } from './context';
+import { StorageRetentionPanel } from './StorageRetentionPanel';
 import { Body, Button, Definition, Field, LinkButton, Notice, Panel, Select, Table } from './ui';
+
 const labels = {
   queued: '排队中',
   running: '构建中',
@@ -35,10 +37,12 @@ export function AnalyticsAccelerationPage() {
     [busy, setBusy] = useState(false),
     [pollPaused, setPollPaused] = useState(false),
     [pollRound, setPollRound] = useState(0),
+    [unsupportedRead, setUnsupportedRead] = useState(false),
     [restricted, setRestricted] = useState(false);
   const restrictedAt = useRef(0);
   const failure = (error: any) => {
     setError(error.message);
+    setUnsupportedRead(error.status === 501);
     if ([401, 403, 404, 409, 410].includes(error.status)) {
       restrictedAt.current = Date.now();
       setRestricted(true);
@@ -56,9 +60,14 @@ export function AnalyticsAccelerationPage() {
   });
   const detailRead = useManualQuery<AnalysisStatusDto>({
     queryKey: ['analytics-acceleration-status', c.user.id, siteId],
-    enabled: !!siteId && listRead.data?.supported !== false,
+    enabled: !!siteId,
     queryFn: ({ signal }) => c.api.get(endpoint(siteId), undefined, signal),
   });
+  const readErrors = [detailRead.error, listRead.error] as any[];
+  const unsupported = unsupportedRead || readErrors.some(error => error?.status === 501);
+  const storageRestricted =
+    restricted || readErrors.some(error => [401, 403, 404, 409, 410].includes(error?.status));
+  const storageWebsiteId = unsupported ? undefined : siteId || undefined;
   useEffect(() => {
     setSiteId(c.query.websiteId || '');
   }, [c.query.websiteId]);
@@ -70,25 +79,28 @@ export function AnalyticsAccelerationPage() {
     setError('');
     setMessage('');
     setPollPaused(false);
+    setUnsupportedRead(false);
     setBusy(false);
   }, [scope]);
   useEffect(() => {
     if (
       authorized &&
+      !detailRead.error &&
       detailRead.data?.websiteId === siteId &&
       (!restricted || detailRead.dataUpdatedAt > restrictedAt.current)
     ) {
       setRestricted(false);
+      setUnsupportedRead(false);
       setDetail(detailRead.data);
     }
-  }, [detailRead.data, detailRead.dataUpdatedAt, authorized, siteId, restricted]);
+  }, [detailRead.data, detailRead.dataUpdatedAt, detailRead.error, authorized, siteId, restricted]);
   useEffect(() => {
     const error = detailRead.error || listRead.error;
     if (error) failure(error);
   }, [detailRead.error, listRead.error]);
   const active = !!detail?.builds?.some(row => ['queued', 'running'].includes(row.status));
   useEffect(() => {
-    if (!authorized || restricted || !siteId || !active) return;
+    if (!authorized || restricted || unsupported || !siteId || !active) return;
     const controller = new AbortController();
     const expectedScope = scope;
     let timer: ReturnType<typeof setTimeout>;
@@ -115,6 +127,7 @@ export function AnalyticsAccelerationPage() {
         );
         if (controller.signal.aborted || current.current !== expectedScope) return;
         setDetail(value);
+        setUnsupportedRead(false);
         setError('');
         if (value.builds.some(row => ['queued', 'running'].includes(row.status)))
           timer = setTimeout(load, 3000);
@@ -127,9 +140,9 @@ export function AnalyticsAccelerationPage() {
       controller.abort();
       clearTimeout(timer);
     };
-  }, [siteId, scope, pollRound, active, authorized, restricted]);
+  }, [siteId, scope, pollRound, active, authorized, restricted, unsupported]);
   async function act(work: () => Promise<unknown>) {
-    if (!authorized || restricted || busy) return;
+    if (!authorized || restricted || unsupported || busy) return;
     const expectedScope = scope;
     setBusy(true);
     setError('');
@@ -141,6 +154,7 @@ export function AnalyticsAccelerationPage() {
       if (current.current !== expectedScope) return;
       if (value.error) throw value.error;
       setDetail(value.data);
+      setUnsupportedRead(false);
       setMessage(i18n.text('操作已提交，关闭页面后后台继续处理。'));
       setPollPaused(false);
       setPollRound(value => value + 1);
@@ -196,169 +210,189 @@ export function AnalyticsAccelerationPage() {
       {list?.supported !== false && siteId && !detail && !error && (
         <Notice>{i18n.text('正在读取加速状态')}</Notice>
       )}
-      {list?.supported !== false && authorized && !restricted && detail?.websiteId === siteId && (
-        <>
-          {detail.expansion && (!detail.expansion.path || !detail.expansion.visit) && (
-            <Notice>{i18n.text('高基数扩展已暂停，未覆盖范围继续使用原始事实。')}</Notice>
-          )}
-          <Panel
-            title={i18n.text('实时维护')}
-            actions={
-              <Button
-                disabled={busy}
-                onClick={() => action(detail.mode === 'live' ? 'disable' : 'enable')}
-              >
-                {i18n.text(detail.mode === 'live' ? '停用加速' : '启用加速')}
-              </Button>
-            }
-          >
-            <Body>
-              <Definition
-                items={[
-                  [i18n.text('维护状态'), i18n.text(detail.mode === 'live' ? '已启用' : '已停用')],
-                  [i18n.text('新增输入捕获起点'), date(detail.captureFrom)],
-                  [
-                    i18n.text('网站派生空间估算'),
-                    `${bytes(detail.capacity.siteBytes)} / ${bytes(detail.capacity.siteLimit)}`,
-                  ],
-                  [
-                    i18n.text('实例派生空间'),
-                    `${bytes(detail.capacity.globalBytes)} / ${bytes(detail.capacity.globalLimit)}`,
-                  ],
-                ]}
-              />
-              <p className="muted">
-                {i18n.text('停用后关闭本站的变更捕获，统计使用原始事实。重新启用会建立新基线。')}
-              </p>
-            </Body>
-          </Panel>
-          <Panel title={i18n.text('历史范围构建')}>
-            <Body>
-              <Select
-                label={i18n.text('构建范围')}
-                value={preset}
-                onChange={e => setPreset(e.target.value)}
-                options={[
-                  ['common', i18n.text('常用报表范围')],
-                  ['custom', i18n.text('自定义范围')],
-                  ['retained', i18n.text('全部留存历史')],
-                ]}
-              />
-              <p className="muted">{i18n.text('常用范围包括近 30 天、对比期及六个自然月趋势。')}</p>
-              {preset === 'custom' && (
-                <div className="two">
-                  <Field
-                    label={i18n.text('开始日期')}
-                    type="date"
-                    value={start}
-                    onChange={e => setStart(e.target.value)}
-                  />
-                  <Field
-                    label={i18n.text('结束日期（不含）')}
-                    type="date"
-                    value={end}
-                    onChange={e => setEnd(e.target.value)}
-                  />
-                </div>
-              )}
-              <Button
-                primary
-                disabled={
-                  busy ||
-                  detail.mode !== 'live' ||
-                  (preset === 'custom' && (!start || !end || start >= end))
-                }
-                onClick={() =>
-                  act(() =>
-                    c.api.post(`${endpoint()}/build`, {
-                      preset,
-                      requestId: crypto.randomUUID(),
-                      expectedRevision: detail.revision,
-                      timezone: c.range.timezone,
-                      locale: i18n.locale,
-                      ...(preset === 'custom'
-                        ? {
-                            startAt: +fromZonedTime(`${start}T00:00:00`, c.range.timezone),
-                            endAt: +fromZonedTime(`${end}T00:00:00`, c.range.timezone),
-                          }
-                        : {}),
-                    }),
-                  )
-                }
-              >
-                {i18n.text('开始构建')}
-              </Button>
-            </Body>
-          </Panel>
-          <Panel
-            title={i18n.text('构建记录')}
-            actions={
-              pollPaused && (
+      {(listRead.data || unsupported) &&
+        authorized &&
+        !storageRestricted &&
+        ((!unsupported && detail?.websiteId === siteId && !!siteId) ||
+          (c.user.role === 'admin' && (!siteId || unsupported))) && (
+          <StorageRetentionPanel
+            key={siteId || 'instance'}
+            websiteId={storageWebsiteId}
+            warehouseMode={listRead.data?.backend === 'clickhouse'}
+          />
+        )}
+      {list?.supported !== false &&
+        authorized &&
+        !restricted &&
+        !unsupported &&
+        detail?.websiteId === siteId && (
+          <>
+            {detail.expansion && (!detail.expansion.path || !detail.expansion.visit) && (
+              <Notice>{i18n.text('高基数扩展已暂停，未覆盖范围继续使用原始事实。')}</Notice>
+            )}
+            <Panel
+              title={i18n.text('实时维护')}
+              actions={
                 <Button
-                  onClick={() => {
-                    setPollPaused(false);
-                    setPollRound(value => value + 1);
-                  }}
+                  disabled={busy}
+                  onClick={() => action(detail.mode === 'live' ? 'disable' : 'enable')}
                 >
-                  {i18n.text('继续查看计算状态')}
+                  {i18n.text(detail.mode === 'live' ? '停用加速' : '启用加速')}
                 </Button>
-              )
-            }
-          >
-            <Table
-              columns={['状态', '进度', '构建范围', '最近更新', '操作'].map(label =>
-                i18n.text(label),
-              )}
-              rows={detail.builds.map(build => [
-                <span>
-                  {i18n.text(labels[build.status])}
-                  {build.errorCode && <small> · {i18n.text('请重试或检查后台服务')}</small>}
-                </span>,
-                <span className="num">
-                  {build.progress}% · {build.completedUnits}/{build.totalUnits}
-                </span>,
-                <span>
-                  {date(build.rangeStart)}
-                  <br />
-                  {date(build.rangeEnd)}
-                </span>,
-                date(build.updatedAt),
-                <>
-                  {['queued', 'running'].includes(build.status) && (
-                    <Button disabled={busy} onClick={() => action('pause', build)}>
-                      {i18n.text('暂停')}
-                    </Button>
-                  )}
-                  {build.status === 'paused' && (
-                    <Button disabled={busy} onClick={() => action('resume', build)}>
-                      {i18n.text('继续')}
-                    </Button>
-                  )}
-                  {['failed', 'capacity_limited'].includes(build.status) && (
-                    <Button disabled={busy} onClick={() => action('retry', build)}>
-                      {i18n.text('重试')}
-                    </Button>
-                  )}
-                </>,
-              ])}
-            />
-          </Panel>
-          <Panel
-            title={i18n.text('已发布覆盖')}
-            subtitle={i18n.text('缺口和当前未结束范围仍由原始事实补齐。')}
-          >
-            <Table
-              columns={['指标族', '开始时间', '结束时间', '状态'].map(label => i18n.text(label))}
-              rows={detail.coverage.map(row => [
-                i18n.text(row.family === 'log' ? 'AI 抓取' : '访客统计'),
-                date(row.rangeStart),
-                date(row.rangeEnd),
-                i18n.text(row.current ? '有效' : '待更新'),
-              ])}
-            />
-          </Panel>
-        </>
-      )}
+              }
+            >
+              <Body>
+                <Definition
+                  items={[
+                    [
+                      i18n.text('维护状态'),
+                      i18n.text(detail.mode === 'live' ? '已启用' : '已停用'),
+                    ],
+                    [i18n.text('新增输入捕获起点'), date(detail.captureFrom)],
+                    [
+                      i18n.text('网站派生空间估算'),
+                      `${bytes(detail.capacity.siteBytes)} / ${bytes(detail.capacity.siteLimit)}`,
+                    ],
+                    [
+                      i18n.text('实例派生空间'),
+                      `${bytes(detail.capacity.globalBytes)} / ${bytes(detail.capacity.globalLimit)}`,
+                    ],
+                  ]}
+                />
+                <p className="muted">
+                  {i18n.text('停用后关闭本站的变更捕获，统计使用原始事实。重新启用会建立新基线。')}
+                </p>
+              </Body>
+            </Panel>
+            <Panel title={i18n.text('历史范围构建')}>
+              <Body>
+                <Select
+                  label={i18n.text('构建范围')}
+                  value={preset}
+                  onChange={e => setPreset(e.target.value)}
+                  options={[
+                    ['common', i18n.text('常用报表范围')],
+                    ['custom', i18n.text('自定义范围')],
+                    ['retained', i18n.text('全部留存历史')],
+                  ]}
+                />
+                <p className="muted">
+                  {i18n.text('常用范围包括近 30 天、对比期及六个自然月趋势。')}
+                </p>
+                {preset === 'custom' && (
+                  <div className="two">
+                    <Field
+                      label={i18n.text('开始日期')}
+                      type="date"
+                      value={start}
+                      onChange={e => setStart(e.target.value)}
+                    />
+                    <Field
+                      label={i18n.text('结束日期（不含）')}
+                      type="date"
+                      value={end}
+                      onChange={e => setEnd(e.target.value)}
+                    />
+                  </div>
+                )}
+                <Button
+                  primary
+                  disabled={
+                    busy ||
+                    detail.mode !== 'live' ||
+                    (preset === 'custom' && (!start || !end || start >= end))
+                  }
+                  onClick={() =>
+                    act(() =>
+                      c.api.post(`${endpoint()}/build`, {
+                        preset,
+                        requestId: crypto.randomUUID(),
+                        expectedRevision: detail.revision,
+                        timezone: c.range.timezone,
+                        locale: i18n.locale,
+                        ...(preset === 'custom'
+                          ? {
+                              startAt: +fromZonedTime(`${start}T00:00:00`, c.range.timezone),
+                              endAt: +fromZonedTime(`${end}T00:00:00`, c.range.timezone),
+                            }
+                          : {}),
+                      }),
+                    )
+                  }
+                >
+                  {i18n.text('开始构建')}
+                </Button>
+              </Body>
+            </Panel>
+            <Panel
+              title={i18n.text('构建记录')}
+              actions={
+                pollPaused && (
+                  <Button
+                    onClick={() => {
+                      setPollPaused(false);
+                      setPollRound(value => value + 1);
+                    }}
+                  >
+                    {i18n.text('继续查看计算状态')}
+                  </Button>
+                )
+              }
+            >
+              <Table
+                columns={['状态', '进度', '构建范围', '最近更新', '操作'].map(label =>
+                  i18n.text(label),
+                )}
+                rows={detail.builds.map(build => [
+                  <span>
+                    {i18n.text(labels[build.status])}
+                    {build.errorCode && <small> · {i18n.text('请重试或检查后台服务')}</small>}
+                  </span>,
+                  <span className="num">
+                    {build.progress}% · {build.completedUnits}/{build.totalUnits}
+                  </span>,
+                  <span>
+                    {date(build.rangeStart)}
+                    <br />
+                    {date(build.rangeEnd)}
+                  </span>,
+                  date(build.updatedAt),
+                  <>
+                    {['queued', 'running'].includes(build.status) && (
+                      <Button disabled={busy} onClick={() => action('pause', build)}>
+                        {i18n.text('暂停')}
+                      </Button>
+                    )}
+                    {build.status === 'paused' && (
+                      <Button disabled={busy} onClick={() => action('resume', build)}>
+                        {i18n.text('继续')}
+                      </Button>
+                    )}
+                    {['failed', 'capacity_limited'].includes(build.status) && (
+                      <Button disabled={busy} onClick={() => action('retry', build)}>
+                        {i18n.text('重试')}
+                      </Button>
+                    )}
+                  </>,
+                ])}
+              />
+            </Panel>
+            <Panel
+              title={i18n.text('已发布覆盖')}
+              subtitle={i18n.text('缺口和当前未结束范围仍由原始事实补齐。')}
+            >
+              <Table
+                columns={['指标族', '开始时间', '结束时间', '状态'].map(label => i18n.text(label))}
+                rows={detail.coverage.map(row => [
+                  i18n.text(row.family === 'log' ? 'AI 抓取' : '访客统计'),
+                  date(row.rangeStart),
+                  date(row.rangeEnd),
+                  i18n.text(row.current ? '有效' : '待更新'),
+                ])}
+              />
+            </Panel>
+          </>
+        )}
       <LinkButton page="websites">{i18n.text('返回网站管理')}</LinkButton>
     </>
   );

@@ -258,6 +258,14 @@
       "homepage": "https://clickhouse.com"
     },
     {
+      "name": "@confluentinc/kafka-javascript",
+      "versions": [
+        "1.11.0"
+      ],
+      "license": "MIT",
+      "homepage": "https://github.com/confluentinc/confluent-kafka-javascript#readme"
+    },
+    {
       "name": "@csstools/cascade-layer-name-parser",
       "versions": [
         "3.0.0"
@@ -1084,7 +1092,7 @@
     {
       "name": "@img/sharp-darwin-arm64",
       "versions": [
-        "0.35.4"
+        "0.35.5"
       ],
       "license": "Apache-2.0",
       "homepage": "https://sharp.pixelplumbing.com"
@@ -1092,7 +1100,7 @@
     {
       "name": "@img/sharp-libvips-darwin-arm64",
       "versions": [
-        "1.3.3"
+        "1.3.4"
       ],
       "license": "LGPL-3.0-or-later",
       "homepage": "https://sharp.pixelplumbing.com"
@@ -1258,27 +1266,35 @@
       "homepage": "https://github.com/kurkle/color#readme"
     },
     {
+      "name": "@mapbox/node-pre-gyp",
+      "versions": [
+        "2.0.3"
+      ],
+      "license": "BSD-3-Clause",
+      "homepage": "https://github.com/mapbox/node-pre-gyp#readme"
+    },
+    {
       "name": "@modelcontextprotocol/client",
       "versions": [
-        "2.0.0"
+        "2.4.0"
       ],
-      "license": "MIT",
+      "license": "Apache-2.0",
       "homepage": "https://modelcontextprotocol.io"
     },
     {
       "name": "@modelcontextprotocol/core",
       "versions": [
-        "2.0.0"
+        "2.4.0"
       ],
-      "license": "MIT",
+      "license": "Apache-2.0",
       "homepage": "https://modelcontextprotocol.io"
     },
     {
       "name": "@modelcontextprotocol/server",
       "versions": [
-        "2.0.0"
+        "2.4.0"
       ],
-      "license": "MIT",
+      "license": "Apache-2.0",
       "homepage": "https://modelcontextprotocol.io"
     },
     {
@@ -1300,7 +1316,7 @@
     {
       "name": "@next/env",
       "versions": [
-        "16.3.4"
+        "16.4.2"
       ],
       "license": "MIT",
       "homepage": "https://github.com/vercel/next.js#readme"
@@ -1308,7 +1324,7 @@
     {
       "name": "@next/swc-darwin-arm64",
       "versions": [
-        "16.3.4"
+        "16.4.2"
       ],
       "license": "MIT",
       "homepage": "https://github.com/vercel/next.js#readme"
@@ -1405,7 +1421,7 @@
     {
       "name": "@oxc-project/types",
       "versions": [
-        "0.133.0"
+        "0.139.0"
       ],
       "license": "MIT",
       "homepage": "https://oxc.rs"
@@ -1822,7 +1838,7 @@
     {
       "name": "@rolldown/binding-darwin-arm64",
       "versions": [
-        "1.0.3"
+        "1.1.5"
       ],
       "license": "MIT",
       "homepage": "https://rolldown.rs/"
@@ -2124,6 +2140,14 @@
       "homepage": null
     },
     {
+      "name": "@tanstack/query-async-storage-persister",
+      "versions": [
+        "5.102.8"
+      ],
+      "license": "MIT",
+      "homepage": "https://tanstack.com/query"
+    },
+    {
       "name": "@tanstack/query-core",
       "versions": [
         "5.102.8"
@@ -2132,7 +2156,23 @@
       "homepage": "https://tanstack.com/query"
     },
     {
+      "name": "@tanstack/query-persist-client-core",
+      "versions": [
+        "5.102.8"
+      ],
+      "license": "MIT",
+      "homepage": "https://tanstack.com/query"
+    },
+    {
       "name": "@tanstack/react-query",
+      "versions": [
+        "5.102.8"
+      ],
+      "license": "MIT",
+      "homepage": "https://tanstack.com/query"
+    },
+    {
+      "name": "@tanstack/react-query-persist-client",
       "versions": [
         "5.102.8"
       ],
@@ -2452,6 +2492,14 @@
       "homepage": "https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/yargs-parser"
     },
     {
+      "name": "@types/yazl",
+      "versions": [
+        "3.3.0"
+      ],
+      "license": "MIT",
+      "homepage": "https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/yazl"
+    },
+    {
       "name": "@umami/react-zen",
       "versions": [
         "0.254.0"
@@ -2610,6 +2658,14 @@
       ],
       "license": "MIT",
       "homepage": "https://github.com/statelyai/xstate/tree/main/packages/xstate-fsm#readme"
+    },
+    {
+      "name": "abbrev",
+      "versions": [
+        "3.0.1"
+      ],
+      "license": "ISC",
+      "homepage": "https://github.com/npm/abbrev-js#readme"
     },
     {
       "name": "acorn",
@@ -2818,6 +2874,14 @@
       "homepage": "https://github.com/lojjic/bidi-js#readme"
     },
     {
+      "name": "bindings",
+      "versions": [
+        "1.5.0"
+      ],
+      "license": "MIT",
+      "homepage": "https://github.com/TooTallNate/node-bindings"
+    },
+    {
       "name": "boolbase",
       "versions": [
         "1.0.0"
@@ -2828,9 +2892,9 @@
     {
       "name": "brace-expansion",
       "versions": [
-        "1.1.18",
-        "2.1.4",
-        "5.0.9"
+        "1.1.21",
+        "2.1.7",
+        "5.0.12"
       ],
       "license": "MIT",
       "homepage": "https://github.com/juliangruber/brace-expansion#readme"
@@ -2842,6 +2906,14 @@
       ],
       "license": "MIT",
       "homepage": "https://github.com/browserslist/browserslist#readme"
+    },
+    {
+      "name": "buffer-crc32",
+      "versions": [
+        "1.0.0"
+      ],
+      "license": "MIT",
+      "homepage": "https://github.com/brianloveswords/buffer-crc32"
     },
     {
       "name": "buffer-equal-constant-time",
@@ -3743,7 +3815,7 @@
     {
       "name": "echarts",
       "versions": [
-        "5.5.0"
+        "6.1.0"
       ],
       "license": "Apache-2.0",
       "homepage": "https://echarts.apache.org"
@@ -4019,7 +4091,7 @@
     {
       "name": "fast-uri",
       "versions": [
-        "3.1.6"
+        "3.1.9"
       ],
       "license": "BSD-3-Clause",
       "homepage": "https://github.com/fastify/fast-uri"
@@ -4055,6 +4127,14 @@
       ],
       "license": "MIT",
       "homepage": "https://101arrowz.github.io/fflate"
+    },
+    {
+      "name": "file-uri-to-path",
+      "versions": [
+        "1.0.0"
+      ],
+      "license": "MIT",
+      "homepage": "https://github.com/TooTallNate/file-uri-to-path"
     },
     {
       "name": "find-my-way",
@@ -5372,6 +5452,14 @@
       "homepage": "https://github.com/mysqljs/named-placeholders#readme"
     },
     {
+      "name": "nan",
+      "versions": [
+        "2.30.0"
+      ],
+      "license": "MIT",
+      "homepage": "https://github.com/nodejs/nan#readme"
+    },
+    {
       "name": "nanoid",
       "versions": [
         "3.3.18"
@@ -5390,7 +5478,7 @@
     {
       "name": "next",
       "versions": [
-        "16.3.4"
+        "16.4.2"
       ],
       "license": "MIT",
       "homepage": "https://nextjs.org"
@@ -5446,6 +5534,7 @@
     {
       "name": "node-fetch",
       "versions": [
+        "2.7.0",
         "3.3.2"
       ],
       "license": "MIT",
@@ -5466,6 +5555,14 @@
       ],
       "license": "MIT",
       "homepage": "https://github.com/sindresorhus/non-error#readme"
+    },
+    {
+      "name": "nopt",
+      "versions": [
+        "8.1.0"
+      ],
+      "license": "ISC",
+      "homepage": "https://github.com/npm/nopt#readme"
     },
     {
       "name": "normalize-package-data",
@@ -5722,7 +5819,6 @@
     {
       "name": "pg",
       "versions": [
-        "8.22.0",
         "8.23.1"
       ],
       "license": "MIT",
@@ -5739,7 +5835,6 @@
     {
       "name": "pg-cloudflare",
       "versions": [
-        "1.4.0",
         "1.4.1"
       ],
       "license": "MIT",
@@ -5748,7 +5843,6 @@
     {
       "name": "pg-connection-string",
       "versions": [
-        "2.14.0",
         "2.14.1"
       ],
       "license": "MIT",
@@ -6137,7 +6231,7 @@
     {
       "name": "postcss-selector-parser",
       "versions": [
-        "7.1.4"
+        "7.1.6"
       ],
       "license": "MIT",
       "homepage": "https://github.com/postcss/postcss-selector-parser"
@@ -6275,7 +6369,7 @@
     {
       "name": "react",
       "versions": [
-        "19.3.0"
+        "19.3.1"
       ],
       "license": "MIT",
       "homepage": "https://react.dev/"
@@ -6291,7 +6385,7 @@
     {
       "name": "react-dom",
       "versions": [
-        "19.3.0"
+        "19.3.1"
       ],
       "license": "MIT",
       "homepage": "https://react.dev/"
@@ -6520,7 +6614,7 @@
     {
       "name": "rolldown",
       "versions": [
-        "1.0.3"
+        "1.1.5"
       ],
       "license": "MIT",
       "homepage": "https://rolldown.rs/"
@@ -6659,7 +6753,6 @@
     {
       "name": "serialize-error",
       "versions": [
-        "13.0.1",
         "13.0.2"
       ],
       "license": "MIT",
@@ -6724,7 +6817,7 @@
     {
       "name": "sharp",
       "versions": [
-        "0.35.4"
+        "0.35.5"
       ],
       "license": "Apache-2.0",
       "homepage": "https://sharp.pixelplumbing.com"
@@ -6750,7 +6843,7 @@
     {
       "name": "shell-quote",
       "versions": [
-        "1.9.0"
+        "1.11.0"
       ],
       "license": "MIT",
       "homepage": "https://github.com/ljharb/shell-quote"
@@ -6840,7 +6933,7 @@
     {
       "name": "source-map-js",
       "versions": [
-        "1.2.1"
+        "1.2.2"
       ],
       "license": "BSD-3-Clause",
       "homepage": "https://github.com/7rulnik/source-map-js"
@@ -7238,6 +7331,7 @@
     {
       "name": "tr46",
       "versions": [
+        "0.0.3",
         "6.0.0"
       ],
       "license": "MIT",
@@ -7352,8 +7446,8 @@
     {
       "name": "undici",
       "versions": [
-        "7.30.0",
-        "8.9.0"
+        "7.30.1",
+        "8.11.2"
       ],
       "license": "MIT",
       "homepage": "https://undici.nodejs.org"
@@ -7457,7 +7551,7 @@
     {
       "name": "vite",
       "versions": [
-        "8.0.16"
+        "8.1.6"
       ],
       "license": "MIT",
       "homepage": "https://vite.dev"
@@ -7489,6 +7583,7 @@
     {
       "name": "webidl-conversions",
       "versions": [
+        "3.0.1",
         "8.0.1"
       ],
       "license": "BSD-2-Clause",
@@ -7505,6 +7600,7 @@
     {
       "name": "whatwg-url",
       "versions": [
+        "5.0.0",
         "16.0.1",
         "17.1.0"
       ],
@@ -7662,6 +7758,14 @@
       "homepage": "https://github.com/yargs/yargs-parser#readme"
     },
     {
+      "name": "yazl",
+      "versions": [
+        "3.3.1"
+      ],
+      "license": "MIT",
+      "homepage": "https://github.com/thejoshwolfe/yazl"
+    },
+    {
       "name": "zeptomatch",
       "versions": [
         "2.1.0"
@@ -7672,7 +7776,8 @@
     {
       "name": "zod",
       "versions": [
-        "4.6.2"
+        "4.6.6",
+        "4.6.7"
       ],
       "license": "MIT",
       "homepage": "https://zod.dev"
@@ -7688,7 +7793,7 @@
     {
       "name": "zrender",
       "versions": [
-        "5.5.0"
+        "6.1.0"
       ],
       "license": "BSD-3-Clause",
       "homepage": "https://github.com/ecomfe/zrender#readme"

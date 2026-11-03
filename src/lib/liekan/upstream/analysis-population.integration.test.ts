@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { ANALYSIS_ROLLUP_VERSION } from './analysis-rollups-model';
 import { randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { Client } from 'pg';
@@ -98,8 +99,10 @@ async function build(from = startDate, until = endDate) {
 async function oracle(start = startDate, end = endDate, halfOpen = true) {
   const [row] = await q(
     `WITH p AS MATERIALIZED (
-    SELECT e.*,env.identity_version,q.rule_version,q.catalog_version
-    FROM liekan_geographic_website_event e
+    SELECT e.*,env.identity_version,q.rule_version,q.catalog_version,
+     coalesce(e.event_type IN(3,4) OR (env.scope='browser' AND env.identity_available AND present.session_id IS NOT NULL AND q.source='browser' AND q.classification='browser'),false) AS liekan_identity_available
+    FROM liekan_observed_website_event e
+    LEFT JOIN session present ON present.session_id=e.session_id AND present.website_id=e.website_id
     LEFT JOIN liekan_event_environment env ON env.website_id=e.website_id AND env.event_id=e.event_id
     LEFT JOIN liekan_reporting_event_quality q ON q.website_id=e.website_id AND q.event_id=e.event_id
     WHERE e.website_id=$1 AND e.created_at>=$2 AND e.created_at${halfOpen ? '<' : '<='}$3
@@ -108,6 +111,7 @@ async function oracle(start = startDate, end = endDate, halfOpen = true) {
     count(*) FILTER(WHERE event_type IN(1,3,4) AND liekan_identity_available)::int AS qualified_pv,
     count(DISTINCT session_id) FILTER(WHERE event_type IN(1,3,4) AND liekan_identity_available)::int AS visitors,
     ARRAY(SELECT DISTINCT identity_version FROM p WHERE identity_version IS NOT NULL ORDER BY 1 LIMIT 33) AS identities,
+    ARRAY(SELECT DISTINCT identity_version FROM p WHERE identity_version IS NOT NULL AND liekan_identity_available AND event_type IN(1,3,4) ORDER BY 1 LIMIT 33) AS qualified_identities,
     ARRAY(SELECT DISTINCT rule_version FROM p WHERE rule_version IS NOT NULL ORDER BY 1 LIMIT 33) AS rules,
     ARRAY(SELECT DISTINCT catalog_version::text FROM p WHERE catalog_version IS NOT NULL ORDER BY 1 LIMIT 33) AS catalogs
    FROM p`,
@@ -131,7 +135,10 @@ function expectPopulation(actual: BrowserPopulation, expected: Awaited<ReturnTyp
     qualifiedPV: expected.qualified_pv,
     qualifiedVisitors: expected.visitors,
     versions: expected.identities.slice(0, 32),
+    qualifiedVersions: expected.qualified_identities.slice(0, 32),
+    coverage: expected.pv ? expected.qualified_pv / expected.pv : null,
   });
+  expect(actual.metricScope).toBe('qualified-browser');
   expect(actual.ruleVersions).toEqual(expected.rules.slice(0, 32));
   expect(actual.catalogVersions).toEqual(expected.catalogs.slice(0, 32));
   expect(actual.versionSetsTruncated).toBe(
@@ -303,6 +310,32 @@ describe.skipIf(!enabled)('browser population facts in an owned PostgreSQL schem
     },
   );
 
+  it.each(['missing', 'foreign'])('keeps %s session identities outside the qualified cohort before and after building', async kind => {
+    const regular = session;
+    session = randomUUID();
+    if (kind === 'foreign') {
+      const foreign = randomUUID();
+      sites.push(foreign);
+      await execute("INSERT INTO website(website_id,user_id,name,domain) VALUES($1,$2,'Foreign fixture','foreign.invalid')", foreign, actor.userId);
+      await execute('INSERT INTO session(session_id,website_id) VALUES($1,$2)', session, foreign);
+    }
+    const orphanSession = session;
+    const orphan = await event('2026-01-01T00:10Z', { identityVersion: 'orphan-identity' });
+    const before = await population.readBrowserPopulation(site, startDate, endDate);
+    expect(before.identity).toMatchObject({ status: 'unavailable', eligibleEvents: 1, eligiblePV: 1, qualifiedPV: 0, qualifiedVisitors: 0, coverage: 0, qualifiedVersions: [] });
+    session = regular;
+    await event('2026-01-01T00:20Z');
+    const mixed = await population.readBrowserPopulation(site, startDate, endDate);
+    expect(mixed.identity).toMatchObject({ status: 'partial', eligiblePV: 2, qualifiedPV: 1, qualifiedVisitors: 1, coverage: 0.5, qualifiedVersions: ['identity-fixture'] });
+    await build();
+    expect((await population.readBrowserPopulation(site, startDate, endDate)).identity).toEqual(mixed.identity);
+    expect(await api.readAnalysisVisitTotals({ websiteId: site, startDate, endDate })).toMatchObject({ pageviews: 1, visitors: 1 });
+    expect((await q('SELECT identity_available FROM liekan_event_environment WHERE event_id=$1', orphan))[0].identity_available).toBe(true);
+    if (kind === 'missing') {
+      await execute('INSERT INTO session(session_id,website_id) VALUES($1,$2)', orphanSession, site);
+      expect((await population.readBrowserPopulation(site, startDate, endDate)).identity).toMatchObject({ status: 'complete', eligiblePV: 2, qualifiedPV: 2, qualifiedVisitors: 2, coverage: 1 });
+    }
+  });
   it('uses covered facts for the existing whole-window population API without executing raw scans', async () => {
     await event('2026-01-01T00:10Z');
     await event('2026-01-01T01:10Z', {
@@ -836,6 +869,7 @@ describe.skipIf(!enabled)('browser population facts in an owned PostgreSQL schem
     expect(after[2].versions).toEqual(before[2].versions);
     expect(after[2].fingerprint).not.toBe(before[2].fingerprint);
     expect(after[2]).toMatchObject({ compared: true, input_rows: 4n, derived_rows: 2n });
+    expect((await population.readBrowserPopulation(site, new Date('2026-01-03T00:00Z'), until)).identity).toMatchObject({ status: 'partial', eligibleEvents: 4, eligiblePV: 4, qualifiedPV: 3, qualifiedVisitors: 1, coverage: 0.75 });
     await build(startDate, until);
     await execute(
       'UPDATE liekan_event_environment SET identity_available=true WHERE event_id=$1',
@@ -903,7 +937,7 @@ describe.skipIf(!enabled)('browser population facts in an owned PostgreSQL schem
         qualifiedVisitors: 1,
       });
       const statement = captured.find(
-        c => c.sql.includes('"qualifiedEvents"') && c.sql.includes('FROM facts'),
+        c => c.sql.includes('"qualifiedEvents"') && c.sql.includes('FROM population_facts'),
       );
       expect(statement).toBeTruthy();
       const plan = (
@@ -936,7 +970,7 @@ describe.skipIf(!enabled)('browser population facts in an owned PostgreSQL schem
           ),
         ),
       );
-      expect(filtered.value).toEqual([{ x: 'Firefox', y: null }]);
+      expect(filtered.value).toEqual([{ x: 'Firefox', y: 1 }]);
       expect(
         filtered.populations.some(
           p => p.identity.eligibleEvents === 2 && p.identity.status === 'partial',
@@ -1052,7 +1086,7 @@ describe.skipIf(!enabled)('browser population facts in an owned PostgreSQL schem
         expect(plans).toHaveLength(2);
         for (const item of plans) {
           expect(item.sql).not.toContain('liekan_analysis_fingerprint(');
-          expect(item.values[1]).toBe('analysis-rollups-v2');
+          expect(item.values[1]).toBe(ANALYSIS_ROLLUP_VERSION);
           expect(
             nodes(item.plan.Plan).some(node =>
               [

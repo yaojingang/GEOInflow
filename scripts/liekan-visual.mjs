@@ -39,7 +39,8 @@ for (const [file, hash] of Object.entries(referenceHashes))
     `Original GEO reference changed: ${file}`,
   );
 const tailwind = fs.readFileSync('design/reference/vendor/tailwind-3.4.17.js', 'utf8');
-const echarts = fs.readFileSync('node_modules/echarts/dist/echarts.min.js', 'utf8');
+const echarts = fs.readFileSync('design/reference/vendor/echarts-5.5.0.min.js', 'utf8');
+assert.equal(createHash('sha256').update(echarts).digest('hex'), '42f8329d989b6f6539dd2b15bbdf0d82025762ac112fbb60dc57b27d7bcf3946', 'Preserve the original chart reference runtime');
 const fonts = fs.readFileSync('public/liekan/fonts/inter-latin.woff2');
 const credentialFile = process.env.LIEKAN_TEST_CREDENTIAL_FILE || '.local/ui-test.env';
 const credentials = Object.fromEntries(
@@ -641,13 +642,13 @@ try {
       navigationBaseline.geo[name].title,
       `${name} approved header title`,
     );
-    // 用户批准（2026-10-07）：快捷时间钮位于工具栏最前、自定义范围 chip 之前，默认 30 天亮。
+    // Keep toolbar placement and the approved account-owned natural-day default.
     const toolbarButtons = await actual
       .locator('[data-website-toolbar-actions] button')
       .allTextContents();
     assert.deepEqual(
       toolbarButtons.slice(0, 3),
-      ['24h', '7 天', '30 天'],
+      navigationBaseline.todayCalendarApproval.shortcuts,
       `${name} quick range buttons must lead the website toolbar`,
     );
     assert(
@@ -657,11 +658,11 @@ try {
     assert.equal(
       await actual
         .locator('[data-website-toolbar-actions] button')
-        .filter({ hasText: '30 天' })
+        .filter({ hasText: navigationBaseline.todayCalendarApproval.shortcuts[0] })
         .first()
         .getAttribute('aria-pressed'),
       'true',
-      `${name} default 30-day quick range must be active`,
+      `${name} approved natural-day quick range must be active`,
     );
     assert.deepEqual(
       await actual.locator('[class*="analysisTools"] a').allTextContents(),
@@ -983,7 +984,7 @@ try {
         .count(),
       1,
     );
-    assert.deepEqual(await footer.locator('[data-product-publishers] > span').allTextContents(), [
+    assert.deepEqual(await footer.locator('[data-product-publishers] > *').allTextContents(), [
       '联合发布：',
       ...branding.publishers,
     ]);

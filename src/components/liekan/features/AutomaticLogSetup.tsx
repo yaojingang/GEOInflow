@@ -721,7 +721,15 @@ export function AutomaticLogSetup({
                   ? i18n.text('主要来源已变更；确认后可将此连接设为主要来源。')
                   : source.errorCode === 'reauthorization-required'
                     ? i18n.text('授权或网站配置已变更，请重新连接。')
-                    : i18n.text('日志推送暂时异常，请检查服务与权限。')}
+                    : source.errorCode === 'provider-not-entitled'
+                      ? i18n.text(
+                          '当前 Cloudflare 账户尚未启用所需的 Logpush 能力，请核对启用与计费，或改用服务器采集。',
+                        )
+                      : source.errorCode === 'provider-permission-denied'
+                        ? i18n.text(
+                            'Cloudflare 授权缺少日志管理权限，请核对 Zone Logs 权限后重新连接。',
+                          )
+                        : i18n.text('日志推送暂时异常，请检查服务与权限。')}
               </p>
             )}
             {source.health?.gap === true && (

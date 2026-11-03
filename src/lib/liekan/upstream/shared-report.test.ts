@@ -26,6 +26,7 @@ vi.mock('./server', async () => ({
 }));
 import { readSharedReport } from './shared-report';
 import { analyticsCache } from './query-cache';
+import { populationFromRow } from './browser-population';
 
 const id = '5b4c0de0-6c47-5b51-8f53-11e5e8c79001';
 const website = { id, name: '测试站', domain: 'example.com' };
@@ -275,4 +276,21 @@ it('conceals crawler integration states from public reports when display is disa
     expect(report.states.human).toBe('available');
   }
   expect(mocks.snapshot).toHaveBeenCalledTimes(2);
+});
+
+it('preserves the public trend population for its independent date window', async () => {
+  const source = await mocks.build();
+  const trend = populationFromRow({
+    resourceKind: 'website', metricScope: 'qualified-browser', eligibleEvents: 4,
+    qualifiedEvents: 4, eligiblePV: 4, qualifiedPV: 4, qualifiedVisitors: 2,
+  }, { startAt: 0, endAt: 86400000, timezone: 'Asia/Shanghai' });
+  source.meta.trendPopulation = trend;
+  source.meta.population = populationFromRow({
+    resourceKind: 'website', metricScope: 'qualified-browser', eligibleEvents: 3,
+    qualifiedEvents: 0, eligiblePV: 3, qualifiedPV: 0, qualifiedVisitors: 0,
+  }, { startAt: 43200000, endAt: 86400000, timezone: 'Asia/Shanghai' });
+  mocks.build.mockResolvedValue(source);
+  const actual = await readSharedReport(request(), id);
+  expect(actual.meta.population).toEqual(source.meta.population);
+  expect(actual.meta.trendPopulation).toEqual(trend);
 });

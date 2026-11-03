@@ -1,4 +1,5 @@
 import { crawlerTransaction } from '../upstream/crawler-access';
+import { pauseRobotsForRestore } from '../upstream/robots-management';
 
 // Run with application and workers stopped after restoring a database, before restarting services.
 export async function pauseRestoredCrawlerControl() {
@@ -12,6 +13,7 @@ export async function pauseRestoredCrawlerControl() {
       "UPDATE liekan_crawler_deployment SET state='unknown',error_code='restore-readback-required',updated_at=now(),lease_until=NULL WHERE state='running'",
     );
     await tx.execute('UPDATE liekan_crawler_preview SET expires_at=LEAST(expires_at,now())');
+    await pauseRobotsForRestore(tx);
     return { controlPaused: true, cancelled, unknown };
   });
 }

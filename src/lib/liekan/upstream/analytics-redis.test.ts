@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { withQueryCacheHeaders } from './cache-context';
+import { currentCacheContext, withQueryCacheHeaders } from './cache-context';
 const factory = vi.hoisted(() => vi.fn());
 vi.mock('redis', () => ({ createClient: factory }));
 import { AnalyticsRedis } from './analytics-redis';
@@ -123,4 +123,61 @@ it('limits a later overlapping command to the remaining request wait', async () 
   expect(await completion).toHaveProperty('value.ok', true);
   expect(client.sendCommand).toHaveBeenCalledTimes(2);
   expect(client.destroy).toHaveBeenCalled();
+});
+
+it('releases an owned lease after the compute deadline so worker fallback can claim immediately', async () => {
+  vi.useFakeTimers();
+  let owner: string | undefined;
+  const client = {
+    isReady: true,
+    on: vi.fn(),
+    destroy: vi.fn(),
+    sendCommand: vi.fn(async (args: string[]) => {
+      const token = args[4];
+      if (args[1].includes('EXISTS')) {
+        if (owner) return 0;
+        owner = token;
+        return 1;
+      }
+      if (owner === token) {
+        owner = undefined;
+        return 1;
+      }
+      return 0;
+    }),
+  };
+  factory.mockReturnValue(client);
+  const redis = new AnalyticsRedis('redis://cache');
+  let first: string;
+  const response = withQueryCacheHeaders(async () => {
+    currentCacheContext().deadline = Date.now() + 750;
+    first = (await redis.claim('fast-attempt', true, true)) as string;
+    expect(typeof first).toBe('string');
+    await vi.advanceTimersByTimeAsync(751);
+    await redis.release('fast-attempt', first);
+    return Response.json({});
+  });
+  expect((await response).ok).toBe(true);
+  expect(owner).toBeUndefined();
+  expect(typeof (await redis.claim('fast-attempt', true, true))).toBe('string');
+});
+it('bounds cleanup reply waiting after deadline exhaustion', async () => {
+  vi.useFakeTimers();
+  const client = {
+    isReady: true,
+    on: vi.fn(),
+    destroy: vi.fn(),
+    sendCommand: vi.fn(() => new Promise(() => {})),
+  };
+  factory.mockReturnValue(client);
+  const redis = new AnalyticsRedis('redis://cache');
+  const response = withQueryCacheHeaders(async () => {
+    currentCacheContext().deadline = Date.now() - 1;
+    await redis.release('expired-attempt', 'owned-token');
+    return Response.json({});
+  });
+  await vi.advanceTimersByTimeAsync(150);
+  expect((await response).ok).toBe(true);
+  expect(client.sendCommand).toHaveBeenCalledOnce();
+  expect(client.destroy).toHaveBeenCalledOnce();
 });

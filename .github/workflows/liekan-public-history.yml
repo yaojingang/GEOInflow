@@ -1,0 +1,59 @@
+name: GEOInflow public history
+
+on:
+  push:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify public ancestry
+    if: github.repository == 'yaojingang/GEOInflow'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Fetch the candidate graph without executing candidate files
+        env:
+          CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: git fetch --no-tags origin "$CANDIDATE"
+      - name: Check every candidate ancestor using the trusted base policy
+        env:
+          CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: node scripts/liekan-public-history.mjs "$CANDIDATE"
+      - name: Exercise clean and contaminated history fixtures from the trusted base
+        run: node --test tests/liekan/public-history.test.mjs tests/liekan/pre-push.test.mjs
+  report:
+    name: Report public ancestry
+    needs: verify
+    if: always() && github.event_name == 'pull_request_target' && github.repository == 'yaojingang/GEOInflow'
+    permissions:
+      contents: read
+      statuses: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
+          VERIFIED: ${{ needs.verify.result }}
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: process.env.CANDIDATE,
+              context: 'GEOInflow public history',
+              state: process.env.VERIFIED === 'success' ? 'success' : 'failure',
+              description: process.env.VERIFIED === 'success' ? 'Project ancestry verified' : 'Project ancestry verification failed',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });

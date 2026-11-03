@@ -1,4 +1,6 @@
-vi.mock('@/lib/liekan/upstream/crawler-registry-context', () => ({ withPublishedRegistry: (work: () => unknown) => work() }));
+vi.mock('@/lib/liekan/upstream/crawler-registry-context', () => ({
+  withPublishedRegistry: (work: () => unknown) => work(),
+}));
 import { beforeEach, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({ authorize: vi.fn(), read: vi.fn() }));
 vi.mock('./server', async () => ({
@@ -9,6 +11,7 @@ vi.mock('./page-report', () => ({ readPageReport: mocks.read }));
 import { GET } from '@/app/api/liekan/websites/[websiteId]/page-report/route';
 import { LiekanError } from './errors';
 import { bindCacheRequest } from './cache-context';
+import { timeReportQuery } from './analysis-diagnostics';
 const id = '11111111-1111-4111-8111-111111111111';
 const request = () =>
   new Request(
@@ -94,4 +97,31 @@ it('keeps search engine reports behind the same private authorization gate', asy
   expect(mocks.read).not.toHaveBeenCalled();
   expect((await GET(request, params)).status).toBe(200);
   expect(mocks.read.mock.calls[0][1].resource).toBe('human/search-engines');
+});
+
+it('keeps current HTTP timings alongside cache timings and excludes prior background timings', async () => {
+  mocks.read.mockImplementationOnce(() =>
+    timeReportQuery('human', async () => ({
+      value: { meta: { workerComputeWallMs: 999999 } },
+      generatedAt: 1,
+      expiresAt: 30001,
+      status: 'miss',
+    })),
+  );
+  const response = await GET(request(), params);
+  const timing = response.headers.get('Server-Timing');
+  expect(timing).toContain('analytics;dur=');
+  expect(timing).toMatch(/auth;dur=\d+\.\d;desc="wall-clock"/);
+  expect(timing).toMatch(/report-human;dur=\d+\.\d;desc="wall-clock"/);
+  expect(timing).not.toMatch(/999999|worker|queue/);
+  const warm = await GET(request(), params);
+  expect(warm.headers.get('Server-Timing')).not.toContain('report-human');
+});
+
+it('reports only current request and authorization time on access failures', async () => {
+  mocks.authorize.mockRejectedValueOnce(new LiekanError('无法访问', 403));
+  const response = await GET(request(), params);
+  expect(response.headers.get('Server-Timing')).toContain('request;dur=');
+  expect(response.headers.get('Server-Timing')).toContain('auth;dur=');
+  expect(response.headers.get('Server-Timing')).not.toContain('report;dur=');
 });

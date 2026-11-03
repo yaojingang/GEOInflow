@@ -31,9 +31,11 @@ export function AccountPreferencesBoundary({ children }: { children: ReactNode }
   }, [attempt]);
   if (loaded && preferences?.configured) return <>{children}</>;
   return (
-    <div data-liekan-features lang={i18n.locale} className="identity-flow">
-      <main className="content" style={{ maxWidth: 760, margin: '0 auto', padding: 32 }}>
-        <LanguageSelector toolbar />
+    <div data-liekan-features lang={i18n.locale} className="identity-flow account-timezone-setup">
+      <main className="content account-timezone-content">
+        <div className="account-timezone-toolbar">
+          <LanguageSelector toolbar />
+        </div>
         <Panel
           title={i18n.text('确认分析时区')}
           subtitle={i18n.text('选择国家和时区后，所有统计页面会按当地日期定义今天。')}

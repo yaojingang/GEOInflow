@@ -34,6 +34,7 @@ const commands = [
   ['run', 'build:prisma:client'],
   ['run', 'build:ai:maintenance'],
   ['run', 'liekan:build-worker'],
+  ['run', 'liekan:check-demo'],
   ['run', 'build:openapi'],
   ['run', 'openapi:check', '--explicit'],
   ['run', 'check:api:client'],

@@ -9,7 +9,7 @@ const artifact = z.strictObject({
 const manifestSchema = z.strictObject({
   version: z.literal('1.0.0'),
   protocol: z.literal(1),
-  runtime: z.literal('22.23.3'),
+  runtime: z.literal('22.23.4'),
   installerSha256: z.string().regex(/^[a-f0-9]{64}$/),
   platforms: z.strictObject({ x64: artifact, arm64: artifact }),
   docker: z

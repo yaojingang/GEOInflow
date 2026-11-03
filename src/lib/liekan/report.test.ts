@@ -323,7 +323,7 @@ beforeEach(() => {
   mocks.settings.mockResolvedValue({ isDemo: false, rules: [], robots: '' });
   mocks.plotLogs.mockResolvedValue([]);
   mocks.conversions.mockResolvedValue(0);
-  mocks.humanDays.mockResolvedValue([]);
+  mocks.humanDays.mockResolvedValue({ rows: [] });
   mocks.months.mockResolvedValue([]);
 });
 
@@ -631,10 +631,10 @@ describe('report evidence states', () => {
   it('preserves undefined chart percentages as gaps and measured zero percentages as zero', async () => {
     const logs = await mocks.logs();
     mocks.logs.mockResolvedValue({ ...logs, latest: '2026-01-01' });
-    mocks.humanDays.mockResolvedValue([
+    mocks.humanDays.mockResolvedValue({ rows: [
       { day: '1970-01-01', pv: 0, uv: 0, sessions: 0, bounces: 0 },
       { day: '1970-01-02', pv: 3, uv: 3, sessions: 3, bounces: 0 },
-    ]);
+    ] });
     mocks.months.mockResolvedValue([
       { month: '2026-01', ai: 0, total: 0 },
       { month: '2026-02', ai: 0, total: 5 },
@@ -1128,4 +1128,180 @@ it('anchors Today hourly trends to the selected comparison date',async () => {
  await buildReport(website,false,{...params,resource:'human/overview',startAt,endAt,timezone:'America/New_York',chartPeriod:'today'},true);
  expect(mocks.humanDays).toHaveBeenCalledWith(website.id,new Date(startAt),new Date(endAt),'America/New_York',true);
  expect(mocks.plotLogs.mock.calls[0][1]).toEqual(new Date(startAt));
+});
+
+it('keeps qualified history in an independent trend window when the card window lacks identity', async () => {
+  const range = {
+    startAt: Date.parse('2026-01-09T00:00:00Z'),
+    endAt: Date.parse('2026-01-10T00:00:00Z') - 1,
+    timezone: 'UTC',
+  };
+  const human = await mocks.human();
+  const population = populationFromRow(
+    {
+      resourceKind: 'website',
+      metricScope: 'qualified-browser',
+      eligibleEvents: 5,
+      qualifiedEvents: 0,
+      eligiblePV: 5,
+      qualifiedPV: 0,
+      qualifiedVisitors: 0,
+    },
+    range,
+  );
+  mocks.human.mockResolvedValue({
+    ...human,
+    totals: {
+      pageviews: 0,
+      visitors: null,
+      visits: null,
+      bounces: null,
+      totaltime: null,
+      population,
+    },
+  });
+  mocks.humanDays.mockResolvedValue({
+    rows: [{ day: '2026-01-08', pv: 3, uv: 2, sessions: 2, bounces: 1 }],
+    population: populationFromRow(
+      {
+        resourceKind: 'website',
+        metricScope: 'qualified-browser',
+        eligibleEvents: 3,
+        qualifiedEvents: 3,
+        eligiblePV: 3,
+        qualifiedPV: 3,
+        qualifiedVisitors: 2,
+      },
+      { ...range, startAt: range.startAt - 7 * 86400000 },
+    ),
+  });
+  const actual = await buildReport(
+    website,
+    false,
+    { ...range, resource: 'human/overview', chartPeriod: '7d' },
+    true,
+  );
+  expect(+mocks.humanDays.mock.calls[0][1]).toBeLessThan(range.startAt);
+  expect(actual.charts.h1.series[0].values).toEqual([3]);
+  expect(actual.charts.h1.series[1].values).toEqual([2]);
+  expect(actual.charts.h1.state).toBe('available');
+  expect(actual.cards.find(card => card.key === '访客数 UV')).toMatchObject({
+    value: null,
+    state: 'unavailable',
+  });
+});
+
+it('uses the trend population without clearing usable card metrics', async () => {
+  const range = {
+    startAt: Date.parse('2026-01-02T00:00:00Z'),
+    endAt: Date.parse('2026-01-10T00:00:00Z') - 1,
+    timezone: 'UTC',
+  };
+  const human = await mocks.human();
+  const population = populationFromRow(
+    {
+      resourceKind: 'website',
+      metricScope: 'qualified-browser',
+      eligibleEvents: 3,
+      qualifiedEvents: 3,
+      eligiblePV: 3,
+      qualifiedPV: 3,
+      qualifiedVisitors: 2,
+    },
+    range,
+  );
+  const trendPopulation = populationFromRow(
+    {
+      resourceKind: 'website',
+      metricScope: 'qualified-browser',
+      eligibleEvents: 5,
+      qualifiedEvents: 0,
+      eligiblePV: 5,
+      qualifiedPV: 0,
+      qualifiedVisitors: 0,
+    },
+    { ...range, startAt: Date.parse('2026-01-09T00:00:00Z') },
+  );
+  mocks.human.mockResolvedValue({
+    ...human,
+    totals: { pageviews: 3, visitors: 2, visits: 2, bounces: 1, totaltime: 10, population },
+  });
+  mocks.humanDays.mockResolvedValue({ rows: [], population: trendPopulation });
+  mocks.plotLogs.mockResolvedValue([{ day: '2026-01-09', bot: 'GPTBot', count: 5, aiRequests: 5 }]);
+  const actual = await buildReport(
+    website,
+    false,
+    { ...range, resource: 'human/overview', chartPeriod: 'today' },
+    true,
+  );
+  expect(actual.cards.find(card => card.key === '访客数 UV').value).toBe(2);
+  expect(actual.charts.h1.series.map(series => series.values)).toEqual([[null], [null], [null]]);
+  expect(actual.charts.h1.state).toBe('unavailable');
+  expect(actual.meta.trendPopulation.range.startAt).toBeGreaterThan(range.startAt);
+  expect(liekanReportSchema.shape.meta.parse(actual.meta).trendPopulation).toEqual(trendPopulation);
+});
+
+const unavailableReviewRange = {
+  startAt: Date.parse('2026-01-09T00:00:00Z'),
+  endAt: Date.parse('2026-01-10T00:00:00Z') - 1,
+  timezone: 'UTC',
+};
+async function missingBrowserReport() {
+  const human = await mocks.human();
+  const population = populationFromRow(
+    {
+      resourceKind: 'website',
+      metricScope: 'qualified-browser',
+      eligibleEvents: 5,
+      qualifiedEvents: 0,
+      eligiblePV: 5,
+      qualifiedPV: 0,
+      qualifiedVisitors: 0,
+    },
+    unavailableReviewRange,
+  );
+  mocks.human.mockResolvedValue({
+    ...human,
+    totals: {
+      pageviews: 0,
+      visitors: null,
+      visits: null,
+      bounces: null,
+      totaltime: null,
+      population,
+    },
+  });
+  mocks.humanDays.mockResolvedValue({ rows: [], population });
+}
+it('keeps unavailable geography coverage distinct from measured zero', async () => {
+  await missingBrowserReport();
+  const actual = await buildReport(
+    website,
+    false,
+    { ...unavailableReviewRange, resource: 'human/geo' },
+    true,
+  );
+  for (const key of ['覆盖省份', '海外国家/地区'])
+    expect(actual.cards.find(card => card.key === key)).toMatchObject({
+      value: null,
+      state: 'unavailable',
+    });
+});
+it('keeps unavailable browser PV missing while retaining the log trend', async () => {
+  await missingBrowserReport();
+  const logs = await mocks.logs();
+  mocks.logs.mockResolvedValue({
+    ...logs,
+    latest: '2026-01-09T12:00:00Z',
+    summary: { requests: 5, ai: 5 },
+  });
+  mocks.plotLogs.mockResolvedValue([{ day: '2026-01-09', bot: 'GPTBot', count: 5, aiRequests: 5 }]);
+  const actual = await buildReport(
+    website,
+    false,
+    { ...unavailableReviewRange, resource: 'overview', chartPeriod: '24h' },
+    true,
+  );
+  expect(actual.charts.d1.series[0].values).toEqual([null]);
+  expect(actual.charts.d1.series[1].values).toEqual([5]);
 });

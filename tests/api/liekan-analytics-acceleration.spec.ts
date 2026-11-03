@@ -104,6 +104,9 @@ test('requires a full authorized session on acceleration and result endpoints', 
         await client.post(`${root}/analytics-acceleration/build`, build),
         await client.get(`${root}/analytics-jobs/${job}`),
         await client.get(`${root}/analytics-jobs/${job}/result`),
+        await client.delete(`${root}/analytics-jobs/${job}`, {
+          headers: { 'X-Liekan-View': randomUUID() },
+        }),
       ];
       for (const result of responses) expect([401, 403, 404]).toContain(result.status);
     }
@@ -141,6 +144,12 @@ test('reads an asynchronous analytics job and its private result within the owni
     expect(status.status).toBe(200);
     expect(status.headers['cache-control']).toMatch(/private.*no-store/);
     expect(status.body.analysisJob).toMatchObject({ id: jobId, websiteId: website.id });
+    expect((await admin.delete(root, { headers: { 'X-Liekan-View': 'invalid' } })).status).toBe(
+      400,
+    );
+    const released = await admin.delete(root, { headers: { 'X-Liekan-View': randomUUID() } });
+    expect(released.status).toBe(200);
+    expect(released.body).toEqual({ released: true });
     const first = await admin.get(`${root}/result`);
     expect([200, 202]).toContain(first.status);
     expect(first.headers['cache-control']).toMatch(/private.*no-store/);

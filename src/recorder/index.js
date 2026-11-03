@@ -36,7 +36,7 @@ import { addCustomEvent, record } from 'rrweb';
   let heatmapEnabled = false;
   let sampleRate = 0.15;
   let heatmapSampleRate = 0.15;
-  let maskLevel = 'moderate';
+  let maskLevel = 'strict';
   let maxDuration = 300000;
   let blockSelector = '';
 
@@ -309,14 +309,14 @@ import { addCustomEvent, record } from 'rrweb';
 
   const getMaskConfig = level => {
     switch (level) {
-      case 'strict':
+      case 'moderate':
         return {
           maskAllInputs: true,
-          maskTextSelector: '*',
         };
       default:
         return {
           maskAllInputs: true,
+          maskTextSelector: '*',
         };
     }
   };

@@ -5,6 +5,8 @@ import { useEffect, useRef, useState } from 'react';
 import { Panel } from './ui';
 import { observeChartLayout } from '../mobileChart';
 import { ChartLoading, Skeleton, useDataLoading } from '../DataLoading';
+import { loadEcharts } from '../chartRuntime';
+import { legacyChartOptions } from '../chartOptions';
 export interface ChartSeries {
   name: string;
   values: (number | null)[];
@@ -64,9 +66,9 @@ export function Chart({
       stopLayout: () => void,
       canceled = false;
     void (async () => {
-      const echarts = await import('echarts');
+      const echarts = await loadEcharts();
       if (canceled || !ref.current) return;
-      chart = echarts.init(ref.current);
+      chart = echarts.init(ref.current, 'v5');
       const colors = ['#0F62FE', '#4589FF', '#009D9A', '#7C5CFC', '#B7791F', '#9AA3B2'];
       const cartesian = ['line', 'bar'].includes(type);
       const base = {
@@ -179,7 +181,7 @@ export function Chart({
       stopLayout = observeChartLayout(
         chart,
         ref.current,
-        final,
+        legacyChartOptions(final),
         () => {
           retained.option = undefined;
           stopLayout?.();

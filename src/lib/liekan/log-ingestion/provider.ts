@@ -19,11 +19,14 @@ export async function maintainProvider(
     await maintainCloudflare(sourceId, action);
   } catch (error) {
     const code =
-      error instanceof LiekanError && [401, 403, 404].includes(error.status)
-        ? 'reauthorization-required'
-        : error instanceof LiekanError && error.status === 409
-          ? 'confirmation-required'
-          : 'provider-unavailable';
+      error instanceof LiekanError &&
+      ['provider-not-entitled', 'provider-permission-denied'].includes(error.code)
+        ? error.code
+        : error instanceof LiekanError && [401, 403, 404].includes(error.status)
+          ? 'reauthorization-required'
+          : error instanceof LiekanError && error.status === 409
+            ? 'confirmation-required'
+            : 'provider-unavailable';
     await transaction(async tx => {
       await tx.$queryRawUnsafe(
         'SELECT website_id FROM website WHERE website_id=(SELECT website_id FROM liekan_log_source WHERE id=$1::uuid) FOR UPDATE',
@@ -35,7 +38,14 @@ export async function maintainProvider(
         sourceId,
         code,
       );
-      if (code === 'reauthorization-required' || code === 'confirmation-required') {
+      if (
+        [
+          'reauthorization-required',
+          'confirmation-required',
+          'provider-not-entitled',
+          'provider-permission-denied',
+        ].includes(code)
+      ) {
         const changed = await tx.$executeRawUnsafe(
           code === 'reauthorization-required'
             ? "UPDATE liekan_log_source SET state='error',credential_hash=NULL WHERE id=$1::uuid AND state!='disconnected' AND credential_hash IS NOT NULL"

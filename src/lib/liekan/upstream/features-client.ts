@@ -167,6 +167,12 @@ export async function featureRequest<T = any>(
   if (aggregate && context?.refresh) url.searchParams.set('refresh', '1');
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (!shareToken && aggregate && analysisAsyncPath(path, params)) headers.Prefer = 'respond-async';
+  if (
+    !shareToken &&
+    headers.Prefer === 'respond-async' &&
+    /^\/liekan\/websites\/[^/]+\/page-report$/.test(path)
+  )
+    headers['X-Liekan-View'] = crypto.randomUUID();
   if (shareToken) {
     headers['x-umami-share-token'] = shareToken;
     headers['x-umami-share-context'] = '1';
@@ -186,12 +192,15 @@ export async function featureRequest<T = any>(
     signal?.throwIfAborted();
   }
   const load = async (requestSignal?: AbortSignal, idleResume = -Infinity): Promise<any> => {
+    const attemptHeaders = { ...headers };
+    if (attemptHeaders['X-Liekan-View'] && idleResume !== -Infinity)
+      attemptHeaders['X-Liekan-View'] = crypto.randomUUID();
     let startedAt = monotonicNow();
     const send = () => {
       startedAt = monotonicNow();
       return fetch(url, {
         method,
-        headers,
+        headers: attemptHeaders,
         signal: requestSignal,
         cache: 'no-store',
         ...(method !== 'GET' && params && { body: JSON.stringify(params) }),
@@ -200,12 +209,15 @@ export async function featureRequest<T = any>(
     let response = await send();
     let data = await response.json().catch(() => null);
     if (
-      headers.Prefer === 'respond-async' &&
+      attemptHeaders.Prefer === 'respond-async' &&
       response.status === 429 &&
       data?.error?.code === 'analysis-concurrency-limited'
     ) {
       const websiteId = /\/websites\/([^/]+)\//.exec(path)?.[1];
-      response = await waitForAnalysisAdmission(websiteId, send, requestSignal);
+      response = await waitForAnalysisAdmission(websiteId, send, requestSignal, {
+        initialResponse: response,
+        retryAfter,
+      });
       data = await response.json().catch(() => null);
     }
     if (!response.ok)
@@ -216,7 +228,7 @@ export async function featureRequest<T = any>(
         data?.error,
         retryAfter(response),
       );
-    if (response.status === 202 && headers.Prefer === 'respond-async') {
+    if (response.status === 202 && attemptHeaders.Prefer === 'respond-async') {
       try {
         const result = await followAnalysisJob(data, {
           signal: requestSignal,
@@ -232,10 +244,23 @@ export async function featureRequest<T = any>(
             );
             options?.onPrevious?.(value);
           },
+          ...(attemptHeaders['X-Liekan-View']
+            ? {
+                releaseJob: (taskPath: string) =>
+                  fetch(new URL(getApiUrl(taskPath), window.location.origin), {
+                    method: 'DELETE',
+                    keepalive: true,
+                    cache: 'no-store',
+                    headers: Object.fromEntries(
+                      Object.entries(attemptHeaders).filter(([key]) => key !== 'Prefer'),
+                    ),
+                  }),
+              }
+            : {}),
           fetchJob: taskPath =>
             fetch(new URL(getApiUrl(taskPath), window.location.origin), {
               headers: Object.fromEntries(
-                Object.entries(headers).filter(([key]) => key !== 'Prefer'),
+                Object.entries(attemptHeaders).filter(([key]) => key !== 'Prefer'),
               ),
               signal: requestSignal,
               cache: 'no-store',
@@ -246,7 +271,10 @@ export async function featureRequest<T = any>(
         startedAt = result.startedAt;
       } catch (error) {
         // A visible reader can replace a parked handle; rapid repeated failures remain bounded.
-        if ((error as any)?.code !== 'analysis-idle' || Date.now() - idleResume < 120000)
+        if (
+          (error as any)?.code !== 'analysis-idle' ||
+          (!(error as any)?.visibilitySuspended && Date.now() - idleResume < 120000)
+        )
           throw error;
         await waitForAnalysisVisibility(requestSignal);
         return load(requestSignal, Date.now());
@@ -266,7 +294,10 @@ export async function featureRequest<T = any>(
   try {
     const data = await (method === 'GET'
       ? (headers.Prefer === 'respond-async' ? analysisReads : reads).read(
-          JSON.stringify([url.href, headers]),
+          JSON.stringify([
+            url.href,
+            Object.fromEntries(Object.entries(headers).filter(([key]) => key !== 'X-Liekan-View')),
+          ]),
           load,
           signal,
           options?.priority ?? context?.priority,

@@ -1,9 +1,8 @@
 import {
   analysisTransaction,
   analysisVersions,
-  logDimensionsSql,
-  visitDimensionsSql,
-  visitEvidenceJoinsSql,
+  analysisLogRawFactsSql,
+  analysisVisitRowsSql,
 } from './analysis-rollups-db';
 import {
   ANALYSIS_ROLLUP_VERSION,
@@ -47,20 +46,19 @@ const pathManifest = ` AND ${analysisPathCoverageSql('m')}`;
 function measurement(family: 'path' | 'visit', raw: boolean) {
   if (family === 'path') {
     const facts = raw
-      ? `SELECT l.path,${logDimensionsSql} AS dimensions,count(*)::bigint AS requests
-   FROM liekan_reporting_log l WHERE l.website_id=$1::uuid AND l.created_at>=$3::timestamptz AND l.created_at<$4::timestamptz GROUP BY 1,2`
+      ? `SELECT path,dimensions,count(*)::bigint AS requests FROM reporting_facts GROUP BY 1,2`
       : `SELECT f.path,f.dimensions,sum(f.requests)::bigint AS requests FROM liekan_analysis_path f JOIN covered c ON c.website_id=f.website_id AND c.generation=f.generation GROUP BY 1,2`;
-    return `WITH covered AS(${activeManifest}${pathManifest}),facts AS(${facts})
+    return `WITH covered AS(${activeManifest}${pathManifest}),
+    ${raw ? `expansion_gaps AS(SELECT $3::timestamptz AS starts,$4::timestamptz AS ends),${analysisLogRawFactsSql('expansion_gaps')},` : ''}facts AS(${facts})
    SELECT count(*)::text AS rows,coalesce(sum(requests),0)::text AS inputs,
    md5(coalesce(string_agg(md5(jsonb_build_array(path,dimensions,requests)::text),'' ORDER BY path,dimensions::text),'')) AS digest
    FROM facts CROSS JOIN(SELECT $2::bigint,$5::text,$6::jsonb) parameters`;
   }
   const facts = raw
-    ? `SELECT e.session_id,e.visit_id,coalesce(e.hostname,'') AS hostname,${visitDimensionsSql} AS dimensions,
+    ? `SELECT e.session_id,e.visit_id,coalesce(e.hostname,'') AS hostname,e.dimensions,
    count(*) FILTER(WHERE e.event_type NOT IN(2,5))::bigint AS pv,bool_or(e.event_type=2) AS custom,
    min(e.created_at) FILTER(WHERE e.event_type NOT IN(2,5)) AS first,max(e.created_at) FILTER(WHERE e.event_type NOT IN(2,5)) AS last,count(*)::bigint AS inputs
-   FROM liekan_geographic_website_event e ${visitEvidenceJoinsSql}
-   WHERE e.website_id=$1::uuid AND e.created_at>=$3::timestamptz AND e.created_at<$4::timestamptz GROUP BY 1,2,3,4`
+   FROM (${analysisVisitRowsSql('e.website_id=$1::uuid AND e.created_at>=$3::timestamptz AND e.created_at<$4::timestamptz')}) e GROUP BY 1,2,3,4`
     : `SELECT f.session_id,f.visit_id,f.hostname,f.dimensions,sum(f.pageviews)::bigint AS pv,bool_or(f.has_custom) AS custom,
      min(f.min_time) AS first,max(f.max_time) AS last,sum(f.eligible_events)::bigint AS inputs
      FROM liekan_analysis_visit f JOIN covered c ON c.website_id=f.website_id AND c.generation=f.generation GROUP BY 1,2,3,4`;

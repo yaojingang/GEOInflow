@@ -20,18 +20,21 @@ export class AnalyticsRedis {
   get enabled() {
     return !!this.url;
   }
-  async command<T>(args: string[]): Promise<T | null> {
-    if (!this.url || Date.now() < this.disabledUntil) return null;
+  async command<T>(args: string[], cleanup = false): Promise<T | null> {
+    if (!this.url || (!cleanup && Date.now() < this.disabledUntil)) return null;
     const context = currentCacheContext();
     const started = performance.now();
     const waiting = context?.redisWaiting;
-    const budget = Math.min(
-      150 - (context?.redisSpentMs || 0) - (waiting ? started - waiting.startedAt : 0),
-      (context?.deadline || Infinity) - Date.now(),
-    );
+    // Owner-checked release has a separate reply budget after computation has expired.
+    const budget = cleanup
+      ? 150
+      : Math.min(
+          150 - (context?.redisSpentMs || 0) - (waiting ? started - waiting.startedAt : 0),
+          (context?.deadline || Infinity) - Date.now(),
+        );
     if (budget <= 0) return null;
     // Concurrent aggregates share one request's elapsed network wait, including connection setup.
-    if (context) {
+    if (context && !cleanup) {
       context.redisWaiting ??= { count: 0, startedAt: started };
       context.redisWaiting.count++;
     }
@@ -79,7 +82,7 @@ export class AnalyticsRedis {
       return null;
     } finally {
       clearTimeout(timer);
-      if (context && --context.redisWaiting.count === 0) {
+      if (context && !cleanup && --context.redisWaiting.count === 0) {
         context.redisSpentMs =
           (context.redisSpentMs || 0) + performance.now() - context.redisWaiting.startedAt;
         context.redisWaiting = undefined;
@@ -145,7 +148,7 @@ redis.call('SET',KEYS[1],ARGV[1],'PX',5000); return 1`;
     return (await this.command<number>(['EVAL', RENEW, '1', `${key}:lock`, token])) === 1;
   }
   async release(key: string, token: string) {
-    await this.command(['EVAL', RELEASE, '1', `${key}:lock`, token]);
+    await this.command(['EVAL', RELEASE, '1', `${key}:lock`, token], true);
   }
   async publish<T>(key: string, token: string, result: CachedResult<T> | 'unshareable' | 'error') {
     const marker = typeof result === 'string' ? result : undefined;

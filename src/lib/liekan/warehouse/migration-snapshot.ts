@@ -4,7 +4,7 @@ import {
   identifier,
   schemaDifferences,
   sourceCatalogSQL,
-  sourceFingerprint,
+  schemaFingerprint,
   type ActualTable,
 } from './catalog';
 
@@ -57,7 +57,7 @@ export async function sealMigrationClone(
     snapshotId: randomUUID(),
     database,
     archiveSHA256,
-    sourceFingerprint,
+    sourceFingerprint: schemaFingerprint(actual),
     boundary,
   };
   const digest = snapshotDigest(descriptor);

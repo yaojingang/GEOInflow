@@ -3,6 +3,7 @@ import { getPublishedCatalog } from '../crawlers/published';
 import { geographyVersion } from '../contracts/geography';
 import { GEOGRAPHY_ANCHOR_VERSION } from '../geography/evidence';
 import { analyticsCacheLimits } from './cache-policy';
+import { ANALYTICS_READ_VERSION } from './analytics-revision';
 import { createHash } from 'node:crypto';
 import { deserialize, serialize } from 'node:v8';
 import { Decimal } from '@prisma/client/runtime/client';
@@ -216,7 +217,7 @@ export function invalidateWebsiteAnalytics(...ids: string[]) {
     .catch(() => {});
 }
 export function analyticsCacheKey(namespace: string, value: unknown) {
-  namespace = `${namespace}:${getPublishedCatalog()?.version || 'bundled'}:${geographyVersion}:${GEOGRAPHY_ANCHOR_VERSION}`;
+  namespace = `${namespace}:${ANALYTICS_READ_VERSION}:${getPublishedCatalog()?.version || 'bundled'}:${geographyVersion}:${GEOGRAPHY_ANCHOR_VERSION}`;
   return analyticsInfrastructureKey(namespace, value);
 }
 /** Infrastructure and permission identities stay stable across request catalog snapshots. */

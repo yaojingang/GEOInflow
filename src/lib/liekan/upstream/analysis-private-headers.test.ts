@@ -20,6 +20,10 @@ it.each(['', '/private-api'])(
   'preserves private analysis headers through Next routing under %s',
   async prefix => {
     for (const path of [
+      '/liekan/storage',
+      '/liekan/storage?runId=preview',
+      '/liekan/websites/site/storage',
+      '/liekan/websites/site/storage?runId=preview',
       '/liekan/analytics-acceleration',
       '/liekan/websites/site/analytics-acceleration',
       '/liekan/websites/site/analytics-acceleration/build',
@@ -61,12 +65,11 @@ it.each(['', '/private-api'])(
   },
 );
 
-it('preserves analysis privacy under a configured base path', async () => {
-  const response = await responseFor(
-    '/liekan/websites/site/analytics-jobs/job/result',
-    '',
-    undefined,
-    '/stats',
-  );
+it.each([
+  '/liekan/websites/site/analytics-jobs/job/result',
+  '/liekan/storage',
+  '/liekan/websites/site/storage',
+])('preserves analysis privacy under a configured base path for %s', async path => {
+  const response = await responseFor(path, '', undefined, '/stats');
   expect(response.headers.get('cache-control')).toBe('private, no-store');
 });

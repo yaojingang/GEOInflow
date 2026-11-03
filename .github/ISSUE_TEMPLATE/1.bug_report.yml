@@ -29,6 +29,10 @@ body:
     attributes:
       label: How are you deploying your application?
       description: 'For example: the standard Docker Compose deployment, source development or a custom deployment.'
+  - type: textarea
+    attributes:
+      label: Deployment resources and failing stage
+      description: 'For installation/build failures, include CPU count, RAM, swap, free disk, Docker memory allocation, the last completed step and any OOM/exit code. Remove private paths and secrets.'
   - type: input
     attributes:
       label: Which browser are you using?

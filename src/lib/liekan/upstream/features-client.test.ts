@@ -52,7 +52,10 @@ it.each([true, false])(
       .mockResolvedValueOnce(
         Response.json({ analysisJob: { ...job, status: 'failed', errorCode: 'analysis-idle' } }),
       );
-    vi.stubGlobal('fetch', fetcher);
+    const release = vi.fn(async () => Response.json({ released: true }));
+    vi.stubGlobal('fetch', (url: any, options: any) =>
+      options?.method === 'DELETE' ? release() : fetcher(url, options),
+    );
     try {
       const pending = featureApi.get(`/liekan/websites/${site}/page-report`, {
         resource: 'ai/pages',
@@ -65,6 +68,7 @@ it.each([true, false])(
       await vi.advanceTimersByTimeAsync(3000);
       await checked;
       expect(fetcher).toHaveBeenCalledTimes(success ? 3 : 4);
+      expect(release).toHaveBeenCalledTimes(success ? 1 : 2);
     } finally {
       vi.useRealTimers();
       vi.restoreAllMocks();
@@ -72,6 +76,130 @@ it.each([true, false])(
     }
   },
 );
+
+it('resumes each new visible reading round without repeating immediate idle failures', async () => {
+  vi.useFakeTimers();
+  let visible = 'visible';
+  vi.spyOn(document, 'visibilityState', 'get').mockImplementation(
+    () => visible as DocumentVisibilityState,
+  );
+  const site = '11111111-1111-4111-8111-111111111111',
+    id = '22222222-2222-4222-8222-222222222222';
+  const job = {
+    id,
+    websiteId: site,
+    status: 'running',
+    queuedAt: '2026-01-01',
+    startedAt: null,
+    completedAt: null,
+    generatedAt: null,
+    expiresAt: null,
+    errorCode: null,
+    retryAfterMs: 1000,
+    resultUrl: `/liekan/websites/${site}/analytics-jobs/${id}/result`,
+  };
+  let submissions = 0;
+  vi.stubGlobal('fetch', async (url: URL, options: RequestInit) => {
+    if (options?.method === 'DELETE') return Response.json({ released: true });
+    if (url.pathname.endsWith('/page-report'))
+      return ++submissions === 3
+        ? Response.json({ synthetic: 'resumed twice' })
+        : Response.json({ analysisJob: job }, { status: 202 });
+    return Response.json(
+      { error: { code: 'analysis-idle', message: 'expired viewer' } },
+      { status: 410 },
+    );
+  });
+  const controller = new AbortController();
+  try {
+    const pending = featureApi.get(
+      `/liekan/websites/${site}/page-report`,
+      { resource: 'ai/pages', startAt: 3, endAt: 4 },
+      controller.signal,
+    );
+    const checked = expect(pending).resolves.toEqual({ synthetic: 'resumed twice' });
+    void checked.catch(() => {});
+    await vi.advanceTimersByTimeAsync(0);
+    expect(submissions).toBe(1);
+    for (let round = 0; round < 2; round++) {
+      visible = 'hidden';
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.advanceTimersByTimeAsync(20000);
+      visible = 'visible';
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    await checked;
+    expect(submissions).toBe(3);
+  } finally {
+    controller.abort();
+    vi.useRealTimers();
+  }
+});
+it('keeps a delayed old release from expiring a rejoined running task', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+  const site = '11111111-1111-4111-8111-111111111111',
+    id = '22222222-2222-4222-8222-222222222222';
+  const job = {
+    id,
+    websiteId: site,
+    status: 'running',
+    queuedAt: '2026-01-01',
+    startedAt: null,
+    completedAt: null,
+    generatedAt: null,
+    expiresAt: null,
+    errorCode: null,
+    retryAfterMs: 1000,
+    resultUrl: `/liekan/websites/${site}/analytics-jobs/${id}/result`,
+  };
+  const active = new Set<string>(),
+    submissions: string[] = [],
+    releases: (() => void)[] = [];
+  let polls = 0;
+  vi.stubGlobal('fetch', async (url: URL, options: RequestInit) => {
+    const viewer = new Headers(options?.headers).get('X-Liekan-View');
+    if (options?.method === 'DELETE')
+      return new Promise<Response>(resolve =>
+        releases.push(() => {
+          active.delete(viewer);
+          resolve(Response.json({ released: true }));
+        }),
+      );
+    if (url.pathname.endsWith('/page-report')) {
+      submissions.push(viewer);
+      active.add(viewer);
+      if (submissions.length === 2) releases[0]();
+      return Response.json({ analysisJob: job }, { status: 202 });
+    }
+    if (url.pathname.endsWith('/result')) return Response.json({ synthetic: 'running result' });
+    if (++polls === 1 || !active.has(viewer))
+      return Response.json(
+        { error: { code: 'analysis-idle', message: 'expired viewer' } },
+        { status: 410 },
+      );
+    return Response.json({ analysisJob: { ...job, status: 'ready' } });
+  });
+  const controller = new AbortController();
+  try {
+    const pending = featureApi.get(
+      `/liekan/websites/${site}/page-report`,
+      { resource: 'ai/pages', startAt: 5, endAt: 6 },
+      controller.signal,
+    );
+    const checked = expect(pending).resolves.toEqual({ synthetic: 'running result' });
+    void checked.catch(() => {});
+    await vi.advanceTimersByTimeAsync(3000);
+    await checked;
+    expect(submissions).toHaveLength(2);
+    expect(new Set(submissions).size).toBe(2);
+  } finally {
+    controller.abort();
+    for (const release of releases) release();
+    vi.useRealTimers();
+  }
+});
 
 it('keeps previous and final async populations with their own exact range and freshness headers', async () => {
   vi.useFakeTimers();
@@ -617,3 +745,57 @@ it.each(['ready', 'queued', 'running', 'failed'])(
       expect(serializeClientFreshness(result).expiresAt).toBe(now + 86400000);
   },
 );
+
+it('merges identical page reads and releases one transport lease after the last reader finishes', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+  const site = '11111111-1111-4111-8111-111111111111',
+    id = '22222222-2222-4222-8222-222222222222';
+  const job = {
+    id,
+    websiteId: site,
+    status: 'queued',
+    queuedAt: '2026-01-01',
+    startedAt: null,
+    completedAt: null,
+    generatedAt: null,
+    expiresAt: null,
+    errorCode: null,
+    retryAfterMs: 1000,
+    resultUrl: `/liekan/websites/${site}/analytics-jobs/${id}/result`,
+  };
+  const fetcher = vi.fn(async (url: URL, options: any) => {
+    if (options?.method === 'DELETE') return Response.json({ released: true });
+    if (url.pathname.endsWith('/result')) return Response.json({ synthetic: 'shared' });
+    if (url.pathname.endsWith('/' + id))
+      return Response.json({ analysisJob: { ...job, status: 'ready' } });
+    return Response.json({ analysisJob: job }, { status: 202 });
+  });
+  vi.stubGlobal('fetch', fetcher);
+  try {
+    const controller = new AbortController(),
+      params = { resource: 'ai/pages', startAt: 11, endAt: 22 };
+    const first = featureRequest(
+      'GET',
+      `/liekan/websites/${site}/page-report`,
+      params,
+      controller.signal,
+    ).catch(error => error);
+    const second = featureRequest('GET', `/liekan/websites/${site}/page-report`, params);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    controller.abort();
+    expect((await first).name).toBe('AbortError');
+    expect(fetcher.mock.calls[0][1].signal.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(await second).toEqual({ synthetic: 'shared' });
+    expect(fetcher.mock.calls.filter(([, o]) => o?.method === 'DELETE')).toHaveLength(1);
+    const views = fetcher.mock.calls.map(([, o]) => o.headers['X-Liekan-View']);
+    expect(new Set(views).size).toBe(1);
+    expect(views[0]).toBeTruthy();
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  }
+});

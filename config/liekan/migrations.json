@@ -96,5 +96,19 @@
   "088_warehouse_replay_bookmark_revision.sql": "c319efeabd753b0fd692b033bac6bd156303a9313dbe801344850792b2eea284",
   "089_warehouse_garbage.sql": "d00057d1936c37db7f65265e6e402f5bb788b035c3a10783def62b32a2a5ca73",
   "090_warehouse_deletion_reclamation.sql": "2155ac465ae67d3d0e1b7018f53bdfb33828406d716771d3430937f75770c4cd",
-  "091_warehouse_publication_resource.sql": "b593d62914967b2a50efe3ba4df00c2e12434b3480cc23f7394144f9904a98ec"
+  "091_warehouse_publication_resource.sql": "b593d62914967b2a50efe3ba4df00c2e12434b3480cc23f7394144f9904a98ec",
+  "057_storage_retention.sql": "8dd7ccdbb92cf06ea2bda79acb68101ec8032f6810794a4b87bca9b8da4492c9",
+  "058_storage_physical_measurements.sql": "2511e95a84bfc7fde047d143c616b6559fe7c621f0c4bcf847ff7a8cc7a6d80e",
+  "059_completed_job_retention_guard.sql": "c4528358aa36100f438190c54b1ab5eef92560a733bf69813168385b15455c51",
+  "060_completed_job_policy_ownership.sql": "1df35dd222df805662250e75eb8c384e8df4ef1fda18e9e54c42ae24a34c4efa",
+  "061_storage_candidate_queue_identity.sql": "853687e93be7a7a1ed96b7b13c4c03ea8991ab92d5f4210b014dbacae885aeb6",
+  "062_dashboard_attempt_fingerprint.sql": "211191a4df31560c07771c19a26c453ef89365f096fe9582198e2cafc667be46",
+  "063_dashboard_import_dependencies.sql": "3fda0e27f15520337ae5d51040da3f1afca2c5022d9ad7f0f91d3483e44b1e09",
+  "064_dashboard_metadata_dependencies.sql": "7df545ee4bed6c89ce0a19913b2831c14a59d36ed5d358b7ee01518ce89bd9c2",
+  "065_dashboard_semantic_metadata.sql": "b440d0be3b60df3d14a4e173f756b89108dfa0d3f031e82b40f7cbafbe254467",
+  "066_foreground_analysis_reads.sql": "77563a098c05f741e9415b8568e5a1a3097840a40420772f36589e844cb1c801",
+  "067_robots_management.sql": "a25cd64b9bd54816de76acf14dbbc77d61a2b30e762c2fb1b61ab4497634e34a",
+  "068_optional_analytics_engine.sql": "50af561c083939236cda8f3a3c23678325d977b48ede8e26dc53571a311b94f1",
+  "069_report_fragments.sql": "2fec0a333e012cec6106ca0de8f944edb9bae68cfd4c7db44c775d3cb9f9f2b9",
+  "070_analytics_input_summary.sql": "5d16b0660ecb38480a4d443a46840d546585e1d0f356668071dee5df474eb5e0"
 }

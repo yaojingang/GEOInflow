@@ -153,6 +153,22 @@ describe.skipIf(!target)('human metrics use one evidence-qualified browser popul
     expect(result.newVisitors).toBe(2);
   });
 
+it('returns trend coverage for its own window, including unavailable event ranges', async () => {
+  const { getHumanDays } = await import('./analytics');
+  const actual = await snapshot({ ...executor }, () =>
+    getHumanDays(site, range.startDate, range.endDate, 'UTC'),
+  );
+  expect(actual.rows).toMatchObject([{ pv: 3, uv: 2 }]);
+  expect(actual.population.identity.qualifiedVersions).toEqual(['cookieless-trusted-input-v2']);
+  const missingStart = new Date(+range.startDate + 60000);
+  const missing = await snapshot({ ...executor }, () =>
+    getHumanDays(site, missingStart, range.endDate, 'UTC'),
+  );
+  expect(missing.rows).toEqual([]);
+  expect(missing.population.identity.status).toBe('unavailable');
+  expect(missing.population.identity.qualifiedVersions).toEqual([]);
+  expect(missing.population.range.startAt).toBe(+missingStart);
+});
   it('retains missing-input coverage while allowing explicitly scoped qualified metrics', async () => {
     const result = await population(site, range.startDate, range.endDate, 'UTC', { ...executor });
     expect(result).toMatchObject({

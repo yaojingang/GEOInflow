@@ -53,6 +53,7 @@ async function relationalQuery(
         startDate,
         endDate,
         filters: conditions,
+        allowRawOnly: true,
       });
       if (!totals) return undefined;
       const population = await readBrowserPopulation(websiteId, startDate, endDate, timezone);

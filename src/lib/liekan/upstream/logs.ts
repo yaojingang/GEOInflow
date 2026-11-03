@@ -1,4 +1,9 @@
-import { readAnalysisLogRollup, readAnalysisLogSeries } from './analysis-rollups';
+import { readClickHouseLogRollup, readClickHouseLogSeries } from './analytics-engine-read';
+import {
+  readAnalysisLogRollup,
+  readAnalysisLogSeries,
+  readAnalysisLogToday,
+} from './analysis-rollups';
 import { getPublishedCatalog } from '../crawlers/published';
 import { createHash } from 'node:crypto';
 import { CRAWLER_POPULATION_VERSION } from '../rules/population';
@@ -8,19 +13,85 @@ import { crawlerIdentitySql } from '../crawlers/metric-scope';
 import { crawlerAiSql, unknownCrawlerSql } from '../rules/population';
 import { logInputConnectedSql } from './log-input';
 import { withLogStatisticsRead } from './ai-log-read-priority';
-import { formatInTimeZone } from 'date-fns-tz';
+import { formatInTimeZone, fromZonedTime } from 'date-fns-tz';
+import { calendarDayRange } from '../contracts/calendar';
+import { readReportFragment, reportFragmentsActive } from './report-fragments';
+import { analysisSafeNumber } from './analysis-rollups-model';
 import { decodeCursor, encodeCursor } from '../cursor';
 import { humanPathFromEncoded } from './paths';
 import { LiekanError, query } from './server';
 import { warehouseEnabled } from '../warehouse/runtime';
+import { staticRequestExtensionPattern } from './log-content-boundary';
 
-// This boundary only applies to the today content-request card. Raw logs remain complete.
-export const staticRequestExtensionPattern =
-  '[.](js|mjs|cjs|css|map|avif|webp|png|jpg|jpeg|gif|svg|ico|bmp|tif|tiff|woff|woff2|ttf|otf|eot|mp3|m4a|wav|ogg|mp4|webm|mov|avi)([?#]|$)';
-export const isStaticRequestPath = (path: string) =>
-  new RegExp(staticRequestExtensionPattern, 'i').test(path);
-export async function getLogFacts(...args: Parameters<typeof readLogFacts>):Promise<Awaited<ReturnType<typeof readLogFacts>>> {
-  if(warehouseEnabled())return (await import('./warehouse-log-queries')).warehouseLogFacts(...args);
+export { staticRequestExtensionPattern, isStaticRequestPath } from './log-content-boundary';
+
+const readPreferredLogRollup = async (input: Parameters<typeof readAnalysisLogRollup>[0]) =>
+  (await readClickHouseLogRollup(input)) ?? readAnalysisLogRollup(input);
+const readLogSeries = async (
+  input: Parameters<typeof readAnalysisLogSeries>[0],
+  allowRawOnly = false,
+) =>
+  (await readClickHouseLogSeries(input)) ??
+  readAnalysisLogSeries(allowRawOnly ? { ...input, allowRawOnly: true } : input);
+
+async function readPreferredLogSeries(input: Parameters<typeof readAnalysisLogSeries>[0]) {
+  if (!reportFragmentsActive() || input.crawlerMetricsVersion !== 1) return readLogSeries(input);
+  const { startDate, endDate, websiteId, ...conditions } = input;
+  const timezone = input.timezone || 'UTC';
+  const boundaries = [+startDate];
+  if (input.grain === 'month') {
+    const [year, month] = formatInTimeZone(startDate, timezone, 'yyyy-MM').split('-').map(Number);
+    for (let offset = 1; offset <= 36; offset++) {
+      const next = new Date(Date.UTC(year, month - 1 + offset, 1));
+      const at = +fromZonedTime(`${next.toISOString().slice(0, 10)}T00:00:00`, timezone);
+      if (at >= +endDate) break;
+      boundaries.push(at);
+    }
+  } else {
+    const today = calendarDayRange(Date.now(), timezone).startAt;
+    if (today > +startDate && today < +endDate) boundaries.push(today);
+  }
+  boundaries.push(+endDate);
+  const combined = new Map<
+    string,
+    NonNullable<Awaited<ReturnType<typeof readAnalysisLogSeries>>>[number]
+  >();
+  for (let index = 1; index < boundaries.length; index++) {
+    const start = new Date(boundaries[index - 1]),
+      end = new Date(boundaries[index]);
+    const rows = await readReportFragment('log-series', start, end, conditions, () =>
+      readLogSeries({ ...input, startDate: start, endDate: end }, true),
+    );
+    if (!rows) return null;
+    for (const row of rows) {
+      const key = JSON.stringify([row.day, row.bot, row.type]);
+      const previous = combined.get(key);
+      combined.set(
+        key,
+        previous
+          ? {
+              ...row,
+              count: analysisSafeNumber((BigInt(previous.count) + BigInt(row.count)).toString()),
+              aiRequests: analysisSafeNumber(
+                (BigInt(previous.aiRequests) + BigInt(row.aiRequests)).toString(),
+              ),
+            }
+          : { ...row },
+      );
+    }
+  }
+  return [...combined.values()].sort(
+    (a, b) =>
+      a.day.localeCompare(b.day) ||
+      a.bot.localeCompare(b.bot) ||
+      (a.type || '').localeCompare(b.type || ''),
+  );
+}
+export async function getLogFacts(
+  ...args: Parameters<typeof readLogFacts>
+): Promise<Awaited<ReturnType<typeof readLogFacts>>> {
+  if (warehouseEnabled())
+    return (await import('./warehouse-log-queries')).warehouseLogFacts(...args);
   return withLogStatisticsRead(() => readLogFacts(...args));
 }
 async function readLogFacts(
@@ -98,8 +169,25 @@ async function readLogFacts(
           id,
         )
       : [];
-  const [cursorClassification] =
-    metrics.crawlerMetricsVersion === 1 && (!fields || fields.includes('recent'))
+  const acceleratedClassification =
+    metrics.crawlerMetricsVersion === 1 &&
+    (!fields || fields.includes('recent')) &&
+    !filter &&
+    !search &&
+    /^[a-f0-9-]{36}$/i.test(id)
+      ? await readPreferredLogRollup({
+          websiteId: id,
+          startDate: start,
+          endDate: end,
+          timezone,
+          crawlerMetricsVersion: 1,
+          crawlerIdentityScope: metrics.crawlerIdentityScope,
+          fields: ['classificationSet'],
+        })
+      : null;
+  const [cursorClassification] = acceleratedClassification
+    ? [{ versions: acceleratedClassification.classificationSet }]
+    : metrics.crawlerMetricsVersion === 1 && (!fields || fields.includes('recent'))
       ? await q(
           `SELECT coalesce(string_agg(DISTINCT l.reporting_classification_version,','),'legacy') AS versions ${identityBase}${filterSql}`,
         )
@@ -168,16 +256,31 @@ async function readLogFacts(
     hours: `SELECT extract(hour FROM created_at AT TIME ZONE $4)::int AS hour,count(*)::int AS count ${base}${ai} GROUP BY 1 ORDER BY 1`,
   };
   const selectedAggregates = Object.entries(aggregateQueries).filter(([field]) => needs(field));
-  const accelerated = selectedAggregates.length && /^[a-f0-9-]{36}$/i.test(id)
-    ? await readAnalysisLogRollup({websiteId:id,startDate:start,endDate:end,timezone,
-        crawlerMetricsVersion:metrics.crawlerMetricsVersion,crawlerIdentityScope:metrics.crawlerIdentityScope,fields:selectedAggregates.map(([field])=>field),
-        filters:{resource:metrics.resource,botProductForm:metrics.botProductForm,botCategory:metrics.botCategory,botType:metrics.botType,botId:metrics.botId,botName:metrics.botName}})
-    : null;
+  const accelerated =
+    selectedAggregates.length && /^[a-f0-9-]{36}$/i.test(id)
+      ? await readPreferredLogRollup({
+          websiteId: id,
+          startDate: start,
+          endDate: end,
+          timezone,
+          crawlerMetricsVersion: metrics.crawlerMetricsVersion,
+          crawlerIdentityScope: metrics.crawlerIdentityScope,
+          fields: selectedAggregates.map(([field]) => field),
+          filters: {
+            resource: metrics.resource,
+            botProductForm: metrics.botProductForm,
+            botCategory: metrics.botCategory,
+            botType: metrics.botType,
+            botId: metrics.botId,
+            botName: metrics.botName,
+          },
+        })
+      : null;
   const aggregatesRead = accelerated
-    ? Promise.resolve([{...accelerated,summary:[accelerated.summary]}])
+    ? Promise.resolve([{ ...accelerated, summary: [accelerated.summary] }])
     : selectedAggregates.length
-    ? read(
-        `WITH statistics_scope AS MATERIALIZED (
+      ? read(
+          `WITH statistics_scope AS MATERIALIZED (
         SELECT created_at,path,status,bot,vendor,bot_type,ai_eligible,recognition_state,
           reporting_crawler_id,reporting_catalog_version,reporting_classification_version
         ${base}
@@ -190,14 +293,14 @@ async function readLogFacts(
           return `coalesce((SELECT jsonb_agg(rows) FROM (${scoped}) rows),'[]'::jsonb) AS "${field}"`;
         })
         .join(',')}`,
-        ...args,
-        metrics.botProductForm ?? null,
-        metrics.botCategory ?? null,
-        metrics.resource === 'ai/pages' ? (metrics.botType ?? null) : null,
-        metrics.resource === 'ai/pages' ? (metrics.botId ?? null) : null,
-        metrics.resource === 'ai/pages' && !metrics.botId ? (metrics.botName ?? null) : null,
-      )
-    : Promise.resolve([]);
+          ...args,
+          metrics.botProductForm ?? null,
+          metrics.botCategory ?? null,
+          metrics.resource === 'ai/pages' ? (metrics.botType ?? null) : null,
+          metrics.resource === 'ai/pages' ? (metrics.botId ?? null) : null,
+          metrics.resource === 'ai/pages' && !metrics.botId ? (metrics.botName ?? null) : null,
+        )
+      : Promise.resolve([]);
   const [aggregates, catalog, latest, recent, count] = await Promise.all([
     aggregatesRead,
     needs('catalog')
@@ -238,6 +341,31 @@ async function readLogFacts(
   } = aggregates[0] ?? {};
   for (const row of bots) if (row.lastVisit) row.lastVisit = new Date(row.lastVisit);
   for (const row of pages) if (row.lastCrawled) row.lastCrawled = new Date(row.lastCrawled);
+  const previousStart = new Date(
+    Math.max(0, +start - (+end - +start + (metrics.crawlerMetricsVersion === 1 ? 0 : 1))),
+  );
+  const previousEnd = new Date(+start - (metrics.crawlerMetricsVersion === 1 ? 0 : 1));
+  const previousRollup =
+    needs('previousBots') && withForms && /^[a-f0-9-]{36}$/i.test(id)
+      ? await readPreferredLogRollup({
+          websiteId: id,
+          startDate: previousStart,
+          endDate: previousEnd,
+          timezone,
+          crawlerMetricsVersion: metrics.crawlerMetricsVersion,
+          crawlerIdentityScope: metrics.crawlerIdentityScope,
+          fields: ['bots'],
+          filters: {
+            resource: metrics.resource,
+            botProductForm: metrics.botProductForm,
+            botCategory: metrics.botCategory,
+          },
+        })
+      : null;
+  const previousBots = previousRollup?.bots.map(row => ({
+    ...row,
+    lastVisit: row.lastVisit ? new Date(row.lastVisit) : row.lastVisit,
+  }));
   return {
     summary: summary[0],
     daily,
@@ -252,35 +380,35 @@ async function readLogFacts(
     nextCursor: recent.length ? encodeCursor(recent.at(-1), cursorScope) : '',
     previousCursor: page > 1 && recent.length ? encodeCursor(recent[0], cursorScope) : '',
     totalLogs: count[0].count,
-    previousBots: needs('previousBots')
-      ? await read(
-          withForms
-            ? formBots
-            : `SELECT bot AS name,vendor,bot_type AS type,l.reporting_crawler_id AS "botId",count(*)::int AS requests FROM liekan_reporting_log l LEFT JOIN liekan_crawler_evidence e ON e.website_id=l.website_id AND e.log_id=l.id WHERE l.website_id=$1::uuid AND ${timeCondition}${identityScope} GROUP BY 1,2,3,4`,
-          id,
-          new Date(
-            Math.max(
-              0,
-              start.getTime() -
-                (end.getTime() - start.getTime() + (metrics.crawlerMetricsVersion === 1 ? 0 : 1)),
-            ),
-          ),
-          new Date(start.getTime() - (metrics.crawlerMetricsVersion === 1 ? 0 : 1)),
-          ...(withForms
-            ? [timezone, metrics.botProductForm ?? null, metrics.botCategory ?? null]
-            : []),
-        )
-      : [],
+    previousBots:
+      previousBots ??
+      (needs('previousBots')
+        ? await read(
+            withForms
+              ? formBots
+              : `SELECT bot AS name,vendor,bot_type AS type,l.reporting_crawler_id AS "botId",count(*)::int AS requests FROM liekan_reporting_log l LEFT JOIN liekan_crawler_evidence e ON e.website_id=l.website_id AND e.log_id=l.id WHERE l.website_id=$1::uuid AND ${timeCondition}${identityScope} GROUP BY 1,2,3,4`,
+            id,
+            previousStart,
+            previousEnd,
+            ...(withForms
+              ? [timezone, metrics.botProductForm ?? null, metrics.botCategory ?? null]
+              : []),
+          )
+        : []),
   };
 }
 export async function getLogToday(id: string, start: Date, end: Date) {
   if(warehouseEnabled())return (await import('./warehouse-log-queries')).warehouseLogToday(id,start,end);
   const [rows, imports] = await Promise.all([
-    query(
-      `SELECT count(*) FILTER(WHERE path !~* '${staticRequestExtensionPattern}')::int AS requests,count(*) FILTER(WHERE status>=400)::int AS abnormal FROM liekan_reporting_log WHERE website_id=$1::uuid AND created_at BETWEEN $2 AND $3`,
-      id,
-      start,
-      end,
+    readAnalysisLogToday({ websiteId: id, startDate: start, endDate: end }).then(
+      covered =>
+        covered ||
+        query(
+          `SELECT count(*) FILTER(WHERE path !~* '${staticRequestExtensionPattern}')::int AS requests,count(*) FILTER(WHERE status>=400)::int AS abnormal FROM liekan_reporting_log WHERE website_id=$1::uuid AND created_at BETWEEN $2 AND $3`,
+          id,
+          start,
+          end,
+        ).then(rows => rows[0]),
     ),
     query(
       'SELECT coalesce(sum(accepted),0)::int AS accepted FROM liekan_import WHERE website_id=$1::uuid AND imported_at BETWEEN $2 AND $3',
@@ -289,7 +417,7 @@ export async function getLogToday(id: string, start: Date, end: Date) {
       end,
     ),
   ]);
-  return { ...rows[0], accepted: imports[0].accepted };
+  return { requests: rows.requests, abnormal: rows.abnormal, accepted: imports[0].accepted };
 }
 export async function getContentImpact(
   id: string,
@@ -328,15 +456,30 @@ export async function getMonthlyAiShare(
   if(warehouseEnabled())return (await import('./warehouse-log-queries')).warehouseMonthlyAiShare(id,end,timezone,metrics);
   const monthEnd = metrics.crawlerMetricsVersion === 1 ? new Date(+end - 1) : end;
   if (/^[a-f0-9-]{36}$/i.test(id)) {
-    const [y,m]=formatInTimeZone(monthEnd,timezone,'yyyy-MM').split('-').map(Number);
-    const {fromZonedTime}=await import('date-fns-tz');
-    const start=fromZonedTime(`${new Date(Date.UTC(y,m-6,1)).toISOString().slice(0,10)}T00:00:00`,timezone);
-    const series=await readAnalysisLogSeries({websiteId:id,startDate:start,endDate:end,timezone,...metrics,grain:'month'});
-    if(series) return Array.from({length:6},(_,index)=>{
-      const month=new Date(Date.UTC(y,m-6+index,1)).toISOString().slice(0,7);
-      const rows=series.filter(row=>row.day===month);
-      return {month,total:rows.reduce((sum,row)=>sum+row.count,0),ai:rows.reduce((sum,row)=>sum+row.aiRequests,0)};
+    const [y, m] = formatInTimeZone(monthEnd, timezone, 'yyyy-MM').split('-').map(Number);
+    const { fromZonedTime } = await import('date-fns-tz');
+    const start = fromZonedTime(
+      `${new Date(Date.UTC(y, m - 6, 1)).toISOString().slice(0, 10)}T00:00:00`,
+      timezone,
+    );
+    const series = await readPreferredLogSeries({
+      websiteId: id,
+      startDate: start,
+      endDate: end,
+      timezone,
+      ...metrics,
+      grain: 'month',
     });
+    if (series)
+      return Array.from({ length: 6 }, (_, index) => {
+        const month = new Date(Date.UTC(y, m - 6 + index, 1)).toISOString().slice(0, 7);
+        const rows = series.filter(row => row.day === month);
+        return {
+          month,
+          total: rows.reduce((sum, row) => sum + row.count, 0),
+          ai: rows.reduce((sum, row) => sum + row.aiRequests, 0),
+        };
+      });
   }
 
   const rows = await query<{ month: string; total: number; ai: number }>(
@@ -362,8 +505,15 @@ export async function getPlotLogs(
 ) {
   if(warehouseEnabled())return (await import('./warehouse-log-queries')).warehousePlotLogs(id,start,end,timezone,hour,metrics);
   if (/^[a-f0-9-]{36}$/i.test(id)) {
-    const series=await readAnalysisLogSeries({websiteId:id,startDate:start,endDate:end,timezone,...metrics,grain:hour?'hour':'day'});
-    if(series)return series;
+    const series = await readPreferredLogSeries({
+      websiteId: id,
+      startDate: start,
+      endDate: end,
+      timezone,
+      ...metrics,
+      grain: hour ? 'hour' : 'day',
+    });
+    if (series) return series;
   }
   return query(
     `SELECT to_char(created_at AT TIME ZONE $4,'${hour ? 'YYYY-MM-DD HH24:00' : 'YYYY-MM-DD'}') AS day,bot,bot_type AS type,count(*)::int AS count,count(*) FILTER(WHERE ${crawlerAiSql()})::int AS "aiRequests" FROM liekan_reporting_log WHERE website_id=$1::uuid AND ${metrics.crawlerMetricsVersion === 1 ? "created_at>=$2 AND created_at<$3 AND user_agent NOT LIKE 'Liekan-Crawler-Check/%'" : 'created_at BETWEEN $2 AND $3'}${crawlerIdentitySql(metrics.crawlerIdentityScope)} GROUP BY 1,2,3 ORDER BY 1`,

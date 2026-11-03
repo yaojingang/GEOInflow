@@ -268,6 +268,24 @@ describe('compatible collection quality intake', () => {
     expect(mocks.token).not.toHaveBeenCalled();
     expect(mocks.write).not.toHaveBeenCalled();
   });
+  it('redacts direct-submitted URL and referrer secrets before queueing warehouse facts', async () => {
+    mocks.warehouse = true;
+    const response = await call({
+      eventId,
+      url: '/landing?token=private-token&utm_source=newsletter#access_token=private-fragment',
+      referrer: 'https://referrer.test/from?email=visitor%40example.com&utm_medium=email',
+    });
+    expect(response.status).toBe(200);
+    const envelope = mocks.enqueue.mock.calls[0][0];
+    const serialized = JSON.stringify(envelope);
+    expect(serialized).not.toContain('private-token');
+    expect(serialized).not.toContain('private-fragment');
+    expect(serialized).not.toContain('visitor%40example.com');
+    expect(serialized).not.toContain('visitor@example.com');
+    expect(serialized).toContain('utm_source=newsletter');
+    expect(serialized).toContain('utm_medium=email');
+    expect(mocks.saveEvent).not.toHaveBeenCalled();
+  });
   it('keeps the original session/visit response for warehouse duplicates and 409 for conflicts', async () => {
     mocks.warehouse = true;
     mocks.completion.mockResolvedValue({

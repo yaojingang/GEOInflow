@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { ClickHouseClient } from '@clickhouse/client';
 import { CandidateWriter, candidateDigest, type StoredFact, storedFact } from './candidate';
-import { sourceFingerprint } from './catalog';
+import { sourceFingerprint, supportedSourceFingerprint } from './catalog';
 import { type ControlDatabase, WarehouseConflict } from './control-db';
 import { stableOperation } from './identifiers';
 import { LandingStore } from './landing';
@@ -83,8 +83,13 @@ export class MigrationPages {
     snapshotSHA256: string,
     siteEpochs: Record<string, string>,
     id: string = randomUUID(),
+    fingerprint: string = sourceFingerprint,
   ) {
-    if (!/^[0-9a-f]{64}$/.test(snapshotSHA256) || !sourceIdentity)
+    if (
+      !/^[0-9a-f]{64}$/.test(snapshotSHA256) ||
+      !sourceIdentity ||
+      !supportedSourceFingerprint(fingerprint)
+    )
       throw new Error('Invalid persistent source snapshot');
     return this.db.transaction(async tx => {
       const existing = (
@@ -97,7 +102,7 @@ export class MigrationPages {
         if (
           existing.source_identity !== sourceIdentity ||
           existing.source_snapshot !== snapshotSHA256 ||
-          existing.source_fingerprint !== sourceFingerprint ||
+          existing.source_fingerprint !== fingerprint ||
           existing.transform_version !== MIGRATION_TRANSFORM_VERSION ||
           JSON.stringify(Object.entries(existing.boundary.sites).sort()) !==
             JSON.stringify(Object.entries(siteEpochs).sort())
@@ -113,7 +118,7 @@ export class MigrationPages {
           [
             id,
             sourceIdentity,
-            sourceFingerprint,
+            fingerprint,
             snapshotSHA256,
             MIGRATION_TRANSFORM_VERSION,
             JSON.stringify({ sites: siteEpochs }),
@@ -137,7 +142,7 @@ export class MigrationPages {
       if (
         !migration ||
         !['prepared', 'capturing', 'backfill'].includes(migration.phase) ||
-        migration.source_fingerprint !== sourceFingerprint ||
+        !supportedSourceFingerprint(migration.source_fingerprint) ||
         migration.transform_version !== MIGRATION_TRANSFORM_VERSION
       )
         throw new WarehouseConflict('warehouse-migration-not-writable');

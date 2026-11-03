@@ -5,6 +5,7 @@ import {
   applyReportPopulation,
   qualifiedBrowserReason,
   qualifiedBrowserUnavailableReason,
+  identityEncodingChangeReason,
 } from './population-results';
 import { translateText } from '../i18n/text';
 
@@ -83,4 +84,20 @@ it('translates scope and actionable missing-input explanations in English', () =
   expect(translateText(qualifiedBrowserUnavailableReason, 'en-US')).toContain(
     'Check CLIENT_IP_HEADER',
   );
+});
+
+it('marks identity continuity as estimated only for qualified events spanning the encoding upgrade', () => {
+  const population = metadata();
+  population.identity.versions = ['cookieless-trusted-input-v3', 'cookieless-trusted-input-v4'];
+  population.identity.qualifiedVersions = ['cookieless-trusted-input-v4'];
+  expect(applyReportPopulation(report(), population).cards[0].state).toBe('available');
+  population.identity.qualifiedVersions = [...population.identity.versions];
+  const actual = applyReportPopulation(report(), population);
+  expect(actual.cards[0]).toMatchObject({
+    value: 2,
+    state: 'estimated',
+    detail: identityEncodingChangeReason,
+  });
+  expect(actual.cards[1]).toMatchObject({ value: 3, state: 'available' });
+  expect(translateText(identityEncodingChangeReason, 'en-US')).toContain('encoding upgrade');
 });

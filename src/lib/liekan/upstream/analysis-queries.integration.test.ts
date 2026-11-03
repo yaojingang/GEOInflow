@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { ANALYSIS_ROLLUP_VERSION } from './analysis-rollups-model';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { withPublishedRegistry } from './crawler-registry-context';
@@ -10,7 +11,18 @@ import {
   pumpAnalysisQueries,
 } from './analysis-queries';
 import { analysisTransaction } from './analysis-rollups-db';
+import * as rollupDatabase from './analysis-rollups-db';
 import { withAnalysisPermit } from './analysis-background';
+import { requestDashboardSnapshot } from './dashboard-snapshots';
+import { Client } from 'pg';
+const withBlockedLane = (
+  kind: Parameters<typeof withAnalysisPermit>[0],
+  work: () => Promise<unknown>,
+) =>
+  withAnalysisPermit(kind, async () => {
+    if (kind === 'dashboard') await withAnalysisPermit(kind, work);
+    else await work();
+  });
 const enabled = process.env.LIEKAN_ANALYSIS_ROLLUPS_TEST === '1';
 const actor = { id: randomUUID(), role: 'user' },
   other = { id: randomUUID(), role: 'user' };
@@ -91,6 +103,431 @@ describe.skipIf(!enabled)('durable private query lifecycle in PostgreSQL', () =>
       )[0].n,
     ).toBe(2);
   });
+  it.each([false, true])(
+    'classifies admission contention from observed quota exhaustion (%s)',
+    async full => {
+      const tasks = [];
+      if (full) {
+        tasks.push(await request());
+        tasks.push(await request({ endAt: parameters.endAt + 1000 }));
+      }
+      const locked = new Client({ connectionString: process.env.DATABASE_URL });
+      await locked.connect();
+      await locked.query('BEGIN');
+      await locked.query('SELECT pg_advisory_xact_lock(1277339412)');
+      try {
+        if (full) {
+          const joined = await request();
+          expect(joined).toMatchObject({
+            ready: false,
+            analysisJob: { id: tasks[0].analysisJob.id },
+          });
+        }
+        await expect(request({ endAt: parameters.endAt + 2000 })).rejects.toMatchObject({
+          status: full ? 429 : 503,
+          code: full ? 'analysis-concurrency-limited' : 'analysis-admission-busy',
+        });
+        expect(
+          (
+            await q(
+              'SELECT count(*)::int AS n FROM liekan_analysis_query WHERE website_id=$1::uuid',
+              site,
+            )
+          )[0].n,
+        ).toBe(full ? 2 : 0);
+      } finally {
+        await locked.query('ROLLBACK');
+        await locked.end();
+      }
+    },
+  );
+  it('keeps a polling handle intact while website authorization is locked', async () => {
+    const task = await request();
+    if (task.ready === true) throw new Error('expected cold fixture');
+    const url = new URL(process.env.DATABASE_URL);
+    const schema = url.searchParams.get('schema');
+    url.searchParams.delete('schema');
+    const blocker = new Client({ connectionString: url.toString() });
+    await blocker.connect();
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(`SET LOCAL search_path TO "${schema}"`);
+      await blocker.query('SELECT website_id FROM website WHERE website_id=$1 FOR UPDATE', [site]);
+      let failure: any;
+      try {
+        await withPublishedRegistry(() => readAnalysisQuery(site, actor, task.analysisJob.id));
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeDefined();
+      expect(failure?.meta?.driverAdapterError?.cause?.originalCode ?? failure?.meta?.code ?? failure?.code).toBe('55P03');
+      await blocker.query('ROLLBACK');
+      expect(await withPublishedRegistry(() => readAnalysisQuery(site, actor, task.analysisJob.id))).toMatchObject({
+        analysisJob: { id: task.analysisJob.id, status: 'queued' },
+      });
+      expect((await q('SELECT attempts FROM liekan_analysis_query WHERE id=$1::uuid', task.analysisJob.id))[0].attempts).toBe(0);
+    } finally {
+      await blocker.query('ROLLBACK');
+      await blocker.end();
+    }
+  }, 10000);
+  it('verifies quota when the retry deadline elapses between refusal and caller handling', async () => {
+    await request();
+    await request({ endAt: parameters.endAt + 1000 });
+    const locked = new Client({ connectionString: process.env.DATABASE_URL });
+    await locked.connect();
+    await locked.query('BEGIN');
+    await locked.query('SELECT pg_advisory_xact_lock(1277339412)');
+    const transaction = rollupDatabase.analysisTransaction;
+    const began = Date.now();
+    let refused = false,
+      checks = 0;
+    const clock = vi
+      .spyOn(Date, 'now')
+      .mockImplementation(() => (refused ? began + (++checks === 1 ? 499 : 501) : began));
+    const intercepted = vi
+      .spyOn(rollupDatabase, 'analysisTransaction')
+      .mockImplementation((work, isolation) =>
+        transaction(
+          tx =>
+            work(
+              new Proxy(tx, {
+                get(target, property) {
+                  if (property !== '$queryRawUnsafe') return Reflect.get(target, property);
+                  return async (statement: string, ...values: unknown[]) => {
+                    const result = await target.$queryRawUnsafe(statement, ...values);
+                    if (statement.includes('pg_try_advisory_xact_lock(1277339412)')) refused = true;
+                    return result;
+                  };
+                },
+              }),
+            ),
+          isolation,
+        ),
+      );
+    try {
+      await expect(request({ endAt: parameters.endAt + 2000 })).rejects.toMatchObject({
+        status: 429,
+        code: 'analysis-concurrency-limited',
+      });
+      expect(refused).toBe(true);
+    } finally {
+      clock.mockRestore();
+      intercepted.mockRestore();
+      await locked.query('ROLLBACK');
+      await locked.end();
+    }
+  });
+  async function backgroundPublications(
+    targets = ['native:stats', 'native:pageviews'],
+    range = parameters,
+  ) {
+    const jobs: string[] = [];
+    for (const target of targets) {
+      const initial = await withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, target, range),
+      );
+      if (initial.ready) throw new Error('expected a cold publication fixture');
+      expect((await processAnalysisQuery(initial.analysisJob.id)).value).toBeUndefined();
+      const id = randomUUID();
+      await sql(
+        `INSERT INTO liekan_analysis_query(id,website_id,query_key,actor_id,target,parameters,locale,strong_version,epoch,status)
+        SELECT $2::uuid,website_id,query_key,actor_id,target,parameters,locale,strong_version,epoch,'queued' FROM liekan_analysis_query WHERE id=$1::uuid`,
+        initial.analysisJob.id,
+        id,
+      );
+      await sql(
+        'INSERT INTO liekan_analysis_query_consumer(job_id,actor_id) VALUES($1::uuid,$2::uuid)',
+        id,
+        actor.id,
+      );
+      await sql(
+        "UPDATE liekan_dashboard_snapshot SET job_id=$1::uuid,last_read_at='1970-01-01',next_refresh_at='9999-12-31' WHERE job_id IS NULL AND website_id=$2::uuid AND target=$3",
+        id,
+        site,
+        target,
+      );
+      jobs.push(id);
+    }
+    return jobs;
+  }
+  it('skips retired receipts when choosing a seat that actually counts against the limit', async () => {
+    const retired = await backgroundPublications();
+    await sql(
+      "UPDATE liekan_analysis_query SET retention_until=clock_timestamp()-interval '1 second' WHERE id=ANY($1::uuid[])",
+      retired,
+    );
+    const current = await backgroundPublications(undefined, {
+      ...parameters,
+      endAt: parameters.endAt + 1000,
+    });
+    const incoming = await withPublishedRegistry(() =>
+      requestDashboardSnapshot(site, actor, 'native:stats', {
+        ...parameters,
+        endAt: parameters.endAt + 2000,
+      }),
+    );
+    expect(incoming.ready).toBe(false);
+    expect(
+      (
+        await q(
+          "SELECT count(*)::int AS n FROM liekan_analysis_query WHERE id=ANY($1::uuid[]) AND error_code='analysis-idle'",
+          current,
+        )
+      )[0].n,
+    ).toBe(1);
+    expect(
+      (
+        await q(
+          "SELECT count(*)::int AS n FROM liekan_analysis_query WHERE id=ANY($1::uuid[]) AND error_code='analysis-idle'",
+          retired,
+        )
+      )[0].n,
+    ).toBe(0);
+  });
+  it('selects a refresh from the quota class blocking the reader', async () => {
+    const heavy = await backgroundPublications(['native:heatmaps', 'native:retention']);
+    const live = await backgroundPublications();
+    const incoming = await withPublishedRegistry(() =>
+      requestDashboardSnapshot(site, actor, 'native:stats', {
+        ...parameters,
+        endAt: parameters.endAt + 1000,
+      }),
+    );
+    expect(incoming.ready).toBe(false);
+    expect(
+      (
+        await q(
+          "SELECT count(*)::int AS n FROM liekan_analysis_query WHERE id=ANY($1::uuid[]) AND status='queued'",
+          heavy,
+        )
+      )[0].n,
+    ).toBe(2);
+    expect(
+      (
+        await q(
+          "SELECT count(*)::int AS n FROM liekan_analysis_query WHERE id=ANY($1::uuid[]) AND error_code='analysis-idle'",
+          live,
+        )
+      )[0].n,
+    ).toBe(1);
+  });
+  it('lets a real reader replace an idle published refresh without changing quotas or published facts', async () => {
+    const background = await backgroundPublications();
+    const before = await q(
+      'SELECT query_key,result,fingerprint,data_through FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid ORDER BY query_key',
+      site,
+    );
+    const incoming = await withPublishedRegistry(() =>
+      requestDashboardSnapshot(site, actor, 'native:stats', {
+        ...parameters,
+        endAt: parameters.endAt + 1000,
+      }),
+    );
+    expect(incoming.ready).toBe(false);
+    expect(
+      (
+        await q(
+          "SELECT count(*)::int AS n FROM liekan_analysis_query WHERE website_id=$1::uuid AND status IN('queued','running')",
+          site,
+        )
+      )[0].n,
+    ).toBe(2);
+    const yielded = await q(
+      "SELECT id FROM liekan_analysis_query WHERE id=ANY($1::uuid[]) AND status='failed' AND error_code='analysis-idle'",
+      background,
+    );
+    expect(yielded).toHaveLength(1);
+    const after = await q(
+      'SELECT query_key,result,fingerprint,data_through FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND result IS NOT NULL ORDER BY query_key',
+      site,
+    );
+    expect(after).toEqual(before);
+  });
+  it('joins an existing task at the site limit while preserving an unrelated idle refresh', async () => {
+    const team = randomUUID();
+    teams.push(team);
+    await sql("INSERT INTO team(team_id,name) VALUES($1::uuid,'Shared admission fixture')", team);
+    for (const member of [actor, other])
+      await sql(
+        "INSERT INTO team_user(team_user_id,team_id,user_id,role) VALUES($1::uuid,$2::uuid,$3::uuid,'team-member')",
+        randomUUID(),
+        team,
+        member.id,
+      );
+    await sql(
+      'UPDATE website SET user_id=NULL,team_id=$2::uuid WHERE website_id=$1::uuid',
+      site,
+      team,
+    );
+    const background = await backgroundPublications(['native:stats']);
+    const selected = { ...parameters, endAt: parameters.endAt + 1000 };
+    const shared = await request(selected, other);
+    if (shared.ready === true) throw new Error('expected another reader task');
+    await sql(
+      `INSERT INTO liekan_analysis_query(id,website_id,actor_id,target,parameters,query_key,strong_version,epoch,status,locale)
+      SELECT gen_random_uuid(),website_id,actor_id,target,parameters,query_key||'-filler-'||n,strong_version,epoch,'queued',locale
+      FROM liekan_analysis_query CROSS JOIN generate_series(1,6) n WHERE id=$1::uuid`,
+      shared.analysisJob.id,
+    );
+    const locked = new Client({ connectionString: process.env.DATABASE_URL });
+    await locked.connect();
+    await locked.query('BEGIN');
+    await locked.query('SELECT pg_advisory_xact_lock(1277339412)');
+    try {
+      await expect(request(selected)).rejects.toMatchObject({
+        status: 503,
+        code: 'analysis-admission-busy',
+      });
+    } finally {
+      await locked.query('ROLLBACK');
+      await locked.end();
+    }
+    const joined = await request(selected);
+    expect(joined).toMatchObject({ ready: false, analysisJob: { id: shared.analysisJob.id } });
+    expect(
+      (
+        await q(
+          'SELECT status,error_code FROM liekan_analysis_query WHERE id=$1::uuid',
+          background[0],
+        )
+      )[0],
+    ).toEqual({ status: 'queued', error_code: null });
+    expect(
+      (
+        await q(
+          "SELECT count(*)::int AS n FROM liekan_analysis_query WHERE website_id=$1::uuid AND status IN('queued','running')",
+          site,
+        )
+      )[0].n,
+    ).toBe(8);
+  });
+  it('does not let maintenance evict another refresh to take its seat', async () => {
+    const background = await backgroundPublications();
+    await expect(
+      withPublishedRegistry(() =>
+        requestAnalysisQuery(
+          site,
+          actor,
+          'native:stats',
+          { ...parameters, endAt: parameters.endAt + 1000 },
+          'zh-CN',
+          undefined,
+          false,
+        ),
+      ),
+    ).rejects.toMatchObject({ status: 429 });
+    expect(
+      (
+        await q(
+          "SELECT count(*)::int AS n FROM liekan_analysis_query WHERE id=ANY($1::uuid[]) AND status='queued'",
+          background,
+        )
+      )[0].n,
+    ).toBe(2);
+  });
+  it('preserves background publications on a website whose owner has changed', async () => {
+    const previousSite = site,
+      background = await backgroundPublications();
+    await sql(
+      'UPDATE website SET user_id=$2::uuid WHERE website_id=$1::uuid',
+      previousSite,
+      other.id,
+    );
+    site = randomUUID();
+    await sql(
+      "INSERT INTO website(website_id,user_id,name,domain) VALUES($1::uuid,$2::uuid,'Incoming fixture','incoming.invalid')",
+      site,
+      actor.id,
+    );
+    await expect(
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'native:stats', parameters),
+      ),
+    ).rejects.toMatchObject({ status: 429 });
+    expect(
+      (
+        await q(
+          "SELECT count(*)::int AS n FROM liekan_analysis_query WHERE id=ANY($1::uuid[]) AND status='queued'",
+          background,
+        )
+      )[0].n,
+    ).toBe(2);
+  });
+  it.each([
+    'running',
+    'visible',
+    'cold',
+    'shared',
+    'locked',
+    'capacity-locked',
+    'site-locked',
+  ] as const)('preserves %s work when a reader reaches the existing quota', async kind => {
+    const background = await backgroundPublications();
+    if (kind === 'running')
+      await sql(
+        "UPDATE liekan_analysis_query SET status='running' WHERE id=ANY($1::uuid[])",
+        background,
+      );
+    if (kind === 'visible')
+      await sql(
+        'UPDATE liekan_dashboard_snapshot SET last_read_at=clock_timestamp() WHERE website_id=$1::uuid',
+        site,
+      );
+    if (kind === 'cold')
+      await sql('UPDATE liekan_dashboard_snapshot SET result=NULL WHERE website_id=$1::uuid', site);
+    if (kind === 'shared')
+      await sql(
+        'INSERT INTO liekan_analysis_query_consumer(job_id,actor_id) SELECT id,$2::uuid FROM liekan_analysis_query WHERE id=ANY($1::uuid[])',
+        background,
+        other.id,
+      );
+    let locked: Client;
+    if (['locked', 'capacity-locked', 'site-locked'].includes(kind)) {
+      const url = new URL(process.env.DATABASE_URL),
+        schema = url.searchParams.get('schema');
+      url.search = '';
+      locked = new Client({ connectionString: url.toString() });
+      await locked.connect();
+      await locked.query('BEGIN');
+      await locked.query(`SET search_path TO "${schema}"`);
+      if (kind === 'locked')
+        await locked.query(
+          'SELECT query_key FROM liekan_dashboard_snapshot WHERE website_id=$1 FOR UPDATE',
+          [site],
+        );
+      if (kind === 'capacity-locked')
+        await locked.query('SELECT pg_advisory_xact_lock(1277339413,hashtext($1::text))', [site]);
+      if (kind === 'site-locked')
+        await locked.query(
+          'SELECT website_id FROM liekan_analysis_site WHERE website_id=$1 FOR UPDATE',
+          [site],
+        );
+    }
+    try {
+      await expect(
+        withPublishedRegistry(() =>
+          requestDashboardSnapshot(site, actor, 'native:stats', {
+            ...parameters,
+            endAt: parameters.endAt + 1000,
+          }),
+        ),
+      ).rejects.toMatchObject({ status: 429, code: 'analysis-concurrency-limited' });
+    } finally {
+      if (locked) {
+        await locked.query('ROLLBACK');
+        await locked.end();
+      }
+    }
+    expect(
+      (
+        await q(
+          "SELECT count(*)::int AS n FROM liekan_analysis_query WHERE id=ANY($1::uuid[]) AND status IN('queued','running')",
+          background,
+        )
+      )[0].n,
+    ).toBe(2);
+  });
   it('moves an oversized short attempt to the original heavy budget on retry', async () => {
     const execution = await import('./analysis-query-execution');
     const { currentCacheContext } = await import('./cache-context');
@@ -115,7 +552,7 @@ describe.skipIf(!enabled)('durable private query lifecycle in PostgreSQL', () =>
         )
       )[0],
     ).toEqual({ status: 'queued', attempts: 1 });
-    const queue = { fail: vi.fn(), update: vi.fn() };
+    const queue = { fail: vi.fn(), update: vi.fn(), send: vi.fn() };
     await expect(
       processAnalysisQueryDelivery(
         { id: randomUUID(), retryCount: 0, data: { id: task.analysisJob.id } },
@@ -286,7 +723,7 @@ describe.skipIf(!enabled)('durable private query lifecycle in PostgreSQL', () =>
     const send = vi.fn().mockResolvedValue('delivered');
     await pumpAnalysisQueries({ send, update: vi.fn() });
     expect(send.mock.calls.some(([, data]) => data.id === task.analysisJob.id)).toBe(true);
-    await withAnalysisPermit('dashboard', async () => {
+    await withBlockedLane('dashboard', async () => {
       expect((await processAnalysisQuery(task.analysisJob.id)).acquired).toBe(false);
     });
     const [row] = await q(
@@ -435,7 +872,7 @@ describe.skipIf(!enabled)('durable private query lifecycle in PostgreSQL', () =>
     );
     expect(upgraded).toHaveLength(3);
     for (const row of upgraded) {
-      expect(row.versions.engine).toBe('analysis-rollups-v2');
+      expect(row.versions.engine).toBe(ANALYSIS_ROLLUP_VERSION);
       expect(row.compared).toBe(true);
       expect(row.input_rows).toBe(32n);
     }

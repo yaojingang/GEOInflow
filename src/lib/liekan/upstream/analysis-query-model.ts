@@ -5,8 +5,24 @@ import { parseAnalyticsHotParameters, analyticsRefreshJobSchema } from './analyt
 import { LiekanError } from './errors';
 export const ANALYSIS_QUERY_QUEUE = 'liekan-analysis-query';
 export const ANALYSIS_BUILD_QUEUE = 'liekan-analysis-build';
-export const ANALYSIS_RESULT_FORMAT = 'liekan-analysis-result-v1';
+export const ANALYSIS_RESULT_FORMAT = 'liekan-analysis-result-v3';
 export const liveAnalysisTargets = ['feature:page-report', 'native:stats', 'native:pageviews'];
+/** Classify each unclaimed attempt from current authorized reader demand. */
+export function analysisAttemptPolicy(row: {
+  target: string;
+  attempts: number;
+  foreground?: boolean;
+}) {
+  const firstLive = row.attempts === 0 && liveAnalysisTargets.includes(row.target);
+  const viewedPage = row.target === 'feature:page-report' && row.foreground !== false;
+  return {
+    lane:
+      viewedPage || (firstLive && row.foreground !== false)
+        ? ('dashboard' as const)
+        : ('interactive' as const),
+    budgetMs: (firstLive && !viewedPage) || row.target === 'native:heatmaps' ? 10000 : 60000,
+  };
+}
 export const analysisQueryLimits = Object.freeze({
   global: 32,
   site: 8,

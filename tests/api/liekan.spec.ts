@@ -404,9 +404,14 @@ test('keeps the deployed shared overview scoped and aggregate-only', async ({
       'h2',
       'h3',
     ]);
+    expect(params.endAt - params.startAt).toBeLessThan(30 * 86400000);
+    if (seed.db === 'postgres') expect(result.body.meta.trendPopulation.range.startAt).toBe(params.startAt);
     expect(result.body.meta).toEqual({
       geographyCoverage: privateReport.body.meta.geographyCoverage,
       ...(seed.db === 'postgres' ? { population: privateReport.body.meta.population } : {}),
+      ...(privateReport.body.meta.trendPopulation
+        ? { trendPopulation: privateReport.body.meta.population }
+        : {}),
       aiCrawlerEnabled: true,
       demo: false,
       canManage: false,

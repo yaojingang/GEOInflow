@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { selectRows } from '@/components/liekan/data';
 import { pageUrl } from '../contracts/page-url';
+import { reportEvidenceJson } from '../contracts/report-evidence-view';
 import { tablePageSize, type ReportQuery } from '../contracts/query';
 import type { EvidenceInputs } from '../crawlers/evidence-read';
 import { reportLogRange, reportLogRow } from '../report-log-tables';
@@ -14,7 +15,7 @@ import { withinWarehouseReport } from './warehouse-report-snapshot';
 type Display = { filter: string; sort: { label: string; direction?: number }; search: string };
 const neutral = { filter: '全部', sort: { label: '', direction: 1 }, search: '' };
 
-/** Byte-for-byte JSON.stringify shape used by reportEvidenceViewPayload. Only
+/** Byte-for-byte canonical JSON shape used by reportEvidenceViewPayload. Only
  * the rows array is streamed; no digest substitutes for its original bytes. */
 export async function hashReportEvidenceViewRows(
   metadata: {
@@ -27,15 +28,17 @@ export async function hashReportEvidenceViewRows(
   },
   produce: (emit: (row: any) => void) => Promise<void>,
 ) {
-  const { totalLogs, tablePage, ...prefix } = metadata;
+  // Sorted top-level keys before rows: display, policySnapshot, query.
+  // Keys after rows: table, tablePage, totalLogs. Each row uses the same codec.
+  const { table, totalLogs, tablePage, ...prefix } = metadata;
   const hash = createHash('sha256');
-  hash.update(JSON.stringify(prefix).slice(0, -1) + ',"rows":[');
+  hash.update(reportEvidenceJson(prefix).slice(0, -1) + ',"rows":[');
   let first = true;
   await produce(row => {
-    hash.update((first ? '' : ',') + JSON.stringify(row));
+    hash.update((first ? '' : ',') + reportEvidenceJson(row));
     first = false;
   });
-  const tail = JSON.stringify({ totalLogs, tablePage });
+  const tail = reportEvidenceJson({ table, totalLogs, tablePage });
   hash.update(']' + (tail === '{}' ? '}' : ',' + tail.slice(1)));
   return hash.digest('hex');
 }

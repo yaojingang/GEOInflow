@@ -540,3 +540,95 @@ it('keeps partial-identity session association details unavailable without false
   expect(screen.queryByText(/fallback-session/)).not.toBeInTheDocument();
   expect(screen.getByText('页面访问').parentElement).toHaveTextContent('2');
 });
+
+it('preserves unavailable comparison channels and series as missing', () => {
+  mocks.context.range = {
+    startAt: Date.parse('2026-01-09T00:00:00Z'),
+    endAt: Date.parse('2026-01-10T00:00:00Z') - 1,
+    timezone: 'UTC',
+  };
+  const missing = populationFromRow(
+    {
+      resourceKind: 'website',
+      metricScope: 'qualified-browser',
+      eligibleEvents: 5,
+      qualifiedEvents: 0,
+      eligiblePV: 5,
+      qualifiedPV: 0,
+      qualifiedVisitors: 0,
+    },
+    {
+      startAt: Date.parse('2026-01-08T00:00:00Z'),
+      endAt: Date.parse('2026-01-09T00:00:00Z') - 1,
+      timezone: 'UTC',
+    },
+  );
+  mocks.query['compare-rich'] = {
+    current: { pageviews: 2, visitors: 2, visits: 2, bounces: 1, totaltime: 10 },
+    previous: {
+      pageviews: 0,
+      visitors: null,
+      visits: null,
+      bounces: null,
+      totaltime: null,
+      population: missing,
+    },
+    currentSeries: { sessions: [{ x: '2026-01-09', y: 2 }] },
+    previousSeries: { sessions: [], population: missing },
+    sources: { rows: [{ referrer: null, visitors: 2 }] },
+    oldSources: { rows: [], population: missing },
+    population: missing,
+  };
+  render(<AnalyticsPages page="compare" />);
+  const row = screen.getByRole('cell', { name: '直接访问' }).closest('tr');
+  expect(row).toHaveTextContent('—');
+  expect(row).not.toHaveTextContent('新增');
+  const chart = JSON.parse(screen.getByRole('img', { name: '同期访问趋势' }).textContent);
+  expect(chart.series[1].values).toEqual([null]);
+});
+
+it('keeps a measured empty comparison period at zero and marks a new source', () => {
+  mocks.context.range = {
+    startAt: Date.parse('2026-01-09T00:00:00Z'),
+    endAt: Date.parse('2026-01-10T00:00:00Z') - 1,
+    timezone: 'UTC',
+  };
+  const missing = populationFromRow(
+    {
+      resourceKind: 'website',
+      metricScope: 'qualified-browser',
+      eligibleEvents: 0,
+      qualifiedEvents: 0,
+      eligiblePV: 0,
+      qualifiedPV: 0,
+      qualifiedVisitors: 0,
+    },
+    {
+      startAt: Date.parse('2026-01-08T00:00:00Z'),
+      endAt: Date.parse('2026-01-09T00:00:00Z') - 1,
+      timezone: 'UTC',
+    },
+  );
+  mocks.query['compare-rich'] = {
+    current: { pageviews: 2, visitors: 2, visits: 2, bounces: 1, totaltime: 10 },
+    previous: {
+      pageviews: 0,
+      visitors: null,
+      visits: null,
+      bounces: null,
+      totaltime: null,
+      population: missing,
+    },
+    currentSeries: { sessions: [{ x: '2026-01-09', y: 2 }] },
+    previousSeries: { sessions: [], population: missing },
+    sources: { rows: [{ referrer: null, visitors: 2 }] },
+    oldSources: { rows: [], population: missing },
+    population: missing,
+  };
+  render(<AnalyticsPages page="compare" />);
+  const row = screen.getByRole('cell', { name: '直接访问' }).closest('tr');
+  expect(row).toHaveTextContent('0');
+  expect(row).toHaveTextContent('新增');
+  const chart = JSON.parse(screen.getByRole('img', { name: '同期访问趋势' }).textContent);
+  expect(chart.series[1].values).toEqual([0]);
+});

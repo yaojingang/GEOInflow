@@ -20,6 +20,15 @@ const cf = (time: string) => ({
   RayID: 'same-ray',
   ClientRequestSource: 'eyeball',
 });
+const cloudflareUpload = (text: string, gzip = true, epoch?: number) =>
+  new Request('https://logs.example/upload', {
+    method: 'POST',
+    body: new Uint8Array(gzip ? gzipSync(text) : Buffer.from(text)),
+    headers: {
+      ...(gzip ? { 'content-encoding': 'gzip' } : {}),
+      ...(epoch === undefined ? {} : { 'x-liekan-epoch': String(epoch) }),
+    },
+  });
 describe('automatic log wire protocol', () => {
   it('cancels unfinished input when gzip expansion is rejected', async () => {
     let cancelled = false;
@@ -94,22 +103,84 @@ describe('automatic log wire protocol', () => {
     expect(a.errors).toHaveLength(3);
     expect(JSON.stringify(a.errors)).not.toContain('192.0.2');
   });
-  it('bounds gzip expansion and accepts only the exact provider test payload', async () => {
-    const req = (data: Buffer) =>
-      new Request('https://logs.example/upload', {
-        method: 'POST',
-        body: new Uint8Array(data),
-        headers: { 'content-encoding': 'gzip' },
+  it.each([
+    { content: 'test', gzip: true },
+    { content: 'tests', gzip: true },
+    { content: 'test', gzip: false },
+    { content: 'tests', gzip: false },
+  ])(
+    'accepts the single $content probe with gzip=$gzip and surrounding whitespace',
+    async ({ content, gzip }) => {
+      const request = cloudflareUpload(` \r\n { "content" : "${content}" } \r\n`, gzip);
+      expect(await decodeUpload(request, 'cloudflare')).toEqual({
+        test: true,
+        events: [],
+        epoch: 0,
+        batchId: '',
+        digest: '',
       });
-    expect((await decodeUpload(req(gzipSync('{"content":"tests"}')), 'cloudflare')).test).toBe(
-      true,
+    },
+  );
+  it.each([
+    '{"content":"test","RayID":"fixture"}',
+    '{"content":"tests","RayID":"fixture"}',
+    '{"content":"test"}\n{"content":"tests"}',
+    `{"content":"test"}\n${JSON.stringify(cf('2026-10-04T02:00:00Z'))}`,
+    '{"content":"TEST"}',
+    '{"content":"testing"}',
+    '{"content":null}',
+    '{"content":true}',
+    'null',
+  ])('rejects non-probe content: %s', async text => {
+    await expect(decodeUpload(cloudflareUpload(text), 'cloudflare')).rejects.toMatchObject({
+      status: 400,
+    });
+  });
+  it('keeps array-wrapped content on the real-log validation path', async () => {
+    const decoded = await decodeUpload(
+      cloudflareUpload('[{"content":"test"}]', true, 2),
+      'cloudflare',
     );
+    expect(decoded.test).toBe(false);
+    const parsed = normalizeAutomatic(
+      'cloudflare',
+      source,
+      decoded.events,
+      'example.com',
+      'secret',
+    );
+    expect(parsed.records).toHaveLength(0);
+    expect(parsed.rejected).toBe(1);
+  });
+  it('requires an epoch for real logs and preserves their stable batch identity', async () => {
+    const event = cf('2026-10-04T02:00:00.000000001Z');
+    const text = JSON.stringify(event);
+    await expect(decodeUpload(cloudflareUpload(text), 'cloudflare')).rejects.toMatchObject({
+      status: 409,
+    });
+    const decoded = await decodeUpload(cloudflareUpload(text, true, 2), 'cloudflare');
+    expect(decoded).toMatchObject({ test: false, epoch: 2, events: [event] });
+    expect(await decodeUpload(cloudflareUpload(text, false, 2), 'cloudflare')).toEqual(decoded);
+  });
+  it.each(['test', 'tests'])('rejects the %s probe on the server protocol', async content => {
     await expect(
-      decodeUpload(req(gzipSync('x'.repeat(11 * 1024 * 1024))), 'cloudflare'),
-    ).rejects.toThrow();
+      decodeUpload(cloudflareUpload(JSON.stringify({ content })), 'server'),
+    ).rejects.toMatchObject({ status: 400 });
+  });
+  it('bounds gzip expansion and rejects corrupt gzip', async () => {
     await expect(
-      decodeUpload(req(gzipSync('{"content":"tests","ClientIP":"192.0.2.20"}')), 'cloudflare'),
-    ).rejects.toThrow();
+      decodeUpload(cloudflareUpload('x'.repeat(11 * 1024 * 1024)), 'cloudflare'),
+    ).rejects.toMatchObject({ status: 413 });
+    await expect(
+      decodeUpload(
+        new Request('https://logs.example/upload', {
+          method: 'POST',
+          body: new Uint8Array(gzipSync('{"content":"tests"}').subarray(0, 12)),
+          headers: { 'content-encoding': 'gzip' },
+        }),
+        'cloudflare',
+      ),
+    ).rejects.toMatchObject({ status: 400 });
   });
 });
 describe('credential protection', () => {

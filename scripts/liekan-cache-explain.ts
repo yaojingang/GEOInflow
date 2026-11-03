@@ -156,6 +156,8 @@ const originalFunctionNames = [
 const nativeStatsWindows = [30, 90, 365] as const;
 
 function hasResult(value: unknown) {
+  if (value && typeof value === 'object' && 'rows' in value && Array.isArray(value.rows))
+    return value.rows.length > 0;
   return Array.isArray(value)
     ? value.length > 0
     : !!value && typeof value === 'object' && Object.keys(value).length > 0;

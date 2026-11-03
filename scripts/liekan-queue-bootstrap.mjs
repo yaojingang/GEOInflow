@@ -96,7 +96,7 @@ try {
     'liekan-crawler-analysis',
     'liekan-crawler-check',
     'liekan-crawler-control',
-  ])
+  ]) {
     await boss.createQueue(name, {
       policy: 'short',
       retryLimit: 2,
@@ -104,6 +104,15 @@ try {
       expireInSeconds: 300,
       retentionSeconds: 3600,
     });
+  }
+  // Completed-only retention belongs to the reviewed storage policy. Native expiry still
+  // handles queued, failed and cancelled records using their original queue settings.
+  await client.query(`CREATE OR REPLACE TRIGGER liekan_completed_retention_guard
+    BEFORE DELETE ON liekan_jobs.job FOR EACH ROW
+    EXECUTE FUNCTION "${schema}".liekan_storage_guard_completed_job()`);
+  await client.query(`CREATE OR REPLACE TRIGGER liekan_completed_policy_owner
+    BEFORE UPDATE OF state ON liekan_jobs.job FOR EACH ROW
+    EXECUTE FUNCTION "${schema}".liekan_storage_complete_job()`);
   await client.query(
     "INSERT INTO liekan_queue_installation(id,package_version,checksum) VALUES ('liekan_jobs','12.36.0',$1) ON CONFLICT DO NOTHING",
     [checksum],

@@ -11,12 +11,16 @@ const mocks = vi.hoisted(() => ({
   authorize: vi.fn(),
   execute: vi.fn(),
   read: vi.fn(),
+  observation: vi.fn(),
   warehouseLogs: vi.fn(),
   warehouseBrowser: vi.fn(),
 }));
 vi.mock('./upstream/warehouse-presence', () => ({
   warehouseInstallationLogs: mocks.warehouseLogs,
   warehouseCollectionPresence: mocks.warehouseBrowser,
+}));
+vi.mock('./upstream/installation-observation', () => ({
+  readInstallationObservation: mocks.observation,
 }));
 vi.mock('./upstream/server', async () => ({
   LiekanError: (await import('./upstream/errors')).LiekanError,
@@ -32,6 +36,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'postgresql');
   mocks.read.mockResolvedValue([]);
+  mocks.observation.mockResolvedValue({ status: 'empty', sampleCount: 0, coverage: null });
   mocks.execute.mockResolvedValue(1);
   mocks.lock.mockResolvedValue(undefined);
   mocks.transaction.mockImplementation(work =>
@@ -66,6 +71,66 @@ describe('website installation progress', () => {
         /liekan_reporting_log|liekan_raw_website_event/.test(sql),
       ),
     ).toBe(false);
+  });
+  it.each(['api-key', 'partial', 'share', undefined])(
+    'preserves old fields and omits new private observation for identity %s',
+    async authType => {
+      mocks.authorize.mockResolvedValue({
+        website: { id },
+        canManage: true,
+        auth: {
+          authType,
+          user: { id: identity.userId },
+          ...(authType === 'share' ? { shareToken: {} } : {}),
+        },
+      });
+      const response = await GET(new Request('http://localhost/api'), params);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.progress).toHaveProperty('completedAt', null);
+      expect(body.identityIngress).not.toHaveProperty('observation');
+      expect(mocks.observation).not.toHaveBeenCalled();
+    },
+  );
+  it('adds the optional observation only for a complete private session', async () => {
+    mocks.authorize.mockResolvedValue({
+      website: { id },
+      canManage: false,
+      auth: { authType: 'session', user: { id: identity.userId } },
+    });
+    const response = await GET(new Request('http://localhost/api'), params);
+    expect(response.status).toBe(200);
+    expect((await response.json()).identityIngress.observation).toMatchObject({
+      status: 'empty',
+      coverage: null,
+    });
+    expect(mocks.observation).toHaveBeenCalledWith(id, identity.userId);
+  });
+  it('keeps saved progress, raw browser receipts and logs when the diagnostic times out', async () => {
+    mocks.observation.mockResolvedValue({
+      status: 'temporarily_unavailable',
+      sampleCount: null,
+      coverage: null,
+      reasons: ['diagnostic_timeout'],
+    });
+    const result = await getInstallation(id, false, identity);
+    expect(result).toMatchObject({
+      progress: { completedAt: null },
+      logs: { total: 0 },
+      browser: { pageviews: 0 },
+      identityIngress: { observation: { status: 'temporarily_unavailable', coverage: null } },
+    });
+  });
+  it('rejects observation authority changes without returning the old fields', async () => {
+    mocks.authorize.mockResolvedValue({
+      website: { id },
+      canManage: false,
+      auth: { authType: 'session', user: { id: identity.userId } },
+    });
+    mocks.observation.mockRejectedValue(new LiekanError('站点读取权限已变更', 403));
+    const response = await GET(new Request('http://localhost/api'), params);
+    expect(response.status).toBe(403);
+    expect(await response.json()).not.toHaveProperty('progress');
   });
   it('reports received collection independently of the eligible analytics population', async () => {
     const original = mocks.query.getMockImplementation();

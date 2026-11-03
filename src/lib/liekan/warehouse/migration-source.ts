@@ -7,6 +7,7 @@ import {
   factTable,
   identifier,
   schemaDifferences,
+  schemaFingerprint,
   sourceCatalogSQL,
 } from './catalog';
 import { exportColumns, recordKey, rowDigest, type WireRow } from './codec';
@@ -165,6 +166,8 @@ export class MigrationSource {
     if (
       rows.length !== 1 ||
       rows[0].descriptor.database !== database ||
+      rows[0].descriptor.sourceFingerprint !==
+        schemaFingerprint((await this.client.query(sourceCatalogSQL)).rows) ||
       snapshotDigest(rows[0].descriptor) !== rows[0].digest
     )
       throw new Error('warehouse-source-snapshot-invalid');

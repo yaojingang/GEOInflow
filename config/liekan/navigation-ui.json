@@ -1,11 +1,12 @@
 {
   "baselineVersion": "liekan-navigation-v0.2.3",
-  "approval": "2026-10-04 用户确认紧凑站点选择、14 个常展开菜单、五组分析 Tab 与单行账户栏；全局保留数据总览，以数据管理和协作管理两个静态分类组织其余五个入口，链接与图片追踪合并到追踪管理；2026-10-06 用户确认帮助中心入口仅保留在全局管理侧栏；2026-10-06 用户确认页面事件与日志监测菜单名称；2026-10-07 用户确认网站项目页头增加 24h/7 天/30 天快捷时间按钮（自定义范围左侧）；2026-10-08 用户确认下线数据总览（工作台）页与导航入口，默认落地与历史 /dashboard 地址统一指向网站管理，网站管理列表新增今日/昨日/预计今日的访问次数、访客数、跳出率、AI访问次数并移除最近接收列，整行可点击进入网站统计；2026-10-08 用户确认网站管理页头指标卡沿用数据总览模式：全部网站访客、页面访问、AI 引荐访客、管理空间四卡，含前期与变化对比，按当前所属空间所选网站汇总；2026-10-09 用户确认后台统一手动读取，现有页头增加刷新与本次读取时间，实时和日志取消轮询，今日卡片注明读取日期；2026-10-10 用户确认新增来源关键词标签页及搜索引擎、识别依据、质量状态统计，沿用现有来源分析样式；2026-10-11 用户要求在来源关键词前新增搜索引擎，分别统计传统搜索与 AI 搜索引荐，包含占比饼图与明细；2026-10-14 用户确认审阅后的完整英文界面方案并要求实施，保留中文默认和现有布局，提供语言切换与浏览器偏好记忆；2026-10-18 用户要求明确访客与浏览器特征的区别，优化蜘蛛识别并显露流量质量入口；总览及相关图表使用访客 UV、浏览 PV，质量页增加分类汇总与精确路径筛选，保留原始图表、字段结构与样式。；2026-10-20 用户确认 GEOInflow 品牌、v1.2 展示版本、GEO STATS 副标题，以及猎看科技和北京日报社智源GEO联合发布署名，保留原图标、主体布局与兼容标识。；2026-10-21 用户确认统一爬虫与 AI 平台管理方案，新增全局 /crawlers/manage 唯一入口，四个标签页复用现有表格和抽屉；2026-10-21 用户要求菜单与页标题简化为爬虫管理，新增记录入口自动创建草稿并打开表单，沿用预览与确认发布流程。；2026-10-21 用户要求在 AI 爬虫与抓取页面增加 AI 工作台和个人 Agent 筛选，沿用现有按钮和表格样式。；2026-10-21 用户要求两页将其他已知改为其他爬虫并排在最后，筛选排除前面四种用途及两种产品形态。；2026-10-24 用户确认开源项目信息弹窗设计，左下角四宫格入口打开居中宽屏弹窗，联合开源名称链接到带 ?GEOInflow 参数的官方网站，贡献者先显示 GitHub 仓库待接入。",
+  "approval": "2026-10-04 用户确认紧凑站点选择、14 个常展开菜单、五组分析 Tab 与单行账户栏；全局保留数据总览，以数据管理和协作管理两个静态分类组织其余五个入口，链接与图片追踪合并到追踪管理；2026-10-06 用户确认帮助中心入口仅保留在全局管理侧栏；2026-10-06 用户确认页面事件与日志监测菜单名称；2026-10-07 用户确认网站项目页头增加 24h/7 天/30 天快捷时间按钮（自定义范围左侧）；2026-10-08 用户确认下线数据总览（工作台）页与导航入口，默认落地与历史 /dashboard 地址统一指向网站管理，网站管理列表新增今日/昨日/预计今日的访问次数、访客数、跳出率、AI访问次数并移除最近接收列，整行可点击进入网站统计；2026-10-08 用户确认网站管理页头指标卡沿用数据总览模式：全部网站访客、页面访问、AI 引荐访客、管理空间四卡，含前期与变化对比，按当前所属空间所选网站汇总；2026-10-09 用户确认后台统一手动读取，现有页头增加刷新与本次读取时间，实时和日志取消轮询，今日卡片注明读取日期；2026-10-10 用户确认新增来源关键词标签页及搜索引擎、识别依据、质量状态统计，沿用现有来源分析样式；2026-10-11 用户要求在来源关键词前新增搜索引擎，分别统计传统搜索与 AI 搜索引荐，包含占比饼图与明细；2026-10-14 用户确认审阅后的完整英文界面方案并要求实施，保留中文默认和现有布局，提供语言切换与浏览器偏好记忆；2026-10-18 用户要求明确访客与浏览器特征的区别，优化蜘蛛识别并显露流量质量入口；总览及相关图表使用访客 UV、浏览 PV，质量页增加分类汇总与精确路径筛选，保留原始图表、字段结构与样式。；2026-10-20 用户确认 GEOInflow 品牌、v1.2 展示版本、GEO STATS 副标题，以及猎看科技和北京日报社智源GEO联合发布署名，保留原图标、主体布局与兼容标识。；2026-10-21 用户确认统一爬虫与 AI 平台管理方案，新增全局 /crawlers/manage 唯一入口，四个标签页复用现有表格和抽屉；2026-10-21 用户要求菜单与页标题简化为爬虫管理，新增记录入口自动创建草稿并打开表单，沿用预览与确认发布流程。；2026-10-21 用户要求在 AI 爬虫与抓取页面增加 AI 工作台和个人 Agent 筛选，沿用现有按钮和表格样式。；2026-10-21 用户要求两页将其他已知改为其他爬虫并排在最后，筛选排除前面四种用途及两种产品形态。；2026-10-24 用户确认开源项目信息弹窗设计，左下角四宫格入口打开居中宽屏弹窗，联合开源名称链接到带 ?GEOInflow 参数的官方网站，贡献者先显示 GitHub 仓库待接入。；2026-10-26 用户确认可选 ClickHouse 历史日志分析，系统管理增加存储与分析，保留现有 PostgreSQL 与原始界面。",
   "originalReferencePolicy": "Original HTML, SHA-256 fingerprints, chart pixels, table columns and body VI remain authoritative. Approved navigation/header/toolbars have bounded independent checks.",
   "incrementalVisualPages": [
     "crawlers-manage",
     "history-repair",
-    "analytics-acceleration"
+    "analytics-acceleration",
+    "admin-analytics-engine"
   ],
   "groups": {
     "global": [
@@ -155,6 +156,12 @@
       }
     ],
     "admin": [
+      {
+        "id": "admin-analytics-engine",
+        "page": "admin-analytics-engine",
+        "label": "存储与分析",
+        "children": []
+      },
       {
         "id": "admin-users",
         "label": "用户管理",
@@ -1261,6 +1268,14 @@
       "title": "统计加速",
       "tabs": [],
       "activeTab": null
+    },
+    "admin-analytics-engine": {
+      "scope": "admin",
+      "section": "admin-analytics-engine",
+      "active": "admin-analytics-engine",
+      "title": "存储与分析",
+      "tabs": [],
+      "activeTab": null
     }
   },
   "geo": {
@@ -1547,14 +1562,27 @@
       "mobileActionMinHeight": 40
     },
     "toolbar": {
-      "approval": "2026-10-05 用户要求网站统计页面顶部的网站切换与日期、页面操作水平左右对齐置顶",
+      "approval": "2026-10-31 用户要求移除顶部蜘蛛身份范围筛选、合并 robots 入口、将管理蜘蛛白名单简称管理蜘蛛，网站操作按钮统一单行展示",
       "contextPosition": "left",
       "actionsPosition": "right",
       "desktopHeight": 60,
       "desktopControlHeight": 36,
       "mobileControlMinHeight": 44,
-      "mobileActions": "wrap",
-      "titlePosition": "below"
+      "mobileActions": "single-row-horizontal-scroll",
+      "titlePosition": "below",
+      "desktopActionRows": 1,
+      "identityScopeFilter": "removed-from-header",
+      "robotsEntry": "shared-only",
+      "crawlerManagementLabel": "管理蜘蛛"
+    },
+    "robotsManagement": {
+      "label": "robots 管理",
+      "entry": "shared-website-toolbar",
+      "scope": "private-website",
+      "initialView": "overview",
+      "preserveOriginalBody": true,
+      "fileAddress": "https-origin-robots-and-authorized-server-path",
+      "advice": "current-file-snapshot-and-selected-period-crawler-evidence"
     }
   },
   "analysisTabs": {
@@ -1772,9 +1800,9 @@
       "fallback"
     ],
     "preserveOriginalBody": true,
-    "headerRows": "title-or-website-and-language-first-actions-wrap-below",
-    "desktopToolbarMaxRows": 3,
-    "maxAdditionalHeaderHeight": 88
+    "headerRows": "desktop-single-row-mobile-context-and-scrollable-actions",
+    "desktopToolbarMaxRows": 1,
+    "maxAdditionalHeaderHeight": 0
   },
   "productInformation": {
     "entry": "sidebar-footer-grid",

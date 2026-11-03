@@ -3,6 +3,8 @@ import { AnalyticsUnavailable } from './analytics-budget';
 import { HISTORY_REPAIR_CAMPAIGN, HISTORY_REPAIR_ENGINE } from '../contracts/history-repair';
 import { getPublishedCatalog } from '../crawlers/published';
 import { CALENDAR_POLICY_VERSION } from '../contracts/calendar';
+/** Fences derived results and queued work when reporting semantics change. */
+export const ANALYTICS_READ_VERSION = 'analytics-read-v4';
 export type AnalyticsResource = 'website' | 'link' | 'pixel';
 export const resourceCacheTag = (type: AnalyticsResource, id: string) =>
   `${type}:${id.toLowerCase()}`;
@@ -67,6 +69,7 @@ export async function readAnalyticsVersions(tx: any, tags: string[]): Promise<An
       ids,
       revisions,
       logs.map(({ id, policy }: any) => ({ id, policy })),
+      ANALYTICS_READ_VERSION,
       CALENDAR_POLICY_VERSION,
     ]),
     data: JSON.stringify(logs.map(({ id, data }: any) => ({ id, data }))),

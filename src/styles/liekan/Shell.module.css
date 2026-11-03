@@ -447,7 +447,7 @@
   display: flex;
   gap: 16px;
   flex-wrap: wrap;
-  padding: 10px 80px;
+  padding: 10px max(32px, calc((100% - 1200px) / 2 + 32px));
   font-size: 12px;
   color: #0f62fe;
   border-bottom: 1px solid #e7ebf2;

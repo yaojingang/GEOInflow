@@ -177,6 +177,7 @@ function projectSharedReport(
     ),
     meta: {
       population: report.meta.population,
+      trendPopulation: report.meta.trendPopulation,
       geographyCoverage: report.meta.geographyCoverage,
       demo: report.meta.demo,
       ...(report.meta.aiCrawlerEnabled !== undefined && {

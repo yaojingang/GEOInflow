@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { formatInTimeZone, fromZonedTime } from 'date-fns-tz';
 
 export function livePageReadAllowed(read, now = Date.now()) {
+  if (read.path === '/api/liekan/admin/analytics-engine') return true;
   if (/^\/api\/(?:realtime\/[^/]+|websites\/[^/]+\/active)$/.test(read.path)) return true;
   if (/^\/api\/liekan\/websites\/[^/]+\/analytics$/.test(read.path) && read.kind === 'realtime') return true;
   if (/^\/api\/liekan\/websites\/[^/]+\/analytics-jobs\/[^/]+(?:\/result)?$/.test(read.path)) return true;
@@ -199,6 +200,7 @@ export function manualPageReads(id, values) {
     teams: [endpoint('/api/teams')],
     'team-detail': [endpoint(`/api/teams/${values.id}`), endpoint(`/api/teams/${values.id}/users`)],
     'admin-users': [endpoint('/api/admin/users')],
+    'admin-analytics-engine': [endpoint('/api/liekan/admin/analytics-engine')],
     'admin-user': [
       endpoint(`/api/users/${values.id}`),
       endpoint(`/api/users/${values.id}/websites`),

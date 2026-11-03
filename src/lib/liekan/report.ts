@@ -51,6 +51,8 @@ import {
 import { humanPathFromEncoded } from './upstream/paths';
 import { LiekanError } from './upstream/server';
 import type { PreparedReport } from './report-prepared';
+import { timeReportQuery } from './upstream/analysis-diagnostics';
+import { readReportFragment } from './upstream/report-fragments';
 
 const pct = (a: number, b: number): number | null => (b ? Math.round((a / b) * 10000) / 100 : null);
 const ratio = (a: number, b: number) => (b ? Math.round((a / b) * 100) / 100 : null);
@@ -123,6 +125,46 @@ export async function buildReport(
             { '30d': 30, '7d': 7, '24h': 1 }[p.chartPeriod] * 86400000,
         ),
   );
+  const module = <T>(
+    kind: Parameters<typeof timeReportQuery>[0],
+    from: Date,
+    until: Date,
+    conditions: unknown,
+    load: () => Promise<T>,
+  ) =>
+    timeReportQuery(kind, () =>
+      fullTableExport ||
+      (kind === 'logs' && (!parts?.logs || parts.logs.some(field => field === 'recent')))
+        ? load()
+        : readReportFragment(
+            kind,
+            from,
+            until,
+            conditions,
+            load,
+            kind === 'human' || kind === 'plot-human' || p.crawlerMetricsVersion !== 1,
+          ),
+    );
+  // These modules consume their own fields and range; chart selection is assembled separately.
+  const logConditions = {
+    timezone: p.timezone,
+    page: p.page,
+    filter: p.filter,
+    search: p.search,
+    cursor: p.cursor,
+    seek: p.seek,
+    fields: parts?.logs,
+    crawlerIdentityScope: p.crawlerIdentityScope,
+    crawlerMetricsVersion: p.crawlerMetricsVersion,
+    botType: p.botType,
+    botId: p.botId,
+    botName: p.botName,
+    botProductForm: p.botProductForm,
+    botCategory: p.botCategory,
+    resource: p.resource,
+    fullTableExport,
+    comparisonBoundary,
+  };
   const [
     rawHuman,
     rawLogs,
@@ -131,61 +173,115 @@ export async function buildReport(
     todayConversions,
     impact,
     months,
-    plotHuman,
+    plotFacts,
     plotLogs,
   ] = await Promise.all([
     prepared?.human ??
-      getHumanFacts(website.id, start, end, p.timezone, parts?.human as readonly HumanFact[]),
-    prepared?.logs ??
-      getLogFacts(
-        website.id,
+      module(
+        'human',
         start,
         end,
-        p.timezone,
-        p.page,
-        p.filter,
-        p.search,
-        p.cursor,
-        p.seek,
-        parts?.logs,
-        p,
-        fullTableExport,
-        comparisonBoundary,
+        {
+          timezone: p.timezone,
+          fields: parts?.human,
+          crawlerContext: pageOnly === true && p.resource.startsWith('ai/'),
+        },
+        () =>
+          getHumanFacts(
+            website.id,
+            start,
+            end,
+            p.timezone,
+            parts?.human as readonly HumanFact[],
+            undefined,
+            { crawlerContext: pageOnly === true && p.resource.startsWith('ai/') },
+          ),
       ),
-    getSettings(website.id),
+    prepared?.logs ??
+      module('logs', start, end, logConditions, () =>
+        getLogFacts(
+          website.id,
+          start,
+          end,
+          p.timezone,
+          p.page,
+          p.filter,
+          p.search,
+          p.cursor,
+          p.seek,
+          parts?.logs,
+          p,
+          fullTableExport,
+          comparisonBoundary,
+        ),
+      ),
+    timeReportQuery('settings', () => getSettings(website.id)),
     needed('overview', 'logs') && (!clock || now > +todayStart)
-      ? getLogToday(website.id, todayStart, new Date(Math.max(+todayStart, now)))
+      ? timeReportQuery('today-logs', () =>
+          getLogToday(website.id, todayStart, new Date(Math.max(+todayStart, now))),
+        )
       : Promise.resolve({ requests: 0, accepted: 0, abnormal: 0 }),
     needed('overview', 'conversions') && (!clock || now > +todayStart)
-      ? getHumanConversions(
-          website.id,
-          todayStart,
-          new Date(Math.max(+todayStart, now)),
-          p.timezone,
+      ? timeReportQuery('today-conversions', () =>
+          getHumanConversions(
+            website.id,
+            todayStart,
+            new Date(Math.max(+todayStart, now)),
+            p.timezone,
+          ),
         )
       : Promise.resolve(0),
-    needed('content') ? getContentImpact(website.id, start, end, p) : Promise.resolve([]),
-    needed('ai/overview') ? getMonthlyAiShare(website.id, end, p.timezone, p) : Promise.resolve([]),
-    needed('overview', 'human/overview')
-      ? getHumanDays(
-          website.id,
-          plotStart,
-          end,
-          p.timezone,
-          ['today', '24h'].includes(p.chartPeriod),
-        )
+    needed('content')
+      ? timeReportQuery('content-impact', () => getContentImpact(website.id, start, end, p))
+      : Promise.resolve([]),
+    needed('ai/overview')
+      ? timeReportQuery('monthly-ai', () => getMonthlyAiShare(website.id, end, p.timezone, p))
       : Promise.resolve([]),
     needed('overview', 'human/overview')
-      ? getPlotLogs(
-          website.id,
+      ? module(
+          'plot-human',
           plotStart,
           end,
-          p.timezone,
-          ['today', '24h'].includes(p.chartPeriod),
-          p,
+          { timezone: p.timezone, hour: ['today', '24h'].includes(p.chartPeriod) },
+          () =>
+            getHumanDays(
+              website.id,
+              plotStart,
+              end,
+              p.timezone,
+              ['today', '24h'].includes(p.chartPeriod),
+            ),
+        )
+      : Promise.resolve({ rows: [], population: undefined }),
+    needed('overview', 'human/overview')
+      ? module(
+          'plot-logs',
+          plotStart,
+          end,
+          {
+            timezone: p.timezone,
+            hour: ['today', '24h'].includes(p.chartPeriod),
+            crawlerIdentityScope: p.crawlerIdentityScope,
+            crawlerMetricsVersion: p.crawlerMetricsVersion,
+          },
+          () =>
+            getPlotLogs(
+              website.id,
+              plotStart,
+              end,
+              p.timezone,
+              ['today', '24h'].includes(p.chartPeriod),
+              p,
+            ),
         )
       : Promise.resolve([]),
   ]);
+  const plotHuman = plotFacts.rows;
+  const trendState: DataState = !identityUsable(plotFacts.population)
+    ? 'unavailable'
+    : plotHuman.length
+      ? 'available'
+      : 'empty';
   const h = stringifySafe(rawHuman),
     l = stringifySafe(rawLogs);
   h.geo = mergeGeography(h.geo);
@@ -211,6 +307,7 @@ export async function buildReport(
     tables: {},
     insights: [],
     meta: {
+      ...(plotFacts.population ? { trendPopulation: plotFacts.population } : {}),
       catalogVersion: getPublishedCatalog()?.version,
       ...(p.resource === 'ai/pages'
         ? {
@@ -593,7 +690,7 @@ export async function buildReport(
         }),
       },
     ],
-    humanState,
+    trendState,
   );
   chart(
     'h2',

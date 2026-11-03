@@ -147,22 +147,17 @@ export async function readWebsiteSummary(request: Request, input: unknown) {
           COUNT(*) FILTER(WHERE e.event_type NOT IN (2,5)) AS c,
           MIN(e.created_at) FILTER(WHERE e.event_type NOT IN (2,5)) AS first_at,
           MAX(e.created_at) FILTER(WHERE e.event_type NOT IN (2,5)) AS last_at,
-          MAX(CASE WHEN e.event_type=2 THEN 1 ELSE 0 END) AS custom
+          MAX(CASE WHEN e.event_type=2 THEN 1 ELSE 0 END) AS custom,
+          MAX(CASE WHEN e.event_type NOT IN (2,5) AND ${channelFilterColumn('e.')}='AI 搜索引荐' THEN 1 ELSE 0 END) AS ai
         FROM website_event e JOIN windows w ON e.created_at BETWEEN w.start_at AND w.end_at
         WHERE e.website_id=ANY($1::uuid[]) AND e.event_type!=5
         GROUP BY 1,2,3,4 HAVING COUNT(*) FILTER(WHERE e.event_type NOT IN (2,5))>0
-      ), ai AS (
-        SELECT e.website_id,w.label,COUNT(DISTINCT e.visit_id) AS "aiVisits"
-        FROM website_event e JOIN windows w ON e.created_at BETWEEN w.start_at AND w.end_at
-        WHERE e.website_id=ANY($1::uuid[]) AND e.event_type NOT IN (2,5)
-          AND ${channelFilterColumn('e.')}='AI 搜索引荐'
-        GROUP BY 1,2
       ), totals AS (
         SELECT v.website_id,v.label,SUM(v.c) AS pageviews,COUNT(DISTINCT v.session_id) AS visitors,COUNT(DISTINCT v.visit_id) AS visits,
           SUM(CASE WHEN v.c=1 AND v.custom=0 THEN 1 ELSE 0 END) AS bounces,SUM(FLOOR(EXTRACT(epoch FROM v.last_at-v.first_at))) AS totaltime,
-          COALESCE(a."aiVisits",0) AS "aiVisits"
-        FROM visits v LEFT JOIN ai a ON a.website_id=v.website_id AND a.label=v.label
-        GROUP BY 1,2,a."aiVisits"
+          COUNT(DISTINCT v.visit_id) FILTER(WHERE v.ai=1) AS "aiVisits"
+        FROM visits v
+        GROUP BY 1,2
       ) SELECT w.website_id AS id,
         COALESCE((SELECT row_to_json(t) FROM totals t WHERE t.website_id=w.website_id AND label='current'),'{}') AS current,
         COALESCE((SELECT row_to_json(t) FROM totals t WHERE t.website_id=w.website_id AND label='previous'),'{}') AS previous,

@@ -232,6 +232,7 @@ try {
         print(
           await seedWarehouseDemo(db, ch, {
             secret: required('APP_SECRET'),
+            automatic: process.argv.includes('--automatic'),
             signal: signal.signal,
             progress: print,
           }),
@@ -314,6 +315,7 @@ try {
             sealed.digest,
             sites,
             existing[0]?.migration_id,
+            sealed.descriptor.sourceFingerprint,
           );
           await db.transaction(async tx => {
             await tx.query(

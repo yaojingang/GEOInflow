@@ -104,8 +104,8 @@ async function saveWebsiteSettings(live: boolean) {
   mocks.live = live;
   const user = userEvent.setup();
   render(<LiekanPage resource={live ? 'logs' : 'ai/overview'} />);
-  await user.click(screen.getByRole('button', { name: live ? '蜘蛛识别规则' : '编辑 robots.txt' }));
-  const label = live ? '保存识别规则' : '保存 robots.txt';
+  await user.click(screen.getByRole('button', { name: live ? '蜘蛛识别规则' : '管理蜘蛛' }));
+  const label = live ? '保存识别规则' : '保存白名单';
   await waitFor(() => expect(screen.getByRole('button', { name: label })).toBeEnabled());
   await user.click(screen.getByRole('button', { name: label }));
   await waitFor(() => expect(mocks.put).toHaveBeenCalledTimes(1));
@@ -146,7 +146,7 @@ it.each([false])(
     await saveWebsiteSettings(live);
     const savedResult = await screen.findByText(/页面状态刷新失败/);
     expect(savedResult.closest('[role="status"]')).toHaveTextContent(
-      live ? '蜘蛛识别规则已保存' : 'robots.txt 已保存',
+      live ? '蜘蛛识别规则已保存' : '白名单已保存',
     );
     expect(mocks.put).toHaveBeenCalledTimes(1);
   },
@@ -164,4 +164,12 @@ it('routes log rule editing to the single catalog manager with its website', asy
   );
   expect(screen.queryByRole('button', { name: '保存识别规则' })).toBeNull();
   expect(mocks.put).not.toHaveBeenCalled();
+});
+
+it('keeps the website header compact with one shared robots entry and crawler management', () => {
+  render(<LiekanPage resource="ai/overview" />);
+  expect(screen.getByRole('button', { name: '管理蜘蛛' })).toBeVisible();
+  expect(screen.getByRole('button', { name: '30 天', pressed: true })).toBeVisible();
+  expect(screen.queryByRole('combobox', { name: '蜘蛛身份范围' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '编辑 robots.txt' })).not.toBeInTheDocument();
 });

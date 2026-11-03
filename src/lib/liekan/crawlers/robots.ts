@@ -312,3 +312,101 @@ export function mergeRobotsPolicy(text: string, input: CrawlerRobotsPolicy): Rob
   }
   return { safe: true, content, fragment, reasons: [] };
 }
+
+/** Apply an explicitly selected directory policy while retaining other crawlers and scopes. */
+export function setRobotsAccess(text: string, input: CrawlerRobotsPolicy): RobotsMergeResult {
+  const policy = crawlerRobotsPolicySchema.parse(input);
+  if (policy.botIds.length !== 1 || policy.paths.length !== 1 || policy.paths[0].match !== 'prefix')
+    throw new Error('Select one crawler and directory');
+  const document = parseRobots(text);
+  const bot = getCrawler(policy.botIds[0]);
+  const token = bot.robotsToken.toLowerCase();
+  const applicable = applicableRobotsGroups(document, bot.robotsToken);
+  const scope = normalizeRobotsOctets(literalRobotsPath(policy.paths[0].value));
+  const rules = applicable.flatMap(group => group.rules);
+  const fallback = mergeRobotsPolicy(text, policy);
+  if (
+    document.issues.length ||
+    applicable.some(group => group.otherDirectives.length) ||
+    (scope !== '/' && rules.some(rule => rule.path.includes('*')))
+  ) {
+    return {
+      safe: false,
+      content: null,
+      fragment: fallback.fragment,
+      reasons: ['Existing malformed, extension or wildcard rules require manual review.'],
+    };
+  }
+  const crossesBoundary = (rule: RobotsRule) =>
+    scope !== '/' &&
+    !scope.endsWith('/') &&
+    !rule.path.endsWith('$') &&
+    normalizeRobotsOctets(rule.path) === scope;
+  if (
+    policy.action === 'block' &&
+    rules.some(rule => rule.directive === 'allow' && crossesBoundary(rule))
+  ) {
+    return {
+      safe: false,
+      content: null,
+      fragment: fallback.fragment,
+      reasons: ['An existing Allow crosses the directory boundary and requires manual review.'],
+    };
+  }
+  const inside = (path: string) => {
+    const normalized = normalizeRobotsOctets(path.replace(/\$$/, ''));
+    return (
+      scope === '/' ||
+      normalized === scope ||
+      normalized.startsWith(scope.endsWith('/') ? scope : `${scope}/`) ||
+      normalized.startsWith(`${scope}?`)
+    );
+  };
+  // An unanchored boundary rule also covers sibling paths such as /docs-other.
+  const retained = rules.filter(rule => crossesBoundary(rule) || !inside(rule.path));
+  const lines = text.split(/\r\n|\n|\r/);
+  const removed = new Set<number>();
+  for (let index = 0; index < document.groups.length; index++) {
+    const group = document.groups[index];
+    if (!group.agents.some(agent => agent.toLowerCase() === token)) continue;
+    const shared = group.agents.some(agent => agent.toLowerCase() !== token);
+    const end = (document.groups[index + 1]?.startLine ?? lines.length + 1) - 1;
+    for (let line = group.startLine; line <= end; line++) {
+      const match = lines[line - 1]
+        .replace(/^\ufeff/, '')
+        .split('#', 1)[0]
+        .match(/^\s*user-agent\s*:\s*(.*?)\s*$/i);
+      if (match?.[1].toLowerCase() === token) removed.add(line);
+    }
+    if (!shared) for (const rule of group.rules) removed.add(rule.line);
+  }
+  let original = lines.filter((_, index) => !removed.has(index + 1)).join(document.newline);
+  const finalGroup = parseRobots(original).groups.at(-1);
+  // An empty Disallow keeps a trailing rule-free group open to all paths and ends its UA list.
+  if (finalGroup && !finalGroup.rules.length)
+    original += `${document.newline}Disallow:${document.newline}`;
+  const path = literalRobotsPath(policy.paths[0].value);
+  const directive = policy.action === 'allow' ? 'Allow' : 'Disallow';
+  const generated = path.endsWith('/')
+    ? [`${directive}: ${path}`]
+    : [`${directive}: ${path}$`, `${directive}: ${path}?`, `${directive}: ${path}/`];
+  const fragment = [
+    `# GEOInflow managed access: ${bot.robotsToken}`,
+    ...(bot.robotsApplicability === 'user_triggered_caveat'
+      ? ['# User-triggered retrieval may not apply robots.txt.']
+      : []),
+    `User-agent: ${bot.robotsToken}`,
+    ...retained.map(rule => `${rule.directive}: ${rule.path}`),
+    ...generated,
+    '',
+  ].join(document.newline);
+  const content = `${original}${document.newline}${document.newline}${fragment}`;
+  if (new TextEncoder().encode(content).length > ROBOTS_MAX_BYTES)
+    return {
+      safe: false,
+      content: null,
+      fragment,
+      reasons: ['Edited file exceeds the 256 KiB limit.'],
+    };
+  return { safe: true, content, fragment, reasons: [] };
+}

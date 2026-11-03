@@ -15,7 +15,15 @@ This guide uses Docker Compose on a single host. See the [local deployment detai
 - Network access to container images, Node dependencies, and geographic database download sources.
 - Sufficient memory and disk space for Docker, builds, PostgreSQL, and the application.
 
-The image pins Node.js 22.23.3 and pnpm 12.3.4. Docker builds configure a Node heap of 3072 MiB; native component builds, the Docker VM, and other services also need memory. Runtime capacity depends on actual log volume, retention, concurrency, and background builds. Measure capacity using your own data.
+The image pins Node.js 22.23.4 and pnpm 12.3.4. Source deployment requires at least **6 GiB total Docker memory**; **8 GiB or more and at least 2 CPUs** are recommended, with free memory reserved for compilation. For Docker Desktop, check the VM allocation. For remote Docker, check the daemon host. The script checks daemon-reported memory before creating configuration, building, or stopping existing services.
+
+```sh
+sh scripts/liekan-deploy.sh --check
+```
+
+This read-only command checks Docker connectivity and the build memory floor. The 6 GiB floor reserves headroom beyond the 3072 MiB Node heap. Other services, native allocations, and compilation peaks still require monitoring; passing this check does not establish sufficient free memory. For a small server, build an image on a separate machine and deploy that same revision to the application and both workers. Measure runtime capacity with your actual log volume, retention, concurrency, and background computation. The memory floor applies to this script's source-build path.
+
+If the host becomes unresponsive or a build exits with code 137, inspect host/Docker memory, disk space, and system OOM logs. On Linux, use `free -h`, `df -h`, and `journalctl -k --since "30 minutes ago"`. Remove credentials and personal information before sharing logs.
 
 New installations use PostgreSQL 16 and Redis 7.4. Existing PostgreSQL 15 instances retain version 15. Changing the database major version requires a separate migration and recovery plan.
 
@@ -40,6 +48,10 @@ Default endpoints:
 
 A fresh installation starts with `admin / liekan`. Change the password after signing in and confirm the country and analytics timezone. Upgrades preserve customized credentials, renamed accounts, and deleted accounts.
 
+Password login uses fixed one-minute limits: 10 attempts per account, 30 per trusted client source, and 120 across the shared instance, with a concurrent verification limit. Rejected attempts return `429` and `Retry-After`; an unavailable configured Redis returns `503`. Counters use `REDIS_URL`, then `LIEKAN_ANALYTICS_REDIS_URL`, or process-local memory when neither is configured. Process restarts and Redis eviction can reset counters, so public ingress should also enforce independent limits. Only explicitly configured trusted ingress headers establish client identities; missing or invalid addresses share one unknown-source quota. Multiple application instances should share Redis, and the ingress proxy must overwrite the trusted address header.
+
+The browser tracker and collector redact known sensitive URL query and fragment parameters while retaining ordinary UTM attribution parameters. This applies to new events; existing records, page titles, and custom properties require separate review. Recording defaults to strict masking when no level is configured, while explicitly saved moderate masking remains supported. Strict masking covers text and inputs; exclude sensitive elements or omit the recorder from sensitive pages.
+
 Repeated deployments preserve the existing `.env`, database credentials, and data volumes. If an existing database volume is found without its original configuration, the script stops and asks for that configuration to be restored. Upgrades retain the original database container and image major version to avoid an unintended storage-version change.
 
 Commands in this guide explicitly use `docker-compose.liekan.yml`. Other Docker files at the repository root retain upstream compatibility uses. Standard deployments use the product deployment script.
@@ -63,13 +75,13 @@ docker compose -f docker-compose.liekan.yml logs --tail=100 analytics-worker
 
 Log receipt and processing, statistics queries, and historical builds run through different workers. If receipt succeeds before analytics updates, check processing status, queues, and the data cutoff.
 
-## Initialize the optional example
+## Official example initialization
 
 ```sh
 docker compose -f docker-compose.liekan.yml exec app node scripts/liekan-seed-demo.mjs
 ```
 
-The example is named “猎看官网（示例数据）” and is explicitly labeled as demo data. The first import shifts timestamps; repeated imports preserve existing data and deletion state. Connect real inputs for production websites using the [quick start](getting-started.en.md).
+Docker startup imports “猎看官网（示例数据）” after migrations on a fresh installation. Use the command above for manual development or an explicit retry. Source and Docker images carry the complete sanitized dataset, catalog, and checksum manifest. The first import shifts timestamps; repeated imports preserve existing data, customized resources, and cleared or deleted state. Connect real inputs for production websites using the [quick start](getting-started.en.md).
 
 ## Domain, HTTPS, and trusted ingress
 

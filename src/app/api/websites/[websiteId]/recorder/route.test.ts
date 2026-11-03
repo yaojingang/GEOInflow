@@ -20,6 +20,19 @@ beforeEach(() => {
 });
 
 describe('recorder config route CORS', () => {
+  test.each([undefined, 'moderate', 'strict'])(
+    'defaults to strict while preserving explicit %s',
+    async maskLevel => {
+      getWebsiteMock.mockResolvedValue({
+        recorderEnabled: true,
+        replayConfig: { replayEnabled: true, maskLevel },
+      } as any);
+      const response = await GET(new Request('http://localhost/api/websites/test/recorder'), {
+        params: Promise.resolve({ websiteId: '11111111-1111-4111-8111-111111111111' }),
+      });
+      expect((await response.json()).maskLevel).toBe(maskLevel ?? 'strict');
+    },
+  );
   test('handles preflight requests', async () => {
     const response = OPTIONS();
 

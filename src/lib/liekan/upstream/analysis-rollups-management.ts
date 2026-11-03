@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { lockWritableWebsite, LiekanError, type WriteIdentity } from './server';
 import { bumpAnalyticsRevision } from './analytics-revision';
 import { analysisCapacity, analysisTransaction, analysisVersions } from './analysis-rollups-db';
+import { hasAnalysisBuildCapacity } from './storage-capacity';
 import {
   analysisBuildDto,
   analysisHash,
@@ -122,10 +123,7 @@ export async function createAnalysisBuild(
     expectRevision(site.revision, input.expectedRevision);
     if (site.mode !== 'live') throw new LiekanError('请先启用统计加速', 409, 'analysis-disabled');
     const capacity = await analysisCapacity(tx, websiteId);
-    if (
-      BigInt(capacity.siteBytes) >= BigInt(capacity.siteLimit) ||
-      BigInt(capacity.globalBytes) >= BigInt(capacity.globalLimit)
-    )
+    if (!hasAnalysisBuildCapacity(capacity))
       throw new LiekanError('统计加速存储已达到容量保护阈值', 409, 'analysis-capacity-limited');
     const [build] = await tx.$queryRawUnsafe<AnalysisBuildRow[]>(
       `INSERT INTO liekan_analysis_build(id,website_id,actor_id,epoch,range_start,range_end,timezone,locale,request_id,request_hash,status,work_total,checkpoint)
@@ -250,7 +248,7 @@ export async function actionAnalysisBuild(
           mode,
         );
         await tx.$executeRawUnsafe(
-          `UPDATE liekan_analysis_build SET status='invalidated',lease_token=NULL,lease_until=NULL,error_code='analysis-mode-changed',revision=revision+1,updated_at=clock_timestamp() WHERE website_id=$1::uuid AND status IN('queued','running','paused')`,
+          `UPDATE liekan_analysis_build SET status='invalidated',lease_token=NULL,lease_until=NULL,error_code='analysis-mode-changed',revision=revision+1,updated_at=clock_timestamp() WHERE website_id=$1::uuid AND status IN('queued','running','paused','failed','capacity_limited')`,
           websiteId,
         );
         await bumpAnalyticsRevision(tx, 'website', websiteId);

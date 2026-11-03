@@ -26,7 +26,7 @@ beforeEach(() => {
     JSON.stringify({
       version: '1.0.0',
       protocol: 1,
-      runtime: '22.23.3',
+      runtime: '22.23.4',
       installerSha256: sha(files.get('install.sh')!),
       platforms: Object.fromEntries(
         ['x64', 'arm64'].map(arch => [

@@ -21,7 +21,7 @@
 
 ## 本地开发
 
-使用 `.nvmrc` 固定的 Node.js 22.23.3 与 pnpm 12.3.4，准备独立 PostgreSQL 15 / 16 开发数据库。`.env` 根据 `env.example` 配置并保留为私有文件，原有部署的配置与数据库继续保持独立。
+使用 `.nvmrc` 固定的 Node.js 22.23.4 与 pnpm 12.3.4，准备独立 PostgreSQL 15 / 16 开发数据库。`.env` 根据 `env.example` 配置并保留为私有文件，原有部署的配置与数据库继续保持独立。
 
 ```sh
 pnpm install --frozen-lockfile

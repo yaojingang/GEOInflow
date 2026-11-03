@@ -764,7 +764,7 @@ describe('core form flows', () => {
           heatmapEnabled: false,
           sampleRate: 0.5,
           heatmapSampleRate: 0.15,
-          maskLevel: 'moderate',
+          maskLevel: 'strict',
           maxDuration: 600000,
           blockSelector: '',
         },
@@ -1219,7 +1219,9 @@ describe('core form flows', () => {
     };
     mocks.context.query = { section: 'install' };
     render(<CorePages page="website-settings" />);
-    expect(screen.getByText('设置已完成')).toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', { name: '接入设置已保存', level: 3 }),
+    ).toBeInTheDocument();
     expect(screen.getAllByText('检查已延后')).toHaveLength(2);
     expect(screen.getByRole('link', { name: '服务器安装页面' })).toHaveAttribute(
       'href',

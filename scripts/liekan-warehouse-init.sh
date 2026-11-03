@@ -10,5 +10,5 @@ node scripts/liekan-queue-bootstrap.mjs
 node dist/liekan-warehouse-command.mjs install --mode "$LIEKAN_INSTALL_MODE"
 
 if [ "$LIEKAN_INSTALL_MODE" = fresh ] && [ "${LIEKAN_SEED_DEMO:-true}" = true ]; then
-  node dist/liekan-warehouse-command.mjs seed-demo
+  node dist/liekan-warehouse-command.mjs seed-demo --automatic
 fi

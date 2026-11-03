@@ -264,6 +264,8 @@ try {
     sealed.descriptor.snapshotId,
     sealed.digest,
     { [site]: '0' },
+    undefined,
+    sealed.descriptor.sourceFingerprint,
   );
   await db.transaction(async tx => {
     await tx.query(
