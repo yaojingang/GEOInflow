@@ -181,6 +181,44 @@ it('keeps a ready status separate from fetching the result and rejects malformed
   });
   expect(m.read).toHaveBeenCalledTimes(1);
 });
+it.each([false, true])(
+  'returns retry guidance for a polling lock timeout, result=%s',
+  async result => {
+    const failure = {
+      code: 'P2010',
+      meta: {
+        driverAdapterError: { cause: { originalCode: '55P03', originalMessage: 'private query' } },
+      },
+    };
+    m.read.mockRejectedValue(failure);
+    const response = await analysisJobResponse(request(), site, id, result);
+    expect(response.status).toBe(503);
+    expect(response.headers.get('Retry-After')).toBe('3');
+    expect(response.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(await response.json()).toEqual({
+      error: {
+        status: 503,
+        code: 'analysis-read-busy',
+        message: '统计数据暂时不可读取，请稍后重试',
+      },
+    });
+    expect(m.request).not.toHaveBeenCalled();
+  },
+);
+it.each([{ code: '55P03' }, { meta: { code: '55P03' } }, { cause: { code: '55P03' } }])(
+  'recognizes supported PostgreSQL lock error envelopes: %j',
+  async failure => {
+    m.read.mockRejectedValue(failure);
+    expect((await analysisJobResponse(request(), site, id)).status).toBe(503);
+  },
+);
+it.each([{ status: 403 }, { code: '57014' }, { code: '23505' }, new Error('unknown failure')])(
+  'preserves non-lock failures: %j',
+  async failure => {
+    m.read.mockRejectedValue(failure);
+    await expect(analysisJobResponse(request(), site, id)).rejects.toBe(failure);
+  },
+);
 it('preserves link and pixel synchronous routing', () => {
   for (const eventType of [3, 4])
     expect(

@@ -3,8 +3,7 @@ import { storageHistorySiteAllowedSql } from './storage-capacity';
 
 export const ANALYSIS_ROLLUP_VERSION = 'analysis-rollups-v4';
 export const ANALYSIS_CHUNK_SIZE = 2000;
-export const ANALYSIS_SITE_LIMIT = 1024 ** 3;
-export const ANALYSIS_GLOBAL_LIMIT = 8 * 1024 ** 3;
+export { ANALYSIS_SITE_LIMIT, ANALYSIS_GLOBAL_LIMIT } from './analysis-storage-limits';
 /** Keep today's short recovery units ahead of retained history within each site. */
 export const analysisBuildPrioritySql = `CASE
  WHEN b.actor_id IS NULL AND NOT b.automatic_history

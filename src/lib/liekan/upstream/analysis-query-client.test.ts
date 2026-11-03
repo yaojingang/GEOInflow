@@ -48,6 +48,69 @@ it('polls status at a bounded interval and fetches the final data once', async (
   expect(fetchJob.mock.calls.at(-1)[0]).toBe(job.resultUrl);
   expect(analysisPendingStore.snapshot()).toBe('[]');
 });
+it.each(['status', 'result'])(
+  'retains the same task through a retryable %s lock timeout',
+  async phase => {
+    const busy = () =>
+      Response.json(
+        { error: { code: 'analysis-read-busy' } },
+        { status: 503, headers: { 'Retry-After': '4' } },
+      );
+    const fetchJob = vi.fn();
+    if (phase === 'status') fetchJob.mockResolvedValueOnce(busy());
+    else
+      fetchJob
+        .mockResolvedValueOnce(Response.json({ analysisJob: { ...job, status: 'ready' } }))
+        .mockResolvedValueOnce(busy());
+    fetchJob
+      .mockResolvedValueOnce(Response.json({ analysisJob: { ...job, status: 'ready' } }))
+      .mockResolvedValueOnce(Response.json({ pageviews: 12 }));
+    const releaseJob = vi.fn(async () => {});
+    const pending = followAnalysisJob({ analysisJob: job }, { fetchJob, releaseJob });
+    const settled = vi.fn();
+    void pending.then(settled, settled);
+    await vi.advanceTimersByTimeAsync(3000);
+    const calls = fetchJob.mock.calls.length;
+    expect(settled).not.toHaveBeenCalled();
+    expect(releaseJob).not.toHaveBeenCalled();
+    expect(JSON.parse(analysisPendingStore.snapshot())[0].job.id).toBe(id);
+    await vi.advanceTimersByTimeAsync(3999);
+    expect(fetchJob).toHaveBeenCalledTimes(calls);
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await pending).data).toEqual({ pageviews: 12 });
+    expect(releaseJob).toHaveBeenCalledOnce();
+  },
+);
+it.each([401, 403, 410, 500, 503])('stops for non-retryable HTTP %s', async status => {
+  const fetchJob = vi.fn(async () =>
+    Response.json({ error: { code: 'analysis-failed' } }, { status }),
+  );
+  const pending = followAnalysisJob({ analysisJob: job }, { fetchJob });
+  const assertion = expect(pending).rejects.toMatchObject({ status, code: 'analysis-failed' });
+  await vi.advanceTimersByTimeAsync(3000);
+  await assertion;
+  expect(fetchJob).toHaveBeenCalledOnce();
+});
+it('aborts a transient lock retry and releases only the current viewer', async () => {
+  const controller = new AbortController();
+  const fetchJob = vi.fn(async () =>
+    Response.json({ error: { code: 'analysis-read-busy' } }, { status: 503 }),
+  );
+  const releaseJob = vi.fn(async () => {});
+  const pending = followAnalysisJob(
+    { analysisJob: job },
+    { fetchJob, releaseJob, signal: controller.signal },
+  );
+  const assertion = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(fetchJob).toHaveBeenCalledOnce();
+  controller.abort();
+  await assertion;
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(fetchJob).toHaveBeenCalledOnce();
+  expect(releaseJob).toHaveBeenCalledWith(job.resultUrl.replace(/\/result$/, ''));
+  expect(analysisPendingStore.snapshot()).toBe('[]');
+});
 it('pauses hidden tabs and aborts the consumer without deleting server work', async () => {
   vi.mocked(vi.spyOn(document, 'visibilityState', 'get')).mockReturnValue('hidden');
   const controller = new AbortController(),
