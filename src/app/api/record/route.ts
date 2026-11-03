@@ -17,6 +17,8 @@ import { badRequest, forbidden, json, payloadTooLarge, serverError } from '@/lib
 import { getWebsite } from '@/queries/prisma';
 import { saveRecording } from '@/queries/sql';
 import { saveHeatmapEvents } from '@/queries/sql/heatmap/saveHeatmapEvents';
+import { sanitizeReplayEvents } from '@/recorder/privacy';
+import { sanitizeCollectionUrl } from '@/tracker/privacy';
 
 interface Cache {
   sessionId: string;
@@ -74,9 +76,13 @@ const schema = z.discriminatedUnion('type', [
 
 function getUrlPath(url: string) {
   try {
-    return new URL(url).pathname || '/';
+    return (
+      new URL(
+        sanitizeCollectionUrl(url, url.startsWith('/') ? 'https://privacy.invalid' : undefined),
+      ).pathname || '/'
+    );
   } catch {
-    return url.startsWith('/') ? url.split(/[?#]/)[0] || '/' : '/';
+    return '/';
   }
 }
 
@@ -207,7 +213,7 @@ export async function POST(request: Request) {
         sessionId,
         visitId,
         chunkIndex,
-        events,
+        events: sanitizeReplayEvents(events),
         eventCount: getReplayEventCount(events),
         startedAt,
         endedAt,

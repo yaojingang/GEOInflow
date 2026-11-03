@@ -467,7 +467,7 @@ async function collect(request: Request) {
         }
       } else if (type === COLLECTION_TYPE.performance) {
         const base = hostname ? `https://${hostname}` : 'https://localhost';
-        const currentUrl = new URL(url, base);
+        const currentUrl = new URL(sanitizeCollectionUrl(url, base));
         const urlPath = currentUrl.pathname === '/undefined' ? '' : currentUrl.pathname;
 
         await writer.saveEvent({

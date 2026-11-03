@@ -2402,9 +2402,11 @@
     },
     {
       "path": "src/app/api/record/route.test.ts",
-      "purpose": "Regression coverage for upstream recorder compatibility and warehouse collection dispatch",
+      "purpose": "Regression coverage for upstream recorder compatibility and warehouse collection dispatch; Redact replay and heatmap URLs before buffering and fragmentation and at collector persistence; retain replay structure, geometry and legacy fragment compatibility",
       "tests": [
-        "pnpm exec vitest run src/app/api/record/route.test.ts"
+        "pnpm exec vitest run src/app/api/record/route.test.ts",
+        "pnpm exec vitest run src/recorder/privacy.test.ts src/app/api/record/route.test.ts src/lib/replay.test.ts",
+        "pnpm build:recorder"
       ],
       "owner": "Liekan warehouse maintenance",
       "constraint": "Keep original recorder protocol compatible and do not allow public payloads to bypass source authority",
@@ -2412,10 +2414,13 @@
     },
     {
       "path": "src/app/api/record/route.ts",
-      "purpose": "Liekan warehouse collection and reporting adapter; route Liekan collection and reads through versioned warehouse packages and reports",
+      "purpose": "Liekan warehouse collection and reporting adapter; route Liekan collection and reads through versioned warehouse packages and reports; Redact replay and heatmap URLs before buffering and fragmentation and at collector persistence; retain replay structure, geometry and legacy fragment compatibility",
       "tests": [
         "tests/liekan/warehouse-reporting.integration.ts",
-        "tests/liekan/warehouse-consumer.integration.ts"
+        "tests/liekan/warehouse-consumer.integration.ts",
+        "pnpm exec vitest run src/recorder/privacy.test.ts src/app/api/record/route.test.ts src/lib/replay.test.ts",
+        "pnpm build:recorder",
+        "WAREHOUSE_SCHEMA_TEST=isolated-round2 pnpm exec tsx tests/liekan/warehouse-privacy.integration.ts"
       ],
       "owner": "Liekan warehouse maintenance",
       "constraint": "Preserve upstream API, UI and other database behavior; CH facts use accepted publication and quality boundaries",
@@ -2458,11 +2463,12 @@
     },
     {
       "path": "src/app/api/send/route.test.ts",
-      "purpose": "Preserve cookieless Umami collection while verifying exact event deduplication and uniform traffic quality; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "Preserve cookieless Umami collection while verifying exact event deduplication and uniform traffic quality; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; redact sensitive URL and referrer path segments at browser send and collector storage boundaries while preserving raw navigation identity",
       "tests": [
         "pnpm liekan:verify",
         "Isolated traffic quality database integration",
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "pnpm exec vitest run src/tracker/privacy.test.ts src/tracker/index.test.ts src/app/api/send/route.test.ts"
       ],
       "owner": "Liekan collection compatibility",
       "constraint": "Preserve existing SDK fields, response shapes, legitimate refreshes and original raw analytics rows",
@@ -2477,7 +2483,8 @@
         "pnpm test:crawler-evidence",
         "pnpm exec vitest run src/lib/liekan/upstream/warehouse-collection-package.test.ts",
         "Isolated warehouse real collector and recovery integration",
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "WAREHOUSE_SCHEMA_TEST=isolated-round2 pnpm exec tsx tests/liekan/warehouse-privacy.integration.ts"
       ],
       "owner": "Liekan collection compatibility",
       "constraint": "Preserve old SDK payloads, response shapes, legitimate refreshes, authorized server transport and original raw analytics; missing automation evidence never proves human identity",
@@ -6402,9 +6409,11 @@
     },
     {
       "path": "src/recorder/index.js",
-      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; Redact replay and heatmap URLs before buffering and fragmentation and at collector persistence; retain replay structure, geometry and legacy fragment compatibility",
       "tests": [
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "pnpm exec vitest run src/recorder/privacy.test.ts src/app/api/record/route.test.ts src/lib/replay.test.ts",
+        "pnpm build:recorder"
       ],
       "owner": "Liekan security maintenance",
       "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
@@ -6412,9 +6421,11 @@
     },
     {
       "path": "src/recorder/privacy.test.ts",
-      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; Redact replay and heatmap URLs before buffering and fragmentation and at collector persistence; retain replay structure, geometry and legacy fragment compatibility",
       "tests": [
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "pnpm exec vitest run src/recorder/privacy.test.ts src/app/api/record/route.test.ts src/lib/replay.test.ts",
+        "pnpm build:recorder"
       ],
       "owner": "Liekan security maintenance",
       "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
@@ -6477,11 +6488,12 @@
     },
     {
       "path": "src/tracker/index.test.ts",
-      "purpose": "Preserve cookieless collection, exact event deduplication and uniform quality; retain positive WebDriver and public request UA automation evidence; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "Preserve cookieless collection, exact event deduplication and uniform quality; retain positive WebDriver and public request UA automation evidence; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; redact sensitive URL and referrer path segments at browser send and collector storage boundaries while preserving raw navigation identity",
       "tests": [
         "pnpm liekan:verify",
         "Isolated traffic quality database integration",
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "pnpm exec vitest run src/tracker/privacy.test.ts src/tracker/index.test.ts src/app/api/send/route.test.ts"
       ],
       "owner": "Liekan collection compatibility",
       "constraint": "Preserve old SDK payloads, response shapes, legitimate refreshes, authorized server transport and original raw analytics; missing automation evidence never proves human identity",
@@ -6512,9 +6524,10 @@
     },
     {
       "path": "src/tracker/privacy.test.ts",
-      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; redact sensitive URL and referrer path segments at browser send and collector storage boundaries while preserving raw navigation identity",
       "tests": [
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "pnpm exec vitest run src/tracker/privacy.test.ts src/tracker/index.test.ts src/app/api/send/route.test.ts"
       ],
       "owner": "Liekan security maintenance",
       "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
@@ -6522,9 +6535,11 @@
     },
     {
       "path": "src/tracker/privacy.ts",
-      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; redact sensitive URL and referrer path segments at browser send and collector storage boundaries while preserving raw navigation identity",
       "tests": [
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "pnpm exec vitest run src/tracker/privacy.test.ts src/tracker/index.test.ts src/app/api/send/route.test.ts",
+        "WAREHOUSE_SCHEMA_TEST=isolated-round2 pnpm exec tsx tests/liekan/warehouse-privacy.integration.ts"
       ],
       "owner": "Liekan security maintenance",
       "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
@@ -6893,6 +6908,29 @@
       "owner": "Liekan automatic logs maintenance",
       "constraint": "Keep the existing browser test environment unchanged",
       "removalCondition": "Remove when the primary test configuration supports explicit multi-environment projects"
+    },
+    {
+      "path": "src/recorder/privacy.ts",
+      "purpose": "Redact replay and heatmap URLs before buffering and fragmentation and at collector persistence; retain replay structure, geometry and legacy fragment compatibility",
+      "tests": [
+        "pnpm exec vitest run src/recorder/privacy.test.ts src/app/api/record/route.test.ts src/lib/replay.test.ts",
+        "pnpm build:recorder",
+        "WAREHOUSE_SCHEMA_TEST=isolated-round2 pnpm exec tsx tests/liekan/warehouse-privacy.integration.ts"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve recorder masking, node IDs, geometry, fragment protocol and historical data; document incomplete legacy fragment limits",
+      "removalCondition": "Remove when upstream provides equivalent URL privacy with passing replay and heatmap regressions"
+    },
+    {
+      "path": "rollup.recorder.config.js",
+      "purpose": "Redact replay and heatmap URLs before buffering and fragmentation and at collector persistence; retain replay structure, geometry and legacy fragment compatibility",
+      "tests": [
+        "pnpm exec vitest run src/recorder/privacy.test.ts src/app/api/record/route.test.ts src/lib/replay.test.ts",
+        "pnpm build:recorder"
+      ],
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve recorder masking, node IDs, geometry, fragment protocol and historical data; document incomplete legacy fragment limits",
+      "removalCondition": "Remove when upstream provides equivalent URL privacy with passing replay and heatmap regressions"
     }
   ]
 }

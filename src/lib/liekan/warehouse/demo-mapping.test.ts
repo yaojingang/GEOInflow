@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { gunzipSync, gzipSync } from 'node:zlib';

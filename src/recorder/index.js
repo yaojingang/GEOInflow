@@ -1,4 +1,6 @@
 import { addCustomEvent, record } from 'rrweb';
+import { sanitizeTrackerUrl } from '../tracker/privacy';
+import { sanitizeReplayEvent } from './privacy';
 
 (window => {
   const { document } = window;
@@ -282,6 +284,7 @@ import { addCustomEvent, record } from 'rrweb';
   const queueHeatmapEvent = event => {
     heatmapBuffer.push({
       ...event,
+      url: sanitizeTrackerUrl(event.url),
       timestamp: Date.now(),
     });
 
@@ -442,6 +445,10 @@ import { addCustomEvent, record } from 'rrweb';
           stopReplay();
           return;
         }
+
+        // URL metadata and DOM attributes are outside rrweb's input/text masks.
+        // Clean the complete event before size checks and opaque fragmentation.
+        event = sanitizeReplayEvent(event);
 
         if (isReplayFullSnapshot(event)) {
           flushReplay();
