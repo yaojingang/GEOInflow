@@ -141,6 +141,36 @@ describe.skipIf(!enabled)('durable private query lifecycle in PostgreSQL', () =>
       }
     },
   );
+  it('keeps a polling handle intact while website authorization is locked', async () => {
+    const task = await request();
+    if (task.ready === true) throw new Error('expected cold fixture');
+    const url = new URL(process.env.DATABASE_URL);
+    const schema = url.searchParams.get('schema');
+    url.searchParams.delete('schema');
+    const blocker = new Client({ connectionString: url.toString() });
+    await blocker.connect();
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query(`SET LOCAL search_path TO "${schema}"`);
+      await blocker.query('SELECT website_id FROM website WHERE website_id=$1 FOR UPDATE', [site]);
+      let failure: any;
+      try {
+        await withPublishedRegistry(() => readAnalysisQuery(site, actor, task.analysisJob.id));
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeDefined();
+      expect(failure?.meta?.driverAdapterError?.cause?.originalCode ?? failure?.meta?.code ?? failure?.code).toBe('55P03');
+      await blocker.query('ROLLBACK');
+      expect(await withPublishedRegistry(() => readAnalysisQuery(site, actor, task.analysisJob.id))).toMatchObject({
+        analysisJob: { id: task.analysisJob.id, status: 'queued' },
+      });
+      expect((await q('SELECT attempts FROM liekan_analysis_query WHERE id=$1::uuid', task.analysisJob.id))[0].attempts).toBe(0);
+    } finally {
+      await blocker.query('ROLLBACK');
+      await blocker.end();
+    }
+  }, 10000);
   it('verifies quota when the retry deadline elapses between refusal and caller handling', async () => {
     await request();
     await request({ endAt: parameters.endAt + 1000 });

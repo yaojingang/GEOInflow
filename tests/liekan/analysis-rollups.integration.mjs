@@ -20,6 +20,7 @@ if (retainFixture && !firstLoadBenchmark)
   throw new Error('Retention requires --first-load-benchmark');
 const scopeC = args.includes('--scope-c');
 const scopeReads = args.includes('--scope-reads');
+const scopeCapacity = args.includes('--scope-capacity');
 if ([benchmark, captureBenchmark, dashboardBenchmark].filter(Boolean).length > 1)
   throw new Error('Select one benchmark mode');
 let rows = 1000000,
@@ -36,6 +37,7 @@ for (let index = 0; index < args.length; index++) {
       '--retain-fixture',
       '--scope-c',
       '--scope-reads',
+      '--scope-capacity',
     ].includes(args[index])
   )
     continue;
@@ -80,7 +82,7 @@ for (let index = 0; index < args.length; index++) {
     continue;
   }
   throw new Error(
-    'Usage: node tests/liekan/analysis-rollups.integration.mjs [--scope-c|--scope-reads|--benchmark|--capture-benchmark|--dashboard-benchmark --rows 10000|1000000|10000000|--first-load-benchmark --log-rows 30000|9000000 --browser-rows 900|9000|90000 --retain-fixture] [--candidate-image image] [--baseline-image image] [--distribution uniform|hotspot80]',
+    'Usage: node tests/liekan/analysis-rollups.integration.mjs [--scope-c|--scope-reads|--scope-capacity|--benchmark|--capture-benchmark|--dashboard-benchmark --rows 10000|1000000|10000000|--first-load-benchmark --log-rows 30000|9000000 --browser-rows 900|9000|90000 --retain-fixture] [--candidate-image image] [--baseline-image image] [--distribution uniform|hotspot80]',
   );
 }
 if (
@@ -89,10 +91,12 @@ if (
 )
   throw new Error('Benchmark rows must be 10000 (smoke), 1000000, or 10000000');
 if (
-  (scopeC || scopeReads) &&
+  (scopeC || scopeReads || scopeCapacity) &&
   (benchmark || captureBenchmark || dashboardBenchmark || baselineImage)
 )
-  throw new Error('--scope-c is a focused correctness run');
+  throw new Error('Scoped correctness runs cannot include benchmarks');
+if ([scopeC, scopeReads, scopeCapacity].filter(Boolean).length > 1)
+  throw new Error('Select one correctness scope');
 if (baselineImage && !dashboardBenchmark)
   throw new Error('--baseline-image requires --dashboard-benchmark');
 if (distribution && (!dashboardBenchmark || !['uniform', 'hotspot80'].includes(distribution)))
@@ -326,7 +330,14 @@ try {
   await run('pnpm', ['exec', 'prisma', 'migrate', 'deploy']);
   await run('node', ['scripts/liekan-migrate.mjs']);
   await run('node', ['scripts/liekan-migrate.mjs']);
-  if (!benchmark && !captureBenchmark && !dashboardBenchmark && !scopeC && !scopeReads) {
+  if (
+    !benchmark &&
+    !captureBenchmark &&
+    !dashboardBenchmark &&
+    !scopeC &&
+    !scopeReads &&
+    !scopeCapacity
+  ) {
     await verifyAnalysisUpgradeHistories({ run, env, folder });
     const browser = await run(
       'pnpm',
@@ -424,33 +435,46 @@ try {
         ? ['src/lib/liekan/upstream/analysis-capture.benchmark.test.ts']
         : benchmark
           ? ['src/lib/liekan/upstream/analysis-rollups.benchmark.test.ts']
-          : scopeReads
+          : scopeCapacity
             ? [
+                'src/lib/liekan/upstream/analysis-capacity.integration.test.ts',
                 'src/lib/liekan/upstream/analysis-queries.integration.test.ts',
-                'src/lib/liekan/upstream/dashboard-snapshots.integration.test.ts',
-                'src/lib/liekan/upstream/dashboard-scheduling.integration.test.ts',
               ]
-            : scopeC
+            : scopeReads
               ? [
-                  'src/lib/liekan/upstream/analysis-rollups.integration.test.ts',
                   'src/lib/liekan/upstream/analysis-queries.integration.test.ts',
                   'src/lib/liekan/upstream/dashboard-snapshots.integration.test.ts',
                   'src/lib/liekan/upstream/dashboard-scheduling.integration.test.ts',
-                  'src/lib/liekan/upstream/bounded-browser-events.integration.test.ts',
-                  'src/lib/liekan/upstream/visit-build-paging.integration.test.ts',
+                  'src/lib/liekan/upstream/report-fragments.integration.test.ts',
+                  'src/lib/liekan/upstream/analytics-input-summary.integration.test.ts',
                 ]
-              : [
-                  'src/lib/liekan/upstream/analysis-ingestion.integration.test.ts',
-                  'src/lib/liekan/upstream/analysis-revenue.integration.test.ts',
-                  'src/lib/liekan/upstream/analysis-population.integration.test.ts',
-                  'src/lib/liekan/upstream/analysis-rollups.integration.test.ts',
-                  'src/lib/liekan/upstream/analysis-queries.integration.test.ts',
-                  'src/lib/liekan/upstream/dashboard-snapshots.integration.test.ts',
-                  'src/lib/liekan/upstream/dashboard-scheduling.integration.test.ts',
-                  'src/lib/liekan/upstream/bounded-browser-events.integration.test.ts',
-                  'src/lib/liekan/upstream/browser-detail-facts.integration.test.ts',
-                  'src/lib/liekan/upstream/visit-build-paging.integration.test.ts',
-                ];
+              : scopeC
+                ? [
+                    'src/lib/liekan/upstream/analysis-rollups.integration.test.ts',
+                    'src/lib/liekan/upstream/analysis-capacity.integration.test.ts',
+                    'src/lib/liekan/upstream/analysis-queries.integration.test.ts',
+                    'src/lib/liekan/upstream/dashboard-snapshots.integration.test.ts',
+                    'src/lib/liekan/upstream/dashboard-scheduling.integration.test.ts',
+                    'src/lib/liekan/upstream/report-fragments.integration.test.ts',
+                    'src/lib/liekan/upstream/analytics-input-summary.integration.test.ts',
+                    'src/lib/liekan/upstream/bounded-browser-events.integration.test.ts',
+                    'src/lib/liekan/upstream/visit-build-paging.integration.test.ts',
+                  ]
+                : [
+                    'src/lib/liekan/upstream/analysis-ingestion.integration.test.ts',
+                    'src/lib/liekan/upstream/analysis-revenue.integration.test.ts',
+                    'src/lib/liekan/upstream/analysis-population.integration.test.ts',
+                    'src/lib/liekan/upstream/analysis-rollups.integration.test.ts',
+                    'src/lib/liekan/upstream/analysis-capacity.integration.test.ts',
+                    'src/lib/liekan/upstream/analysis-queries.integration.test.ts',
+                    'src/lib/liekan/upstream/dashboard-snapshots.integration.test.ts',
+                    'src/lib/liekan/upstream/dashboard-scheduling.integration.test.ts',
+                    'src/lib/liekan/upstream/bounded-browser-events.integration.test.ts',
+                    'src/lib/liekan/upstream/browser-detail-facts.integration.test.ts',
+                    'src/lib/liekan/upstream/report-fragments.integration.test.ts',
+                    'src/lib/liekan/upstream/analytics-input-summary.integration.test.ts',
+                    'src/lib/liekan/upstream/visit-build-paging.integration.test.ts',
+                  ];
   await run(
     'pnpm',
     [

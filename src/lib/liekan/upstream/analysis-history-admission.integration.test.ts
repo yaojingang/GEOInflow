@@ -104,6 +104,9 @@ describe.skipIf(!enabled)(
       CREATE TABLE liekan_analysis_meter(website_id uuid,bytes bigint);
       CREATE TABLE liekan_analysis_query(id uuid PRIMARY KEY,website_id uuid,status text,target text,attempts integer,result_bytes bigint);
       CREATE TABLE liekan_dashboard_snapshot(job_id uuid,last_read_at timestamptz,website_id uuid,result_bytes bigint);
+      CREATE TABLE liekan_report_fragment(website_id uuid,result_bytes bigint);
+      CREATE TABLE liekan_analytics_input_summary(website_id uuid);
+      CREATE TABLE liekan_analytics_input_state(website_id uuid);
       CREATE TABLE liekan_geo_weight_head(task_status text);
       CREATE TABLE liekan_history_repair_run(status text);
       CREATE TABLE history_test_capacity(id boolean PRIMARY KEY CHECK(id),bytes bigint NOT NULL);

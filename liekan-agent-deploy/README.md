@@ -78,8 +78,21 @@ docker compose -f docker-compose.server.yml build --build-arg BASE_IMAGE=docker.
 
 - 配对码 10 分钟内有效、只能消耗一次。容器首次启动且状态目录为空时自动用它换取长期接收凭据；配对成功后该码即失效，可从 `.env` 删除。
 - 长期接收凭据只保存在 `state/<来源ID>/config.json`（权限 0600），不会进入 `.env`、容器编排或镜像。
-- 日常重启、升级镜像都不需要重新配对。只有接入新网站、后台断开连接后重连、或 `state/` 目录丢失时，才需要重新生成配对码。
+- 日常重启、升级镜像都不需要重新配对。已有配置会继续使用原凭据；后台断开后按下方步骤显式重连。接入新网站时使用独立的部署目录和状态目录。
 - 配对失败（码过期、已使用或网站不符）时容器会退出并在日志中说明原因：重新生成配对码、更新 `.env` 后执行 `docker compose up -d` 重建容器。
+
+## 后台断开后的重连
+
+在后台为原网站生成新配对码，更新 `.env` 中的 `LIEKAN_PAIRING_CODE`，保留接收地址、网站标识、日志路径和整个 `state/` 目录，然后执行：
+
+```sh
+docker compose stop collector &&
+docker compose run --rm -T --no-deps --entrypoint sh collector -c \
+  'printf "%s" "$LIEKAN_PAIRING_CODE" | node /app/container.mjs pair' &&
+  docker compose up -d --force-recreate
+```
+
+源码构建方式在以上每条 `docker compose` 命令后加 `-f docker-compose.server.yml`。配对命令先核对原凭据，授权仍有效时复用原连接；凭据已撤销时交换新码，旧来源配置和缓存继续保留。只有配对命令成功才会启动采集器；失败时按提示修正后重试，并保留状态目录。重连成功后可删除 `.env` 中已消耗的配对码，再检查后台接收状态。
 
 ## 安全与保密
 

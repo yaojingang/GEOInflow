@@ -73,5 +73,7 @@
   "065_dashboard_semantic_metadata.sql": "b440d0be3b60df3d14a4e173f756b89108dfa0d3f031e82b40f7cbafbe254467",
   "066_foreground_analysis_reads.sql": "77563a098c05f741e9415b8568e5a1a3097840a40420772f36589e844cb1c801",
   "067_robots_management.sql": "a25cd64b9bd54816de76acf14dbbc77d61a2b30e762c2fb1b61ab4497634e34a",
-  "068_optional_analytics_engine.sql": "50af561c083939236cda8f3a3c23678325d977b48ede8e26dc53571a311b94f1"
+  "068_optional_analytics_engine.sql": "50af561c083939236cda8f3a3c23678325d977b48ede8e26dc53571a311b94f1",
+  "069_report_fragments.sql": "2fec0a333e012cec6106ca0de8f944edb9bae68cfd4c7db44c775d3cb9f9f2b9",
+  "070_analytics_input_summary.sql": "5d16b0660ecb38480a4d443a46840d546585e1d0f356668071dee5df474eb5e0"
 }

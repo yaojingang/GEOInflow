@@ -1,3 +1,5 @@
+import { sanitizeTrackerUrl } from './privacy';
+
 /** Public types for the browser tracker. */
 export type TrackedProperties = {
   /**
@@ -455,6 +457,19 @@ type MetricEntry = PerformanceEntry & {
     }
 
     if (!payload) return;
+
+    // Apply privacy after user callbacks and explicit payload overrides as well.
+    payload = {
+      ...payload,
+      ...(typeof payload.url === 'string'
+        ? {
+            url: sanitizeTrackerUrl(payload.url),
+          }
+        : {}),
+      ...(typeof payload.referrer === 'string' && payload.referrer
+        ? { referrer: sanitizeTrackerUrl(payload.referrer) }
+        : {}),
+    };
 
     // Preserve observed automation even when a before-send hook replaces the payload.
     if (window.navigator.webdriver === true) payload = { ...payload, webdriver: true };

@@ -44,6 +44,46 @@ it('does not run queued statements after an active query has failed and settled'
   expect(query).toHaveBeenCalledOnce();
 });
 
+it('attributes a failure to the statement that executed it', async () => {
+  const error = new Error('synthetic SQL failure');
+  const failed = vi.fn();
+  const parent = timedAnalyticsClient(
+    {
+      $executeRawUnsafe: async () => 0,
+      $queryRawUnsafe: async () => {
+        throw error;
+      },
+    },
+    Date.now() + 1000,
+  );
+  const child = timedAnalyticsClient(parent, Date.now() + 1000, false, failed);
+  await expect(child.$queryRawUnsafe('cache')).rejects.toBe(error);
+  expect(failed).toHaveBeenCalledExactlyOnceWith(error);
+});
+
+it('keeps a queued cache statement from claiming an earlier source failure', async () => {
+  const error = new Error('synthetic source failure');
+  const failed = vi.fn();
+  const parent = timedAnalyticsClient(
+    {
+      $executeRawUnsafe: async () => 0,
+      $queryRawUnsafe: async () => {
+        throw error;
+      },
+    },
+    Date.now() + 1000,
+  );
+  const child = timedAnalyticsClient(parent, Date.now() + 1000, false, failed);
+  const results = await Promise.allSettled([
+    parent.$queryRawUnsafe('source'),
+    child.$queryRawUnsafe('cache'),
+  ]);
+  expect(results.every(result => result.status === 'rejected' && result.reason === error)).toBe(
+    true,
+  );
+  expect(failed).not.toHaveBeenCalled();
+});
+
 it.each([
   [800, 5000],
   [5000, 800],

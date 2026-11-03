@@ -46,6 +46,7 @@ import {
 import { humanPathFromEncoded } from './upstream/paths';
 import { LiekanError } from './upstream/server';
 import { timeReportQuery } from './upstream/analysis-diagnostics';
+import { readReportFragment } from './upstream/report-fragments';
 
 const pct = (a: number, b: number): number | null => (b ? Math.round((a / b) * 10000) / 100 : null);
 const ratio = (a: number, b: number) => (b ? Math.round((a / b) * 100) / 100 : null);
@@ -126,12 +127,55 @@ export async function buildReport(
   const start = new Date(p.startAt),
     end = new Date(readEndAt);
   const todayStart = new Date(calendarDayRange(clock?.dayAt ?? now, p.timezone).startAt);
-  const plotStart = new Date(p.chartPeriod === 'today' ? calendarDayRange(p.endAt, p.timezone).startAt :
-    Math.max(
-      pageOnly === 'share' ? p.startAt : 0,
-      (clock ? p.endAt : readEndAt) - { '30d': 30, '7d': 7, '24h': 1 }[p.chartPeriod] * 86400000,
-    ),
+  const plotStart = new Date(
+    p.chartPeriod === 'today'
+      ? calendarDayRange(p.endAt, p.timezone).startAt
+      : Math.max(
+          pageOnly === 'share' ? p.startAt : 0,
+          (clock ? p.endAt : readEndAt) -
+            { '30d': 30, '7d': 7, '24h': 1 }[p.chartPeriod] * 86400000,
+        ),
   );
+  const module = <T>(
+    kind: Parameters<typeof timeReportQuery>[0],
+    from: Date,
+    until: Date,
+    conditions: unknown,
+    load: () => Promise<T>,
+  ) =>
+    timeReportQuery(kind, () =>
+      fullTableExport ||
+      (kind === 'logs' && (!parts?.logs || parts.logs.some(field => field === 'recent')))
+        ? load()
+        : readReportFragment(
+            kind,
+            from,
+            until,
+            conditions,
+            load,
+            kind === 'human' || kind === 'plot-human' || p.crawlerMetricsVersion !== 1,
+          ),
+    );
+  // These modules consume their own fields and range; chart selection is assembled separately.
+  const logConditions = {
+    timezone: p.timezone,
+    page: p.page,
+    filter: p.filter,
+    search: p.search,
+    cursor: p.cursor,
+    seek: p.seek,
+    fields: parts?.logs,
+    crawlerIdentityScope: p.crawlerIdentityScope,
+    crawlerMetricsVersion: p.crawlerMetricsVersion,
+    botType: p.botType,
+    botId: p.botId,
+    botName: p.botName,
+    botProductForm: p.botProductForm,
+    botCategory: p.botCategory,
+    resource: p.resource,
+    fullTableExport,
+    comparisonBoundary,
+  };
   const [
     rawHuman,
     rawLogs,
@@ -143,18 +187,27 @@ export async function buildReport(
     plotFacts,
     plotLogs,
   ] = await Promise.all([
-    timeReportQuery('human', () =>
-      getHumanFacts(
-        website.id,
-        start,
-        end,
-        p.timezone,
-        parts?.human as readonly HumanFact[],
-        undefined,
-        { crawlerContext: pageOnly === true && p.resource.startsWith('ai/') },
-      ),
+    module(
+      'human',
+      start,
+      end,
+      {
+        timezone: p.timezone,
+        fields: parts?.human,
+        crawlerContext: pageOnly === true && p.resource.startsWith('ai/'),
+      },
+      () =>
+        getHumanFacts(
+          website.id,
+          start,
+          end,
+          p.timezone,
+          parts?.human as readonly HumanFact[],
+          undefined,
+          { crawlerContext: pageOnly === true && p.resource.startsWith('ai/') },
+        ),
     ),
-    timeReportQuery('logs', () =>
+    module('logs', start, end, logConditions, () =>
       getLogFacts(
         website.id,
         start,
@@ -194,25 +247,54 @@ export async function buildReport(
       ? timeReportQuery('monthly-ai', () => getMonthlyAiShare(website.id, end, p.timezone, p))
       : Promise.resolve([]),
     needed('overview', 'human/overview')
-      ? timeReportQuery('plot-human', () =>
-          getHumanDays(website.id, plotStart, end, p.timezone, ['today', '24h'].includes(p.chartPeriod)),
+      ? module(
+          'plot-human',
+          plotStart,
+          end,
+          { timezone: p.timezone, hour: ['today', '24h'].includes(p.chartPeriod) },
+          () =>
+            getHumanDays(
+              website.id,
+              plotStart,
+              end,
+              p.timezone,
+              ['today', '24h'].includes(p.chartPeriod),
+            ),
         )
       : Promise.resolve({ rows: [], population: undefined }),
     needed('overview', 'human/overview')
-      ? timeReportQuery('plot-logs', () =>
-          getPlotLogs(website.id, plotStart, end, p.timezone, ['today', '24h'].includes(p.chartPeriod), p),
+      ? module(
+          'plot-logs',
+          plotStart,
+          end,
+          {
+            timezone: p.timezone,
+            hour: ['today', '24h'].includes(p.chartPeriod),
+            crawlerIdentityScope: p.crawlerIdentityScope,
+            crawlerMetricsVersion: p.crawlerMetricsVersion,
+          },
+          () =>
+            getPlotLogs(
+              website.id,
+              plotStart,
+              end,
+              p.timezone,
+              ['today', '24h'].includes(p.chartPeriod),
+              p,
+            ),
         )
       : Promise.resolve([]),
   ]);
   const plotHuman = plotFacts.rows;
   const trendState: DataState = !identityUsable(plotFacts.population)
     ? 'unavailable'
-    : plotHuman.length ? 'available' : 'empty';
+    : plotHuman.length
+      ? 'available'
+      : 'empty';
   const h = stringifySafe(rawHuman),
     l = stringifySafe(rawLogs);
   const halfOpen = p.crawlerMetricsVersion === 1;
-  const calendarStart =
-    calendarDayRange(+start, p.timezone).startAt === +start;
+  const calendarStart = calendarDayRange(+start, p.timezone).startAt === +start;
   const days = Math.max(
     1,
     calendarStart
@@ -454,7 +536,10 @@ export async function buildReport(
     path: page.path,
     humanPv: page.pv,
     aiRequests: l.latest ? (humanAiPages.get(page.path)?.requests ?? 0) : null,
-    ratio: l.latest && identityComplete(t.population) ? ratio(humanAiPages.get(page.path)?.requests ?? 0, page.pv) : null,
+    ratio:
+      l.latest && identityComplete(t.population)
+        ? ratio(humanAiPages.get(page.path)?.requests ?? 0, page.pv)
+        : null,
     bot: humanAiPages.get(page.path)?.bot ?? null,
     ...(humanAiPages.get(page.path)?.botId !== undefined && {
       botId: humanAiPages.get(page.path).botId,
@@ -985,7 +1070,9 @@ export async function buildReport(
   );
   card(
     '案例页 AI/浏览 比值',
-    l.latest && catalog.size && identityComplete(t.population) ? ratio(cases.ai, cases.human) : null,
+    l.latest && catalog.size && identityComplete(t.population)
+      ? ratio(cases.ai, cases.human)
+      : null,
     catalogLogState,
   );
   card(

@@ -13,7 +13,10 @@ import { crawlerIdentitySql } from '../crawlers/metric-scope';
 import { crawlerAiSql, unknownCrawlerSql } from '../rules/population';
 import { logInputConnectedSql } from './log-input';
 import { withLogStatisticsRead } from './ai-log-read-priority';
-import { formatInTimeZone } from 'date-fns-tz';
+import { formatInTimeZone, fromZonedTime } from 'date-fns-tz';
+import { calendarDayRange } from '../contracts/calendar';
+import { readReportFragment, reportFragmentsActive } from './report-fragments';
+import { analysisSafeNumber } from './analysis-rollups-model';
 import { decodeCursor, encodeCursor } from '../cursor';
 import { humanPathFromEncoded } from './paths';
 import { LiekanError, query } from './server';
@@ -23,8 +26,66 @@ export { staticRequestExtensionPattern, isStaticRequestPath } from './log-conten
 
 const readPreferredLogRollup = async (input: Parameters<typeof readAnalysisLogRollup>[0]) =>
   (await readClickHouseLogRollup(input)) ?? readAnalysisLogRollup(input);
-const readPreferredLogSeries = async (input: Parameters<typeof readAnalysisLogSeries>[0]) =>
-  (await readClickHouseLogSeries(input)) ?? readAnalysisLogSeries(input);
+const readLogSeries = async (
+  input: Parameters<typeof readAnalysisLogSeries>[0],
+  allowRawOnly = false,
+) =>
+  (await readClickHouseLogSeries(input)) ??
+  readAnalysisLogSeries(allowRawOnly ? { ...input, allowRawOnly: true } : input);
+
+async function readPreferredLogSeries(input: Parameters<typeof readAnalysisLogSeries>[0]) {
+  if (!reportFragmentsActive() || input.crawlerMetricsVersion !== 1) return readLogSeries(input);
+  const { startDate, endDate, websiteId, ...conditions } = input;
+  const timezone = input.timezone || 'UTC';
+  const boundaries = [+startDate];
+  if (input.grain === 'month') {
+    const [year, month] = formatInTimeZone(startDate, timezone, 'yyyy-MM').split('-').map(Number);
+    for (let offset = 1; offset <= 36; offset++) {
+      const next = new Date(Date.UTC(year, month - 1 + offset, 1));
+      const at = +fromZonedTime(`${next.toISOString().slice(0, 10)}T00:00:00`, timezone);
+      if (at >= +endDate) break;
+      boundaries.push(at);
+    }
+  } else {
+    const today = calendarDayRange(Date.now(), timezone).startAt;
+    if (today > +startDate && today < +endDate) boundaries.push(today);
+  }
+  boundaries.push(+endDate);
+  const combined = new Map<
+    string,
+    NonNullable<Awaited<ReturnType<typeof readAnalysisLogSeries>>>[number]
+  >();
+  for (let index = 1; index < boundaries.length; index++) {
+    const start = new Date(boundaries[index - 1]),
+      end = new Date(boundaries[index]);
+    const rows = await readReportFragment('log-series', start, end, conditions, () =>
+      readLogSeries({ ...input, startDate: start, endDate: end }, true),
+    );
+    if (!rows) return null;
+    for (const row of rows) {
+      const key = JSON.stringify([row.day, row.bot, row.type]);
+      const previous = combined.get(key);
+      combined.set(
+        key,
+        previous
+          ? {
+              ...row,
+              count: analysisSafeNumber((BigInt(previous.count) + BigInt(row.count)).toString()),
+              aiRequests: analysisSafeNumber(
+                (BigInt(previous.aiRequests) + BigInt(row.aiRequests)).toString(),
+              ),
+            }
+          : { ...row },
+      );
+    }
+  }
+  return [...combined.values()].sort(
+    (a, b) =>
+      a.day.localeCompare(b.day) ||
+      a.bot.localeCompare(b.bot) ||
+      (a.type || '').localeCompare(b.type || ''),
+  );
+}
 export async function getLogFacts(...args: Parameters<typeof readLogFacts>) {
   return withLogStatisticsRead(() => readLogFacts(...args));
 }

@@ -79,7 +79,7 @@ export function prepareAiPrompt(input: {
           .map(reference => ({ contextId: reference.contextId, factId: reference.factId })),
       }));
     return {
-      question: turn.question,
+      question: sanitizeAiText(turn.question.replace(/[\r\n\t]+/g, ' '), 12000),
       answer: {
         summary: sanitizeAiText(turn.answer.summary, 1000),
         observations: textItems(turn.answer.observations),
@@ -100,7 +100,7 @@ export function prepareAiPrompt(input: {
     inputBytes = 0;
   const measure = () => {
     prompt = JSON.stringify({
-      question: input.question,
+      question: sanitizeAiText(input.question.replace(/[\r\n\t]+/g, ' '), 12000),
       currentContext: contextSent,
       history,
       ...(input.structuredOutput ? {} : { responseSchema }),

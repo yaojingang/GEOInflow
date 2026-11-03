@@ -43,6 +43,12 @@ export function createDataAdapters(query, { sourceRef } = {}) {
       // This harness compares original source queries; rollup equivalence has its own database suite.
       if (id === './analysis-rollups')
         return { readAnalysisLogRollup: async () => null, readAnalysisLogSeries: async () => null };
+      // Keep the raw SQL oracle independent of the persistent report-cache runtime.
+      if (id === './report-fragments')
+        return {
+          reportFragmentsActive: () => false,
+          readReportFragment: (_kind, _start, _end, _parameters, load) => load(),
+        };
       if (id === './browser-detail-facts') return { readBrowserDetailFacts: async () => null };
       // This synthetic adapter checks SQL metric shapes; runtime population evidence has PostgreSQL integration coverage.
       if (id === './browser-population' && relative.startsWith('src/lib/liekan/upstream/'))

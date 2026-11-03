@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { readFileSync } from 'node:fs';
-import { transformSync } from 'esbuild';
+import { fileURLToPath } from 'node:url';
+import { buildSync } from 'esbuild';
 import { JSDOM } from 'jsdom';
 import { afterEach, expect, test, vi } from 'vitest';
 import { z } from 'zod';
@@ -8,14 +9,35 @@ import type { UmamiTracker } from './index';
 
 // Exercise the same classic script boundary as the published tracker, with a fresh
 // browser for every test so history hooks and window-only state cannot leak.
-const trackerScript = transformSync(
-  readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
-    .replaceAll('__COLLECT_API_HOST__', '')
-    .replaceAll('__COLLECT_API_ENDPOINT__', '/api/send'),
-  { loader: 'ts', format: 'iife', target: 'es2022' },
-).code;
+const trackerScript = buildSync({
+  stdin: {
+    contents: readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
+      .replaceAll('__COLLECT_API_HOST__', '')
+      .replaceAll('__COLLECT_API_ENDPOINT__', '/api/send'),
+    loader: 'ts',
+    resolveDir: fileURLToPath(new URL('.', import.meta.url)),
+  },
+  bundle: true,
+  write: false,
+  format: 'iife',
+  target: 'es2022',
+}).outputFiles[0].text;
 const browsers: { close: () => void }[] = [];
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+test('explicit tracker payloads redact credentials before the network boundary', () => {
+  const browser = createBrowser();
+  browser.load({ 'website-id': 'website-id', 'auto-track': 'false' });
+  browser.window.umami.track({
+    website: 'website-id',
+    url: '/callback?token=browser-private-value&utm_source=google#access_token=fragment-private-value',
+  });
+  const payload = browser.requests()[0].payload;
+  expect(JSON.stringify(payload)).not.toMatch(/browser-private-value|fragment-private-value/);
+  expect(new URL(payload.url, 'https://shop.example.com').searchParams.get('utm_source')).toBe(
+    'google',
+  );
+});
 
 test('case variants of a website UUID share one tracker identity', () => {
   const browser = createBrowser();
@@ -526,3 +548,55 @@ test('activation records the final prerender route once', async () => {
   expect(browser.requests()).toHaveLength(1);
   expect(browser.requests()[0].payload.url).toBe('https://shop.example.com/activated-route');
 });
+
+
+test.each([
+  ['/verify?code=first', '/verify?code=second'],
+  ['/verify#access_token=first', '/verify#access_token=second'],
+])('redacts outgoing credentials while preserving navigation identity: %s', async (from, to) => {
+  const browser = createBrowser();
+  browser.window.history.replaceState({}, '', from);
+  browser.load();
+  browser.window.history.pushState({}, '', to);
+  await browser.flushNavigation();
+  expect(browser.requests()).toHaveLength(2);
+  for (const request of browser.requests()) {
+    expect(request.payload.url).toContain('redacted');
+    expect(JSON.stringify(request.payload)).not.toMatch(/first|second/);
+  }
+});
+
+test.each(['manual', 'before-send'])(
+  'preserves explicit %s URL/referrer resolution and exclusions',
+  async mode => {
+    const browser = createBrowser();
+    browser.window.history.replaceState({}, '', '/catalog/item');
+    let override = { url: '', referrer: '' };
+    (browser.window as any).override = (_type: string, payload: any) => ({ ...payload, ...override });
+    browser.load({
+      'auto-track': 'false', 'exclude-search': 'true', 'exclude-hash': 'true',
+      ...(mode === 'before-send' ? { 'before-send': 'override' } : {}),
+    });
+    for (const value of ['virtual?category=safe', '/virtual?category=safe#details', 'https://other.example/virtual?category=safe#details']) {
+      override = { url: value, referrer: value };
+      await browser.window.umami.track(mode === 'manual' ? { website: 'website-id', ...override } : undefined);
+      expect(browser.requests().at(-1).payload).toMatchObject(override);
+    }
+    override = { url: 'virtual?token=private-url-value&category=safe#access_token=private-fragment-value', referrer: '/source?password=private-source-value&category=safe' };
+    await browser.window.umami.track(mode === 'manual' ? { website: 'website-id', ...override } : undefined);
+    const result = browser.requests().at(-1).payload;
+    expect(result.url).toMatch(/^virtual\?/);
+    expect(result.referrer).toMatch(/^\/source\?/);
+    expect(result.url).toContain('category=safe');
+    expect(result.referrer).toContain('category=safe');
+    expect(result.url).toContain('redacted');
+    expect(JSON.stringify(result)).not.toMatch(/private-url-value|private-fragment-value|private-source-value/);
+    override = { url: ' https://fixture-user:fixture-password@other.example/virtual?token=private-url-value', referrer: '\thttps://fixture-user:fixture-password@other.example/source' };
+    await browser.window.umami.track(mode === 'manual' ? { website: 'website-id', ...override } : undefined);
+    const credentialResult = browser.requests().at(-1).payload;
+    expect(credentialResult.url).toContain('redacted');
+    expect(credentialResult.referrer).toBe('https://other.example/source');
+    expect(JSON.stringify(credentialResult)).not.toMatch(/fixture-user|fixture-password|private-url-value/);
+
+  },
+);

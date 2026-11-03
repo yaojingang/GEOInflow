@@ -1,9 +1,15 @@
+import { ANALYSIS_SITE_LIMIT } from './analysis-storage-limits';
+
 export const storageResultReserve = { site: 32 * 1024 ** 2, global: 128 * 1024 ** 2 };
 export const storageSiteBytesSql = `(s.derived_bytes+pg_column_size(s)*2+16777216
  +coalesce((SELECT sum(m.bytes) FROM liekan_analysis_meter m WHERE m.website_id=s.website_id),0)
  +coalesce((SELECT sum(q.result_bytes) FROM liekan_analysis_query q WHERE q.website_id=s.website_id),0)*2
- +coalesce((SELECT sum(d.result_bytes) FROM liekan_dashboard_snapshot d WHERE d.website_id=s.website_id),0)*2)`;
-export const storageHistorySiteAllowedSql = `${storageSiteBytesSql}<966367642`;
+ +coalesce((SELECT sum(d.result_bytes) FROM liekan_dashboard_snapshot d WHERE d.website_id=s.website_id),0)*2
+ +coalesce((SELECT sum(f.result_bytes) FROM liekan_report_fragment f WHERE f.website_id=s.website_id),0)*2
+ +(SELECT count(*)*512 FROM liekan_analytics_input_summary i WHERE i.website_id=s.website_id)
+ +(SELECT count(*)*512 FROM liekan_analytics_input_state i WHERE i.website_id=s.website_id))`;
+export const storageHistorySiteAllowedSql = `${storageSiteBytesSql}*100<${ANALYSIS_SITE_LIMIT}::bigint*90`;
+export const storageSitePressureSql = `${storageSiteBytesSql}*100>=${ANALYSIS_SITE_LIMIT}::bigint*80`;
 export function storageHistoryAllowed(capacity: { globalBytes: string; globalLimit: number }) {
   return BigInt(capacity.globalBytes) * 100n < BigInt(capacity.globalLimit) * 90n;
 }

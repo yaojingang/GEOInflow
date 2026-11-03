@@ -78,8 +78,21 @@ Both paths produce the identical image and runtime configuration; copying the wh
 
 - The pairing code is valid for 10 minutes and can be consumed once. On first start with an empty state directory the container exchanges it for the long-term receive credential automatically; the code is dead afterwards and can be removed from `.env`.
 - The long-term receive credential only lives in `state/<source id>/config.json` (mode 0600). It never enters `.env`, the compose file or the image.
-- Restarts and image upgrades never re-pair. A new code is only needed for a new website, after disconnecting the source in the console, or if the `state/` directory is lost.
+- Restarts and image upgrades reuse the saved credential. After disconnecting in the console, follow the explicit reconnection steps below. Use a separate deployment folder and state directory for a new website.
 - If pairing fails (expired, already used, or wrong website) the container exits with the reason in its logs: generate a new code, update `.env` and recreate the container with `docker compose up -d`.
+
+## Reconnect after disconnecting in the console
+
+Generate a new code for the original website and update `LIEKAN_PAIRING_CODE` in `.env`. Keep the receive URL, website ID, log path and entire `state/` directory, then run:
+
+```sh
+docker compose stop collector &&
+docker compose run --rm -T --no-deps --entrypoint sh collector -c \
+  'printf "%s" "$LIEKAN_PAIRING_CODE" | node /app/container.mjs pair' &&
+  docker compose up -d --force-recreate
+```
+
+For source builds, add `-f docker-compose.server.yml` immediately after `docker compose` in each command above. The pairing command checks the saved credential first and reuses an active connection. A revoked credential allows the new code to be exchanged while preserving the old source configuration and buffer. The collector starts only after the pairing command succeeds. If it fails, correct the reported problem and retry while retaining the state directory. After reconnection, remove the consumed code from `.env` if desired and check reception in the console.
 
 ## Security notes
 

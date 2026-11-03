@@ -59,7 +59,12 @@ const timedClients = processSingleton(
       }
     >(),
 );
-export function timedAnalyticsClient(tx: any, deadline: number, computing = false) {
+export function timedAnalyticsClient(
+  tx: any,
+  deadline: number,
+  computing = false,
+  onFailure?: (error: unknown) => void,
+) {
   const parent = timedClients.get(tx);
   const state = parent?.state || { tx, tail: Promise.resolve(), failure: undefined };
   deadline = Math.min(deadline, parent?.deadline ?? Infinity);
@@ -68,10 +73,15 @@ export function timedAnalyticsClient(tx: any, deadline: number, computing = fals
   const run = <T>(work: () => Promise<T>): Promise<T> => {
     const next = state.tail.then(async () => {
       if (state.failure) throw state.failure;
-      await tx.$executeRawUnsafe(
-        `SET LOCAL statement_timeout = ${analyticsRemaining(deadline, computing)}`,
-      );
-      return work();
+      try {
+        await tx.$executeRawUnsafe(
+          `SET LOCAL statement_timeout = ${analyticsRemaining(deadline, computing)}`,
+        );
+        return await work();
+      } catch (error) {
+        onFailure?.(error);
+        throw error;
+      }
     });
     state.tail = next.then(
       () => {},
