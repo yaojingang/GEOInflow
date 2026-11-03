@@ -205,7 +205,10 @@ export async function featureRequest<T = any>(
       data?.error?.code === 'analysis-concurrency-limited'
     ) {
       const websiteId = /\/websites\/([^/]+)\//.exec(path)?.[1];
-      response = await waitForAnalysisAdmission(websiteId, send, requestSignal);
+      response = await waitForAnalysisAdmission(websiteId, send, requestSignal, {
+        initialResponse: response,
+        retryAfter,
+      });
       data = await response.json().catch(() => null);
     }
     if (!response.ok)

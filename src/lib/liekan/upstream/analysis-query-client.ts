@@ -140,10 +140,16 @@ export async function waitForAnalysisAdmission(
   websiteId: string,
   send: () => Promise<Response>,
   signal?: AbortSignal,
+  options?: {
+    initialResponse: Response;
+    retryAfter: (response: Response) => number | undefined;
+  },
 ) {
   const id = `waiting:${websiteId}:${crypto.randomUUID()}`,
     entry: Pending = { websiteId, paused: false };
   const budget = foregroundBudget();
+  let response = options?.initialResponse,
+    retryDelay = 250;
   pending.set(id, entry);
   publish();
   try {
@@ -153,16 +159,23 @@ export async function waitForAnalysisAdmission(
       if (budget.elapsed() >= 15 * 60000) {
         await resumePolling(entry, signal);
         budget.reset();
+        retryDelay = 250;
       }
-      await wait(3000, signal);
+      const hint = response && options?.retryAfter(response);
+      // Recover short contention quickly, then return to the existing bounded cadence.
+      await wait(
+        Math.max(retryDelay, Number.isFinite(hint) ? Math.max(0, Math.min(10000, hint)) : 0),
+        signal,
+      );
       if (document.visibilityState === 'hidden') continue;
-      const response = await send();
+      response = await send();
       if (response.status !== 429) return response;
       const value = await response
         .clone()
         .json()
         .catch(() => null);
       if (value?.error?.code !== 'analysis-concurrency-limited') return response;
+      retryDelay = Math.min(3000, retryDelay * 2);
     }
   } finally {
     budget.close();
@@ -193,14 +206,27 @@ export async function followAnalysisJob(
     const startedAt = performance.now();
     const response = await options.fetchJob(path),
       data = await response.json().catch(() => null);
+    if (response.status === 503 && data?.error?.code === 'analysis-read-busy') {
+      const seconds = Number(response.headers.get('Retry-After'));
+      return {
+        response,
+        data,
+        startedAt,
+        retryAfterMs:
+          Number.isFinite(seconds) && seconds > 0
+            ? Math.max(1000, Math.min(10000, seconds * 1000))
+            : 3000,
+      };
+    }
     if (!response.ok) {
       const error: any = new Error(data?.error?.message || '后台统计读取失败');
       error.status = response.status;
       error.code = data?.error?.code;
       throw error;
     }
-    return { response, data, startedAt };
+    return { response, data, startedAt, retryAfterMs: 0 };
   };
+  let retryAfterMs = 0;
   try {
     for (;;) {
       options.signal?.throwIfAborted();
@@ -209,9 +235,14 @@ export async function followAnalysisJob(
         await resumePolling(entry, options.signal);
         budget.reset();
       }
-      await wait(Math.max(1000, Math.min(10000, job.retryAfterMs)), options.signal);
+      await wait(retryAfterMs || Math.max(1000, Math.min(10000, job.retryAfterMs)), options.signal);
+      retryAfterMs = 0;
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') continue;
       const status = await read(job.resultUrl.replace(/\/result$/, ''));
+      if (status.retryAfterMs) {
+        retryAfterMs = status.retryAfterMs;
+        continue;
+      }
       job = analysisAcceptedSchema.parse(status.data).analysisJob;
       entry.job = job;
       publish();
@@ -229,6 +260,10 @@ export async function followAnalysisJob(
       }
       if (job.status === 'ready') {
         const result = await read(job.resultUrl);
+        if (result.retryAfterMs) {
+          retryAfterMs = result.retryAfterMs;
+          continue;
+        }
         if (result.response.status !== 202) return result;
       }
     }

@@ -14,7 +14,7 @@ import { analysisCapacity, analysisTransaction } from './analysis-rollups-db';
 import { analysisHash } from './analysis-rollups-model';
 import { authorizeCrawler } from './crawler-access';
 import { LiekanError, lockWritableWebsite, primary } from './server';
-import { storagePressure, storageSiteBytesSql } from './storage-capacity';
+import { storagePressure, storageSitePressureSql } from './storage-capacity';
 import {
   collectGenerationBatch,
   previewGenerations,
@@ -441,7 +441,7 @@ async function scheduleStorageRuns(deadline: number) {
        instanceOnly
          ? 'p.website_id IS NULL AND p.next_check_at<=clock_timestamp()'
          : `(p.next_check_at<=clock_timestamp()
-      OR ((p.settings->>'pressureEnabled')::boolean AND s.website_id IS NOT NULL AND (${storageSiteBytesSql}>=858993459 OR $1::boolean)))`
+      OR ((p.settings->>'pressureEnabled')::boolean AND s.website_id IS NOT NULL AND (${storageSitePressureSql} OR $1::boolean)))`
 }
      AND NOT EXISTS(SELECT 1 FROM liekan_storage_cleanup r WHERE r.scope_key=p.scope_key AND
       (r.status IN('queued','running') OR (r.kind='pressure' AND r.created_at>clock_timestamp()-interval '5 minutes')))

@@ -281,10 +281,11 @@
     },
     {
       "path": "docker-compose.liekan.yml",
-      "purpose": "Isolate local Liekan runtime, database and immutable image revision Isolate local Liekan runtime, database and immutable image revision; Isolate local Liekan runtime, database and immutable image revision Pass optional AI runtime settings to the isolated Liekan service.",
+      "purpose": "Isolate Liekan runtime, database and immutable image revision; pass optional AI settings and consistent analysis storage budgets to app and workers.",
       "tests": [
         "pnpm liekan:verify",
-        "Liekan Docker and visual acceptance"
+        "Liekan Docker and visual acceptance",
+        "node tests/liekan/analysis-rollups.integration.mjs --scope-capacity"
       ],
       "owner": "Liekan release maintenance",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Isolate local Liekan runtime, database and immutable image revision Preserve upstream behavior and protocols outside this recorded purpose: Isolate local Liekan runtime, database and immutable image revision; Preserve upstream behavior and protocols outside this recorded purpose: Isolate local Liekan runtime, database and immutable image revision",
