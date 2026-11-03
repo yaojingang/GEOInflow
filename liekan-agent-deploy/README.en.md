@@ -34,6 +34,33 @@ A self-contained deployment folder for the log collector. Copy the whole folder 
 
 6. Check status with `docker compose ps` and logs with `docker compose logs collector`. A healthy container plus a passing "re-check" in the console means the source is connected.
 
+## Alternative: build from source on the log server
+
+The default flow above requires copying pre-built `agent.mjs` / `container.mjs` from the build machine (they are generated artifacts kept out of git). If the log server can reach the code repository and the npm registry, you can skip the copy step and build the image from source on the server:
+
+1. Clone the repository (or upload a source archive) on the log server and enter this folder:
+
+   ```sh
+   git clone -b <branch> https://github.com/<your-account>/GEOInflow.git /opt/GEOInflow
+   cd /opt/GEOInflow/liekan-agent-deploy
+   ```
+
+2. Prepare `.env`, `state/` and the pairing code as in steps 2–4 above.
+3. Start with the server-build compose file (bundling happens inside the image build; pulling the base image and two npm packages is required):
+
+   ```sh
+   docker compose -f docker-compose.server.yml up -d --build
+   ```
+
+If npm is slow or blocked, point the build at a mirror:
+
+```sh
+docker compose -f docker-compose.server.yml build --build-arg NPM_REGISTRY=https://registry.npmmirror.com
+docker compose -f docker-compose.server.yml up -d
+```
+
+Both paths produce the identical image and runtime configuration; copying the whole folder remains the default recommendation (the log server then needs no access to the repository or npm).
+
 ## Finding the log path and GID
 
 - BT (BaoTa) panel: website → Settings → Log shows the path (usually `/www/wwwlogs/<domain>.log`); the log group is usually `www` — run `id -g www` for the GID.

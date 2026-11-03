@@ -34,6 +34,33 @@
 
 6. 查看状态：`docker compose ps`、日志：`docker compose logs collector`。容器显示 healthy 且后台"重新检查"通过即接入成功。
 
+## 备选：在日志服务器上从源码构建
+
+以上默认流程需要从构建机拷贝预生成的 `agent.mjs`、`container.mjs`（它们是构建产物，不进 git）。如果日志服务器能直接访问代码仓库和 npm 源，也可以跳过拷贝步骤，在服务器上直接从源码构建镜像：
+
+1. 在日志服务器上克隆仓库（或上传源码包），进入本部署文件夹：
+
+   ```sh
+   git clone -b <分支> https://github.com/<你的账号>/GEOInflow.git /opt/GEOInflow
+   cd /opt/GEOInflow/liekan-agent-deploy
+   ```
+
+2. 按上文步骤 2–4 准备 `.env`、`state/` 和配对码。
+3. 使用服务器构建编排启动（打包在镜像构建阶段完成，需能拉取基础镜像和两个 npm 包）：
+
+   ```sh
+   docker compose -f docker-compose.server.yml up -d --build
+   ```
+
+npm 访问受限时可指定镜像源：
+
+```sh
+docker compose -f docker-compose.server.yml build --build-arg NPM_REGISTRY=https://registry.npmmirror.com
+docker compose -f docker-compose.server.yml up -d
+```
+
+两种方式产出的镜像和运行配置完全一致；整目录拷贝仍是默认推荐方式（日志服务器无需访问代码仓库与 npm 源）。
+
 ## 如何确定日志路径和 GID
 
 - 宝塔面板：网站 → 设置 → 日志，可查看日志路径（通常 `/www/wwwlogs/域名.log`）；日志组通常为 `www`，执行 `id -g www` 得到 GID。

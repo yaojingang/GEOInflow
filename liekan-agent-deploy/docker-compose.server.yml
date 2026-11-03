@@ -1,0 +1,49 @@
+# Server-side source build variant of docker-compose.yml.
+# Identical runtime configuration — only the build section differs: the image
+# is built from the repository source (see Dockerfile.server) instead of
+# requiring prebuilt agent.mjs / container.mjs in this folder.
+# Run from this directory:  docker compose -f docker-compose.server.yml up -d --build
+services:
+  collector:
+    build:
+      context: ..
+      dockerfile: liekan-agent-deploy/Dockerfile.server
+    image: liekan-agent-manual
+    user: "65532:${LIEKAN_LOG_GID:?请设置日志只读用户组}"
+    environment:
+      LIEKAN_PUBLIC_URL: ${LIEKAN_PUBLIC_URL:?请设置统计服务地址}
+      LIEKAN_LOG_FILE: ${LIEKAN_LOG_FILE:?请设置网站访问日志文件名}
+      LIEKAN_LOG_DIRECTORY: ${LIEKAN_LOG_DIRECTORY:?请设置网站访问日志目录}
+      LIEKAN_WEBSITE_ID: ${LIEKAN_WEBSITE_ID:?请设置网站标识}
+      LIEKAN_PAIRING_CODE: ${LIEKAN_PAIRING_CODE:-}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    stop_grace_period: 45s
+    mem_limit: 256m
+    cpus: 0.50
+    pids_limit: 64
+    volumes:
+      - type: bind
+        source: ${LIEKAN_LOG_DIRECTORY:?请设置网站访问日志目录}
+        target: /logs
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${LIEKAN_STATE_DIRECTORY:-./state}
+        target: /var/lib/liekan-agent
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: [CMD, node, /app/container.mjs, health]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
