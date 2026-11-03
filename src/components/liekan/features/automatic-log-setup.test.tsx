@@ -1,9 +1,10 @@
-import { StrictMode } from 'react';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { StrictMode } from 'react';
 import { beforeEach, expect, it, vi } from 'vitest';
-import { AutomaticLogSetup } from './AutomaticLogSetup';
 import { LiekanLocaleContext } from '@/lib/liekan/i18n/client';
+import { AutomaticLogSetup } from './AutomaticLogSetup';
+
 const mocks = vi.hoisted(() => ({
   api: { get: vi.fn(), post: vi.fn(), put: vi.fn(), del: vi.fn() },
   notify: vi.fn(),
@@ -352,4 +353,43 @@ it('treats omitted legacy checks as unverified and keeps runtime readiness autho
   expect(screen.getByText(/尚未返回逐项检查结果/)).toBeVisible();
   fireEvent.click(screen.getByRole('button', { name: '重新检查配置' }));
   expect(await screen.findByText(/接收服务已就绪/)).toBeVisible();
+});
+it('offers manual deployment with a one-time pairing code when installer assets are absent', async () => {
+  mocks.api.post.mockResolvedValueOnce({
+    manual: true,
+    websiteId: site,
+    url: 'https://stats.example.com',
+    pairingCode: 'c'.repeat(43),
+    expiresAt: new Date(Date.now() + 600000).toISOString(),
+  });
+  mount('server', {
+    ...status,
+    capabilities: { server: false, cloudflare: false },
+    availability: {
+      server: {
+        available: false,
+        reason: '采集器部署包尚未准备完成',
+        runtimes: { docker: false, systemd: false },
+        checks: [
+          { id: 'public-url', state: 'ready' },
+          { id: 'queue', state: 'ready' },
+          { id: 'worker', state: 'ready' },
+          { id: 'agent-package', state: 'missing' },
+        ],
+      },
+    },
+  });
+  fireEvent.click(screen.getByText('手动部署（自带部署包）'));
+  fireEvent.click(screen.getByRole('button', { name: '生成一次性配对码（手动部署）' }));
+  await waitFor(() =>
+    expect(mocks.api.post).toHaveBeenCalledWith(
+      `/liekan/websites/${site}/log-sources/server/pairing`,
+      { manual: true },
+    ),
+  );
+  expect(await screen.findByText(/LIEKAN_PUBLIC_URL=https:\/\/stats\.example\.com/)).toBeVisible();
+  expect(screen.getByText(/LIEKAN_WEBSITE_ID=5b4c0de0-6c47-5b51-8f53-11e5e8c79001/)).toBeVisible();
+  expect(screen.getByText(/LIEKAN_PAIRING_CODE=c{43}/)).toBeVisible();
+  // The guided one-shot command stays gated while the manual kit path works.
+  expect(screen.queryByRole('button', { name: '生成一次安装命令' })).not.toBeInTheDocument();
 });

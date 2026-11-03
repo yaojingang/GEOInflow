@@ -212,9 +212,7 @@ cat /tmp/fetches
     await rm(temp, { recursive: true, force: true });
   }
 });
-test('packaged Docker collector validates, pairs, persists, rotates and recovers offline batches', {
-  timeout: 240000,
-}, async () => {
+async function exerciseDockerCollector(manual) {
   const temp = await mkdtemp(join(tmpdir(), 'liekan-agent-docker-'));
   const id = randomUUID();
   const prefix = `liekan-agent-test-${id.slice(0, 8)}`;
@@ -246,6 +244,22 @@ test('packaged Docker collector validates, pairs, persists, rotates and recovers
   ]) {
     assert.ok(archive.file(file), `packaged file ${file}`);
     await writeFile(join(context, file), await archive.file(file).async('nodebuffer'));
+  }
+  if (manual) {
+    for (const file of ['Dockerfile', 'docker-compose.yml'])
+      await writeFile(join(context, file), await readFile(join('liekan-agent-deploy', file)));
+    const state = join(context, 'state');
+    await mkdir(state);
+    docker(
+      'run',
+      '--rm',
+      '--mount',
+      `type=bind,src=${state},dst=/state`,
+      'node:22.23.4-alpine',
+      'chown',
+      '65532:65532',
+      '/state',
+    );
   }
   const log = join(logs, 'access.log');
   const line = path =>
@@ -311,6 +325,7 @@ https.createServer({key:fs.readFileSync('/fixture/key.pem'),cert:fs.readFileSync
       'LIEKAN_PUBLIC_URL=https://stats.example.test:8443',
       'LIEKAN_LOG_FILE=access.log',
       `LIEKAN_LOG_DIRECTORY=${logs}`,
+      ...(manual ? [`LIEKAN_PAIRING_CODE=${code}`] : []),
     ].join('\n'),
   );
   await writeFile(
@@ -319,6 +334,7 @@ https.createServer({key:fs.readFileSync('/fixture/key.pem'),cert:fs.readFileSync
       services: {
         collector: {
           container_name: collector,
+          image,
           environment: { NODE_EXTRA_CA_CERTS: '/trust/ca.pem' },
           networks: ['fixture'],
           volumes: [
@@ -431,17 +447,26 @@ exit 1
     assert.match(invalid.stderr, /日志格式/);
     assert.equal((await result()).pairs, 0, 'preflight failure never consumes a code');
     await writeFile(log, line('/historical'));
-    const paired = spawnSync(
-      'docker',
-      [...composeArgs, 'run', '--rm', '-T', '--no-deps', 'collector', 'pair'],
-      {
-        input: code,
-        encoding: 'utf8',
-      },
-    );
-    assert.equal(paired.status, 0, paired.stderr);
-    assert.equal(paired.stdout.includes(code), false);
-    assert.equal(paired.stdout.includes(token), false);
+    if (manual) {
+      const probe = spawnSync(
+        'docker',
+        [...composeArgs, 'run', '--rm', '-T', '--no-deps', 'collector', 'health'],
+        { encoding: 'utf8' },
+      );
+      assert.notEqual(probe.status, 0);
+      assert.equal((await result()).pairs, 0, 'health probes never consume the environment code');
+      compose('up', '-d', '--wait', '--wait-timeout', '60');
+      assert.equal((await result()).pairs, 1, 'the manual kit pairs automatically on first start');
+    } else {
+      const paired = spawnSync(
+        'docker',
+        [...composeArgs, 'run', '--rm', '-T', '--no-deps', 'collector', 'pair'],
+        { input: code, encoding: 'utf8' },
+      );
+      assert.equal(paired.status, 0, paired.stderr);
+      assert.equal(paired.stdout.includes(code), false);
+      assert.equal(paired.stdout.includes(token), false);
+    }
     const repeated = spawnSync(
       'docker',
       [...composeArgs, 'run', '--rm', '-T', '--no-deps', 'collector', 'pair'],
@@ -516,7 +541,9 @@ exit 1
     assert.equal(inspected.HostConfig.ReadonlyRootfs, true);
     assert.equal(inspected.Mounts.find(mount => mount.Destination === '/logs').RW, false);
     assert.equal(
-      inspected.Config.Env.some(value => value.includes(token) || value.includes(code)),
+      inspected.Config.Env.some(
+        value => value.includes(token) || (!manual && value.includes(code)),
+      ),
       false,
     );
     const output = docker('logs', collector);
@@ -547,12 +574,40 @@ exit 1
     );
     assert.notEqual(invalidReconnect.status, 0);
     assert.equal((await result()).pairs, 1);
-    const reconnect = spawnSync(
-      'docker',
-      [...composeArgs, 'run', '--rm', '-T', '--no-deps', 'collector', 'pair'],
-      { input: code2, encoding: 'utf8' },
-    );
-    assert.equal(reconnect.status, 0, reconnect.stderr);
+    if (manual) {
+      await writeFile(join(context, '.env'), originalEnvironment.replace(code, code2));
+      for (const readme of ['README.md', 'README.en.md']) {
+        const text = await readFile(join('liekan-agent-deploy', readme), 'utf8');
+        const script = [...text.matchAll(/```sh\n([\s\S]*?)```/g)]
+          .map(match => match[1])
+          .find(block => block.includes('/app/container.mjs pair'));
+        assert.ok(script, `${readme} must provide executable manual reconnection steps`);
+        const output = execFileSync('sh', ['-c', script], {
+          cwd: context,
+          env: {
+            ...process.env,
+            COMPOSE_PROJECT_NAME: prefix,
+            COMPOSE_FILE: `${join(context, 'docker-compose.yml')}:${join(context, 'override.json')}`,
+          },
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 120000,
+        });
+        assert.equal(output.includes(code2) || output.includes(token2), false);
+        assert.equal(
+          (await result()).pairs,
+          2,
+          'documented reconnection preserves an already valid pairing',
+        );
+      }
+    } else {
+      const reconnect = spawnSync(
+        'docker',
+        [...composeArgs, 'run', '--rm', '-T', '--no-deps', 'collector', 'pair'],
+        { input: code2, encoding: 'utf8' },
+      );
+      assert.equal(reconnect.status, 0, reconnect.stderr);
+    }
     assert.equal((await result()).pairs, 2);
     compose('up', '-d', '--force-recreate', '--wait', '--wait-timeout', '60');
     await appendFile(log, line('/reconnected'));
@@ -590,4 +645,20 @@ exit 1
     }
     await rm(temp, { recursive: true, force: true });
   }
-});
+}
+
+test(
+  'packaged Docker collector validates, pairs, persists, rotates and recovers offline batches',
+  {
+    timeout: 240000,
+  },
+  () => exerciseDockerCollector(false),
+);
+
+test(
+  'manual Docker kit pairs on first start and reconnects using both documented procedures',
+  {
+    timeout: 240000,
+  },
+  () => exerciseDockerCollector(true),
+);

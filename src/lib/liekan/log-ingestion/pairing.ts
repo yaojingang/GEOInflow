@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import { serverPairingSchema } from '../contracts/installation';
 import { LiekanError, sourceWebsite, transaction, type WriteIdentity } from '../upstream/server';
-import { createSource, ensureState, publicUrl } from './service';
-import { hostname } from './protocol';
-import { newToken, tokenHash } from './secrets';
 import { readAgentManifest, readDockerManifest } from './assets';
 import { getLogCapabilities } from './capabilities';
 import { dockerInstallCommand } from './docker-deployment';
-import { serverPairingSchema } from '../contracts/installation';
+import { hostname } from './protocol';
+import { newToken, tokenHash } from './secrets';
+import { createSource, ensureState, publicUrl } from './service';
 
 export async function createPairing(
   websiteId: string,
@@ -17,12 +17,29 @@ export async function createPairing(
   const parsed = serverPairingSchema.safeParse(input);
   if (!parsed.success) throw new LiekanError('安装方式无效');
   const runtime = parsed.data.runtime || 'systemd';
+  const manual = parsed.data.manual === true;
   const capabilities = await getLogCapabilities();
-  if (!capabilities.server.available) throw new LiekanError(capabilities.server.reason, 503);
-  if (!capabilities.server.runtimes?.[runtime])
-    throw new LiekanError('所选安装方式的部署包尚未准备完成', 503);
+  if (manual) {
+    // The pre-built manual kit carries its own verified artifacts; only the
+    // shared ingestion prerequisites gate the one-time pairing code.
+    const states = new Map((capabilities.server.checks || []).map(check => [check.id, check]));
+    const blocked = (
+      [
+        ['public-url', '管理员尚未配置公网 HTTPS 接收地址'],
+        ['queue', '日志队列尚未初始化'],
+        ['worker', '日志处理服务暂未就绪'],
+      ] as const
+    ).find(([id]) => states.get(id)?.state !== 'ready');
+    if (blocked) throw new LiekanError(blocked[1], 503);
+  } else {
+    if (!capabilities.server.available) throw new LiekanError(capabilities.server.reason, 503);
+    if (!capabilities.server.runtimes?.[runtime])
+      throw new LiekanError('所选安装方式的部署包尚未准备完成', 503);
+  }
   const url = publicUrl(),
-    manifest = await (runtime === 'docker' ? readDockerManifest() : readAgentManifest()),
+    manifest = manual
+      ? null
+      : await (runtime === 'docker' ? readDockerManifest() : readAgentManifest()),
     code = newToken();
   await transaction(async tx => {
     const website = await sourceWebsite(tx, websiteId, identity),
@@ -44,6 +61,15 @@ export async function createPairing(
       tokenHash(code),
     );
   });
+  if (manual)
+    return {
+      manual: true as const,
+      websiteId,
+      url,
+      pairingCode: code,
+      expiresAt: new Date(Date.now() + 600000).toISOString(),
+    };
+  if (!manifest) throw new LiekanError('所选安装方式的部署包尚未准备完成', 503);
   const command = `d=$(mktemp -d) && curl -fsSL --proto '=https' --tlsv1.2 '${url}/liekan-agent/install.sh' -o "$d/install.sh" && printf '%s  %s\\n' '${manifest.installerSha256}' "$d/install.sh" | sha256sum -c - && sudo sh "$d/install.sh" --url '${url}' --code '${code}'`;
   return {
     command:

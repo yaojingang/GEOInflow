@@ -1660,9 +1660,11 @@
     },
     {
       "path": "scripts/liekan-static-check.mjs",
-      "purpose": "Preserve approved AI UI reference fingerprints",
+      "purpose": "Preserve approved UI fingerprints and classify the manual collector deployment kit as project-owned source",
       "tests": [
-        "pnpm liekan:verify"
+        "pnpm liekan:verify",
+        "node scripts/liekan-static-check.mjs",
+        "pnpm test:agent-docker"
       ],
       "owner": "Liekan AI integration",
       "constraint": "保留原统计、鉴权及返回契约；AI 数据使用自有扩展表",

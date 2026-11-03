@@ -246,16 +246,30 @@ if command -v git >/dev/null 2>&1 && [ "$(git rev-parse --show-toplevel 2>/dev/n
   source_revision=$(git rev-parse HEAD)
   source_state=clean
   source_difference=none
-  source_status=$(git status --porcelain --untracked-files=all -- . ':!.local' ':!.env*' ':!**/.env*' ':!node_modules' ':!**/node_modules' ':!.next' ':!outputs' ':!tmp' ':!coverage' ':!test-results' ':!playwright-report')
+  # The `:!` exclusion pathspecs need git >= 1.9; CentOS 7 ships 1.8 and falls
+  # back to plain listings filtered in the shell with the same exclusions.
+  liekan_git_pathspecs=1
+  if git status --porcelain --untracked-files=no -- ':!.git' >/dev/null 2>&1; then
+    source_status=$(git status --porcelain --untracked-files=all -- . ':!.local' ':!.env*' ':!**/.env*' ':!node_modules' ':!**/node_modules' ':!.next' ':!outputs' ':!tmp' ':!coverage' ':!test-results' ':!playwright-report')
+  else
+    liekan_git_pathspecs=0
+    liekan_source_excludes='(\.local/|([^/]+/)*\.env[^/]*$|([^/]+/)*node_modules/|\.next/|(outputs|tmp|coverage|test-results|playwright-report)/)'
+    source_status=$(git status --porcelain --untracked-files=all | { grep -vE "^...$liekan_source_excludes" || :; })
+  fi
   if [ -n "$source_status" ]; then
     source_state=dirty
     source_difference=$({
       printf '%s\n' "$source_status"
-      git diff --binary HEAD -- . ':!.local' ':!.env*' ':!**/.env*' ':!node_modules' ':!**/node_modules' ':!.next' ':!outputs' ':!tmp' ':!coverage' ':!test-results' ':!playwright-report'
-      git ls-files --others --exclude-standard -z -- . ':!.local' ':!.env*' ':!**/.env*' ':!node_modules' ':!**/node_modules' ':!.next' ':!outputs' ':!tmp' ':!coverage' ':!test-results' ':!playwright-report' | xargs -0 git hash-object --
+      if [ "$liekan_git_pathspecs" -eq 1 ]; then
+        git diff --binary HEAD -- . ':!.local' ':!.env*' ':!**/.env*' ':!node_modules' ':!**/node_modules' ':!.next' ':!outputs' ':!tmp' ':!coverage' ':!test-results' ':!playwright-report'
+        git ls-files --others --exclude-standard -z -- . ':!.local' ':!.env*' ':!**/.env*' ':!node_modules' ':!**/node_modules' ':!.next' ':!outputs' ':!tmp' ':!coverage' ':!test-results' ':!playwright-report' | xargs -0 git hash-object --
+      else
+        git diff --binary HEAD
+        git ls-files --others --exclude-standard -z | { grep -zvE "^$liekan_source_excludes" || :; } | xargs -0 -r git hash-object --
+      fi
     } | git hash-object --stdin)
   fi
-  unset source_status
+  unset source_status liekan_git_pathspecs liekan_source_excludes
 fi
 candidate_override=$(mktemp .local/liekan-candidate.XXXXXX)
 candidate_tag="liekan:deploy-$(basename "$candidate_override" | tr '[:upper:]' '[:lower:]')"

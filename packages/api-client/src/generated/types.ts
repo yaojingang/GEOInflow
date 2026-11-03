@@ -31465,6 +31465,7 @@ export interface operations {
     requestBody: {
       content: {
         'application/json': {
+          manual?: boolean;
           /** @enum {string} */
           runtime?: 'docker' | 'systemd';
         };

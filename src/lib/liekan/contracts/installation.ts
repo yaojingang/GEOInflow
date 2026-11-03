@@ -37,7 +37,11 @@ export interface LogCapability {
   runtimes?: { docker: boolean; systemd: boolean };
 }
 export const serverRuntimeSchema = z.enum(['docker', 'systemd']);
-export const serverPairingSchema = z.strictObject({ runtime: serverRuntimeSchema.optional() });
+export const serverPairingSchema = z.strictObject({
+  runtime: serverRuntimeSchema.optional(),
+  /** Pre-built manual kit: skip app-served installer assets and return the code only. */
+  manual: z.boolean().optional(),
+});
 export function logPublicOrigin(value: string): string | null {
   try {
     const url = new URL(value);

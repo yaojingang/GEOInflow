@@ -147,7 +147,7 @@ changed.push(
     .filter(Boolean),
 );
 const own = path =>
-  /^(src\/lib\/liekan\/|src\/liekan-agent\/|src\/liekan-worker\/|src\/components\/liekan\/|src\/styles\/liekan\/|src\/app\/api\/liekan\/|src\/app\/\(main\)\/websites\/\[websiteId\]\/geo\/|scripts\/liekan-|db\/liekan\/|config\/liekan\/|design\/|docs\/|public\/liekan\/|tests\/liekan\/|tests\/api\/liekan\.spec\.ts$)/.test(
+  /^(src\/lib\/liekan\/|src\/liekan-agent\/|src\/liekan-worker\/|src\/components\/liekan\/|src\/styles\/liekan\/|src\/app\/api\/liekan\/|src\/app\/\(main\)\/websites\/\[websiteId\]\/geo\/|scripts\/liekan-|liekan-agent-deploy\/|db\/liekan\/|config\/liekan\/|design\/|docs\/|public\/liekan\/|tests\/liekan\/|tests\/api\/liekan\.spec\.ts$)/.test(
     path,
   );
 for (const path of changed)
