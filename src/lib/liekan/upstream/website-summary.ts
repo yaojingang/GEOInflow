@@ -1,3 +1,4 @@
+import { warehouseEnabled } from '../warehouse/authority-routing';
 import { readBrowserPopulation } from './browser-population';
 import {
   type BrowserPopulation,
@@ -88,6 +89,7 @@ export async function readWebsiteSummary(request: Request, input: unknown) {
     ttl,
     p.ids.map(websiteCacheTag),
     async () => {
+      if(warehouseEnabled())return (await import('./warehouse-website-summary')).warehouseWebsiteSummaries(sites,p);
       if (process.env.CLICKHOUSE_URL || process.env.CLOUD_MODE) {
         const rows = [];
         // Bound compatibility fallback fan-out; PostgreSQL uses one grouped query.

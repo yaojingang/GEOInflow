@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { api } from '@/lib/liekan/http';
 import { parseRequest } from '@/lib/request';
 import { json, unauthorized } from '@/lib/response';
 import { canUpdateWebsite, canViewAuthenticatedWebsite } from '@/permissions';
@@ -50,11 +51,13 @@ export async function POST(
     return unauthorized();
   }
 
-  if (body.isSaved) {
-    await createReplaySaved(websiteId, replayId, body.name ?? '');
-  } else {
-    await deleteReplaySaved(websiteId, replayId);
-  }
+  return api(async () => {
+    if (body.isSaved) {
+      await createReplaySaved(websiteId, replayId, body.name ?? '', { userId: auth.user.id });
+    } else {
+      await deleteReplaySaved(websiteId, replayId);
+    }
 
-  return json({ ok: true });
+    return json({ ok: true });
+  });
 }

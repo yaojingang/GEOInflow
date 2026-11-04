@@ -1,3 +1,4 @@
+import { warehouseTransient } from './warehouse/control-db';
 import { withPublishedRegistry } from './upstream/crawler-registry-context';
 import { getPublishedCatalog } from './crawlers/published';
 import { z } from 'zod';
@@ -60,7 +61,7 @@ export async function api(
         });
       }, pinned);
     } catch (error) {
-      if (error instanceof AnalyticsRestart) throw error;
+      if (error instanceof AnalyticsRestart || warehouseTransient(error)) throw error;
       const status = error instanceof LiekanError ? error.status : 500;
       return Response.json(
         {

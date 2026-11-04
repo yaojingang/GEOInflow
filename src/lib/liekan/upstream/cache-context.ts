@@ -7,6 +7,8 @@ import { randomUUID } from 'node:crypto';
 import type { CachedResult } from './query-cache';
 import { AnalyticsRestart, AnalyticsUnavailable } from './analytics-budget';
 import { processSingleton } from './process-singleton';
+import { withinWarehouseAuthority } from '../warehouse/authority-routing';
+import { warehouseTransient } from '../warehouse/control-db';
 
 interface CacheContext {
   populations?: Map<string, BrowserPopulation>;
@@ -108,6 +110,22 @@ export function noteCacheResult({ generatedAt, expiresAt, status, tier }: Cached
 }
 export const withoutQueryCache = <T>(work: () => Promise<T>) =>
   contexts.run({ bypass: true, results: [] }, work);
+/** File generation outlives the HTTP response headers. Retain the submitting
+ * identity and reauthorization callback, without the interactive cache deadline. */
+export function exportReadContext<T>(work: () => Promise<T>) {
+  const parent = contexts.getStore();
+  return contexts.run(
+    {
+      ...parent,
+      bypass: true,
+      deadline: undefined,
+      results: [],
+      versions: new Map(),
+      populations: new Map(),
+    },
+    work,
+  );
+}
 export const CacheProbeMiss = processSingleton(
   'analytics-cache-probe-miss',
   () => class CacheProbeMiss extends Error {},
@@ -186,7 +204,7 @@ export async function withQueryCacheHeaders(
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        response = await contexts.run(context, work);
+        response = await withinWarehouseAuthority(() => contexts.run(context, work));
         break;
       } catch (error) {
         if (!(error instanceof AnalyticsRestart) || attempt > 0)
@@ -210,6 +228,17 @@ export async function withQueryCacheHeaders(
         { status: 403, headers: { 'Cache-Control': 'private, no-store' } },
       );
   } catch (error) {
+    if (warehouseTransient(error))
+      return Response.json(
+        {
+          error: {
+            message: '统计服务暂时繁忙或正在切换，请稍后重试',
+            status: 503,
+            code: error.code,
+          },
+        },
+        { status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '2' } },
+      );
     if (!(error instanceof AnalyticsUnavailable)) throw error;
     return Response.json(
       { error: { message: error.message, status: error.status } },

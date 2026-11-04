@@ -330,7 +330,7 @@ export default withNextIntl({
   },
   basePath,
   output: isVercel ? undefined : 'standalone',
-  serverExternalPackages: ['pg'],
+  serverExternalPackages: ['pg', '@confluentinc/kafka-javascript', 'kafkajs'],
   typescript: {
     ignoreBuildErrors: false,
   },

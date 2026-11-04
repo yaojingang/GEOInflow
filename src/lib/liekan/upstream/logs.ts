@@ -20,6 +20,7 @@ import { analysisSafeNumber } from './analysis-rollups-model';
 import { decodeCursor, encodeCursor } from '../cursor';
 import { humanPathFromEncoded } from './paths';
 import { LiekanError, query } from './server';
+import { warehouseEnabled } from '../warehouse/runtime';
 import { staticRequestExtensionPattern } from './log-content-boundary';
 
 export { staticRequestExtensionPattern, isStaticRequestPath } from './log-content-boundary';
@@ -86,7 +87,11 @@ async function readPreferredLogSeries(input: Parameters<typeof readAnalysisLogSe
       (a.type || '').localeCompare(b.type || ''),
   );
 }
-export async function getLogFacts(...args: Parameters<typeof readLogFacts>) {
+export async function getLogFacts(
+  ...args: Parameters<typeof readLogFacts>
+): Promise<Awaited<ReturnType<typeof readLogFacts>>> {
+  if (warehouseEnabled())
+    return (await import('./warehouse-log-queries')).warehouseLogFacts(...args);
   return withLogStatisticsRead(() => readLogFacts(...args));
 }
 async function readLogFacts(
@@ -393,6 +398,7 @@ async function readLogFacts(
   };
 }
 export async function getLogToday(id: string, start: Date, end: Date) {
+  if(warehouseEnabled())return (await import('./warehouse-log-queries')).warehouseLogToday(id,start,end);
   const [rows, imports] = await Promise.all([
     readAnalysisLogToday({ websiteId: id, startDate: start, endDate: end }).then(
       covered =>
@@ -426,6 +432,8 @@ export async function getContentImpact(
     end,
   );
   if (!targets.length) return [];
+  if (warehouseEnabled()) return (await import('./warehouse-log-queries')).warehouseContentImpact(id,
+    targets.map(target=>({...target,humanPath:humanPathFromEncoded(target.path)})),metrics);
   return query(
     `WITH targets AS (SELECT * FROM jsonb_to_recordset($2::jsonb) AS c(path text,"humanPath" text,"publishedAt" timestamptz))
     SELECT c.path,
@@ -445,6 +453,7 @@ export async function getMonthlyAiShare(
   timezone: string,
   metrics: CrawlerMetricOptions = { crawlerIdentityScope: 'all' },
 ) {
+  if(warehouseEnabled())return (await import('./warehouse-log-queries')).warehouseMonthlyAiShare(id,end,timezone,metrics);
   const monthEnd = metrics.crawlerMetricsVersion === 1 ? new Date(+end - 1) : end;
   if (/^[a-f0-9-]{36}$/i.test(id)) {
     const [y, m] = formatInTimeZone(monthEnd, timezone, 'yyyy-MM').split('-').map(Number);
@@ -494,6 +503,7 @@ export async function getPlotLogs(
   hour = false,
   metrics: CrawlerMetricOptions = { crawlerIdentityScope: 'all' },
 ) {
+  if(warehouseEnabled())return (await import('./warehouse-log-queries')).warehousePlotLogs(id,start,end,timezone,hour,metrics);
   if (/^[a-f0-9-]{36}$/i.test(id)) {
     const series = await readPreferredLogSeries({
       websiteId: id,

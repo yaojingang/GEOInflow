@@ -1,9 +1,16 @@
+import { warehouseEnabled } from '@/lib/liekan/warehouse/authority-routing';
+import { assertTransitionMaintenance } from './warehouse-maintenance';
 import {
-  emptyLogImpact,
-  logImpactCategories,
-  addLogImpact,
-  distinctLogKey,
-} from '../history-repair/log-impact';
+  finishRepairPreview,
+  planRepairEvents,
+  planRepairLogs,
+  type EventRow,
+  type LogRow,
+  type ResultWrite,
+  type DayWrite,
+  type VisitorWrite,
+} from './history-repair-plan';
+import { emptyLogImpact } from '../history-repair/log-impact';
 import { randomUUID } from 'node:crypto';
 import { lockWritableWebsite, LiekanError } from './server';
 import { withPublishedRegistry } from './crawler-registry-context';
@@ -12,23 +19,15 @@ import { invalidateWebsiteAnalytics } from './query-cache';
 import {
   HISTORY_REPAIR_CAMPAIGN,
   HISTORY_REPAIR_ENGINE,
-  type HistoryRepairPreview,
   type HistoryRepairDay,
 } from '../contracts/history-repair';
 import {
   addCounts,
   emptyCounts,
   publicRepairCounts,
-  eventDecision,
-  fraction,
   hash,
-  includedEvent,
-  includedBrowserMetricEvent,
-  logDecision,
-  terminalStatuses,
   workingStatuses,
   type EventVerdict,
-  type LogVerdict,
 } from '../history-repair/model';
 import {
   repairTransaction,
@@ -46,73 +45,6 @@ import {
 import type { SavedEvidence } from './history-repair-evidence';
 const EVENT_SCOPE = `q.website_id=$1::uuid AND q.repair_scope_id IS NULL`;
 const LOG_SCOPE = `l.website_id=$1::uuid AND i.repair_scope_id IS NULL`;
-interface EventRow {
-  id: string;
-  time: string;
-  day: string;
-  session_id: string;
-  event_type: number;
-  hostname: string | null;
-  origin_hostname: string | null;
-  excluded: boolean;
-  identity_available: boolean;
-  identity_scope: string | null;
-  classification: EventVerdict['classification'];
-  source: string;
-  reasons: string[];
-  rule_version: string;
-  current_classification: EventVerdict['classification'];
-  current_reasons: string[];
-  current_rule_version: string;
-}
-interface LogRow {
-  id: string;
-  time: string;
-  day: string;
-  user_agent: string;
-  bot: string;
-  vendor: string;
-  bot_type: string;
-  ai_eligible: boolean | null;
-  crawler_id: string | null;
-  recognition_state: string | null;
-  recognition_candidates: string[] | null;
-  verification: string;
-  verification_version: string | null;
-  verification_observed_at: string | null;
-  verification_reason: string | null;
-  path: string;
-  catalog_version: string | null;
-  identity_evidence: { subjectId?: string; status?: string } | null;
-}
-interface ResultWrite {
-  id: string;
-  kind: 'event' | 'log';
-  before: unknown;
-  after: unknown;
-  proof: unknown;
-  issue: string | null;
-}
-interface DayWrite {
-  day: string;
-  beforePV: number;
-  afterPV: number;
-  beforeIdentityMissingPV: number;
-  afterIdentityMissingPV: number;
-  events: number;
-  logs: number;
-  changedEvents: number;
-  changedLogs: number;
-  evidence: number;
-  logEvidence: number;
-}
-interface VisitorWrite {
-  itemKey?: string;
-  day: string;
-  session: string;
-  before: boolean;
-  after: boolean;
-}
 async function writeResults(tx: RepairTx, row: RunRow, values: ResultWrite[]) {
   if (!values.length) return;
   await tx.$executeRawUnsafe(
@@ -222,134 +154,10 @@ async function eventBatch(tx: RepairTx, row: RunRow) {
     ids,
     row.snapshot.rulepack.hash,
   );
-  const supplied = new Map(evidence.map(item => [item.record.eventId, item.record]));
-  const results: ResultWrite[] = [],
-    days: DayWrite[] = [],
-    visitors: VisitorWrite[] = [];
-  let changed = 0,
-    covered = 0,
-    conflicts = 0,
-    beforePV = 0,
-    afterPV = 0,
-    beforeIdentityMissingPV = 0,
-    afterIdentityMissingPV = 0;
-  for (const event of rows) {
-    const original: EventVerdict = {
-      classification: event.classification,
-      source: event.source,
-      reasons: event.reasons,
-      ruleVersion: event.rule_version,
-    };
-    const decision = eventDecision(original, row.snapshot.rulepack, supplied.get(event.id));
-    if (decision.changed || decision.issue)
-      results.push({
-        id: event.id,
-        kind: 'event',
-        before: decision.before,
-        after: decision.after,
-        proof: supplied.has(event.id)
-          ? { ...decision.proof, catalogVersion: row.snapshot.rulepack.catalogVersion }
-          : decision.proof,
-        issue: decision.issue,
-      });
-    const before = {
-      ...original,
-      classification: event.current_classification,
-      reasons: event.current_reasons,
-      ruleVersion: event.current_rule_version,
-    };
-    const pv = event.event_type === 1;
-    const beforeAdmissible =
-      pv &&
-      includedEvent(before, event.event_type, event.hostname, row.snapshot.policy, {
-        originHostname: event.origin_hostname,
-        excluded: event.excluded,
-      });
-    const afterAdmissible =
-      pv &&
-      includedEvent(decision.after, event.event_type, event.hostname, row.snapshot.policy, {
-        originHostname: event.origin_hostname,
-        excluded: event.excluded,
-      });
-    const metricContext = {
-      originHostname: event.origin_hostname,
-      excluded: event.excluded,
-      identityScope: event.identity_scope,
-      identityAvailable: event.identity_available,
-    };
-    const beforeIncluded =
-      pv &&
-      includedBrowserMetricEvent(
-        before,
-        event.event_type,
-        event.hostname,
-        row.snapshot.policy,
-        metricContext,
-      );
-    const afterIncluded =
-      pv &&
-      includedBrowserMetricEvent(
-        decision.after,
-        event.event_type,
-        event.hostname,
-        row.snapshot.policy,
-        metricContext,
-      );
-    if (pv)
-      visitors.push(
-        {
-          day: event.day,
-          session: event.session_id,
-          before: beforeIncluded && event.identity_available,
-          after: afterIncluded && event.identity_available,
-        },
-        {
-          day: 'all',
-          session: event.session_id,
-          before: beforeIncluded && event.identity_available,
-          after: afterIncluded && event.identity_available,
-        },
-      );
-    changed += +decision.changed;
-    covered += +decision.evidence;
-    conflicts += +!!decision.issue;
-    beforePV += +beforeIncluded;
-    afterPV += +afterIncluded;
-    beforeIdentityMissingPV += +(beforeAdmissible && !beforeIncluded);
-    afterIdentityMissingPV += +(afterAdmissible && !afterIncluded);
-    days.push({
-      day: event.day,
-      beforePV: +beforeIncluded,
-      afterPV: +afterIncluded,
-      beforeIdentityMissingPV: +(beforeAdmissible && !beforeIncluded),
-      afterIdentityMissingPV: +(afterAdmissible && !afterIncluded),
-      events: 1,
-      logs: 0,
-      changedEvents: +decision.changed,
-      changedLogs: 0,
-      evidence: +decision.evidence,
-      logEvidence: 0,
-    });
-  }
+  const { results, days, visitors } = planRepairEvents(row, rows, evidence);
   await writeResults(tx, row, results);
   await writeDays(tx, row, days);
   await writeVisitors(tx, row, visitors);
-  row.counts = addCounts(row.counts, {
-    processed: String(rows.length),
-    changedEvents: String(changed),
-    browserEvidence: String(covered),
-    conflicts: String(conflicts),
-    beforePV: String(beforePV),
-    afterPV: String(afterPV),
-    beforeIdentityMissingPV: String(beforeIdentityMissingPV),
-    afterIdentityMissingPV: String(afterIdentityMissingPV),
-  });
-  const last = rows.at(-1);
-  row.cursor = {
-    time: last.time,
-    id: last.id,
-    membership: hash([row.cursor.membership, rows.map(value => [value.id, value.time])]),
-  };
 }
 async function undatedEventBatch(tx: RepairTx, row: RunRow) {
   const rows = await tx.$queryRawUnsafe<
@@ -416,9 +224,6 @@ async function logBatch(tx: RepairTx, row: RunRow) {
     row.cursor = { membership: row.cursor.membership };
     return;
   }
-  let changed = 0,
-    covered = 0,
-    conflicts = 0;
   const originalForms = await tx.$queryRawUnsafe<{ version: string; id: string; form: string }[]>(
     `SELECT DISTINCT v.version::text,identity->>'id' AS id,identity->>'productForm' AS form FROM jsonb_to_recordset($1::jsonb) wanted(version uuid,id text) JOIN liekan_crawler_registry_version v ON v.version=wanted.version CROSS JOIN LATERAL jsonb_array_elements(v.payload->'identities') identity WHERE identity->>'id'=wanted.id`,
     JSON.stringify(
@@ -433,93 +238,10 @@ async function logBatch(tx: RepairTx, row: RunRow) {
     row.snapshot.rulepack.catalogVersion,
   );
   const afterForms = new Map(pinnedForms.map(item => [item.id, item.form]));
-  const results: ResultWrite[] = [],
-    days: DayWrite[] = [],
-    visitors: VisitorWrite[] = [];
-  row.log_impact = { ...emptyLogImpact(), ...row.log_impact };
-  for (const log of logs) {
-    const original: LogVerdict = {
-      bot: log.bot,
-      vendor: log.vendor,
-      botType: log.bot_type,
-      aiEligible: log.ai_eligible,
-      crawlerId: log.crawler_id,
-      recognitionState: log.recognition_state,
-      recognitionCandidates: log.recognition_candidates || [],
-      verification: log.verification,
-      verificationVersion: log.verification_version,
-      verificationObservedAt: log.verification_observed_at,
-      verificationReason: log.verification_reason,
-    };
-    const decision = logDecision(
-      original,
-      log.user_agent,
-      row.snapshot.rulepack,
-      log.identity_evidence,
-      {
-        originalVersion: log.catalog_version,
-        originalProductForm: beforeForms.get(`${log.catalog_version}:${log.crawler_id}`) || null,
-        forms: afterForms,
-      },
-    );
-    const before = logImpactCategories(original, decision.productForm.before);
-    const after = logImpactCategories(decision.after, decision.productForm.after);
-    row.log_impact = addLogImpact(row.log_impact, before, after);
-    for (const identity of new Set([before.identity, after.identity].filter(Boolean)))
-      visitors.push({
-        day: 'log:identities',
-        ...distinctLogKey('identity', identity),
-        before: before.identity === identity,
-        after: after.identity === identity,
-      });
-    if (before.ai || after.ai)
-      visitors.push({
-        day: 'log:ai-pages',
-        ...distinctLogKey('ai-page', log.path),
-        before: before.ai,
-        after: after.ai,
-      });
-    if (decision.changed || decision.issue)
-      results.push({
-        id: log.id,
-        kind: 'log',
-        before: decision.before,
-        after: decision.after,
-        proof: decision.proof,
-        issue: decision.issue,
-      });
-    changed += +decision.changed;
-    covered += +decision.evidence;
-    conflicts += +(decision.issue === 'identity-conflict');
-    days.push({
-      day: log.day,
-      beforePV: 0,
-      afterPV: 0,
-      beforeIdentityMissingPV: 0,
-      afterIdentityMissingPV: 0,
-      events: 0,
-      logs: 1,
-      changedEvents: 0,
-      changedLogs: +decision.changed,
-      evidence: 0,
-      logEvidence: +decision.evidence,
-    });
-  }
+  const { results, days, visitors } = planRepairLogs(row, logs, beforeForms, afterForms);
   await writeResults(tx, row, results);
   await writeDays(tx, row, days);
   await writeVisitors(tx, row, visitors);
-  row.counts = addCounts(row.counts, {
-    processed: String(logs.length),
-    changedLogs: String(changed),
-    logEvidence: String(covered),
-    conflicts: String(conflicts),
-  });
-  const last = logs.at(-1);
-  row.cursor = {
-    time: last.time,
-    id: last.id,
-    membership: hash([row.cursor.membership, logs.map(value => [value.id, value.time])]),
-  };
 }
 async function visitorBatch(tx: RepairTx, row: RunRow) {
   const visitors = await tx.$queryRawUnsafe<
@@ -606,76 +328,12 @@ async function finishPreview(tx: RepairTx, row: RunRow) {
     row.cursor.daysAfter = days.at(-1).day;
     return;
   }
-  const limitations: string[] = [];
-  if (BigInt(row.counts.browserEvidence) < BigInt(row.counts.events))
-    limitations.push('browser-input-incomplete');
-  if (BigInt(row.counts.logEvidence) < BigInt(row.counts.logs))
-    limitations.push('log-input-incomplete');
-  if (BigInt(row.counts.missingQuality)) limitations.push('missing-quality-scan-time-only');
-  if (BigInt(row.counts.undatedEvents)) limitations.push('undated-events');
-  if (BigInt(row.counts.conflicts)) limitations.push('evidence-conflicts-retained');
-  if (row.excluded_batches.length) limitations.push('excluded-old-batches');
-  if (
-    BigInt(row.counts.beforeIdentityMissingPV ?? '0') ||
-    BigInt(row.counts.afterIdentityMissingPV ?? '0')
-  )
-    limitations.push('identity-input-incomplete');
-  if (row.snapshot.rulepack.botCheckDisabled) limitations.push('bot-check-disabled');
   const sourceUploads = await tx.$queryRawUnsafe<{ id: string }[]>(
     `SELECT DISTINCT upload_id::text AS id FROM liekan_history_repair_input i WHERE run_id=$1::uuid AND state='finalized' AND rulepack_hash=$2 AND ${currentRepairInputSql} ORDER BY id LIMIT 100`,
     row.id,
     row.snapshot.rulepack.hash,
   );
-  const preview: HistoryRepairPreview = {
-    generation: row.generation,
-    revision: row.revision,
-    digest: '',
-    complete: true,
-    metricScope: 'qualified-browser',
-    counts: publicRepairCounts(row.counts, 'qualified-browser'),
-    logImpact: { ...emptyLogImpact(), ...row.log_impact },
-    sourceUploads: sourceUploads.map(source => source.id),
-    browserCoverage: fraction(row.counts.browserEvidence, row.counts.events),
-    logCoverage: fraction(row.counts.logEvidence, row.counts.logs),
-    partial: limitations.length > 0,
-    limitations,
-    excludedBatches: row.excluded_batches,
-    timezone: row.snapshot.timezone,
-    policy: row.snapshot.policy,
-    rulepack: {
-      engine: row.snapshot.rulepack.engine,
-      matcher: row.snapshot.rulepack.matcher,
-      detector: row.snapshot.rulepack.detector,
-      botCheckDisabled: row.snapshot.rulepack.botCheckDisabled,
-      catalogVersion: row.snapshot.rulepack.catalogVersion,
-      rulesRevision: row.snapshot.rulepack.rulesRevision,
-      hash: row.snapshot.rulepack.hash,
-    },
-  };
-  preview.digest = hash([
-    preview,
-    row.cursor.membership,
-    row.scope_revision.toString(),
-    row.input_revision,
-    row.snapshot.authorityHash,
-  ]);
-  row.preview = preview;
-  row.membership_digest = row.cursor.membership;
-  row.phase = 'preview';
-  const total = BigInt(row.counts.events) + BigInt(row.counts.logs),
-    changes = BigInt(row.counts.changedEvents) + BigInt(row.counts.changedLogs),
-    coverage = BigInt(row.counts.browserEvidence) + BigInt(row.counts.logEvidence);
-  row.status =
-    total === 0n
-      ? BigInt(row.counts.missingQuality)
-        ? 'unidentifiable'
-        : 'empty'
-      : changes > 0n
-        ? 'ready'
-        : coverage > 0n
-          ? 'unchanged'
-          : 'unidentifiable';
-  if (terminalStatuses.includes(row.status)) row.completed_at = new Date();
+  finishRepairPreview(row, sourceUploads);
   await tx.$executeRawUnsafe(
     `UPDATE liekan_history_repair_run SET membership_digest=$2 WHERE id=$1::uuid`,
     row.id,
@@ -744,6 +402,7 @@ export async function historyRepairCapability() {
 }
 export async function processHistoryRepairJob(
   payload: { runId: string; stepId?: string } | string,
+  warehouse?: import('../warehouse/runtime').WarehouseRuntime,
 ) {
   if (process.env.CLICKHOUSE_URL) return;
   const runId = typeof payload === 'string' ? payload : payload.runId;
@@ -751,6 +410,7 @@ export async function processHistoryRepairJob(
   const stepId = typeof payload === 'string' ? undefined : payload.stepId;
   const token = randomUUID();
   const acquired = await repairTransaction(async tx => {
+    await assertTransitionMaintenance(tx, 'repair');
     const [first] = await tx.$queryRawUnsafe<RunRow[]>(
       'SELECT * FROM liekan_history_repair_run WHERE id=$1::uuid',
       runId,
@@ -806,13 +466,19 @@ export async function processHistoryRepairJob(
   let heartbeatPending: Promise<unknown> | undefined;
   const heartbeat = setInterval(() => {
     if (heartbeatPending) return;
-    heartbeatPending = repairTransaction(tx =>
-      tx.$executeRawUnsafe(
+    heartbeatPending = repairTransaction(async tx => {
+      const owned = await tx.$executeRawUnsafe(
         `UPDATE liekan_history_repair_campaign SET lease_until=clock_timestamp()+interval '60 seconds' WHERE id=$1 AND lease_token=$2::uuid AND lease_until>clock_timestamp()`,
         HISTORY_REPAIR_CAMPAIGN,
         token,
-      ),
-    )
+      );
+      if (owned && warehouseEnabled())
+        await tx.$executeRawUnsafe(
+          "UPDATE liekan_history_repair_run SET lease_until=clock_timestamp()+interval '60 seconds' WHERE id=$1::uuid AND lease_token=$2::uuid AND lease_until>clock_timestamp()",
+          runId,
+          token,
+        );
+    })
       .catch(() => {})
       .finally(() => {
         heartbeatPending = undefined;
@@ -822,58 +488,81 @@ export async function processHistoryRepairJob(
   try {
     await withPublishedRegistry(
       () =>
-        repairTransaction(async tx => {
-          await lockWritableWebsite(
-            tx,
-            acquired.website_id,
-            { userId: acquired.actor_id },
-            acquired.status === 'validating' ? 'update' : 'share',
-          );
-          const row = await runForSite(tx, acquired.website_id);
-          if (
-            !row ||
-            row.lease_token !== token ||
-            !row.lease_until ||
-            +row.lease_until < Date.now() ||
-            !workingStatuses.includes(row.status)
-          )
-            return;
-          if (row.snapshot.rulepack.engine !== HISTORY_REPAIR_ENGINE)
-            throw new LiekanError('工作进程不支持该规则包', 409, 'history-repair-engine-changed');
-          await assertSnapshot(tx, row, false);
-          // Each lease commits one bounded work unit. SQL has a 5s deadline and the transaction a 30s deadline.
-          if (row.status === 'queued' || row.status === 'running') {
-            row.status = 'validating';
-            row.phase = 'activation';
-          } else if (row.status === 'validating') {
-            await activate(tx, row);
-            invalidated = true;
-          } else if (row.phase === 'boundary') await prepareBoundary(tx, row);
-          else if (row.phase === 'events') await eventBatch(tx, row);
-          else if (row.phase === 'undated-events') await undatedEventBatch(tx, row);
-          else if (row.phase === 'logs') await logBatch(tx, row);
-          else if (row.phase === 'visitors') await visitorBatch(tx, row);
-          else if (row.phase === 'log-impact') await logImpactBatch(tx, row);
-          else if (row.phase === 'days') await finishPreview(tx, row);
-          const [owned] = await tx.$queryRawUnsafe(
-            `SELECT 1 FROM liekan_history_repair_campaign c JOIN liekan_history_repair_run r ON r.id=c.lease_run_id WHERE c.id=$1 AND c.lease_token=$2::uuid AND c.lease_until>clock_timestamp() AND r.lease_token=$2::uuid AND r.lease_until>clock_timestamp()`,
-            HISTORY_REPAIR_CAMPAIGN,
-            token,
-          );
-          if (!owned) throw new LiekanError('工作租约已失效', 409, 'history-repair-lease-lost');
-          row.attempts = 0;
-          await saveRun(tx, row);
-          await tx.$executeRawUnsafe(
-            `UPDATE liekan_history_repair_run SET lease_token=NULL,lease_until=NULL,attempts=0 WHERE id=$1::uuid AND lease_token=$2::uuid`,
-            row.id,
-            token,
-          );
-          if (workingStatuses.includes(row.status) && row.error_code !== 'waiting-old-batches')
-            await enqueueRepair(tx, row);
-        }),
+        warehouseEnabled() && ['scanning', 'preparing'].includes(acquired.status)
+          ? import('./warehouse-history-repair-worker').then(m =>
+              m.processWarehouseHistoryRepairUnit(acquired, warehouse),
+            )
+          : repairTransaction(async tx => {
+              await lockWritableWebsite(
+                tx,
+                acquired.website_id,
+                { userId: acquired.actor_id },
+                acquired.status === 'validating' ? 'update' : 'share',
+              );
+              const row = await runForSite(tx, acquired.website_id);
+              if (
+                !row ||
+                row.lease_token !== token ||
+                !row.lease_until ||
+                +row.lease_until < Date.now() ||
+                !workingStatuses.includes(row.status)
+              )
+                return;
+              if (row.snapshot.rulepack.engine !== HISTORY_REPAIR_ENGINE)
+                throw new LiekanError(
+                  '工作进程不支持该规则包',
+                  409,
+                  'history-repair-engine-changed',
+                );
+              await assertSnapshot(tx, row, false);
+              // Each lease commits one bounded work unit. SQL has a 5s deadline and the transaction a 30s deadline.
+              if (row.status === 'queued' || row.status === 'running') {
+                row.status = 'validating';
+                row.phase = 'activation';
+              } else if (row.status === 'validating') {
+                await activate(tx, row);
+                invalidated = true;
+              } else if (row.phase === 'boundary') await prepareBoundary(tx, row);
+              else if (row.phase === 'events') await eventBatch(tx, row);
+              else if (row.phase === 'undated-events') await undatedEventBatch(tx, row);
+              else if (row.phase === 'logs') await logBatch(tx, row);
+              else if (row.phase === 'visitors') await visitorBatch(tx, row);
+              else if (row.phase === 'log-impact') await logImpactBatch(tx, row);
+              else if (row.phase === 'days') await finishPreview(tx, row);
+              const [owned] = await tx.$queryRawUnsafe(
+                `SELECT 1 FROM liekan_history_repair_campaign c JOIN liekan_history_repair_run r ON r.id=c.lease_run_id WHERE c.id=$1 AND c.lease_token=$2::uuid AND c.lease_until>clock_timestamp() AND r.lease_token=$2::uuid AND r.lease_until>clock_timestamp()`,
+                HISTORY_REPAIR_CAMPAIGN,
+                token,
+              );
+              if (!owned) throw new LiekanError('工作租约已失效', 409, 'history-repair-lease-lost');
+              row.attempts = 0;
+              await saveRun(tx, row);
+              await tx.$executeRawUnsafe(
+                `UPDATE liekan_history_repair_run SET lease_token=NULL,lease_until=NULL,attempts=0 WHERE id=$1::uuid AND lease_token=$2::uuid`,
+                row.id,
+                token,
+              );
+              if (workingStatuses.includes(row.status) && row.error_code !== 'waiting-old-batches')
+                await enqueueRepair(tx, row);
+            }),
       acquired.snapshot.rulepack.catalogVersion,
     );
   } catch (error) {
+    // A registered result survives worker/HTTP failure. Its queue publication
+    // owns the cursor; the old worker must not invalidate or overwrite it.
+    if (
+      warehouseEnabled() &&
+      (
+        await repairTransaction(tx =>
+          tx.$queryRawUnsafe(
+            "SELECT 1 FROM liekan_warehouse_task WHERE website_id=$1::uuid AND kind='history-repair-batch' AND scope_key=$2 AND status IN('pending','confirmed') LIMIT 1",
+            acquired.website_id,
+            runId,
+          ),
+        )
+      ).length
+    )
+      return;
     const conflict = error instanceof LiekanError && [401, 403, 404, 409].includes(error.status);
     const lockWait = /lock timeout|55P03/i.test(
       String(error instanceof Error ? error.message : ''),
@@ -931,49 +620,58 @@ export async function processHistoryRepairJob(
 }
 export async function reconcileHistoryRepairs() {
   if (process.env.CLICKHOUSE_URL) return;
+  const warehouse = warehouseEnabled();
+  const pendingFence = warehouse
+    ? `AND NOT EXISTS(SELECT 1 FROM liekan_warehouse_task t WHERE t.website_id=r.website_id AND t.scope_key=r.id::text AND t.kind IN('history-repair-batch','history-repair-input') AND t.status IN('pending','confirmed'))`
+    : '';
   const unreferencedInput = unreferencedRepairInputSql;
   await repairTransaction(async tx => {
+    await assertTransitionMaintenance(tx, 'repair');
     await tx.$executeRawUnsafe(
-      `UPDATE liekan_history_repair_run r SET scope_changed=true,scope_revision=scope_revision+1,error_code=CASE WHEN active_generation IS NOT NULL THEN 'active-scope-gap' ELSE 'scope-changed' END WHERE NOT scope_changed AND EXISTS(SELECT 1 FROM liekan_history_repair_action a WHERE a.run_id=r.id AND a.generation=r.generation AND a.action='scope-gap')`,
+      `UPDATE liekan_history_repair_run r SET scope_changed=true,scope_revision=scope_revision+1,error_code=CASE WHEN active_generation IS NOT NULL THEN 'active-scope-gap' ELSE 'scope-changed' END WHERE NOT scope_changed AND EXISTS(SELECT 1 FROM liekan_history_repair_action a WHERE a.run_id=r.id AND a.generation=r.generation AND a.action='scope-gap') ${pendingFence}`,
     );
     await tx.$executeRawUnsafe(
-      `UPDATE liekan_history_repair_run SET status='expired',error_code='history-repair-idle-expired',preview=NULL,snapshot=jsonb_set(snapshot,'{inputNotBefore}',to_jsonb(clock_timestamp())),completed_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id IN(SELECT id FROM liekan_history_repair_run WHERE status IN('ready','failed','paused') AND confirmed_at IS NULL AND updated_at<clock_timestamp()-interval '7 days' ORDER BY updated_at,id LIMIT 20 FOR NO KEY UPDATE SKIP LOCKED)`,
+      `UPDATE liekan_history_repair_run SET status='expired',error_code='history-repair-idle-expired',preview=NULL,snapshot=jsonb_set(snapshot,'{inputNotBefore}',to_jsonb(clock_timestamp())),completed_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id IN(SELECT r.id FROM liekan_history_repair_run r WHERE status IN('ready','failed','paused') ${pendingFence} AND confirmed_at IS NULL AND updated_at<clock_timestamp()-interval '7 days' ORDER BY updated_at,id LIMIT 20 FOR NO KEY UPDATE SKIP LOCKED)`,
     );
     await tx.$executeRawUnsafe(
-      `UPDATE liekan_history_repair_run SET snapshot=jsonb_set(snapshot,'{inputNotBefore}',to_jsonb(clock_timestamp())) WHERE id IN(SELECT id FROM liekan_history_repair_run WHERE status IN('unchanged','unidentifiable','empty','cancelled','invalidated') AND updated_at<clock_timestamp()-interval '7 days' AND (snapshot->>'inputNotBefore' IS NULL OR (snapshot->>'inputNotBefore')::timestamptz<updated_at) ORDER BY updated_at,id LIMIT 20 FOR NO KEY UPDATE SKIP LOCKED)`,
+      `UPDATE liekan_history_repair_run SET snapshot=jsonb_set(snapshot,'{inputNotBefore}',to_jsonb(clock_timestamp())) WHERE id IN(SELECT r.id FROM liekan_history_repair_run r WHERE status IN('unchanged','unidentifiable','empty','cancelled','invalidated') ${pendingFence} AND updated_at<clock_timestamp()-interval '7 days' AND (snapshot->>'inputNotBefore' IS NULL OR (snapshot->>'inputNotBefore')::timestamptz<updated_at) ORDER BY updated_at,id LIMIT 20 FOR NO KEY UPDATE SKIP LOCKED)`,
     );
-    await tx.$executeRawUnsafe(
-      `DELETE FROM liekan_history_repair_visitor v WHERE v.ctid IN(SELECT v.ctid FROM liekan_history_repair_visitor v JOIN liekan_history_repair_run r ON r.id=v.run_id WHERE (r.completed_at<clock_timestamp()-interval '7 days' AND r.status IN('completed','completed_limited','unchanged','unidentifiable','empty','cancelled','rolled_back','expired','invalidated')) OR (v.generation<>r.generation AND v.created_at<clock_timestamp()-interval '7 days') LIMIT 2000)`,
-    );
-    const obsolete = `SELECT r.id AS run_id,a.key::uuid AS generation FROM liekan_history_repair_run r CROSS JOIN LATERAL jsonb_each(r.generation_archive) a WHERE a.value->>'confirmedAt' IS NULL AND (a.value->>'archivedAt')::timestamptz<clock_timestamp()-interval '7 days' AND a.key<>r.generation::text AND a.key IS DISTINCT FROM r.active_generation::text AND a.key IS DISTINCT FROM r.previous_generation::text`;
-    await tx.$executeRawUnsafe(
-      `WITH obsolete AS (${obsolete}) DELETE FROM liekan_history_repair_result p WHERE p.ctid IN(SELECT p.ctid FROM liekan_history_repair_result p JOIN obsolete o ON o.run_id=p.run_id AND o.generation=p.generation LIMIT 2000)`,
-    );
-    await tx.$executeRawUnsafe(
-      `WITH obsolete AS (${obsolete}) DELETE FROM liekan_history_repair_visitor p WHERE p.ctid IN(SELECT p.ctid FROM liekan_history_repair_visitor p JOIN obsolete o ON o.run_id=p.run_id AND o.generation=p.generation LIMIT 2000)`,
-    );
-    await tx.$executeRawUnsafe(
-      `WITH obsolete AS (${obsolete}) DELETE FROM liekan_history_repair_input i WHERE i.ctid IN(SELECT i.ctid FROM liekan_history_repair_input i JOIN obsolete o ON o.run_id=i.run_id AND o.generation=i.generation JOIN liekan_history_repair_run r ON r.id=i.run_id WHERE (i.state='discarded' OR i.created_at<=(r.snapshot->>'inputNotBefore')::timestamptz) AND ${unreferencedInput} LIMIT 100)`,
-    );
-    // Expiry drops unsubmitted material. Active and previous result/proof generations stay readable.
-    await tx.$executeRawUnsafe(
-      `DELETE FROM liekan_history_repair_result v WHERE v.ctid IN(SELECT v.ctid FROM liekan_history_repair_result v JOIN liekan_history_repair_run r ON r.id=v.run_id WHERE (r.status='expired' OR v.created_at<=(r.snapshot->>'inputNotBefore')::timestamptz) AND v.generation IS DISTINCT FROM r.active_generation AND v.generation IS DISTINCT FROM r.previous_generation LIMIT 2000)`,
-    );
-    await tx.$executeRawUnsafe(
-      `DELETE FROM liekan_history_repair_day v WHERE v.ctid IN(SELECT v.ctid FROM liekan_history_repair_day v JOIN liekan_history_repair_run r ON r.id=v.run_id WHERE r.status='expired' AND v.generation IS DISTINCT FROM r.active_generation AND v.generation IS DISTINCT FROM r.previous_generation LIMIT 2000)`,
-    );
-    await tx.$executeRawUnsafe(
-      `DELETE FROM liekan_history_repair_input i WHERE i.ctid IN(SELECT i.ctid FROM liekan_history_repair_input i JOIN liekan_history_repair_run r ON r.id=i.run_id WHERE (r.status='expired' OR i.created_at<=(r.snapshot->>'inputNotBefore')::timestamptz) AND ${unreferencedInput} LIMIT 100)`,
-    );
-    await tx.$executeRawUnsafe(
-      `UPDATE liekan_history_repair_input i SET state='discarded',records='[]' WHERE i.ctid IN(SELECT i.ctid FROM liekan_history_repair_input i JOIN liekan_history_repair_run r ON r.id=i.run_id WHERE (r.status='expired' OR i.created_at<=(r.snapshot->>'inputNotBefore')::timestamptz) AND i.state<>'discarded' AND ${unreferencedInput} LIMIT 100)`,
-    );
+    if (!warehouse) {
+      await tx.$executeRawUnsafe(
+        `DELETE FROM liekan_history_repair_visitor v WHERE v.ctid IN(SELECT v.ctid FROM liekan_history_repair_visitor v JOIN liekan_history_repair_run r ON r.id=v.run_id WHERE (r.completed_at<clock_timestamp()-interval '7 days' AND r.status IN('completed','completed_limited','unchanged','unidentifiable','empty','cancelled','rolled_back','expired','invalidated')) OR (v.generation<>r.generation AND v.created_at<clock_timestamp()-interval '7 days') LIMIT 2000)`,
+      );
+      const obsolete = `SELECT r.id AS run_id,a.key::uuid AS generation FROM liekan_history_repair_run r CROSS JOIN LATERAL jsonb_each(r.generation_archive) a WHERE a.value->>'confirmedAt' IS NULL AND (a.value->>'archivedAt')::timestamptz<clock_timestamp()-interval '7 days' AND a.key<>r.generation::text AND a.key IS DISTINCT FROM r.active_generation::text AND a.key IS DISTINCT FROM r.previous_generation::text`;
+      await tx.$executeRawUnsafe(
+        `WITH obsolete AS (${obsolete}) DELETE FROM liekan_history_repair_result p WHERE p.ctid IN(SELECT p.ctid FROM liekan_history_repair_result p JOIN obsolete o ON o.run_id=p.run_id AND o.generation=p.generation LIMIT 2000)`,
+      );
+      await tx.$executeRawUnsafe(
+        `WITH obsolete AS (${obsolete}) DELETE FROM liekan_history_repair_visitor p WHERE p.ctid IN(SELECT p.ctid FROM liekan_history_repair_visitor p JOIN obsolete o ON o.run_id=p.run_id AND o.generation=p.generation LIMIT 2000)`,
+      );
+      await tx.$executeRawUnsafe(
+        `WITH obsolete AS (${obsolete}) DELETE FROM liekan_history_repair_input i WHERE i.ctid IN(SELECT i.ctid FROM liekan_history_repair_input i JOIN obsolete o ON o.run_id=i.run_id AND o.generation=i.generation JOIN liekan_history_repair_run r ON r.id=i.run_id WHERE (i.state='discarded' OR i.created_at<=(r.snapshot->>'inputNotBefore')::timestamptz) AND ${unreferencedInput} LIMIT 100)`,
+      );
+      // Expiry drops unsubmitted material. Active and previous result/proof generations stay readable.
+      await tx.$executeRawUnsafe(
+        `DELETE FROM liekan_history_repair_result v WHERE v.ctid IN(SELECT v.ctid FROM liekan_history_repair_result v JOIN liekan_history_repair_run r ON r.id=v.run_id WHERE (r.status='expired' OR v.created_at<=(r.snapshot->>'inputNotBefore')::timestamptz) AND v.generation IS DISTINCT FROM r.active_generation AND v.generation IS DISTINCT FROM r.previous_generation LIMIT 2000)`,
+      );
+      await tx.$executeRawUnsafe(
+        `DELETE FROM liekan_history_repair_day v WHERE v.ctid IN(SELECT v.ctid FROM liekan_history_repair_day v JOIN liekan_history_repair_run r ON r.id=v.run_id WHERE r.status='expired' AND v.generation IS DISTINCT FROM r.active_generation AND v.generation IS DISTINCT FROM r.previous_generation LIMIT 2000)`,
+      );
+      await tx.$executeRawUnsafe(
+        `DELETE FROM liekan_history_repair_input i WHERE i.ctid IN(SELECT i.ctid FROM liekan_history_repair_input i JOIN liekan_history_repair_run r ON r.id=i.run_id WHERE (r.status='expired' OR i.created_at<=(r.snapshot->>'inputNotBefore')::timestamptz) AND ${unreferencedInput} LIMIT 100)`,
+      );
+      await tx.$executeRawUnsafe(
+        `UPDATE liekan_history_repair_input i SET state='discarded',records='[]' WHERE i.ctid IN(SELECT i.ctid FROM liekan_history_repair_input i JOIN liekan_history_repair_run r ON r.id=i.run_id WHERE (r.status='expired' OR i.created_at<=(r.snapshot->>'inputNotBefore')::timestamptz) AND i.state<>'discarded' AND ${unreferencedInput} LIMIT 100)`,
+      );
+    }
     await tx.$executeRawUnsafe(
       `UPDATE liekan_history_repair_run r SET counts=$1::jsonb,cursor='{}',generation_archive=coalesce((SELECT jsonb_object_agg(a.key,a.value) FROM jsonb_each(r.generation_archive) a WHERE a.key IN(r.active_generation::text,r.previous_generation::text)),'{}'::jsonb) WHERE status='expired'`,
       JSON.stringify(emptyCounts()),
     );
     const rows = await tx.$queryRawUnsafe<RunRow[]>(
-      `SELECT * FROM liekan_history_repair_run WHERE status IN('scanning','preparing','queued','running','validating') AND attempts<4 AND next_attempt_at<=clock_timestamp() AND updated_at<clock_timestamp()-interval '60 seconds' AND (lease_until IS NULL OR lease_until<clock_timestamp()) ORDER BY updated_at,id LIMIT 20 FOR NO KEY UPDATE SKIP LOCKED`,
+      `SELECT * FROM liekan_history_repair_run r WHERE status IN('scanning','preparing','queued','running','validating') AND attempts<4 AND next_attempt_at<=clock_timestamp() AND updated_at<clock_timestamp()-interval '60 seconds' AND (lease_until IS NULL OR lease_until<clock_timestamp())
+      ${warehouseEnabled() ? "AND NOT EXISTS(SELECT 1 FROM liekan_warehouse_task t WHERE t.website_id=r.website_id AND t.kind IN('history-repair-batch','history-repair-input') AND t.scope_key=r.id::text AND t.status IN('pending','confirmed'))" : ''}
+      ORDER BY updated_at,id LIMIT 20 FOR NO KEY UPDATE SKIP LOCKED`,
     );
     for (const row of rows) {
       const [job] = row.queued_job_id
@@ -1002,14 +700,22 @@ export async function reconcileHistoryRepairs() {
     }
   });
 }
-export function dayDto(row: Record<string, unknown>, metricScope?: 'qualified-browser'): HistoryRepairDay {
-  const counts = publicRepairCounts({
-    ...emptyCounts(),
-    beforeUV: row.before_uv == null ? null : String(row.before_uv),
-    afterUV: row.after_uv == null ? null : String(row.after_uv),
-    beforeIdentityMissingPV: row.before_identity_missing_pv == null ? null : String(row.before_identity_missing_pv),
-    afterIdentityMissingPV: row.after_identity_missing_pv == null ? null : String(row.after_identity_missing_pv),
-  }, metricScope);
+export function dayDto(
+  row: Record<string, unknown>,
+  metricScope?: 'qualified-browser',
+): HistoryRepairDay {
+  const counts = publicRepairCounts(
+    {
+      ...emptyCounts(),
+      beforeUV: row.before_uv == null ? null : String(row.before_uv),
+      afterUV: row.after_uv == null ? null : String(row.after_uv),
+      beforeIdentityMissingPV:
+        row.before_identity_missing_pv == null ? null : String(row.before_identity_missing_pv),
+      afterIdentityMissingPV:
+        row.after_identity_missing_pv == null ? null : String(row.after_identity_missing_pv),
+    },
+    metricScope,
+  );
   return {
     date: String(row.day),
     beforePV: String(row.before_pv),

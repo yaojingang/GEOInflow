@@ -1,6 +1,8 @@
 import clickhouse from '@/lib/clickhouse';
 import { getClickHouseCountrySQL, getPostgresCountrySQL } from '@/lib/country';
 import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { warehouseSessionReplays } from '@/lib/liekan/upstream/warehouse-replay-queries';
+import { warehouseEnabled } from '@/lib/liekan/warehouse/runtime';
 import prisma from '@/lib/prisma';
 import type { IdentityPageResult, QueryFilters, SessionReplaySummary } from '@/lib/types';
 
@@ -9,6 +11,7 @@ const FUNCTION_NAME = 'getSessionReplays';
 export function getSessionReplays(
   ...args: [websiteId: string, filters: QueryFilters, sessionId?: string]
 ): Promise<IdentityPageResult<SessionReplaySummary[]>> {
+  if (warehouseEnabled()) return warehouseSessionReplays(...args);
   return runQuery({
     [PRISMA]: () => relationalQuery(...args),
     [CLICKHOUSE]: () => clickhouseQuery(...args),

@@ -15,6 +15,10 @@ elif [ "$#" -ne 0 ]; then
   exit 1
 fi
 cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+if [ -f .env ] && grep -Eq '^[[:space:]]*(export[[:space:]]+)?LIEKAN_INSTALL_MODE[[:space:]]*=' .env; then
+  printf '%s\n' '此实例已配置 ClickHouse 部署。请使用 python3 scripts/liekan-warehouse-deploy.py --mode 原安装模式；完整迁移与更新步骤见 docs/warehouse.md。' >&2
+  exit 1
+fi
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
   printf '%s\n' '请先安装并启动 Docker 和 Docker Compose。' >&2
   exit 1

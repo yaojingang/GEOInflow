@@ -1,6 +1,8 @@
 import { gunzipSync } from 'node:zlib';
 import clickhouse from '@/lib/clickhouse';
 import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { warehouseReplayChunks } from '@/lib/liekan/upstream/warehouse-replay-queries';
+import { warehouseEnabled } from '@/lib/liekan/warehouse/runtime';
 import prisma from '@/lib/prisma';
 
 const FUNCTION_NAME = 'getReplayChunks';
@@ -25,6 +27,7 @@ export async function getReplayChunks(
   visitId: string,
   options: GetReplayChunksOptions = {},
 ): Promise<ReplayChunk[]> {
+  if (warehouseEnabled()) return warehouseReplayChunks(websiteId, visitId, options);
   return runQuery({
     [PRISMA]: () => relationalQuery(websiteId, visitId, options),
     [CLICKHOUSE]: () => clickhouseQuery(websiteId, visitId, options),

@@ -1,0 +1,81 @@
+name: liekan_ch_proto_round2_20261027
+services:
+  pg:
+    image: postgres@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    platform: linux/arm64
+    environment:
+      POSTGRES_USER: liekan_ch_proto
+      POSTGRES_DB: liekan_ch_proto
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg-password
+    ports: ["127.0.0.1:25449:5432"]
+    volumes:
+      - /var/tmp/liekan_ch_proto_round2_20261027/source-pg-complete:/var/lib/postgresql/data
+      - ../../.local/ch-prototype-round2/pg-password:/run/secrets/pg-password:ro
+      - ${PROTO_SOURCE_BACKUP:?Set the verified private backup directory}:/source-backup:ro
+    mem_limit: 512m
+    cpus: 1.0
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -h 127.0.0.1 -U liekan_ch_proto -d liekan_ch_proto"]
+      interval: 2s
+      timeout: 10s
+      retries: 40
+  control:
+    image: postgres@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    platform: linux/arm64
+    environment:
+      POSTGRES_USER: liekan_ch_proto
+      POSTGRES_DB: liekan_ch_proto
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg-password
+    ports: ["127.0.0.1:25459:5432"]
+    volumes:
+      - /var/tmp/liekan_ch_proto_round2_20261027/control:/var/lib/postgresql/data
+      - ../../.local/ch-prototype-round2/pg-password:/run/secrets/pg-password:ro
+    mem_limit: 384m
+    cpus: 1.0
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -h 127.0.0.1 -U liekan_ch_proto -d liekan_ch_proto"]
+      interval: 2s
+      timeout: 10s
+      retries: 60
+  ch:
+    image: clickhouse/clickhouse-server@sha256:61dee53a0b34659b6b16048fa7f937dcd7b19696e0331a5b24e8f60760bf1fa6
+    platform: linux/arm64
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    ports: ["127.0.0.1:28139:8123"]
+    volumes:
+      - /var/tmp/liekan_ch_proto_round2_20261027/ch:/var/lib/clickhouse
+      - ./clickhouse.xml:/etc/clickhouse-server/config.d/prototype.xml:ro
+    mem_limit: 1536m
+    cpus: 1.0
+    healthcheck:
+      test: [CMD, clickhouse-client, --query, "SELECT 1"]
+      interval: 2s
+      timeout: 10s
+      retries: 60
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda@sha256:2de12f55ca48ce20f140b94c0efa2870f4f3627c4793d6a87c4afac63f994fcf
+    platform: linux/arm64
+    entrypoint: [/bin/sh, -c]
+    command:
+      - >-
+        cp /prototype/redpanda.yaml /etc/redpanda/redpanda.yaml &&
+        exec /usr/bin/rpk redpanda start --config /etc/redpanda/redpanda.yaml
+        --smp=1 --memory=768M --reserve-memory=0M --overprovisioned
+        --check=false --unsafe-bypass-fsync=false
+    ports: ["127.0.0.1:29109:29109"]
+    volumes:
+      - /var/tmp/liekan_ch_proto_round2_20261027/redpanda:/var/lib/redpanda/data
+      - ./redpanda-round2.yaml:/prototype/redpanda.yaml:ro
+    mem_limit: 1280m
+    cpus: 1.0
+    healthcheck:
+      test: [CMD, rpk, cluster, info, -X, brokers=127.0.0.1:9092]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+volumes:
+  control:
+  pg:
+  ch:
+  redpanda:

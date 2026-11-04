@@ -34,6 +34,8 @@ export const engineValueKey = (value: unknown): string =>
   );
 let cached: { key: string; client: ClickHouseClient } | undefined;
 export function engineConnection() {
+  // Retain this independent destination for deletion of pre-migration replicas.
+  // Warehouse guards belong on readers/builders, not on cleanup transport.
   const raw = process.env.LIEKAN_ANALYTICS_CLICKHOUSE_URL;
   if (!raw) return null;
   const url = new URL(raw);

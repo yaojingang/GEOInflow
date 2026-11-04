@@ -1,31 +1,31 @@
-import { readBrowserPopulation } from './browser-population';
-import { applyReportPopulation } from '../contracts/population-results';
-import { TRAFFIC_POLICY_VERSION } from './traffic-query';
 import { createHash, randomUUID } from 'node:crypto';
+import { EXPORT_MAX_BYTES, EXPORT_MAX_ROWS } from '../contracts/exports';
 import {
   addKeywordCandidate,
+  type KeywordCandidate,
+  type KeywordRow,
   keywordConditionsSchema,
   selectKeywords,
   supportsKeywordRedirect,
-  type KeywordCandidate,
-  type KeywordRow,
 } from '../contracts/keywords';
-import { EXPORT_MAX_BYTES, EXPORT_MAX_ROWS } from '../contracts/exports';
-import type { LiekanReport } from '../contracts/report';
+import { applyReportPopulation } from '../contracts/population-results';
 import type { ReportQuery } from '../contracts/query';
+import type { LiekanReport } from '../contracts/report';
 import { getSettings } from '../store';
-import { humanVisitsSql, visitMetrics, convertedJoin } from './analytics';
-import { query, reportSnapshot } from './server';
-import { getQuerySnapshot } from './query-snapshot';
+import { warehouseEnabled } from '../warehouse/authority-routing';
+import { convertedJoin, humanVisitsSql, visitMetrics } from './analytics';
+import { readBrowserPopulation } from './browser-population';
+import { currentCacheContext, withoutQueryCache } from './cache-context';
 import { LiekanError } from './errors';
 import {
   analyticsCache,
   analyticsCacheKey,
-  websiteCacheTag,
   type CachedResult,
+  websiteCacheTag,
 } from './query-cache';
-import { withoutQueryCache } from './cache-context';
-import { withTrafficPolicy } from './traffic-query';
+import { getQuerySnapshot } from './query-snapshot';
+import { query, reportSnapshot } from './server';
+import { TRAFFIC_POLICY_VERSION, withTrafficPolicy } from './traffic-query';
 
 type Website = LiekanReport['website'];
 export type KeywordFacts = {
@@ -57,6 +57,7 @@ export async function readKeywordFacts(
   signal?: AbortSignal,
 ): Promise<KeywordFacts> {
   validateKeywordRange(p);
+  if (warehouseEnabled()) throw new Error('warehouse-keyword-bounded-reader-required');
   const tx = getQuerySnapshot();
   if (!tx) return reportSnapshot(() => readKeywordFacts(websiteId, p, signal));
   const groups = new Map<string, KeywordRow>();
@@ -122,15 +123,19 @@ export function keywordReport(
   facts: KeywordFacts,
   settings: Awaited<ReturnType<typeof getSettings>>,
   canManage = false,
+  prepared?: { selected: ReturnType<typeof selectKeywords>; count: number; engines: string[] },
 ): LiekanReport {
-  const selected = selectKeywords(
-    facts.rows,
-    keywordConditionsSchema.parse(p),
-    facts.hasGoals,
-    supportsKeywordRedirect(p),
-  );
+  const selected =
+    prepared?.selected ??
+    selectKeywords(
+      facts.rows,
+      keywordConditionsSchema.parse(p),
+      facts.hasGoals,
+      supportsKeywordRedirect(p),
+    );
   const changed = Boolean(p.keywordSnapshot && p.keywordSnapshot !== facts.snapshot && p.page > 1);
-  const page = changed ? 1 : Math.min(p.page, Math.max(1, Math.ceil(selected.rows.length / 20)));
+  const count = prepared?.count ?? selected.rows.length;
+  const page = changed ? 1 : Math.min(p.page, Math.max(1, Math.ceil(count / 20)));
   const state = selected.total ? 'available' : 'empty';
   const scope = `${p.engine || '全部搜索引擎'} · 所选统计范围`;
   return {
@@ -169,7 +174,9 @@ export function keywordReport(
       },
     ],
     charts: {},
-    tables: { keywordBody: selected.rows.slice((page - 1) * 20, page * 20) },
+    tables: {
+      keywordBody: prepared ? selected.rows : selected.rows.slice((page - 1) * 20, page * 20),
+    },
     insights: [],
     meta: {
       demo: settings.isDemo,
@@ -180,9 +187,9 @@ export function keywordReport(
       keywordSnapshot: facts.snapshot,
       keywordReset: changed,
       keywordReadAt: facts.readAt,
-      keywordEngines: [...new Set(facts.rows.map(row => row.engine))].sort(),
+      keywordEngines: prepared?.engines ?? [...new Set(facts.rows.map(row => row.engine))].sort(),
       keywordHasGoals: facts.hasGoals,
-      tablePages: { keywordBody: { page, pageSize: 20, total: selected.rows.length } },
+      tablePages: { keywordBody: { page, pageSize: 20, total: count } },
     },
   };
 }
@@ -193,6 +200,72 @@ export async function readKeywordPage(
   refresh: boolean,
 ): Promise<CachedResult<LiekanReport>> {
   validateKeywordRange(p);
+  if (warehouseEnabled()) {
+    const { withWarehouseKeywords } = await import('./warehouse-keywords');
+    // Cache only the requested bounded page and scalar metadata. Conditions,
+    // snapshot/reset state and page all participate in the cache identity.
+    const { refresh: _refresh, ...parameters } = p;
+    return analyticsCache.read(
+      analyticsCacheKey(`source-keywords-ch-v1-${TRAFFIC_POLICY_VERSION}`, [
+        process.env.DATABASE_URL,
+        website.id,
+        parameters,
+      ]),
+      ttl,
+      [websiteCacheTag(website.id)],
+      () =>
+        reportSnapshot(() =>
+          withoutQueryCache(() =>
+            withWarehouseKeywords(
+              website.id,
+              p,
+              async selection => {
+                const count = await selection.rows.count();
+                const changed = Boolean(
+                  p.keywordSnapshot && p.keywordSnapshot !== selection.snapshot && p.page > 1,
+                );
+                const page = changed ? 1 : Math.min(p.page, Math.max(1, Math.ceil(count / 20)));
+                const rows = await selection.rows.page((page - 1) * 20, 20);
+                const report = keywordReport(
+                  website,
+                  p,
+                  {
+                    rows: [],
+                    hasGoals: selection.hasGoals,
+                    snapshot: selection.snapshot,
+                    readAt: selection.readAt,
+                  },
+                  await getSettings(website.id),
+                  false,
+                  {
+                    selected: {
+                      rows,
+                      total: selection.total,
+                      referrer: selection.referrer,
+                      utm: selection.utm,
+                      availability: selection.availability,
+                    },
+                    count,
+                    engines: selection.engines,
+                  },
+                );
+                return applyReportPopulation(
+                  report,
+                  await readBrowserPopulation(
+                    website.id,
+                    new Date(p.startAt),
+                    new Date(p.endAt),
+                    p.timezone,
+                  ),
+                );
+              },
+              currentCacheContext()?.request?.signal,
+            ),
+          ),
+        ),
+      refresh,
+    );
+  }
   const key = analyticsCacheKey(`source-keywords-v4-${TRAFFIC_POLICY_VERSION}`, [
     process.env.DATABASE_URL,
     website.id,

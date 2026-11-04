@@ -74,6 +74,15 @@ export async function streamFeatureExport(
         if (!line) continue;
         const frame: ExportFrame = JSON.parse(line);
         if (frame.type === 'error') throw new FeatureApiError(frame.message, frame.status);
+        if (frame.type === 'file' && frame.downloadUrl) {
+          if (
+            !/^\/api\/liekan\/websites\/[a-f0-9-]{36}\/exports\/[a-f0-9-]{36}$/.test(
+              frame.downloadUrl,
+            )
+          )
+            throw new FeatureApiError('导出下载地址无效', 500);
+          frame.downloadUrl = getApiUrl(frame.downloadUrl.slice('/api'.length));
+        }
         if (frame.type === 'complete') complete = true;
         onFrame(frame);
       }

@@ -1,4 +1,9 @@
 import { registryVersionIsCurrent } from './crawler-registry';
+import { warehouseEnabled } from '../warehouse/runtime';
+import { warehouseControlRead } from './warehouse-control-read';
+import { warehouseReportQuery, withinWarehouseReport } from './warehouse-report-snapshot';
+import { effectiveLogRelation } from '../warehouse/reporting-relations';
+import { warehouseTime } from '../warehouse/fact-input';
 import { getPublishedCatalog } from '../crawlers/published';
 import { randomUUID } from 'node:crypto';
 import { ROLES, SHARE_CONTEXT_HEADER, SHARE_TOKEN_HEADER } from '@/lib/constants';
@@ -367,6 +372,7 @@ export async function crawlerRecognition(
 }
 function queryTimedOut(error: any): boolean {
   return (
+    (warehouseEnabled() && (error?.code === '159' || ['AbortError','TimeoutError'].includes(error?.name))) ||
     error?.code === '57014' ||
     error?.meta?.code === '57014' ||
     error?.cause?.code === '57014' ||
@@ -387,7 +393,14 @@ export async function crawlerCandidates(
     scanLimit: 100000 as const,
   };
   try {
-    const rows = await crawlerTransaction(
+    const rows = warehouseEnabled() ? await withinWarehouseReport(() => warehouseControlRead(async tx => {
+      await authorizeCrawler(tx,actor,websiteId);
+      const rows=await warehouseReportQuery<{userAgent:string;createdAt:string}>(websiteId,`SELECT l.user_agent AS userAgent,toString(l.created_at) AS createdAt
+        FROM ${effectiveLogRelation({immutableTimeWindow:{start:'candidateStart',end:'candidateEnd',endExclusive:true}})} l
+        WHERE ${unknownCrawlerSql('l')} AND l.user_agent NOT LIKE 'Liekan-Crawler-Check/%' ORDER BY l.created_at DESC,l.id DESC LIMIT 100000`,
+        {candidateStart:warehouseTime(start),candidateEnd:warehouseTime(end)}, {timeoutSeconds:5,signal:AbortSignal.timeout(Math.max(1,deadline-Date.now()))});
+      return rows.map(row=>({...row,createdAt:new Date(row.createdAt.replace(' ','T')+'Z')}));
+    },{deadline})) : await crawlerTransaction(
       async tx => {
         await authorizeCrawler(tx, actor, websiteId);
         return tx.query<{ userAgent: string; createdAt: Date }>(

@@ -66,3 +66,28 @@ test('POST does not delete a key when auth fails', async () => {
   expect(redisMock.client.del).not.toHaveBeenCalled();
   expect(response.status).toBe(401);
 });
+
+test.each([true, false])(
+  'logout expires the export credential with Redis enabled=%s',
+  async enabled => {
+    redisMock.enabled = enabled;
+    parseRequestMock.mockResolvedValue({ auth: { authKey: 'auth:session-key' }, error: undefined });
+    const response = await POST(
+      new Request('https://example.com/geo/api/auth/logout', { method: 'POST' }),
+    );
+    expect(response.headers.get('set-cookie')).toBe(
+      'liekan_export_session=; Path=/geo/api; HttpOnly; SameSite=Strict; Max-Age=0; Secure',
+    );
+    expect(response.headers.get('clear-site-data')).toBeNull();
+  },
+);
+
+test('logout clears the export cookie even when the main credential is already missing', async () => {
+  parseRequestMock.mockResolvedValue({
+    auth: null,
+    error: () => new Response(null, { status: 401 }),
+  });
+  const response = await POST(new Request('http://localhost/api/auth/logout', { method: 'POST' }));
+  expect(response.headers.get('set-cookie')).toContain('liekan_export_session=; Path=/api;');
+  expect(response.headers.get('set-cookie')).toContain('Max-Age=0');
+});

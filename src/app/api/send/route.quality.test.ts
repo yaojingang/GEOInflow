@@ -9,6 +9,26 @@ const mocks = vi.hoisted(() => ({
   classify: vi.fn(),
   authenticated: vi.fn(),
   token: vi.fn(),
+  warehouse: false,
+  enqueue: vi.fn(),
+  completion: vi.fn(),
+}));
+vi.mock('@/lib/liekan/warehouse/runtime', () => ({
+  warehouseIntakeEnabled: () => mocks.warehouse,
+  warehouseRuntime: async () => ({
+    resource: async () => ({ epoch: '0', policy_revision: '0' }),
+    envelope: (_site: any, args: any) => ({
+      ...args,
+      version: 1,
+      routingVersion: 1,
+      topicId: '1'.repeat(32),
+      inputId: '55555555-5555-4555-8555-555555555555',
+      epoch: '0',
+      policyRevision: '0',
+    }),
+    queue: { enqueue: mocks.enqueue },
+    completion: { wait: mocks.completion },
+  }),
 }));
 vi.mock('@/lib/liekan/upstream/collection-admission', () => ({
   collectionAdmission: async () => ({ revision: '0', mode: 'standard', allowedHostnames: [] }),
@@ -66,8 +86,9 @@ vi.mock('@/lib/liekan/upstream/collection-write', () => ({
   recordCollectionIdentity: vi.fn(),
   withCollectionWrite: mocks.write,
 }));
-import { POST } from './route';
+
 import { CACHE_TOKEN_TYPE } from '@/lib/constants';
+import { POST } from './route';
 
 const website = '89be6d70-22a5-4433-8bfe-f5b9bd4f08f1';
 const eventId = 'd614f956-5fda-40c9-a378-0e8a07d93e54';
@@ -123,6 +144,13 @@ describe('compatible collection quality intake', () => {
       value: await work(),
     }));
     delete process.env.DISABLE_BOT_CHECK;
+    mocks.warehouse = false;
+    mocks.enqueue.mockResolvedValue({});
+    mocks.completion.mockImplementation(async (e: any) => ({
+      status: 'new',
+      sessionId: e.sessionId,
+      visitId: e.visitId,
+    }));
   });
   it('old scripts collect without an ID and preserve the exact Umami response shape', async () => {
     const response = await call();
@@ -202,5 +230,75 @@ describe('compatible collection quality intake', () => {
       ip: '192.0.2.40',
       userAgent: 'Producer/1.0',
     });
+  });
+  it('routes the real browser package to the warehouse and preserves the public response', async () => {
+    mocks.warehouse = true;
+    const response = await call({
+      eventId,
+      name: 'purchase',
+      data: { revenue: 2.12345, currency: 'CNY' },
+    });
+    expect(response.status).toBe(200);
+    expect(Object.keys(await response.json()).sort()).toEqual(['cache', 'sessionId', 'visitId']);
+    expect(mocks.write).not.toHaveBeenCalled();
+    expect(mocks.saveEvent).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    const envelope = mocks.enqueue.mock.calls[0][0];
+    expect(envelope.clientEventId).toBe(eventId);
+    expect(envelope.data.facts.map((f: any) => f.family)).toEqual(
+      expect.arrayContaining([
+        'website_event',
+        'event_data',
+        'revenue',
+        'liekan_event_quality',
+        'liekan_event_environment',
+        'liekan_collection_receipt',
+      ]),
+    );
+    expect(JSON.stringify(envelope)).not.toContain('192.0.2.1');
+    expect(JSON.stringify(envelope)).not.toContain('Mozilla/5.0');
+  });
+  it('returns a retryable unknown result when the durable queue cannot confirm', async () => {
+    mocks.warehouse = true;
+    mocks.enqueue.mockRejectedValue(new Error('isolated transport outage'));
+    const response = await call({ eventId });
+    expect(response.status).toBe(503);
+    expect(response.headers.get('Retry-After')).toBe('2');
+    expect(mocks.completion).not.toHaveBeenCalled();
+    expect(mocks.token).not.toHaveBeenCalled();
+    expect(mocks.write).not.toHaveBeenCalled();
+  });
+  it('redacts direct-submitted URL and referrer secrets before queueing warehouse facts', async () => {
+    mocks.warehouse = true;
+    const response = await call({
+      eventId,
+      url: '/landing?token=private-token&utm_source=newsletter#access_token=private-fragment',
+      referrer: 'https://referrer.test/from?email=visitor%40example.com&utm_medium=email',
+    });
+    expect(response.status).toBe(200);
+    const envelope = mocks.enqueue.mock.calls[0][0];
+    const serialized = JSON.stringify(envelope);
+    expect(serialized).not.toContain('private-token');
+    expect(serialized).not.toContain('private-fragment');
+    expect(serialized).not.toContain('visitor%40example.com');
+    expect(serialized).not.toContain('visitor@example.com');
+    expect(serialized).toContain('utm_source=newsletter');
+    expect(serialized).toContain('utm_medium=email');
+    expect(mocks.saveEvent).not.toHaveBeenCalled();
+  });
+  it('keeps the original session/visit response for warehouse duplicates and 409 for conflicts', async () => {
+    mocks.warehouse = true;
+    mocks.completion.mockResolvedValue({
+      status: 'duplicate',
+      sessionId: website,
+      visitId: eventId,
+    });
+    expect(await (await call({ eventId })).json()).toEqual({
+      cache: 'fixture-cache',
+      sessionId: website,
+      visitId: eventId,
+    });
+    mocks.completion.mockResolvedValue({ status: 'conflict', sessionId: null, visitId: null });
+    expect((await call({ eventId })).status).toBe(409);
   });
 });

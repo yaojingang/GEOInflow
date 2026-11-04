@@ -19,6 +19,7 @@ import { query, reportSnapshot } from './server';
 import { attachReportEvidenceView } from './report-evidence-view';
 import { dashboardClock } from './dashboard-clock';
 import { DASHBOARD_INTERVAL } from './dashboard-snapshot-model';
+import { warehouseEnabled } from '../warehouse/runtime';
 import { withReportFragments } from './report-fragments';
 
 async function readPageReportSnapshot(
@@ -66,9 +67,22 @@ async function readPageReportSnapshot(
   }
   const load = async () => {
     const report = await reportSnapshot(() =>
-      withoutQueryCache(async () =>
-        attachReportEvidenceView(await buildReport(website, false, p, true), parsed.data),
-      ),
+      withoutQueryCache(async () => {
+        const prepared = warehouseEnabled()
+          ? await (await import('./warehouse-page-report')).prepareWarehousePageReport(
+              website,
+              parsed.data,
+            )
+          : undefined;
+        try {
+          return await attachReportEvidenceView(
+            await buildReport(website, false, p, true, false, undefined, prepared),
+            parsed.data,
+          );
+        } finally {
+          await prepared?.dispose?.();
+        }
+      }),
     );
     const generatedAt = Date.now();
     return pageReportSchema.parse({
@@ -124,7 +138,10 @@ async function readPageReportSnapshot(
 }
 
 export const readPageReport: typeof readPageReportSnapshot = async (...args) => {
-  const load = () => withReportFragments(args[0].id, () => readPageReportSnapshot(...args));
+  const load = () =>
+    warehouseEnabled()
+      ? readPageReportSnapshot(...args)
+      : withReportFragments(args[0].id, () => readPageReportSnapshot(...args));
   const result = process.env.CLICKHOUSE_URL ? await load() : await withPublishedRegistry(load);
   // The inner cache bypass owns its context; publish validated evidence to the caller's envelope.
   for (const population of [result.value.meta.population, result.value.meta.trendPopulation])

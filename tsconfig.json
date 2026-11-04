@@ -45,6 +45,7 @@
     "./playwright.api.config.ts",
     "tests/e2e",
     "tests/api",
+    "experiments/ch-prototype",
     "tmp",
     "outputs",
     "test-results"

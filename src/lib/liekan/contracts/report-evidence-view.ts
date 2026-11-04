@@ -36,7 +36,11 @@ export function reportEvidenceViewPayload(
     totalLogs: report.meta.totalLogs,
     tablePage: report.meta.tablePages?.[table],
   };
-  // PostgreSQL JSONB can reorder object keys; the evidence keeps displayed array order.
+  return reportEvidenceJson(payload);
+}
+
+/** PostgreSQL JSONB can reorder object keys; evidence keeps displayed array order. */
+export function reportEvidenceJson(payload: unknown) {
   return JSON.stringify(payload, (_key, value) =>
     value && typeof value === 'object' && !Array.isArray(value)
       ? Object.fromEntries(

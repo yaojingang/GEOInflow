@@ -17,8 +17,13 @@ import { checkRateLimit, recordFailedAttempt, resetRateLimit } from '@/lib/two-f
 import { isOtpReplayed, markOtpUsed } from '@/lib/two-factor/replay-prevention';
 import { verifyTotp } from '@/lib/two-factor/totp';
 import { getAllUserTeams, getUser } from '@/queries/prisma';
+import { clearWarehouseExportCookie } from '@/lib/liekan/upstream/warehouse-export-cookie';
 
 export async function POST(request: Request) {
+  return clearWarehouseExportCookie(request, await verify(request));
+}
+
+async function verify(request: Request) {
   if (process.env.CLOUD_MODE) {
     return notFound();
   }

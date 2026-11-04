@@ -11,6 +11,8 @@ const {
   findFirstMock,
   shareFindFirstMock,
   lockMock,
+  warehouseMock,
+  warehouseDeleteMock,
 } = vi.hoisted(() => ({
   transactionMock: vi.fn(),
   redisDelMock: vi.fn(),
@@ -21,6 +23,16 @@ const {
   findFirstMock: vi.fn(),
   shareFindFirstMock: vi.fn(),
   lockMock: vi.fn(),
+  warehouseMock: vi.fn(() => false),
+  warehouseDeleteMock: vi.fn(),
+}));
+
+vi.mock('@/lib/liekan/warehouse/runtime', () => ({
+  warehouseIntakeEnabled: warehouseMock,
+  warehouseEnabled: warehouseMock,
+}));
+vi.mock('@/lib/liekan/upstream/warehouse-lifecycle', () => ({
+  deleteWarehouseStatistics: warehouseDeleteMock,
 }));
 
 vi.mock('@/lib/liekan/upstream/ai-lifecycle', () => ({ clearAiWebsiteInTransaction: vi.fn() }));
@@ -218,6 +230,8 @@ describe('website delete dependencies', () => {
     resetLiekanMock.mockReset();
     stopWebsiteSourcesMock.mockReset();
     lockMock.mockReset();
+    warehouseMock.mockReset().mockReturnValue(false);
+    warehouseDeleteMock.mockReset().mockResolvedValue(undefined);
     delete process.env.CLOUD_MODE;
     process.env.DATABASE_URL = 'postgresql://user:pass@localhost:5432/umami?schema=public';
     lockMock.mockImplementation(async () => {
@@ -412,4 +426,33 @@ describe('website delete dependencies', () => {
     expect(resetLiekanMock).not.toHaveBeenCalled();
     expect(finalTransaction()).toBeUndefined();
   });
+
+  test.each(['reset', 'website'] as const)(
+    'warehouse %s retains the durable lifecycle and actor identity without legacy PG purge',
+    async scope => {
+      warehouseMock.mockReturnValue(true);
+      findUniqueMock.mockResolvedValue({ id: 'website-1' });
+      const identity = { userId: 'owner-1' };
+      const run = scope === 'reset' ? resetWebsite : deleteWebsite;
+      await expect(run('website-1', identity)).resolves.toEqual({ id: 'website-1' });
+      expect(warehouseDeleteMock).toHaveBeenCalledWith('website-1', scope, identity);
+      expect(transactionMock).not.toHaveBeenCalled();
+      expect(resetLiekanMock).not.toHaveBeenCalled();
+      expect(stopWebsiteSourcesMock).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each(['reset', 'website'] as const)(
+    'warehouse %s denial never falls through to legacy cleanup or changes cache',
+    async scope => {
+      warehouseMock.mockReturnValue(true);
+      warehouseDeleteMock.mockRejectedValue(new Error('Permission revoked'));
+      process.env.CLOUD_MODE = '1';
+      const run = scope === 'reset' ? resetWebsite : deleteWebsite;
+      await expect(run('website-1', { userId: 'owner-1' })).rejects.toThrow('Permission revoked');
+      expect(transactionMock).not.toHaveBeenCalled();
+      expect(redisDelMock).not.toHaveBeenCalled();
+      expect(redisSetMock).not.toHaveBeenCalled();
+    },
+  );
 });

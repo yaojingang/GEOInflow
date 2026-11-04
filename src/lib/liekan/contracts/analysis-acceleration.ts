@@ -87,6 +87,7 @@ export interface AnalysisStatusDto {
   capacity: { siteBytes: string; globalBytes: string; siteLimit: number; globalLimit: number };
 }
 export interface AnalysisWebsiteList {
+  backend?: 'postgresql' | 'clickhouse';
   supported: boolean;
   websites: { id: string; name: string; domain: string; mode: string }[];
   nextCursor: string | null;
@@ -139,6 +140,7 @@ export const analysisStatusSchema = z.object({
   }),
 });
 export const analysisWebsiteListSchema = z.object({
+  backend: z.enum(['postgresql', 'clickhouse']).optional(),
   supported: z.boolean(),
   websites: z.array(
     z.object({

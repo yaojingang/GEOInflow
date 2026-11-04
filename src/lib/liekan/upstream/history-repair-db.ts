@@ -1,3 +1,5 @@
+import { warehouseEnabled } from '@/lib/liekan/warehouse/authority-routing';
+import { assertTransitionMaintenance } from './warehouse-maintenance';
 import { randomUUID } from 'node:crypto';
 import { getSettings } from '../store';
 import { getTrafficPolicy } from './traffic-quality';
@@ -18,7 +20,8 @@ import {
 } from '../contracts/history-repair';
 import {
   emptyCounts,
-  publicRepairCounts, publicRepairPreview,
+  publicRepairCounts,
+  publicRepairPreview,
   hash,
   progress,
   rulepack,
@@ -51,6 +54,8 @@ export interface RepairSnapshot {
   timezone: string;
   authorityHash: string;
   inputNotBefore?: string;
+  warehouseSource?: import('../warehouse/read').ReadBoundary;
+  warehouseFreeze?: { epoch: string; version: string; deletionRevision: string };
 }
 export interface RepairCursor {
   time?: string;
@@ -133,7 +138,11 @@ export function dto(row: RunRow): HistoryRepairRun {
     previousGeneration: row.previous_generation,
     progress: progress(row.status, counts),
     phase: row.phase,
-    counts: publicRepairCounts({ ...counts, beforeIdentityMissingPV: row.counts.beforeIdentityMissingPV, afterIdentityMissingPV: row.counts.afterIdentityMissingPV }),
+    counts: publicRepairCounts({
+      ...counts,
+      beforeIdentityMissingPV: row.counts.beforeIdentityMissingPV,
+      afterIdentityMissingPV: row.counts.afterIdentityMissingPV,
+    }),
     frozenAt: iso(row.frozen_at),
     scopeId: row.repair_scope_id,
     scopeChanged: row.scope_changed,
@@ -161,7 +170,7 @@ export async function runForSite(
   websiteId: string,
   lock = true,
 ): Promise<RunRow | undefined> {
-  return (
+  const row = (
     await tx.$queryRawUnsafe<RunRow[]>(
       `SELECT r.*,
    (r.scope_changed OR EXISTS(SELECT 1 FROM liekan_history_repair_action a WHERE a.run_id=r.id AND a.generation=r.generation AND a.action='scope-gap')) AS scope_changed,
@@ -171,6 +180,21 @@ export async function runForSite(
       HISTORY_REPAIR_CAMPAIGN,
     )
   )[0];
+  if (lock && row && warehouseEnabled()) {
+    const [pending] = await tx.$queryRawUnsafe(
+      `SELECT 1 FROM liekan_warehouse_task WHERE website_id=$1::uuid AND kind IN('history-repair-batch','history-repair-input')
+      AND scope_key=$2 AND status IN('pending','confirmed') LIMIT 1`,
+      websiteId,
+      row.id,
+    );
+    if (pending)
+      throw new LiekanError(
+        '修复分批结果正在发布，请稍后重试',
+        409,
+        'history-repair-publication-pending',
+      );
+  }
+  return row;
 }
 export async function requireRun(tx: RepairTx, websiteId: string, identity: WriteIdentity) {
   await lockWritableWebsite(tx, websiteId, identity);
@@ -219,7 +243,7 @@ export async function snapshot(
     rulesRevision: settings.rulesRevision,
     rules: settings.rules,
     configuration: settings.crawlerRules,
-    botCheckDisabled: ['1','true'].includes(process.env.DISABLE_BOT_CHECK || ''),
+    botCheckDisabled: ['1', 'true'].includes(process.env.DISABLE_BOT_CHECK || ''),
   });
   const authority = {
     policy: {
@@ -240,7 +264,20 @@ export async function snapshot(
     botCheckDisabled: pack.botCheckDisabled,
     engine: HISTORY_REPAIR_ENGINE,
   };
-  return { ...authority, rulepack: pack, authorityHash: hash(authority) };
+  const warehouse = warehouseEnabled()
+    ? (
+        await tx.$queryRawUnsafe<{ epoch: string; version: string; deletionRevision: string }[]>(
+          'SELECT epoch::text,version::text,deletion_revision::text AS "deletionRevision" FROM liekan_warehouse_site WHERE website_id=$1::uuid AND state=\'active\'',
+          id,
+        )
+      )[0]
+    : undefined;
+  return {
+    ...authority,
+    rulepack: pack,
+    authorityHash: hash(authority),
+    ...(warehouse ? { warehouseFreeze: warehouse } : {}),
+  };
 }
 export async function assertSnapshot(tx: RepairTx, row: RunRow, includeCatalog = false) {
   if (row.scope_changed)
@@ -304,7 +341,10 @@ export async function replayAction<T>(
     'SELECT website_id,actor_id,payload_hash,response FROM liekan_history_repair_action WHERE id=$1::uuid',
     actionId,
   );
-  if (!old) return undefined;
+  if (!old) {
+    await assertTransitionMaintenance(tx, 'repair');
+    return undefined;
+  }
   if (
     old.website_id !== websiteId ||
     old.actor_id !== identity.userId ||
@@ -354,7 +394,7 @@ export async function saveRun(tx: RepairTx, row: RunRow) {
 export async function eligibility(tx: RepairTx, websiteId: string) {
   const [value] = await tx.$queryRawUnsafe<{ eligible: boolean; has_data: boolean }[]>(
     `SELECT (w.website_id=ANY(c.eligible_websites) AND NOT coalesce(s.is_demo,false) AND c.state='active') AS eligible,
-   (EXISTS(SELECT 1 FROM website_event e WHERE e.website_id=w.website_id) OR EXISTS(SELECT 1 FROM liekan_log l WHERE l.website_id=w.website_id)) AS has_data
+   ${warehouseEnabled() ? 'false' : '(EXISTS(SELECT 1 FROM website_event e WHERE e.website_id=w.website_id) OR EXISTS(SELECT 1 FROM liekan_log l WHERE l.website_id=w.website_id))'} AS has_data
    FROM website w CROSS JOIN liekan_history_repair_campaign c LEFT JOIN liekan_setting s ON s.website_id=w.website_id WHERE w.website_id=$1::uuid AND w.deleted_at IS NULL AND c.id=$2`,
     websiteId,
     HISTORY_REPAIR_CAMPAIGN,
@@ -363,6 +403,7 @@ export async function eligibility(tx: RepairTx, websiteId: string) {
 }
 
 export async function requireCompatibleRepairWorker(tx: RepairTx) {
+  await assertTransitionMaintenance(tx, 'repair');
   try {
     const [ready] = await tx.$queryRawUnsafe<{ worker: boolean; queue: boolean }[]>(
       `SELECT EXISTS(SELECT 1 FROM liekan_worker_state WHERE version=$1 AND heartbeat_at>clock_timestamp()-interval '120 seconds') AS worker,EXISTS(SELECT 1 FROM liekan_queue_installation WHERE id='liekan_jobs' AND package_version='12.36.0') AS queue`,

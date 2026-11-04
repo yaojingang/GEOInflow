@@ -1,13 +1,15 @@
-import { z } from 'zod';
+import { warehouseEnabled } from '@/lib/liekan/warehouse/authority-routing';
+import { assertTransitionMaintenance } from './warehouse-maintenance';
 import { createHash, randomUUID } from 'node:crypto';
+import { z } from 'zod';
 import { trafficExclusionActionSchema } from '../contracts/traffic-exclusions';
 import {
   assessBrowserBehavior,
   BROWSER_RISK_VERSION,
   BROWSER_RISK_WINDOW_LIMIT,
 } from '../traffic-quality/behavior';
-import { COLLECTION_RULE_VERSION } from './collection-quality';
 import { bumpAnalyticsRevision } from './analytics-revision';
+import { COLLECTION_RULE_VERSION } from './collection-quality';
 import { invalidateWebsiteAnalytics } from './query-cache';
 import { LiekanError, lockWritableWebsite, transaction, type WriteIdentity } from './server';
 
@@ -18,7 +20,7 @@ export const exclusionDigest = (ids: string[]) =>
     .update(JSON.stringify([...new Set(ids)].sort()))
     .digest('hex');
 
-async function boundary(tx: any, websiteId: string) {
+export async function trafficGovernanceBoundary(tx: any, websiteId: string) {
   const [state] = await tx.$queryRawUnsafe(
     `SELECT coalesce(g.revision,0)::text AS revision,
     coalesce(l.epoch,1)::text AS epoch,coalesce(p.revision,0)::text AS policy_revision,
@@ -107,11 +109,12 @@ export async function trafficGovernanceState(tx: any, websiteId: string, cursor?
       position.epoch !== state.epoch)
   )
     throw conflict();
+  const warehouse = warehouseEnabled();
   const collections = await tx.$queryRawUnsafe(
     `SELECT x.id::text,x.state,x.epoch::text,x.window_end AS "windowEnd",
     x.created_at AS "createdAt",to_char(x.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "cursorTime",x.confirmed_at AS "confirmedAt",x.revoked_at AS "revokedAt",
-    x.membership_digest AS digest,x.evidence, count(m.event_id)::int AS events
-    FROM liekan_traffic_exclusion x LEFT JOIN liekan_traffic_exclusion_member m ON m.collection_id=x.id AND m.website_id=x.website_id
+    x.membership_digest AS digest,x.evidence, ${warehouse ? '0' : 'count(m.event_id)::int'} AS events
+    FROM liekan_traffic_exclusion x ${warehouse ? '' : 'LEFT JOIN liekan_traffic_exclusion_member m ON m.collection_id=x.id AND m.website_id=x.website_id'}
     WHERE x.website_id=$1::uuid AND x.state IN('active','revoked')
       AND ($2::timestamptz IS NULL OR (x.created_at,x.id)<($2::timestamptz,$3::uuid))
     GROUP BY x.id ORDER BY x.created_at DESC,x.id DESC LIMIT 101`,
@@ -144,18 +147,25 @@ export async function actOnTrafficExclusion(
   input: unknown,
   identity: WriteIdentity,
 ) {
+  if (warehouseEnabled())
+    return (await import('./warehouse-traffic-exclusions')).actOnWarehouseTrafficExclusion(
+      websiteId,
+      input,
+      identity,
+    );
   if (process.env.CLICKHOUSE_URL) throw new LiekanError('流量治理当前支持 PostgreSQL', 501);
   const parsed = trafficExclusionActionSchema.safeParse(input);
   if (!parsed.success) throw new LiekanError('流量治理参数无效');
   const action = parsed.data;
   const result = await transaction(async tx => {
     await lockWritableWebsite(tx, websiteId, identity);
+    await assertTransitionMaintenance(tx, 'governance');
     await tx.$executeRawUnsafe("SET LOCAL statement_timeout='15s'");
     await tx.$executeRawUnsafe(
       'INSERT INTO liekan_traffic_governance(website_id) VALUES($1::uuid) ON CONFLICT DO NOTHING',
       websiteId,
     );
-    const current = await boundary(tx, websiteId);
+    const current = await trafficGovernanceBoundary(tx, websiteId);
     if (current.revision !== action.expectedRevision) throw conflict();
     if (action.action === 'preview') {
       const windowEnd = new Date(action.windowEnd);

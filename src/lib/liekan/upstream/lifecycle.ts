@@ -2,6 +2,13 @@ import { clearAiWebsiteInTransaction } from './ai-lifecycle';
 import { clearHistoryRepair, invalidateHistoryRepair } from './history-repair-lifecycle';
 import { lockWritableWebsite, type WriteIdentity } from './server';
 import { invalidateRobotsWebsite } from './robots-lifecycle';
+import { warehouseEnabled } from '../warehouse/runtime';
+import { factTables } from '../warehouse/catalog';
+
+const warehouseFacts = new Set(factTables.map(table => table.name));
+function clearInPostgres(table: string) {
+  return !warehouseEnabled() || !warehouseFacts.has(table);
+}
 
 // Head is first so publication is fenced before snapshot rows disappear.
 export const LIEKAN_GEO_TABLES = [
@@ -41,6 +48,11 @@ export const LIEKAN_DELETE_FACT_TABLES = [
 ] as const;
 
 async function clearGeoSnapshots(tx: any, websiteId: string) {
+  if (warehouseEnabled())
+    await tx.$executeRawUnsafe(
+      "DELETE FROM liekan_warehouse_reference WHERE website_id=$1::uuid AND kind='geo'",
+      websiteId,
+    );
   for (const table of LIEKAN_GEO_TABLES)
     await tx.$executeRawUnsafe(`DELETE FROM ${table} WHERE website_id=$1::uuid`, websiteId);
 }
@@ -61,7 +73,8 @@ export async function resetLiekanStatistics(tx: any, websiteId: string, identity
     websiteId,
   );
   for (const table of LIEKAN_RESET_FACT_TABLES)
-    await tx.$executeRawUnsafe(`DELETE FROM ${table} WHERE website_id=$1::uuid`, websiteId);
+    if (clearInPostgres(table))
+      await tx.$executeRawUnsafe(`DELETE FROM ${table} WHERE website_id=$1::uuid`, websiteId);
   await tx.$executeRawUnsafe(
     "UPDATE liekan_crawler_check SET state='cancelled',result=NULL,completed_at=now() WHERE website_id=$1::uuid AND state IN('queued','running')",
     websiteId,
@@ -92,7 +105,8 @@ export async function resetLiekanStatistics(tx: any, websiteId: string, identity
     websiteId,
   );
   for (const table of LIEKAN_RESET_TAIL_TABLES)
-    await tx.$executeRawUnsafe(`DELETE FROM ${table} WHERE website_id=$1::uuid`, websiteId);
+    if (clearInPostgres(table))
+      await tx.$executeRawUnsafe(`DELETE FROM ${table} WHERE website_id=$1::uuid`, websiteId);
   await tx.$executeRawUnsafe(
     'DELETE FROM liekan_geo_weight_evidence_revision WHERE website_id=$1::uuid',
     websiteId,
@@ -103,6 +117,11 @@ export async function stopWebsiteSources(tx: any, websiteId: string, deleted = f
   if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schema)) throw new Error('Invalid database schema');
   await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${schema}"`);
   await lockWritableWebsite(tx, websiteId);
+  // Ownership/domain changes cannot invalidate an accepted warehouse task
+  // while its CH package still awaits PG publication.
+  if (warehouseEnabled() && !deleted) {
+    await (await import('./warehouse-lifecycle')).assertWarehouseLifecycleEditable(tx, websiteId);
+  }
   await invalidateRobotsWebsite(tx, websiteId);
   await tx.$queryRawUnsafe(
     'SELECT website_id FROM liekan_analysis_site WHERE website_id=$1::uuid FOR UPDATE',
@@ -161,7 +180,8 @@ export async function stopWebsiteSources(tx: any, websiteId: string, deleted = f
   );
   if (deleted) {
     for (const table of LIEKAN_DELETE_FACT_TABLES)
-      await tx.$executeRawUnsafe(`DELETE FROM ${table} WHERE website_id=$1::uuid`, websiteId);
+      if (clearInPostgres(table))
+        await tx.$executeRawUnsafe(`DELETE FROM ${table} WHERE website_id=$1::uuid`, websiteId);
   }
   // Provider cleanup is reconciled from these durable source rows by the worker.
 }

@@ -28,15 +28,17 @@ const foregroundBudget = 15 * 60000;
 type WithoutRequestId<T> = T extends unknown ? Omit<T, 'requestId'> : never;
 type Action = WithoutRequestId<StorageAction>;
 
-export function StorageRetentionPanel({ websiteId }: { websiteId?: string }) {
+type StoragePanelProps = { websiteId?: string; warehouseMode?: boolean };
+
+export function StorageRetentionPanel({ websiteId, warehouseMode }: StoragePanelProps) {
   const c = useFeature();
   const reading = useManualRefresh();
   if (reading?.authorized === false || (!websiteId && c.user.role !== 'admin')) return null;
   const session = `${c.user.id}:${c.user.role}:${websiteId}:${reading?.page.token}`;
-  return <StorageSelection key={session} websiteId={websiteId} />;
+  return <StorageSelection key={session} websiteId={websiteId} warehouseMode={warehouseMode} />;
 }
 
-function StorageSelection({ websiteId }: { websiteId?: string }) {
+function StorageSelection({ websiteId, warehouseMode }: StoragePanelProps) {
   const c = useFeature();
   const i18n = useLiekanI18n();
   const reading = useManualRefresh();
@@ -45,7 +47,11 @@ function StorageSelection({ websiteId }: { websiteId?: string }) {
   return (
     <Panel
       title={i18n.text('存储与清理')}
-      subtitle={i18n.text('回收无引用的统计副本和超期完成流水，保留原始明细及历史统计。')}
+      subtitle={i18n.text(
+        warehouseMode
+          ? '清理 PostgreSQL 中无引用的旧统计副本和已完成任务，不删除 ClickHouse 明细。'
+          : '回收无引用的统计副本和超期完成流水，保留原始明细及历史统计。',
+      )}
     >
       <Body>
         {c.user.role === 'admin' && websiteId && (
@@ -62,13 +68,14 @@ function StorageSelection({ websiteId }: { websiteId?: string }) {
         <StorageScope
           key={`${selected || 'instance'}:${reading?.page.round}`}
           websiteId={selected}
+          warehouseMode={warehouseMode}
         />
       </Body>
     </Panel>
   );
 }
 
-function StorageScope({ websiteId }: { websiteId?: string }) {
+function StorageScope({ websiteId, warehouseMode }: StoragePanelProps) {
   const c = useFeature();
   const i18n = useLiekanI18n();
   const instance = !websiteId;
@@ -324,7 +331,7 @@ function StorageScope({ websiteId }: { websiteId?: string }) {
           <Definition
             items={[
               [i18n.text('清理范围'), i18n.text(instance ? '实例已完成任务' : '当前网站统计副本')],
-              ...(state.capacity
+              ...(!warehouseMode && state.capacity
                 ? [
                     [
                       i18n.text('网站派生空间估算'),
@@ -337,7 +344,7 @@ function StorageScope({ websiteId }: { websiteId?: string }) {
                 String(instance ? state.preview.completedJobs : state.preview.candidateCount),
               ],
               [
-                i18n.text('预计可回收额度'),
+                i18n.text(warehouseMode ? '预计可回收数据量' : '预计可回收额度'),
                 instance ? i18n.text('按完成流水数量计量') : bytes(state.preview.estimatedBytes),
               ],
               ...(!instance
@@ -356,7 +363,7 @@ function StorageScope({ websiteId }: { websiteId?: string }) {
             checked={settings.enabled}
             onChange={e => changeSettings({ enabled: e.target.checked })}
           />
-          {!instance && (
+          {!instance && !warehouseMode && (
             <Switch
               label={i18n.text('容量达到 80% 时提前回收')}
               disabled={busy}
@@ -400,7 +407,9 @@ function StorageScope({ websiteId }: { websiteId?: string }) {
           />
           <p className="muted">
             {i18n.text(
-              '每小时回收高频和统计调度流水；统计副本及其他完成流水按集中时间回收。容量紧张时提前处理。',
+              warehouseMode
+                ? '每小时回收高频和统计调度流水；旧统计副本及其他完成流水按集中时间回收。'
+                : '每小时回收高频和统计调度流水；统计副本及其他完成流水按集中时间回收。容量紧张时提前处理。',
             )}
           </p>
           <div className="btn-row">
@@ -433,11 +442,16 @@ function StorageScope({ websiteId }: { websiteId?: string }) {
               <p>
                 {instance
                   ? `${i18n.text('候选记录')} ${preview.candidateCount} · ${i18n.text('按完成流水数量计量')}`
-                  : i18n.text('候选记录：{v0}，受保护版本：{v1}，预计恢复额度：{v2}。', [
-                      preview.candidateCount,
-                      preview.protectedCount,
-                      bytes(preview.estimatedBytes),
-                    ])}
+                  : i18n.text(
+                      warehouseMode
+                        ? '候选记录：{v0}，受保护版本：{v1}，预计可回收数据量：{v2}。'
+                        : '候选记录：{v0}，受保护版本：{v1}，预计恢复额度：{v2}。',
+                      [
+                        preview.candidateCount,
+                        preview.protectedCount,
+                        bytes(preview.estimatedBytes),
+                      ],
+                    )}
               </p>
               {previewExpired && <p>{i18n.text('清理预览已过期，请重新预览')}</p>}
               <div className="btn-row">
@@ -457,11 +471,12 @@ function StorageScope({ websiteId }: { websiteId?: string }) {
           {running && (
             <Notice>
               <p>
-                {i18n.text('已清理 {v0} 个统计版本和 {v1} 条任务流水，恢复额度 {v2}。', [
-                  active.generationsDeleted,
-                  active.jobsDeleted,
-                  bytes(active.releasedBytes),
-                ])}
+                {i18n.text(
+                  warehouseMode
+                    ? '已清理 {v0} 个统计版本和 {v1} 条任务流水，已回收数据量 {v2}。'
+                    : '已清理 {v0} 个统计版本和 {v1} 条任务流水，恢复额度 {v2}。',
+                  [active.generationsDeleted, active.jobsDeleted, bytes(active.releasedBytes)],
+                )}
               </p>
               <Button disabled={busy} onClick={() => act({ action: 'stop', id: active.id })}>
                 {i18n.text('停止后续批次')}
@@ -490,7 +505,9 @@ function StorageScope({ websiteId }: { websiteId?: string }) {
           </Notice>
           <p className="muted">
             {i18n.text(
-              '额度恢复和物理磁盘变化分别记录。数据库可先复用已回收空间，文件大小可能暂时保持原值。',
+              warehouseMode
+                ? '回收数据量按 PostgreSQL 逻辑大小计量。数据库可复用已回收空间，物理文件大小可能暂时保持原值。'
+                : '额度恢复和物理磁盘变化分别记录。数据库可先复用已回收空间，文件大小可能暂时保持原值。',
             )}
           </p>
           <Table
@@ -499,7 +516,7 @@ function StorageScope({ websiteId }: { websiteId?: string }) {
               i18n.text('状态'),
               i18n.text('统计版本'),
               i18n.text('任务流水'),
-              i18n.text('恢复额度'),
+              i18n.text(warehouseMode ? '已回收数据量' : '恢复额度'),
               i18n.text('物理存储变化'),
             ]}
             numeric={[2, 3, 4, 5]}

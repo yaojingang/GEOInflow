@@ -161,3 +161,28 @@ it('uses the global server readiness gate when the visible website page has no c
   fireEvent.click(button);
   expect(await screen.findByText('PostgreSQL + ClickHouse')).toBeVisible();
 });
+it.each(['zh-CN', 'en-US'] as const)(
+  'shows authoritative warehouse mode without replica controls in %s',
+  async locale => {
+    const post = vi.fn();
+    mount(
+      vi.fn(async () => ({
+        ...status,
+        warehouse: { authority: 'clickhouse', transition: 'exited' },
+      })),
+      post,
+      true,
+      locale,
+    );
+    expect(
+      await screen.findByText(
+        locale === 'zh-CN' ? '独立分析仓库' : 'Independent analytics warehouse',
+      ),
+    ).toBeVisible();
+    expect(screen.getByText('ClickHouse')).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: locale === 'zh-CN' ? '准备数据' : 'Prepare data' }),
+    ).toBeNull();
+    expect(post).not.toHaveBeenCalled();
+  },
+);

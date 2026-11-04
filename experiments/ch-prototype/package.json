@@ -1,0 +1,26 @@
+{
+  "name": "liekan-ch-isolated-prototype",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:proof": "cd ../.. && PROTO_ROUND=2 node --import ./experiments/ch-prototype/node_modules/tsx/dist/loader.mjs experiments/ch-prototype/round3-proof.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "cd ../.. && node --import ./experiments/ch-prototype/node_modules/tsx/dist/loader.mjs experiments/ch-prototype/integration.ts",
+    "test:clients": "cd ../.. && node --import ./experiments/ch-prototype/node_modules/tsx/dist/loader.mjs experiments/ch-prototype/clients.ts",
+    "test:round2": "cd ../.. && PROTO_ROUND=2 node --import ./experiments/ch-prototype/node_modules/tsx/dist/loader.mjs experiments/ch-prototype/round2-integration.ts",
+    "test:round2-backfill": "cd ../.. && PROTO_ROUND=2 node --import ./experiments/ch-prototype/node_modules/tsx/dist/loader.mjs experiments/ch-prototype/round2-backfill-test.ts",
+    "test:round2-query": "cd ../.. && PROTO_ROUND=2 node --import ./experiments/ch-prototype/node_modules/tsx/dist/loader.mjs experiments/ch-prototype/round2-query.ts"
+  },
+  "dependencies": {
+    "@clickhouse/client": "1.23.1",
+    "kafkajs": "2.2.4",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@confluentinc/kafka-javascript": "1.11.0",
+    "@types/node": "26.5.1",
+    "@types/pg": "8.15.6",
+    "tsx": "4.23.13",
+    "typescript": "6.0.3"
+  }
+}

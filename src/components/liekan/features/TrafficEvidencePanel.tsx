@@ -67,6 +67,8 @@ export function TrafficEvidencePanel({
     [sources, setSources] = useState<any[]>([]),
     [response, setResponse] = useState<{ key: string; data: any } | null>(null);
   const [page, setPage] = useState(1),
+    [reasonsPage, setReasonsPage] = useState(1),
+    [fieldCoveragePage, setFieldCoveragePage] = useState(1),
     [revision, setRevision] = useState(0),
     [error, setError] = useState(''),
     [exportMessage, setExportMessage] = useState(''),
@@ -133,6 +135,8 @@ export function TrafficEvidencePanel({
   useEffect(() => {
     snapshot.current = undefined;
     setPage(1);
+    setReasonsPage(1);
+    setFieldCoveragePage(1);
     setResponse(null);
   }, [requestKey]);
   useEffect(() => {
@@ -182,7 +186,13 @@ export function TrafficEvidencePanel({
         featureRequest<any>(
           'GET',
           endpoint,
-          { ...JSON.parse(conditions), page, snapshot: snapshot.current },
+          {
+            ...JSON.parse(conditions),
+            page,
+            ...(['outcomes', 'performance'].includes(mode) ? { reasonsPage } : {}),
+            ...(mode === 'performance' ? { fieldCoveragePage } : {}),
+            snapshot: snapshot.current,
+          },
           abort.signal,
         ),
       { catalogScope },
@@ -196,7 +206,11 @@ export function TrafficEvidencePanel({
           });
         snapshot.current = data.meta.snapshot;
         setResponse({ key: requestKey, data });
-        if (data.meta.reset) setPage(1);
+        if (data.meta.reset) {
+          setPage(1);
+          setReasonsPage(1);
+          setFieldCoveragePage(1);
+        }
       })
       .catch(e => {
         if (!abort.signal.aborted) {
@@ -208,7 +222,18 @@ export function TrafficEvidencePanel({
         if (!abort.signal.aborted) setLoading(false);
       });
     return () => abort.abort();
-  }, [conditions, endpoint, requestKey, page, needsSource, sourceId, revision, catalogScope]);
+  }, [
+    conditions,
+    endpoint,
+    requestKey,
+    page,
+    reasonsPage,
+    fieldCoveragePage,
+    needsSource,
+    sourceId,
+    revision,
+    catalogScope,
+  ]);
   const identityUnavailable =
     result &&
     (!identityUsable(result.meta.browserPopulation) ||
@@ -259,6 +284,8 @@ export function TrafficEvidencePanel({
           onClick={() => {
             snapshot.current = undefined;
             setPage(1);
+            setReasonsPage(1);
+            setFieldCoveragePage(1);
             setDrilldown({
               scope: identityScope,
               filters: { responseGroup: response, verificationGroup: identity },
@@ -290,6 +317,8 @@ export function TrafficEvidencePanel({
             onClick={() => {
               snapshot.current = undefined;
               setPage(1);
+              setReasonsPage(1);
+              setFieldCoveragePage(1);
               setObservationWindow(null);
               setRevision(value => value + 1);
             }}
@@ -321,6 +350,8 @@ export function TrafficEvidencePanel({
             onChange={event => {
               snapshot.current = undefined;
               setPage(1);
+              setReasonsPage(1);
+              setFieldCoveragePage(1);
               setSourceId(event.target.value);
             }}
             options={[
@@ -425,6 +456,8 @@ export function TrafficEvidencePanel({
                           filters: { recognitionGroup: 'ambiguous', population: 'all_logs' },
                         });
                         setPage(1);
+                        setReasonsPage(1);
+                        setFieldCoveragePage(1);
                         snapshot.current = undefined;
                       }}
                     >
@@ -451,6 +484,8 @@ export function TrafficEvidencePanel({
                               },
                             });
                             setPage(1);
+                            setReasonsPage(1);
+                            setFieldCoveragePage(1);
                             snapshot.current = undefined;
                           }}
                         >
@@ -469,6 +504,8 @@ export function TrafficEvidencePanel({
                   onClick={() => {
                     setDrilldown(null);
                     setPage(1);
+                    setReasonsPage(1);
+                    setFieldCoveragePage(1);
                     snapshot.current = undefined;
                   }}
                 >
@@ -636,6 +673,16 @@ export function TrafficEvidencePanel({
                     i18n.text('目标事件'),
                     i18n.text('会话转化率'),
                   ]}
+                  {...(result.meta.sectionPages?.reasons
+                    ? {
+                        page: result.meta.sectionPages.reasons.page,
+                        pages: Math.ceil(
+                          result.meta.sectionPages.reasons.total /
+                            result.meta.sectionPages.reasons.pageSize,
+                        ),
+                        onPage: setReasonsPage,
+                      }
+                    : {})}
                   rows={result.reasons.map(row => [
                     row.platformId,
                     number(row.requests),
@@ -737,6 +784,16 @@ export function TrafficEvidencePanel({
                 </Notice>
                 <Table
                   columns={[i18n.text('缓存状态'), i18n.text('请求数')]}
+                  {...(result.meta.sectionPages?.reasons
+                    ? {
+                        page: result.meta.sectionPages.reasons.page,
+                        pages: Math.ceil(
+                          result.meta.sectionPages.reasons.total /
+                            result.meta.sectionPages.reasons.pageSize,
+                        ),
+                        onPage: setReasonsPage,
+                      }
+                    : {})}
                   rows={(result.reasons || []).map(row => [row.status, number(row.requests)])}
                 />
                 <details>
@@ -748,6 +805,16 @@ export function TrafficEvidencePanel({
                       i18n.text('数值'),
                       i18n.text('请求数'),
                     ]}
+                    {...(result.meta.sectionPages?.fieldCoverage
+                      ? {
+                          page: result.meta.sectionPages.fieldCoverage.page,
+                          pages: Math.ceil(
+                            result.meta.sectionPages.fieldCoverage.total /
+                              result.meta.sectionPages.fieldCoverage.pageSize,
+                          ),
+                          onPage: setFieldCoveragePage,
+                        }
+                      : {})}
                     rows={(result.fieldCoverage || []).map(row => [
                       row.field,
                       i18n.system(fieldStateLabels[row.state] || '未知'),

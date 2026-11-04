@@ -26,15 +26,20 @@ import {
 } from '../lib/liekan/upstream/geo-weight-snapshots';
 import { writeFile } from 'node:fs/promises';
 import { PgBoss } from 'pg-boss';
-import { QUEUE_SCHEMA } from '../lib/liekan/log-ingestion/queue';
+import { QUEUE_SCHEMA, closeQueue } from '../lib/liekan/log-ingestion/queue';
 import {
   ANALYTICS_QUEUE,
   type AnalyticsRefreshJob,
   pumpAnalyticsHot,
 } from '../lib/liekan/upstream/analytics-hot';
 import { analyticsRedis } from '../lib/liekan/upstream/analytics-redis';
+import { closeWarehouseProcessResources } from '../lib/liekan/warehouse/process-resources';
 import prisma from '../lib/prisma';
 import { processAnalyticsRefresh, readAnalyticsHotStrongVersion } from './analytics-refresh';
+import {
+  warehouseEnabled,
+  withinWarehouseAuthority,
+} from '../lib/liekan/warehouse/authority-routing';
 import { pumpStorageRetention } from '../lib/liekan/upstream/storage-retention';
 import { maintainAnalyticsInputSummaries } from '../lib/liekan/upstream/analytics-input-summary';
 
@@ -50,7 +55,10 @@ boss.on('error', () => console.error('Liekan analytics queue unavailable'));
 let stopped = false,
   pumping = false;
 async function pump() {
-  if (stopped || pumping) return;
+  return withinWarehouseAuthority(pumpSelected).catch(() => {});
+}
+async function pumpSelected() {
+  if (stopped || pumping || warehouseEnabled()) return;
   pumping = true;
   try {
     await pumpAnalysisQueries(boss);
@@ -84,30 +92,44 @@ await boss.work<GeoSnapshotJob>(
   { localConcurrency: 1, batchSize: 1, pollingIntervalSeconds: 1 },
   async jobs => {
     for (const job of jobs)
-      if (!stopped)
-        await withAnalysisPermit('interactive', () => processGeoSnapshotJob(job.data, boss));
+      if (!stopped) {
+        await withinWarehouseAuthority(async () => {
+          if (warehouseEnabled()) await processGeoSnapshotJob(job.data, boss);
+          else await withAnalysisPermit('interactive', () => processGeoSnapshotJob(job.data, boss));
+        });
+      }
   },
 );
 const geoMaintenance = setInterval(() => {
   if (!stopped) {
-    void reconcileGeoSnapshots(boss).catch(() => {});
-    void probeAnalysisExpansion().catch(() => {});
+    void withinWarehouseAuthority(() => reconcileGeoSnapshots(boss)).catch(() => {});
+    void withinWarehouseAuthority(async () => {
+      if (!warehouseEnabled()) await probeAnalysisExpansion();
+    }).catch(() => {});
   }
 }, 60000);
-void reconcileGeoSnapshots(boss).catch(() => {});
+void withinWarehouseAuthority(() => reconcileGeoSnapshots(boss)).catch(() => {});
 await boss.work<AnalyticsRefreshJob>(
   ANALYTICS_QUEUE,
   { localConcurrency: 1, batchSize: 1, pollingIntervalSeconds: 1 },
   async jobs => {
     for (const job of jobs)
-      if (!stopped) await withAnalysisPermit('preheat', () => processAnalyticsRefresh(job.data));
+      if (!stopped)
+        await withinWarehouseAuthority(async () => {
+          if (!warehouseEnabled())
+            await withAnalysisPermit('preheat', () => processAnalyticsRefresh(job.data));
+        });
   },
 );
 await boss.work<{ id: string }>(
   ANALYSIS_QUERY_QUEUE,
   { localConcurrency: 2, batchSize: 1, pollingIntervalSeconds: 1, includeMetadata: true },
   async jobs => {
-    for (const job of jobs) if (!stopped) await processAnalysisQueryDelivery(job, boss);
+    for (const job of jobs)
+      if (!stopped)
+        await withinWarehouseAuthority(async () => {
+          if (!warehouseEnabled()) await processAnalysisQueryDelivery(job, boss);
+        });
   },
 );
 await boss.work<{ id: string; kind: 'history' | 'incremental' }>(
@@ -116,7 +138,10 @@ await boss.work<{ id: string; kind: 'history' | 'incremental' }>(
   async jobs => {
     for (const job of jobs)
       if (!stopped)
-        await processAnalysisBuild(job.data.id, job.data.kind, { shouldStop: () => stopped });
+        await withinWarehouseAuthority(async () => {
+          if (!warehouseEnabled())
+            await processAnalysisBuild(job.data.id, job.data.kind, { shouldStop: () => stopped });
+        });
   },
 );
 const engineMaintenance = setInterval(() => {
@@ -133,6 +158,7 @@ const heartbeat = setInterval(() => {
 await writeFile('/tmp/liekan-analytics-worker-heartbeat', String(Date.now()), { mode: 0o600 });
 for (const signal of ['SIGINT', 'SIGTERM'])
   process.on(signal, async () => {
+    if (stopped) return;
     stopped = true;
     clearInterval(maintenance);
     clearInterval(engineMaintenance);
@@ -141,6 +167,7 @@ for (const signal of ['SIGINT', 'SIGTERM'])
     clearInterval(storageMaintenance);
     await boss.stop({ graceful: true });
     analyticsRedis.close();
+    await Promise.all([closeWarehouseProcessResources(), closeQueue()]);
     await prisma.client.$disconnect();
     process.exit(0);
   });

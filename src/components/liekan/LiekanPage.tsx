@@ -70,6 +70,7 @@ import {
   isLiveLogView,
   previousWeekRange,
   readViewState,
+  readReportPage,
 } from './viewState';
 
 export function LiekanPage({ resource }: { resource: Resource }) {
@@ -127,12 +128,7 @@ export function LiekanPage({ resource }: { resource: Resource }) {
   const keywordConditions = keywordParsed.success
     ? keywordParsed.data
     : keywordConditionsSchema.parse({});
-  const keywordPage =
-    Number.isSafeInteger(Number(params.page)) &&
-    Number(params.page) > 0 &&
-    Number(params.page) <= 100000
-      ? Number(params.page)
-      : 1;
+  const keywordPage = readReportPage(params.page);
   const pageIdentity = JSON.stringify([
     userId,
     websiteId,
@@ -629,7 +625,8 @@ export function LiekanPage({ resource }: { resource: Resource }) {
         frame => {
           if (owner !== currentPage.current.identity || controller.signal.aborted) return;
           if (frame.type === 'file') {
-            if (frame.size > EXPORT_MAX_BYTES) throw new Error('导出文件超过 50 MiB');
+            if (!frame.downloadUrl && frame.size > EXPORT_MAX_BYTES)
+              throw new Error('导出文件超过 50 MiB');
             file = frame;
           }
           if (frame.type === 'chunk') {
@@ -642,13 +639,15 @@ export function LiekanPage({ resource }: { resource: Resource }) {
         report.meta?.catalogVersion,
       );
       if (owner !== currentPage.current.identity || controller.signal.aborted) return;
-      if (!file || file.size !== bytes) throw new Error('导出传输未完成');
-      const url = URL.createObjectURL(new Blob(chunks as BlobPart[], { type: file.mime }));
+      if (!file || (!file.downloadUrl && file.size !== bytes)) throw new Error('导出传输未完成');
+      const url =
+        file.downloadUrl ||
+        URL.createObjectURL(new Blob(chunks as BlobPart[], { type: file.mime }));
       const link = document.createElement('a');
       link.href = url;
       link.download = file.name;
       link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      if (url.startsWith('blob:')) setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (error) {
       if (owner === currentPage.current.identity && !controller.signal.aborted)
         setActionError(error instanceof Error ? error.message : '导出失败');

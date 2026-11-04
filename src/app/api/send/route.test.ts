@@ -139,9 +139,17 @@ function makeComputedSessionId(
   const createdAt = new Date(timestamp * 1000);
   const sessionSalt = getSalt(process.env.SALT_ROTATION || 'month', createdAt);
 
-  return uuid('liekan-collection-v4:', JSON.stringify([
-    'browser', sourceId, defaultClientInfo.ip, defaultClientInfo.userAgent, sessionSalt, distinctId ?? '',
-  ]));
+  return uuid(
+    'liekan-collection-v4:',
+    JSON.stringify([
+      'browser',
+      sourceId,
+      defaultClientInfo.ip,
+      defaultClientInfo.userAgent,
+      sessionSalt,
+      distinctId ?? '',
+    ]),
+  );
 }
 
 beforeEach(() => {
@@ -179,6 +187,81 @@ test('collector redacts direct-submitted URL and referrer secrets while preservi
   expect(new URLSearchParams(saved.urlQuery).get('token')).toBe('[redacted]');
   expect(saved.utmSource).toBe('google');
   expect(new URLSearchParams(saved.referrerQuery).get('q')).toBe('analytics');
+});
+
+test.each([false, true])(
+  'collector protects direct path submissions (ClickHouse: %s)',
+  async enabled => {
+    (clickhouse as any).enabled = enabled;
+    const response = await callPOST({
+      type: 'event',
+      payload: {
+        website: WEBSITE_ID,
+        url: 'https://example.com/reset/url-secret?utm_source=google#/verify/hash-secret',
+        referrer: 'https://external.example/s/ffffffff-ffff-ffff-ffff-ffffffffffff/e?q=analytics',
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(saveEventMock).toHaveBeenCalledTimes(1);
+    expect(saveEventMock.mock.calls[0][0]).toMatchObject({
+      urlPath: '/reset/[redacted]#/verify/[redacted]',
+      referrerPath: '/s/[redacted]/e',
+      referrerDomain: 'external.example',
+      referrerQuery: 'q=analytics',
+      utmSource: 'google',
+    });
+  },
+);
+
+test('performance collection redacts sensitive paths before persistence', async () => {
+  const response = await callPOST({
+    type: 'performance',
+    payload: {
+      website: WEBSITE_ID,
+      url: '/reset/performance-secret',
+      hostname: 'example.com',
+      lcp: 123,
+    },
+  });
+  expect(response.status).toBe(200);
+  expect(saveEventMock.mock.calls[0][0]).toMatchObject({ urlPath: '/reset/[redacted]', lcp: 123 });
+});
+
+test.each(['event', 'performance'])(
+  'collector preserves distinct ordinary UUID paths for %s',
+  async type => {
+    const paths = [
+      '/articles/11111111-1111-4111-8111-111111111111',
+      '/articles/22222222-2222-4222-8222-222222222222',
+    ];
+    for (const url of paths) {
+      const response = await callPOST({
+        type,
+        payload: { website: WEBSITE_ID, url, hostname: 'example.com', lcp: 123 },
+      });
+      expect(response.status).toBe(200);
+    }
+    expect(saveEventMock.mock.calls.map(([event]) => event.urlPath)).toEqual(paths);
+  },
+);
+
+test('collector preserves relative referrer resolution and normal route identity', async () => {
+  const response = await callPOST({
+    type: 'event',
+    payload: {
+      website: WEBSITE_ID,
+      hostname: 'shop.example.com',
+      url: '/users/12345678901234567890/orders/98765',
+      referrer: '/%74oken/short-secret?category=safe',
+    },
+  });
+  expect(response.status).toBe(200);
+  expect(saveEventMock.mock.calls[0][0]).toMatchObject({
+    urlPath: '/users/12345678901234567890/orders/98765',
+    referrerPath: '/token/[redacted]',
+    referrerDomain: undefined,
+    referrerQuery: 'category=safe',
+  });
 });
 
 describe('parseRequest error handling', () => {
@@ -983,7 +1066,6 @@ describe('error handling', () => {
     consoleLog.mockRestore();
   });
 });
-
 
 test('accepts a legacy signed tracker token and starts the recomputed versioned visit', async () => {
   const timestamp = 1704067200;

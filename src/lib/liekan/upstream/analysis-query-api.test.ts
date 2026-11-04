@@ -333,3 +333,26 @@ it('rejects an invalid viewer identifier before registering any task', async () 
   });
   expect(m.request).not.toHaveBeenCalled();
 });
+
+
+it.each([['LIEKAN_ANALYTICS_BACKEND', 'clickhouse'], ['LIEKAN_WAREHOUSE_TRANSITION', 'true']])(
+  'keeps direct routing active with %s=%s',
+  (name, value) => {
+    vi.stubEnv(name, value);
+    expect(analysisAsyncRequested(request())).toBe(false);
+  },
+);
+
+it('authorizes old task handles before retiring them under ClickHouse authority', async () => {
+  vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+  await expect(analysisJobResponse(request(), site, id)).rejects.toMatchObject({
+    status: 410,
+    code: 'analysis-query-upgraded',
+  });
+  expect(m.authenticate).toHaveBeenCalledOnce();
+  expect(m.authorize).toHaveBeenCalledOnce();
+  expect(m.read).not.toHaveBeenCalled();
+  m.authorize.mockRejectedValue(new Error('website authority revoked'));
+  await expect(analysisJobResponse(request(), site, id)).rejects.toThrow('website authority revoked');
+  expect(m.read).not.toHaveBeenCalled();
+});

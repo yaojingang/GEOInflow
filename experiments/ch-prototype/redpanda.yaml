@@ -1,0 +1,18 @@
+redpanda:
+  data_directory: /var/lib/redpanda/data
+  node_id: 0
+  seed_servers: []
+  empty_seed_starts_cluster: true
+  developer_mode: false
+  rpc_server: {address: 0.0.0.0, port: 33145}
+  advertised_rpc_api: {address: redpanda, port: 33145}
+  kafka_api:
+    - {address: 0.0.0.0, port: 9092, name: internal}
+    - {address: 0.0.0.0, port: 29099, name: external}
+  advertised_kafka_api:
+    - {address: redpanda, port: 9092, name: internal}
+    - {address: 127.0.0.1, port: 29099, name: external}
+  admin: [{address: 0.0.0.0, port: 9644}]
+rpk:
+  overprovisioned: true
+  enable_usage_stats: false
