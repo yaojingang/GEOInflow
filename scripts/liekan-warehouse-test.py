@@ -39,6 +39,9 @@ IMAGE_DIGESTS = {
     'warehouse-ch': 'sha256:d426d2f612e1e189c90f9a3f8dcd85a03c6851273833817a296bb327e63aa7a7',
     'warehouse-queue': 'sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837',
 }
+# Published before the Docker tmpfs inspection fix (public candidate 93257f8d).
+# Only this exact script may be replaced in a stopped, backup-only run.
+SCRIPT_REFRESH_FROM = {'8debdb85093e113a6c9c898844ae6cf831cd782e999575166c38838ab835f2f3'}
 KEEP = ('APP_SECRET', 'TWO_FACTOR_ENCRYPTION_KEY', 'LIEKAN_LOG_CREDENTIALS_KEY',
         'LIEKAN_LOG_PREVIOUS_KEYS', 'LIEKAN_AI_ENCRYPTION_KEY')
 RETRY = {'warehouse-transition-input-not-drained', 'warehouse-transition-decisions-not-drained',
@@ -213,6 +216,16 @@ def check_project(project):
         raise Refused('Test project must start with geoinflow-test- and use lowercase letters, digits or hyphens')
 
 
+def check_bind_readability(config, services):
+    for service in services:
+        for mount in config['services'][service].get('volumes', []):
+            if mount['type'] == 'bind' and not Path(mount['source']).stat().st_mode & 0o004:
+                # os.access as the root deployment user would hide this failure.
+                # These are public repository files; never change private env/dump modes.
+                raise Refused('Repository Docker bind file is not readable by container users; '
+                              'set the referenced public configuration/script file to mode 0644')
+
+
 def engine_network_options(version):
     parsed = re.match(r'^(\d+)\.(\d+)\.(\d+)(?:$|[-+])', version)
     if not parsed or tuple(map(int, parsed.groups())) < (26, 1, 4):
@@ -317,7 +330,7 @@ class TestStack:
             raise Refused('State belongs to another checkout/project')
         if self.state['daemon'] != json.loads(docker('info', '--format', '{{json .ID}}')):
             raise Refused('Docker daemon changed')
-        if not recovery and self.args.command in ('run', 'serve', 'refresh-images', 'check-storage'):
+        if not recovery and self.args.command in ('run', 'serve', 'refresh-images', 'refresh-script', 'check-storage'):
             # Refuse an unsafe daemon downgrade; read-only status and stopping
             # owned containers remain available for recovery.
             supported = engine_network_options(docker('version', '--format', '{{.Server.Version}}').decode().strip())
@@ -362,11 +375,21 @@ class TestStack:
                 if container['Id'] in self.state['source_ids'] or attached - {network} or not mounted <= volumes:
                     raise Refused('Test container uses a foreign resource')
                 expected = {v['target']: v for v in config['services'][service].get('volumes', [])}
-                temporary = {v.split(':', 1)[0] for v in config['services'][service].get('tmpfs', [])}
-                if {m['Destination'] for m in container.get('Mounts', [])} != set(expected) | temporary:
+                temporary = dict(v.split(':', 1) for v in config['services'][service].get('tmpfs', []))
+                # Docker can omit Compose tmpfs from Mounts. HostConfig.Tmpfs
+                # retains the declared targets/options, including after exit.
+                actual_temporary = container['HostConfig'].get('Tmpfs') or {}
+                if ({k: sorted(v.split(',')) for k, v in actual_temporary.items()} !=
+                        {k: sorted(v.split(',')) for k, v in temporary.items()}):
+                    raise Refused('Test container temporary mounts changed')
+                mounts = container.get('Mounts', [])
+                if (len({m['Destination'] for m in mounts}) != len(mounts) or
+                        {m['Destination'] for m in mounts if m['Type'] != 'tmpfs'} != set(expected)):
                     raise Refused('Test container mounts changed')
-                for mount in container.get('Mounts', []):
+                for mount in mounts:
                     if mount['Type'] == 'tmpfs' and mount['Destination'] in temporary:
+                        if mount.get('RW') is False:
+                            raise Refused('Test container temporary mounts changed')
                         continue
                     spec = expected.get(mount['Destination'])
                     if not spec or mount['Type'] != spec['type'] or (mount['Type'] == 'volume' and
@@ -563,6 +586,49 @@ class TestStack:
         self.state, self.config_path = updated, destination
         print('Images refreshed; verified backup retained. No services started.')
 
+    def refresh_script(self):
+        """Accept the reviewed guard fix without replacing a completed backup."""
+        def stopped_probes():
+            owned = self.guard()
+            if (set(self.state['done']) != {'backup'} or self.state.get('image_id') or self.state.get('pending')
+                    or any(labels(c).get('com.docker.compose.service') not in ('warehouse-ch', 'warehouse-queue')
+                           or c['State']['Status'] not in ('created', 'exited')
+                           or c['State'].get('Running') or c['State'].get('Restarting') for c in owned)):
+                raise Refused('Script refresh requires backup-only state and stopped storage probes')
+            return {c['Id'] for c in owned}
+
+        ids = stopped_probes()
+        if docker('image', 'ls', '-q', '--filter', 'reference=' + self.state['image']).strip():
+            raise Refused('Script refresh cannot change a run with a built application image')
+        signature = source_signature()
+        previous = self.state['signature']
+        script = 'scripts/liekan-warehouse-test.py'
+        if (set(signature) != set(previous) or
+                any(signature[k] != previous[k] for k in signature if k != script) or
+                (previous[script] != signature[script] and previous[script] not in SCRIPT_REFRESH_FROM)):
+            raise Refused('Script refresh only accepts the published tmpfs guard fix; other source changes refused')
+        archive = self.directory / 'source.dump'
+        receipt_path = self.directory / 'backup.json'
+        if archive.is_symlink() or receipt_path.is_symlink() or not archive.is_file():
+            raise Refused('Backup files must remain regular files')
+        receipt = json.loads(receipt_path.read_text())
+        if (receipt != self.state['done']['backup'] or receipt.get('source_container') != self.state['source_db']
+                or archive.stat().st_size != receipt.get('bytes') or sha(archive) != receipt.get('sha256')):
+            raise Refused('Backup receipt, size or checksum does not match')
+        if stopped_probes() != ids:
+            raise Refused('Storage probes changed during script refresh')
+        if signature == previous:
+            print('Script already refreshed; verified backup and frozen configuration retained.')
+            return
+        updated = copy.deepcopy(self.state)
+        updated.setdefault('script_refreshes', []).append({
+            'signature': previous, 'backup_sha256': receipt['sha256'], 'config_sha': self.state['config_sha'],
+        })
+        updated['signature'] = signature
+        atomic(self.state_path, updated)
+        self.state = updated
+        print('Script refreshed; verified backup and frozen configuration retained. No services started.')
+
     def check_storage(self):
         """Check real CH/queue health before building an app or restoring PG."""
         self.guard()
@@ -679,6 +745,7 @@ class TestStack:
 
     def up(self, names):
         self.guard()
+        check_bind_readability(self.config(), names)
         self.compose('up', '-d', '--no-build', '--no-deps', '--wait', '--wait-timeout', '300', *names)
 
     def deploy(self):
@@ -688,6 +755,7 @@ class TestStack:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         module.compose = lambda *args, capture=False: self.compose(*args).decode()
+        check_bind_readability(self.config(), STORAGE)
         plan = module.dependency_plan(self.config(), list(STORAGE))
         module.dependencies(plan)
         self.guard()
@@ -893,7 +961,7 @@ class TestStack:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['plan', 'run', 'status', 'stop', 'serve', 'refresh-images', 'check-storage'])
+    parser.add_argument('command', choices=['plan', 'run', 'status', 'stop', 'serve', 'refresh-images', 'refresh-script', 'check-storage'])
     parser.add_argument('--source-app', default='liekan-app-1')
     parser.add_argument('--source-db', default='liekan-db-1')
     parser.add_argument('--project', default='geoinflow-test-ch')
@@ -928,7 +996,7 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         # Read the persisted checkpoints only after acquiring the controller lock.
         stack = TestStack(args)
-        if args.command in ('status', 'stop', 'serve', 'refresh-images', 'check-storage') and not stack.state:
+        if args.command in ('status', 'stop', 'serve', 'refresh-images', 'refresh-script', 'check-storage') and not stack.state:
             raise Refused('No test state exists for this project')
         if args.command != 'serve':
             getattr(stack, args.command.replace('-', '_'))()

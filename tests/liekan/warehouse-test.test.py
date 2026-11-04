@@ -195,6 +195,74 @@ class RuntimeGuard(unittest.TestCase):
     def test_owned_runtime_passes(self):
         self.assertEqual(self.guard(self.container), [self.container])
 
+    def kafka_runtime(self):
+        config = model()
+        service = config['services']['warehouse-queue']
+        service['volumes'] = [{'type': 'volume', 'source': 'data', 'target': '/var/lib/kafka/data'}]
+        service['tmpfs'] = [
+            '/etc/kafka/secrets:rw,nosuid,nodev,size=16m,uid=1000,gid=1000',
+            '/mnt/shared/config:rw,nosuid,nodev,size=16m,uid=1000,gid=1000',
+        ]
+        self.stack.config = lambda: config
+        container = copy.deepcopy(self.container)
+        container['Config']['Labels']['com.docker.compose.service'] = 'warehouse-queue'
+        container['Mounts'] = [{'Type': 'volume', 'Name': 'geoinflow-test-unit_data',
+                                'Destination': '/var/lib/kafka/data', 'RW': True}]
+        # Real Docker inspect reports Compose tmpfs in HostConfig.Tmpfs, and
+        # can omit it from Mounts even while the container is running.
+        container['HostConfig']['Tmpfs'] = dict(item.split(':', 1) for item in service['tmpfs'])
+        return container
+
+    def test_kafka_tmpfs_inspection_with_or_without_mount_entries(self):
+        container = self.kafka_runtime()
+        for status in ('created', 'running', 'restarting', 'exited'):
+            for listed in (False, True):
+                with self.subTest(status=status, listed=listed):
+                    candidate = copy.deepcopy(container)
+                    candidate['State'] = {'Status': status}
+                    if listed:
+                        candidate['Mounts'] += [{'Type': 'tmpfs', 'Destination': path, 'RW': True}
+                                                for path in candidate['HostConfig']['Tmpfs']]
+                    self.assertEqual(self.guard(candidate), [candidate])
+
+    def test_kafka_tmpfs_options_and_mount_boundaries_remain_guarded(self):
+        container = self.kafka_runtime()
+        mutations = [
+            lambda c: c['HostConfig'].pop('Tmpfs'),
+            lambda c: c['HostConfig']['Tmpfs'].pop('/etc/kafka/secrets'),
+            lambda c: c['HostConfig']['Tmpfs'].update({'/unexpected': 'rw,size=16m'}),
+            lambda c: c['HostConfig']['Tmpfs'].update({'/etc/kafka/secrets': 'rw,size=1g'}),
+            lambda c: c['Mounts'].clear(),
+            lambda c: c['Mounts'][0].update(RW=False),
+            lambda c: c['Mounts'].append({'Type': 'bind', 'Destination': '/etc/kafka/secrets',
+                                         'Source': '/unexpected', 'RW': True}),
+            lambda c: c['Mounts'].append({'Type': 'tmpfs', 'Destination': '/unexpected', 'RW': True}),
+            lambda c: c['Mounts'].append(copy.deepcopy(c['Mounts'][0])),
+            lambda c: c['Mounts'].append({'Type': 'tmpfs', 'Destination': '/etc/kafka/secrets', 'RW': False}),
+        ]
+        self.assertEqual(self.guard(container), [container])
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                candidate = copy.deepcopy(container)
+                mutate(candidate)
+                with self.assertRaises(w.Refused): self.guard(candidate)
+
+    def test_storage_recovery_accepts_kafka_tmpfs_and_preserves_ownership_check(self):
+        container = self.kafka_runtime()
+        self.stack.args.command = 'check-storage'
+        self.stack.state['signature'] = {'source': 'old'}
+        original_guard = self.stack.guard
+        self.stack.guard = lambda: original_guard(recovery=True)
+        self.assertEqual(self.guard(container), [container])
+        container['Config']['Labels'][w.LABEL] = 'foreign'
+        with self.assertRaises(w.Refused): self.guard(container)
+
+    def test_kafka_tmpfs_option_order_is_not_configuration_drift(self):
+        container = self.kafka_runtime()
+        for path, options in container['HostConfig']['Tmpfs'].items():
+            container['HostConfig']['Tmpfs'][path] = ','.join(reversed(options.split(',')))
+        self.assertEqual(self.guard(container), [container])
+
     def test_queue_storage_readonly_mount_and_environment_cannot_drift(self):
         config = model()
         path = '/app/warehouse-queue-storage'
@@ -527,6 +595,122 @@ class ImageRefresh(unittest.TestCase):
                     with self.assertRaises(w.Refused): self.stack.check_storage()
                 else: self.stack.check_storage()
                 docker.assert_called_once_with('stop', '--time', '30', 'warehouse-ch-id', 'warehouse-queue-id')
+
+
+class BindReadability(unittest.TestCase):
+    def test_root_only_checkout_is_rejected_before_container_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / 'kafka-start.sh'
+            file.write_text('#!/bin/sh\n')
+            stack = object.__new__(w.TestStack)
+            stack.guard = lambda: []
+            stack.config = lambda: {'services': {'warehouse-queue': {'volumes': [
+                {'type': 'bind', 'source': str(file), 'target': '/liekan/kafka-start.sh', 'read_only': True}]}}}
+            with patch.object(stack, 'compose') as compose:
+                file.chmod(0o600)
+                with self.assertRaisesRegex(w.Refused, '0644'):
+                    stack.up(['warehouse-queue'])
+                compose.assert_not_called()
+                self.assertEqual(file.stat().st_mode & 0o777, 0o600)
+                file.chmod(0o644)
+                stack.up(['warehouse-queue'])
+                compose.assert_called_once_with('up', '-d', '--no-build', '--no-deps', '--wait',
+                                                '--wait-timeout', '300', 'warehouse-queue')
+
+
+class ScriptRefresh(unittest.TestCase):
+    def setUp(self):
+        ImageRefresh.setUp(self)
+        self.stack.args.command = 'refresh-script'
+        self.stack.state['signature']['scripts/liekan-warehouse-test.py'] = next(iter(w.SCRIPT_REFRESH_FROM))
+        self.owned = [{'Id': 'test-ch', 'State': {'Status': 'exited', 'Running': False},
+                       'Config': {'Labels': {'com.docker.compose.service': 'warehouse-ch'}}}]
+        self.stack.guard = lambda: self.owned
+        w.atomic(self.stack.state_path, self.stack.state)
+        self.source_state = self.stack.state_path.read_bytes()
+
+    def refresh(self):
+        def docker(*args):
+            if args == ('image', 'ls', '-q', '--filter', 'reference=test:image'):
+                return getattr(self, 'built_image', b'')
+            self.fail('Refresh must not mutate Docker')
+        with patch.object(w, 'source_signature', return_value=self.signature), \
+                patch.object(w, 'docker', side_effect=docker):
+            self.stack.refresh_script()
+
+    def test_refresh_preserves_backup_configuration_and_identity_and_is_idempotent(self):
+        before = copy.deepcopy(self.stack.state)
+        self.refresh()
+        after = json.loads(self.stack.state_path.read_text())
+        expected = dict(before, signature=self.signature, script_refreshes=[{
+            'signature': before['signature'], 'backup_sha256': self.receipt['sha256'],
+            'config_sha': before['config_sha'],
+        }])
+        self.assertEqual(after, expected)
+        self.assertEqual(self.stack.config_path.read_bytes(), self.source_config)
+        self.assertEqual(w.sha(self.root / 'source.dump'), self.receipt['sha256'])
+        self.refresh()
+        self.assertEqual(json.loads(self.stack.state_path.read_text()), after)
+
+    def test_refresh_refuses_active_probes_or_deployment_progress(self):
+        for status in ('running', 'restarting', 'paused', 'dead'):
+            self.owned[0]['State']['Status'] = status
+            with self.assertRaises(w.Refused): self.refresh()
+        self.owned[0]['State']['Status'] = 'exited'
+        self.owned[0]['State']['Running'] = True
+        with self.assertRaises(w.Refused): self.refresh()
+        self.owned[0]['State']['Running'] = False
+        self.built_image = b'partial-build-image'
+        with self.assertRaises(w.Refused): self.refresh()
+        self.built_image = b''
+        for key in ('image_id', 'pending'):
+            self.stack.state[key] = 'present'
+            with self.assertRaises(w.Refused): self.refresh()
+            del self.stack.state[key]
+        self.stack.state['done']['restore'] = True
+        with self.assertRaises(w.Refused): self.refresh()
+        del self.stack.state['done']['restore']
+        self.owned[0]['Config']['Labels']['com.docker.compose.service'] = 'db'
+        with self.assertRaises(w.Refused): self.refresh()
+        self.assertEqual(self.stack.state_path.read_bytes(), self.source_state)
+
+    def test_unknown_script_other_source_changes_and_guard_errors_are_refused(self):
+        previous = self.stack.state['signature'].copy()
+        for change in (lambda s: s.update({'scripts/liekan-warehouse-test.py': 'unknown'}),
+                       lambda s: s.update({'migrations': 'changed'}),
+                       lambda s: s.pop('migrations'),
+                       lambda s: s.update({'new-file': 'unexpected'})):
+            self.stack.state['signature'] = previous.copy()
+            change(self.stack.state['signature'])
+            with self.assertRaises(w.Refused): self.refresh()
+        self.stack.state['signature'] = previous
+        with patch.object(self.stack, 'guard', side_effect=w.Refused('foreign resources')):
+            with self.assertRaisesRegex(w.Refused, 'foreign'): self.refresh()
+        self.assertEqual(self.stack.state_path.read_bytes(), self.source_state)
+
+    def test_changed_backup_or_receipt_never_updates_signature(self):
+        for change in (lambda: (self.root / 'source.dump').write_bytes(b'changed'),
+                       lambda: w.atomic(self.root / 'backup.json', dict(self.receipt, source_container='other'))):
+            change()
+            with self.assertRaises(w.Refused): self.refresh()
+            (self.root / 'source.dump').write_bytes(b'synthetic backup')
+            w.atomic(self.root / 'backup.json', self.receipt)
+        self.assertEqual(self.stack.state_path.read_bytes(), self.source_state)
+
+    def test_probes_are_rechecked_after_backup_hashing(self):
+        for replacement in (dict(self.owned[0], Id='replacement'),
+                            dict(self.owned[0], State={'Status': 'running', 'Running': True})):
+            with patch.object(self.stack, 'guard', side_effect=[self.owned, [replacement]]):
+                with self.assertRaises(w.Refused): self.refresh()
+        self.assertEqual(self.stack.state_path.read_bytes(), self.source_state)
+
+    def test_interrupted_signature_write_can_retry(self):
+        with patch.object(w, 'atomic', side_effect=OSError('interrupted')):
+            with self.assertRaises(OSError): self.refresh()
+        self.assertEqual(self.stack.state_path.read_bytes(), self.source_state)
+        self.assertNotIn('script_refreshes', self.stack.state)
+        self.refresh()
+        self.assertEqual(len(self.stack.state['script_refreshes']), 1)
 
 
 if __name__ == '__main__': unittest.main()

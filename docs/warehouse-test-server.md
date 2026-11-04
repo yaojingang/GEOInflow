@@ -29,6 +29,7 @@
 在测试服务器执行；以下假设当前用户可以运行 Docker：
 
 ```bash
+umask 022
 git clone --branch feature/geoinflow-unified --single-branch \
   https://gitee.com/liekan/liekan-statistics.git geoinflow-ch-test
 cd geoinflow-ch-test

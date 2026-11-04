@@ -7,6 +7,7 @@
 ## 前提与边界
 
 - 在生产目录以外的独立 CH 候选源码目录运行；必须包含本脚本及配套 Compose、迁移和部署文件。运行期间固定版本，不在这个目录拉取更新。
+- 克隆公开源码前使用 `umask 022`。Kafka 启动脚本和 CH 配置通过只读 bind 挂载供容器用户读取，若克隆时使用 `umask 077`，普通文件会变成 `0600`，导致启动时报权限错误。脚本会在启动前检查这些文件的读取权限；私有 `.local` 配置及备份仍由脚本以 `0700` 目录、`0600` 文件保存。
 - Linux Docker Engine **26.1.4 或更新版本**，Python **3.8 或更新版本**，Docker Compose v2 支持 `!override`、`config --hash`、`up --wait`。脚本不升级或重启 Docker。较早的 26.0.0/26.0.1 存在关闭 IPv6 仍可能可达的缺陷，不纳入支持范围。
 - Docker 版本满足要求不代表宿主内核也已通过验证。旧内核机器先运行程序版本检查，再用下文 `check-storage` 验证完整服务健康；这两项通过仍不能代替实际容量验收。
 - 源服务是仓库 Compose 中正在运行的 `app`、`db`，PG 为 12–16。脚本核对应用连接确实指向选定容器，不支持外部托管 PG、未知连接覆盖参数或已经安装完整仓库的源系统。后者不能只复制 PG，需另做一致备份方案。
@@ -115,6 +116,23 @@ python3 scripts/liekan-warehouse-test.py check-storage --project geoinflow-test-
 它仅在测试网络中启动 CH 和队列，等待最多 300 秒的 Compose 健康检查，不构建应用、不启动 PG、不导入备份。成功或失败后都会尝试停止通过归属校验的这两个测试容器，并保留测试卷与备份。若发现配置或资源归属被修改，停止操作也会被拒绝，需按错误检查现场。成功后再运行 `run --until deploy` 继续恢复和部署。
 
 检查会创建测试资源，因此应先完成 `refresh-images`。检查成功不等于旧内核已获厂商支持，也不证明大数据量写入与查询性能。
+
+## 保留备份修复旧版挂载校验
+
+公开候选 `93257f8d` 的脚本错误要求 Docker 的 `Mounts` 同时列出所有 tmpfs，而 Docker 可以只在 `HostConfig.Tmpfs` 中返回它们。这会触发 `Test container mounts changed`，也可能拦住健康检查后的自动停止。修正版分别核验临时挂载的目标和选项、持久挂载的卷身份及只读属性。
+
+已经完成 backup、只创建过 CH/Kafka 探测容器的运行，可以安装已审核的配套修正版后执行：
+
+```bash
+python3 scripts/liekan-warehouse-test.py stop --project geoinflow-test-kafka
+python3 scripts/liekan-warehouse-test.py refresh-script --project geoinflow-test-kafka
+
+# 只调整这两个公开源码文件；不要递归修改 .local、备份或私有环境文件。
+chmod 0644 docker/warehouse/kafka-start.sh docker/warehouse/clickhouse.xml
+python3 scripts/liekan-warehouse-test.py check-storage --project geoinflow-test-kafka
+```
+
+`refresh-script` 只接受上述已知旧脚本的 SHA-256 更新，其他部署文件必须保持原摘要。命令核验运行归属、冻结配置、私有环境和 bind 内容、备份完成回执与完整 SHA-256，并在提交前复核探测容器仍已停止；仅原子更新脚本签名记录，保留原签名以供核对。镜像地址、密码、网络、卷、备份和已完成阶段不变，重复执行不重复登记。已经恢复 PG、构建应用、存在在途步骤或未知来源的运行会被拒绝。此命令不能用于任意版本升级，不要手工改写状态文件来绕过限制。
 
 ## 访问测试页面
 
