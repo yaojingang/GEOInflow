@@ -12,6 +12,16 @@ spec.loader.exec_module(deploy)
 
 
 class DependencyConfigurationTest(unittest.TestCase):
+    def test_redpanda_volume_cannot_be_adopted_by_kafka(self):
+        info = json.dumps([{'Config': {'Labels': {}},
+                            'Mounts': [{'Destination': '/var/lib/redpanda/data'}]}])
+        with patch.object(deploy, 'compose', return_value='original-queue'), \
+                patch.object(deploy.subprocess, 'check_output', return_value=info), \
+                patch.object(deploy.subprocess, 'run') as mutate:
+            with self.assertRaisesRegex(RuntimeError, 'Existing Redpanda queue'):
+                deploy.dependency_plan({'services': {'warehouse-queue': {}}}, ['warehouse-queue'])
+            mutate.assert_not_called()
+
     def test_changed_ch_or_queue_configuration_stops_before_any_service_mutation(self):
         names = ['db', 'analytics-cache', 'warehouse-ch', 'warehouse-queue']
         config = {'services': {name: {} for name in names}}

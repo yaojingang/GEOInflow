@@ -15,7 +15,11 @@ import { EVENT_TYPE } from '../../src/lib/constants';
 import { createWarehouseClient } from '../../src/lib/liekan/warehouse/client';
 import { ControlDatabase } from '../../src/lib/liekan/warehouse/control-db';
 import { boundaryParameters, factRelation } from '../../src/lib/liekan/warehouse/read';
-import { testClickHouseURL } from './warehouse-test-target';
+import {
+  testClickHouseURL,
+  testPostgresPort,
+  testPostgresPasswordFile,
+} from './warehouse-test-target';
 
 assert.equal(process.env.WAREHOUSE_SCHEMA_TEST, 'isolated-round2');
 const directory = resolve(
@@ -25,9 +29,9 @@ assert.ok(directory.startsWith(`${resolve('.local')}/`));
 const state = JSON.parse(await readFile(`${directory}/state.json`, 'utf8'));
 assert.match(state.run, /^warehouse_fresh_\d+$/);
 assert.ok(state.steps.install?.passed);
-const target = new URL(`postgresql://127.0.0.1:25459/${state.run}`);
+const target = new URL(`postgresql://127.0.0.1:${testPostgresPort}/${state.run}`);
 target.username = 'liekan_ch_proto';
-target.password = (await readFile('.local/ch-prototype-round2/pg-password', 'utf8')).trim();
+target.password = (await readFile(testPostgresPasswordFile, 'utf8')).trim();
 const db = new ControlDatabase(target.toString());
 const ch = createWarehouseClient({ url: testClickHouseURL, database: state.run });
 const kafka = new Kafka({ brokers: ['127.0.0.1:29109'], logLevel: logLevel.NOTHING });

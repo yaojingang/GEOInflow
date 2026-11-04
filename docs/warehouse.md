@@ -1,8 +1,10 @@
 # ClickHouse 版本：安装、迁移与运行
 
+同机复制生产 PG 到独立测试环境，可使用 [在线备份、恢复与 CH 测试脚本](warehouse-same-host-test.md)，生产继续运行。
+
 独立测试服务器的逐步操作见 [测试部署与 PG 迁移演练](warehouse-test-server.md)。当前候选版已整合公开 main `cf71de165ae275a4c624d0c36b6a8dfc82758264`，包括 robots 管理、存储清理和可选 CH 分析副本。支持截至 056 的旧 PG 源结构和截至 070 的 main 完整源结构，保留旧密封快照续传；迁移前仍必须校验完整账本和实际结构。
 
-GEOInflow 的 ClickHouse 版本将日志、浏览器事件及关联分析证据放入 ClickHouse。PostgreSQL 继续保存账号、网站、团队、权限、配置、治理规则及运行控制。Redpanda 持久保存采集输入，连续消费者按批确认和发布数据。
+GEOInflow 的 ClickHouse 版本将日志、浏览器事件及关联分析证据放入 ClickHouse。PostgreSQL 继续保存账号、网站、团队、权限、配置、治理规则及运行控制。Apache Kafka（JVM / KRaft）持久保存采集输入，连续消费者按批确认和发布数据。
 
 普通报表直接读 CH。完整路径、权限、质量口径、历史未知状态和业务证明保留；排行榜不替代全量路径。系统没有单站 1 GiB、全局 8 GiB 或结果 2 MiB 的业务封锁线。真实资源不足、队列不可达、控制库切换等情况会如实返回失败或可重试状态，不返回伪造的统计结果。
 
@@ -22,15 +24,27 @@ GEOInflow 的 ClickHouse 版本将日志、浏览器事件及关联分析证据�
 | `LIEKAN_CLICKHOUSE_DATABASE`、`LIEKAN_CLICKHOUSE_USERNAME`、`LIEKAN_CLICKHOUSE_PASSWORD` | 独立 Liekan CH 仓库 |
 | `LIEKAN_QUEUE_PARTITIONS` | 首次创建输入主题时固定的分区数，默认 8；安装后不能直接改变 |
 | `LIEKAN_CH_CPUS`、`LIEKAN_CH_MEMORY` | CH 容器资源，默认 4 CPU / 4 GiB |
-| `LIEKAN_QUEUE_CPUS`、`LIEKAN_QUEUE_MEMORY`、`LIEKAN_QUEUE_CONTAINER_MEMORY` | 队列进程和容器资源 |
+| `LIEKAN_QUEUE_CPUS`、`LIEKAN_QUEUE_CONTAINER_MEMORY` | Kafka 容器资源，默认 2 CPU / 2 GiB；JVM 堆为 256–768 MiB，旧 `LIEKAN_QUEUE_MEMORY` 不再使用 |
 | `LIEKAN_CONSUMER_CPUS`、`LIEKAN_CONSUMER_MEMORY` | 批量消费资源 |
 | `LIEKAN_EXPORT_DIRECTORY` | 完整导出和高基数归并的临时目录；容器使用独立的 `/app/warehouse-exports` 数据卷 |
 | `LIEKAN_EXPORT_MIN_FREE_BYTES=268435456` | 临时文件写入时保留的实际磁盘余量，默认 256 MiB，不是站点或结果总量配额 |
 | `LIEKAN_SEED_DEMO` | 新装默认导入“猎看官网（示例数据）”；设为 `false` 可稍后手动导入 |
 
-这里的容器默认资源只是起始配置，不代表千万/亿级日志容量验收结果。内置队列为单节点，不能抵御整机或数据卷永久丢失；需要高可用时应单独部署多副本队列和 CH，并按实际负载验收。外部队列支持 `LIEKAN_QUEUE_TLS` 与 SCRAM 凭据；必须同步调整 Compose 内网地址配置。
+这里的容器默认资源只是起始配置，不代表千万/亿级日志容量验收结果。内置队列为单节点，不能抵御整机或数据卷永久丢失；需要高可用时应单独部署多副本队列和 CH，并按实际负载验收。外部队列支持 `LIEKAN_QUEUE_TLS` 与 SCRAM 凭据；必须同步调整 Compose 内网地址配置。应用凭据除生产、消费权限外，还需要主题元数据和 `DescribeConfigs` 只读权限，安装账号需要创建主题权限。
 
 不要设置上游 `CLICKHOUSE_URL` 来启用此版本，它对应另一套上游存储路径。Liekan 使用 `LIEKAN_CLICKHOUSE_URL`，并以 PG 中持久记录的安装身份和权威为准。
+
+## Kafka 持久化与原 Redpanda 安装
+
+内置队列固定使用 Apache Kafka 4.3.1 JVM 镜像及 SHA-256，采用单节点 KRaft，无 ZooKeeper。`liekan-warehouse-queue` 卷挂载到 `/var/lib/kafka/data`；集群 ID 首次生成后与日志一起保留。两个临时配置目录使用 tmpfs，重启时重新生成，备份不保存它们。
+
+输入主题和迁移结果主题均设置 `retention.ms=-1`、`retention.bytes=-1`、`cleanup.policy=delete`、`flush.messages=1` 和禁止不完整副本当选。生产者使用幂等生产及 `acks=all`；每批追加同步刷盘，应用成功响应仍需完整业务确认与发布。安装及连接时校验有效主题配置，不安全的刷盘、过期或压缩策略会拒绝启动。多副本主题至少要求两个同步副本确认；单节点仅能确认本机磁盘写入，不能保证磁盘永久损坏后的数据恢复。配置依据见 [Kafka 主题配置](https://kafka.apache.org/43/configuration/topic-configs/)。
+
+内置同机部署将队列卷只读挂入应用，用 `LIEKAN_QUEUE_STORAGE_PATH` 读取文件系统实际可用空间。新输入每批写入前保留 5 GiB 余量；低于余量或挂载不可读时返回可重试失败，不删除未确认消息。已接收包的迁移结果流仍可完成，让消费者和安全回收继续推进。监控输出 `queue.storage` 的余量及输入状态。部署外部 Kafka 时需同时移除 `LIEKAN_QUEUE_STORAGE_PATH` 和该本地卷映射，由队列部署侧提供磁盘监控与背压；本地余量不能代表远程磁盘。
+
+队列回收继续由已验证的消费、发布和恢复边界控制，禁止人工按时间删除未确认的消息。逐批刷盘增加磁盘 I/O，需要按实际批量与吞吐压测；大规模部署需另行规划副本、分区和独立资源。
+
+**已有 Redpanda 仓库不能直接换镜像升级。** Kafka 无法继承其磁盘格式、主题 UUID 或未完成消息；部署预检及 Kafka 启动脚本都会拒绝采用旧卷。保留原栈及一致备份，另行制定队列迁移流程。尚未启用仓库的 PG 安装可在独立项目按下述流程迁移，无需先运行 Redpanda。此前只做了备份或 Redpanda 探测的同机测试，应保留旧项目，新建测试项目；不要删除旧卷或手改冻结状态来续跑。
 
 ## 新安装与应用升级
 
@@ -67,7 +81,7 @@ docker compose -f docker-compose.liekan.yml -f docker-compose.warehouse.yml \
   up -d --no-build --no-deps --wait warehouse-ch
 ```
 
-队列配置变化时将最后的服务名换为 `warehouse-queue`，缓存为 `analytics-cache`。不要把 `db` 加入重建命令，也不要删除数据卷。依赖健康后，重跑原安装模式的部署脚本，完成迁移检查并启动应用与 worker。磁盘扩容、数据引擎版本升级仍需按对应存储的运维流程处理。
+同一 Kafka 引擎的配置变化时将最后的服务名换为 `warehouse-queue`，缓存为 `analytics-cache`。此步骤不能用于 Redpanda 换 Kafka。不要把 `db` 加入重建命令，也不要删除数据卷。依赖健康后，重跑原安装模式的部署脚本，完成迁移检查并启动应用与 worker。磁盘扩容、数据引擎版本升级仍需按对应存储的运维流程处理。
 
 ## 历史 PG 迁移与切换
 

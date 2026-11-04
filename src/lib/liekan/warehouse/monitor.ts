@@ -58,7 +58,7 @@ export async function warehouseMonitor(
   return {
     at: new Date().toISOString(),
     installation: installation[0],
-    queue: { topic: queue.installation.topicName, partitions: lag },
+    queue: { topic: queue.installation.topicName, partitions: lag, storage: await queue.storage() },
     transition: transition[0] ?? null,
     reclamation: reclamation[0],
     postgres: postgres[0],

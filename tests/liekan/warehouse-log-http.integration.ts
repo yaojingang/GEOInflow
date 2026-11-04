@@ -8,18 +8,33 @@ import { setTimeout as delay } from 'node:timers/promises';
 import pg from 'pg';
 
 assert.equal(process.env.WAREHOUSE_DOCKER_TEST, 'isolated-new-project');
-const directory = resolve('.local/ch-deploy-validation');
-const recovery = JSON.parse(await readFile(`${directory}/recovery.json`, 'utf8'));
-assert.ok(recovery.steps.verify?.passed, 'Complete the isolated Docker recovery first');
-const env = Object.fromEntries(
-  (await readFile(`${directory}/private.env`, 'utf8'))
-    .split('\n')
-    .filter(line => line && !line.startsWith('#'))
-    .map(line => {
-      const equal = line.indexOf('=');
-      return [line.slice(0, equal), line.slice(equal + 1)];
-    }),
+const fresh = process.env.WAREHOUSE_LOG_HTTP_FRESH_DIRECTORY;
+const directory = resolve(fresh ?? '.local/ch-deploy-validation');
+assert.ok(directory.startsWith(`${resolve('.local')}/`));
+const recovery = !fresh ? JSON.parse(await readFile(`${directory}/recovery.json`, 'utf8')) : null;
+const state = fresh ? JSON.parse(await readFile(`${directory}/state.json`, 'utf8')) : null;
+assert.ok(
+  fresh ? state.steps.install?.passed : recovery.steps.verify?.passed,
+  'Complete the isolated installation/recovery first',
 );
+if (fresh) assert.match(state.run, /^warehouse_fresh_\d+$/);
+const env = fresh
+  ? {
+      POSTGRES_USER: 'liekan_ch_proto',
+      POSTGRES_DB: state.run,
+      POSTGRES_PASSWORD: (
+        await readFile('.local/kafka-validation-20261104/pg-password', 'utf8')
+      ).trim(),
+    }
+  : Object.fromEntries(
+      (await readFile(`${directory}/private.env`, 'utf8'))
+        .split('\n')
+        .filter(line => line && !line.startsWith('#'))
+        .map(line => {
+          const equal = line.indexOf('=');
+          return [line.slice(0, equal), line.slice(equal + 1)];
+        }),
+    );
 const db = new pg.Client({
   host: '127.0.0.1',
   port: 25479,
@@ -65,12 +80,21 @@ const percentile = (numbers: number[], p: number) =>
   ] ?? null;
 try {
   await db.connect();
+  const installation = (
+    await db.query(
+      'SELECT installation_id,topic_name FROM liekan_warehouse_installation WHERE id=1',
+    )
+  ).rows[0];
   assert.equal(
-    (await db.query('SELECT installation_id FROM liekan_warehouse_installation WHERE id=1')).rows[0]
-      .installation_id,
-    recovery.initial.installation_id,
+    fresh ? installation.topic_name : installation.installation_id,
+    fresh ? state.run : recovery.initial.installation_id,
   );
-  const login = await request('/api/auth/login', { username: 'admin', password: 'liekan' });
+  const login = await request(
+    '/api/auth/login',
+    fresh
+      ? { username: 'isolated-customized-admin', password: 'isolated-customized-password' }
+      : { username: 'admin', password: 'liekan' },
+  );
   assert.equal(login.status, 200);
   owner = login.body.token;
   const created = await request('/api/websites', {
@@ -82,7 +106,11 @@ try {
   const paired = await request(`/api/liekan/websites/${site}/log-sources/server/pairing`, {
     runtime: 'docker',
   });
-  assert.equal(paired.status, 200, 'Installed signed collector package and readiness');
+  assert.equal(
+    paired.status,
+    200,
+    `Installed signed collector package and readiness: ${paired.status === 200 ? 'ready' : JSON.stringify(paired.body)}`,
+  );
   const connection = await request(
     '/api/liekan/collectors/pair',
     { code: paired.body.pairingCode, websiteId: site },

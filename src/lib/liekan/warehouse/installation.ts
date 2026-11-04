@@ -7,6 +7,7 @@ import { initializeWarehouse } from './initialize';
 import { verifyWarehouseIdentity } from './installation-identity';
 import { ROUTING_VERSION } from './routing';
 import { WAREHOUSE_SCHEMA_VERSION } from './schema';
+import { queueTopicConfig, verifyQueuePolicy } from './queue-policy';
 import { inspectQueueTopic, type QueueOptions, WarehouseQueue } from './transport';
 
 type Installation = {
@@ -90,16 +91,10 @@ export async function installWarehouse(
           topic,
           numPartitions: i === 0 ? options.partitions : 1,
           replicationFactor: options.replicationFactor,
-          configEntries: [
-            { name: 'retention.ms', value: '-1' },
-            { name: 'retention.bytes', value: '-1' },
-            { name: 'cleanup.policy', value: 'delete' },
-            { name: 'write.caching', value: 'false' },
-            { name: 'max.message.bytes', value: String(12 * 1024 * 1024) },
-            { name: 'min.insync.replicas', value: String(Math.min(2, options.replicationFactor)) },
-          ],
+          configEntries: queueTopicConfig(options.replicationFactor),
         })),
       });
+    for (const topic of names) await verifyQueuePolicy(broker, topic, 12 * 1024 * 1024);
     const input = await inspectQueueTopic(options.queue, options.inputTopic);
     const result =
       options.mode === 'pg-transition'

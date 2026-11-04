@@ -11,12 +11,16 @@ import { WarehouseRuntime } from '../../src/lib/liekan/warehouse/runtime';
 import { WarehouseCollectionPackage } from '../../src/lib/liekan/upstream/warehouse-collection-package';
 import { factTables } from '../../src/lib/liekan/warehouse/catalog';
 assert.equal(process.env.WAREHOUSE_FULL_UPGRADE_TEST, 'isolated-downloaded-clone');
-const directory = resolve('.local/ch-full-validation'),
+const kafkaValidation = process.env.WAREHOUSE_FULL_KAFKA === 'isolated-new-project';
+const directory = resolve(
+    kafkaValidation ? '.local/kafka-validation-20261104/full' : '.local/ch-full-validation',
+  ),
   artifacts = `${directory}/artifacts`;
 const pgPassword = (await readFile(`${directory}/pg-password`, 'utf8')).trim();
 const chPassword = (await readFile(`${directory}/ch-password`, 'utf8')).trim();
-const target = new URL('postgresql://127.0.0.1:25469/liekan_full_test');
-target.username = 'liekan_full_test';
+const database = kafkaValidation ? 'liekan_full_kafka_20261104' : 'liekan_full_test';
+const target = new URL(`postgresql://127.0.0.1:${kafkaValidation ? 25479 : 25469}/${database}`);
+target.username = kafkaValidation ? 'liekan_ch_proto' : 'liekan_full_test';
 target.password = pgPassword;
 const environment = {
   ...process.env,
@@ -25,15 +29,19 @@ const environment = {
   LIEKAN_MIGRATION_ADMIN_URL: target.toString(),
   LIEKAN_PG_DUMP: `${directory}/pg_dump`,
   LIEKAN_PG_RESTORE: `${directory}/pg_restore`,
-  LIEKAN_CLICKHOUSE_URL: 'http://127.0.0.1:28149',
-  LIEKAN_CLICKHOUSE_DATABASE: 'liekan_full_test',
-  LIEKAN_CLICKHOUSE_USERNAME: 'liekan_full_test',
+  LIEKAN_CLICKHOUSE_URL: kafkaValidation ? 'http://127.0.0.1:28159' : 'http://127.0.0.1:28149',
+  LIEKAN_CLICKHOUSE_DATABASE: database,
+  LIEKAN_CLICKHOUSE_USERNAME: kafkaValidation ? 'default' : 'liekan_full_test',
   LIEKAN_CLICKHOUSE_PASSWORD: chPassword,
   LIEKAN_ANALYTICS_BACKEND: 'clickhouse',
   LIEKAN_WAREHOUSE_TRANSITION: 'true',
   LIEKAN_QUEUE_BROKERS: '127.0.0.1:29109',
-  LIEKAN_QUEUE_TOPIC: 'liekan_full_upgrade_20261103',
-  LIEKAN_RESULT_TOPIC: 'liekan_full_upgrade_20261103_results',
+  LIEKAN_QUEUE_TOPIC: kafkaValidation
+    ? 'liekan_full_kafka_20261104'
+    : 'liekan_full_upgrade_20261103',
+  LIEKAN_RESULT_TOPIC: kafkaValidation
+    ? 'liekan_full_kafka_20261104_results'
+    : 'liekan_full_upgrade_20261103_results',
   LIEKAN_QUEUE_PARTITIONS: '1',
 };
 const db = new ControlDatabase(target.toString());
@@ -206,7 +214,7 @@ try {
     databaseURL: target.toString(),
     clickhouseURL: environment.LIEKAN_CLICKHOUSE_URL,
     clickhouseDatabase: environment.LIEKAN_CLICKHOUSE_DATABASE,
-    clickhouseUsername: 'liekan_full_test',
+    clickhouseUsername: environment.LIEKAN_CLICKHOUSE_USERNAME,
     clickhousePassword: chPassword,
     queue: { brokers: ['127.0.0.1:29109'] },
   });
@@ -237,7 +245,11 @@ try {
   await event('post-snapshot-event');
   const copied = await cli('backfill', ['backfill', '--migration', registered.migrationId], source);
   const audited = await cli('verify', ['verify', '--migration', registered.migrationId], source);
-  assert.equal(audited.digest, copied.digest, 'Independent full audit preserves the migration digest');
+  assert.equal(
+    audited.digest,
+    copied.digest,
+    'Independent full audit preserves the migration digest',
+  );
   await cli('baseline', ['baseline', '--migration', registered.migrationId]);
   await sync();
   const cutover = await barrier('cutover', 'cutover');

@@ -9,6 +9,7 @@ x-warehouse-environment: &warehouse-environment
   LIEKAN_CLICKHOUSE_USERNAME: ${LIEKAN_CLICKHOUSE_USERNAME:-liekan}
   LIEKAN_CLICKHOUSE_PASSWORD: ${LIEKAN_CLICKHOUSE_PASSWORD:?ClickHouse password required}
   LIEKAN_QUEUE_BROKERS: warehouse-queue:9092
+  LIEKAN_QUEUE_STORAGE_PATH: /app/warehouse-queue-storage
   LIEKAN_QUEUE_TOPIC: ${LIEKAN_QUEUE_TOPIC:-liekan-input-v1}
   LIEKAN_RESULT_TOPIC: ${LIEKAN_RESULT_TOPIC:-liekan-authority-v1}
   LIEKAN_QUEUE_PARTITIONS: ${LIEKAN_QUEUE_PARTITIONS:-8}
@@ -24,10 +25,12 @@ x-warehouse-worker: &warehouse-worker
     DISABLE_TELEMETRY: '1'
   depends_on:
     app: {condition: service_healthy}
+  volumes:
+    - liekan-warehouse-queue:/app/warehouse-queue-storage:ro
   restart: unless-stopped
 services:
   warehouse-ch:
-    image: clickhouse/clickhouse-server:26.8.34.13@sha256:8b28eb09479c36c4533eec7a6268917d04ba3a6fd90e3f4205f70e761b6d7779
+    image: clickhouse/clickhouse-server:26.8.36.3@sha256:d426d2f612e1e189c90f9a3f8dcd85a03c6851273833817a296bb327e63aa7a7
     environment:
       CLICKHOUSE_DB: ${LIEKAN_CLICKHOUSE_DATABASE:-liekan}
       CLICKHOUSE_USER: ${LIEKAN_CLICKHOUSE_USERNAME:-liekan}
@@ -46,26 +49,45 @@ services:
       retries: 30
     restart: unless-stopped
   warehouse-queue:
-    image: docker.redpanda.com/redpandadata/redpanda:v26.2.2@sha256:468bd13a9f2bd24794cb7fddc867c767fb1008b9a07b297b89fde48c564d7d96
-    entrypoint: [/bin/sh, -c]
-    command:
-      - >-
-        cp -f /liekan/redpanda.yaml /etc/redpanda/redpanda.yaml &&
-        cp -f /liekan/bootstrap.yaml /etc/redpanda/.bootstrap.yaml &&
-        chmod 600 /etc/redpanda/redpanda.yaml /etc/redpanda/.bootstrap.yaml &&
-        exec /usr/bin/rpk redpanda start --config /etc/redpanda/redpanda.yaml
-        --smp=${LIEKAN_QUEUE_CPUS:-2} --memory=${LIEKAN_QUEUE_MEMORY:-1536M}
-        --reserve-memory=0M --overprovisioned --check=false --unsafe-bypass-fsync=false
+    image: apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+    entrypoint: [sh, /liekan/kafka-start.sh]
+    environment:
+      KAFKA_NODE_ID: '1'
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://warehouse-queue:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@warehouse-queue:9093
+      KAFKA_LOG_DIRS: /var/lib/kafka/data/logs
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: '1'
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '1'
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1'
+      KAFKA_LOG_RETENTION_MS: '-1'
+      KAFKA_LOG_RETENTION_BYTES: '-1'
+      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: '1'
+      KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: 'false'
+      KAFKA_LOG_SEGMENT_BYTES: '134217728'
+      KAFKA_METADATA_LOG_SEGMENT_BYTES: '8388608'
+      KAFKA_MESSAGE_MAX_BYTES: '12582912'
+      KAFKA_REPLICA_FETCH_MAX_BYTES: '12582912'
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx768m
+      KAFKA_JVM_PERFORMANCE_OPTS: -server -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:+ExplicitGCInvokesConcurrent -XX:MaxInlineLevel=15 -Djava.awt.headless=true
     volumes:
-      - liekan-warehouse-queue:/var/lib/redpanda/data
-      - ./docker/warehouse/redpanda.yaml:/liekan/redpanda.yaml:ro
-      - ./docker/warehouse/redpanda-bootstrap.yaml:/liekan/bootstrap.yaml:ro
+      - liekan-warehouse-queue:/var/lib/kafka/data
+      - ./docker/warehouse/kafka-start.sh:/liekan/kafka-start.sh:ro
+    # These image-declared directories hold generated config, never queue facts.
+    tmpfs:
+      - /etc/kafka/secrets:rw,nosuid,nodev,size=16m,uid=1000,gid=1000
+      - /mnt/shared/config:rw,nosuid,nodev,size=16m,uid=1000,gid=1000
     cpus: ${LIEKAN_QUEUE_CPUS:-2}
     mem_limit: ${LIEKAN_QUEUE_CONTAINER_MEMORY:-2g}
     healthcheck:
-      test: [CMD, rpk, cluster, info, -X, brokers=127.0.0.1:9092]
-      interval: 10s
-      timeout: 5s
+      test: [CMD-SHELL, 'KAFKA_HEAP_OPTS="-Xms32m -Xmx128m" /opt/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list >/dev/null']
+      interval: 15s
+      timeout: 10s
       retries: 30
     restart: unless-stopped
   warehouse-init:
@@ -89,14 +111,19 @@ services:
     depends_on:
       warehouse-init: {condition: service_completed_successfully}
     volumes:
+      - liekan-warehouse-queue:/app/warehouse-queue-storage:ro
       - liekan-warehouse-backups:/app/warehouse-backups
       - liekan-warehouse-exports:/app/warehouse-exports
   log-worker:
     environment:
       <<: *warehouse-environment
+    volumes:
+      - liekan-warehouse-queue:/app/warehouse-queue-storage:ro
   analytics-worker:
     environment:
       <<: *warehouse-environment
+    volumes:
+      - liekan-warehouse-queue:/app/warehouse-queue-storage:ro
   warehouse-worker:
     <<: *warehouse-worker
     command: [node, dist/liekan-warehouse-worker.mjs]
@@ -120,6 +147,7 @@ services:
     <<: *warehouse-worker
     command: [node, dist/liekan-maintenance-worker.mjs]
     volumes:
+      - liekan-warehouse-queue:/app/warehouse-queue-storage:ro
       - liekan-warehouse-exports:/app/warehouse-exports
     mem_limit: 512m
     healthcheck:

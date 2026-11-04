@@ -1,5 +1,7 @@
 import { KafkaJS } from '@confluentinc/kafka-javascript';
 import { Kafka, type KafkaConfig, logLevel } from 'kafkajs';
+import { verifyQueuePolicy } from './queue-policy';
+import { queueStorage, requireQueueInputSpace } from './queue-storage';
 import {
   type InputEnvelope,
   ROUTING_VERSION,
@@ -23,6 +25,7 @@ export type QueueOptions = {
     | { mechanism: 'scram-sha-512' }
   );
   maxMessageBytes?: number;
+  storagePath?: string;
 };
 
 export class WarehouseQueue {
@@ -79,10 +82,20 @@ export class WarehouseQueue {
   async connect() {
     await this.nativeAdmin.connect();
     await this.assertIdentity();
+    const admin = this.kafka.admin();
+    try {
+      await admin.connect();
+      await verifyQueuePolicy(admin, this.installation.topicName, this.maxMessageBytes);
+    } finally {
+      await admin.disconnect();
+    }
     await this.producer.connect();
   }
   sibling(installation: QueueInstallation) {
     return new WarehouseQueue(this.options, installation);
+  }
+  storage() {
+    return queueStorage(this.options.storagePath);
   }
 
   async assertIdentity() {
@@ -167,6 +180,9 @@ export class WarehouseQueue {
       bytes = 0;
     const send = async () => {
       if (!batch.length) return;
+      // Stop new intake under physical disk pressure. Result frames are exempt
+      // so already accepted packages can finish and verified GC can reclaim.
+      await requireQueueInputSpace(this.options.storagePath);
       const required = new Set(batch.map(r => r.partition));
       const acknowledgements = await this.producer.send({
         topic: this.installation.topicName,

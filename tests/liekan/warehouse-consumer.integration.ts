@@ -1,4 +1,8 @@
-import { testClickHouseURL } from './warehouse-test-target';
+import {
+  testClickHouseURL,
+  testPostgresPort,
+  testPostgresPasswordFile,
+} from './warehouse-test-target';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
@@ -44,10 +48,10 @@ import { inspectQueueTopic, WarehouseQueue } from '../../src/lib/liekan/warehous
 
 assert.equal(process.env.WAREHOUSE_SCHEMA_TEST, 'isolated-round2');
 const run = `warehouse_consumer_${Date.now()}`;
-const password = (await readFile('.local/ch-prototype-round2/pg-password', 'utf8')).trim();
-const connection = { host: '127.0.0.1', port: 25459, user: 'liekan_ch_proto', password };
+const password = (await readFile(testPostgresPasswordFile, 'utf8')).trim();
+const connection = { host: '127.0.0.1', port: testPostgresPort, user: 'liekan_ch_proto', password };
 const admin = new pg.Client({ ...connection, database: 'liekan_ch_proto' });
-const url = new URL(`postgresql://127.0.0.1:25459/${run}`);
+const url = new URL(`postgresql://127.0.0.1:${testPostgresPort}/${run}`);
 url.username = connection.user;
 url.password = password;
 const db = new ControlDatabase(url.toString());
@@ -137,9 +141,11 @@ try {
   await admin.query(`CREATE DATABASE "${run}" TEMPLATE liekan_ch_catalog_20261103`);
   // The schema-only template has an empty pg-boss version table, not an installed
   // queue. Recreate only that empty test-owned namespace using the pinned package.
-  await db.transaction(async tx=>{
-    const [rows]=(await tx.query<{n:string}>('SELECT count(*)::text AS n FROM liekan_jobs.job')).rows;
-    assert.equal(rows.n,'0');
+  await db.transaction(async tx => {
+    const [rows] = (
+      await tx.query<{ n: string }>('SELECT count(*)::text AS n FROM liekan_jobs.job')
+    ).rows;
+    assert.equal(rows.n, '0');
     await tx.query('DROP SCHEMA liekan_jobs CASCADE');
   });
   for (const file of (await readdir('db/liekan/migrations'))
@@ -167,7 +173,7 @@ try {
         configEntries: [
           { name: 'retention.ms', value: '-1' },
           { name: 'retention.bytes', value: '-1' },
-          { name: 'write.caching', value: 'false' },
+          { name: 'flush.messages', value: '1' },
           { name: 'segment.bytes', value: '1048576' },
         ],
       },
@@ -1905,7 +1911,7 @@ try {
       assert.equal(ready.active_generation, null);
       const detail = await getHistoryRepair(siteB, { view: 'status' }, { userId: actorId });
       assert.equal(detail.uploads.find(u => u.id === activeUpload).finalized, true);
-      assert.equal(detail.hasData,true);
+      assert.equal(detail.hasData, true);
       await confirmHistoryRepair(
         siteB,
         {

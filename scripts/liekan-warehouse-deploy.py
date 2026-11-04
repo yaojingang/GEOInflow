@@ -67,6 +67,10 @@ def dependency_plan(config, names):
         if ids:
             if name != 'db':
                 info = json.loads(subprocess.check_output(['docker', 'inspect', ids[0]], text=True))[0]
+                if name == 'warehouse-queue' and any(
+                    m.get('Destination') == '/var/lib/redpanda/data' for m in info.get('Mounts', [])
+                ):
+                    raise RuntimeError('Existing Redpanda queue found. No services were changed. Kafka cannot adopt its volume, topic IDs or pending messages. Keep the original stack; test PG-to-CH migration in a separate project. See docs/warehouse.md.')
                 expected = compose('config', '--hash', name, capture=True).split()
                 if len(expected) != 2 or expected[0] != name or not re.fullmatch(r'[a-f0-9]{64}', expected[1]):
                     raise RuntimeError(f'Cannot verify {name} Compose configuration; deployment stopped.')

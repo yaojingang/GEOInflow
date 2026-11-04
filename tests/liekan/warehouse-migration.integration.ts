@@ -1,4 +1,8 @@
-import { testClickHouseURL } from './warehouse-test-target';
+import {
+  testClickHouseURL,
+  testPostgresPort,
+  testPostgresPasswordFile,
+} from './warehouse-test-target';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, readdir, writeFile } from 'node:fs/promises';
@@ -41,10 +45,10 @@ const mainSourceMigrations = [
 const stamp = Date.now(),
   run = `warehouse_migration_${stamp}`,
   clone = `liekan_snapshot_test_${stamp}`;
-const password = (await readFile('.local/ch-prototype-round2/pg-password', 'utf8')).trim();
-const connection = { host: '127.0.0.1', port: 25459, user: 'liekan_ch_proto', password };
+const password = (await readFile(testPostgresPasswordFile, 'utf8')).trim();
+const connection = { host: '127.0.0.1', port: testPostgresPort, user: 'liekan_ch_proto', password };
 const url = (database: string) => {
-  const u = new URL(`postgresql://127.0.0.1:25459/${database}`);
+  const u = new URL(`postgresql://127.0.0.1:${testPostgresPort}/${database}`);
   u.username = connection.user;
   u.password = password;
   return u.toString();
@@ -143,7 +147,10 @@ try {
   const exported = await exportMigrationArchive({
     sourceURL: url(clone),
     directory: '.local/ch-implementation',
-    pgDump: '.local/ch-implementation/isolated-pg_dump',
+    pgDump:
+      testPostgresPort === 25479
+        ? '.local/kafka-validation-20261104/pg_dump'
+        : '.local/ch-implementation/isolated-pg_dump',
   });
   const restored = await restoreMigrationClone({
     archive: exported.archive,
@@ -151,7 +158,10 @@ try {
     adminURL: url('liekan_ch_proto'),
     directory: '.local/ch-implementation',
     boundary: exported.boundary,
-    pgRestore: '.local/ch-implementation/isolated-pg_restore',
+    pgRestore:
+      testPostgresPort === 25479
+        ? '.local/kafka-validation-20261104/pg_restore'
+        : '.local/ch-implementation/isolated-pg_restore',
   });
   const sealed = await sealMigrationClone(fixture, 'a'.repeat(64), {
     sites: { [site]: '0' },

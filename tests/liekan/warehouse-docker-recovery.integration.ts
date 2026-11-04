@@ -1,10 +1,11 @@
 // Installed-image and coherent backup recovery acceptance. All resources are
 // new, explicitly named local projects; this driver never selects the live stack.
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { open, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import pg from 'pg';
 
@@ -13,22 +14,30 @@ const stage = process.env.WAREHOUSE_DOCKER_STAGE;
 assert.ok(['prepare', 'backup', 'restore', 'launch', 'verify'].includes(stage!));
 const finalImage = process.env.WAREHOUSE_DOCKER_RECOVERY_FINAL === '1';
 const reviewImage = process.env.WAREHOUSE_DOCKER_RECOVERY_REVIEW === '1';
+const kafkaImage = process.env.WAREHOUSE_DOCKER_RECOVERY_KAFKA === 'isolated-new-project';
 assert.ok(!reviewImage || finalImage, 'Review recovery requires the final-image fixture');
+assert.ok(!kafkaImage || (!reviewImage && !finalImage), 'Kafka uses its own new recovery fixture');
 const directory = resolve(
-  reviewImage
-    ? '.local/ch-final-review-recovery'
-    : finalImage
-      ? '.local/ch-final-recovery'
-      : '.local/ch-deploy-validation',
+  kafkaImage
+    ? '.local/kafka-validation-20261104/docker-recovery'
+    : reviewImage
+      ? '.local/ch-final-review-recovery'
+      : finalImage
+        ? '.local/ch-final-recovery'
+        : '.local/ch-deploy-validation',
 );
-const sourceProject = finalImage
-  ? 'liekan_ch_restore_validation_20261103_v2'
-  : 'liekan_ch_deploy_validation_20261103';
-const restoreProject = reviewImage
-  ? 'liekan_ch_review_recovery_20261103'
+const sourceProject = kafkaImage
+  ? 'geoinflow-kafka-deploy-20261104'
   : finalImage
-    ? 'liekan_ch_final_recovery_20261103'
-    : 'liekan_ch_restore_validation_20261103_v2';
+    ? 'liekan_ch_restore_validation_20261103_v2'
+    : 'liekan_ch_deploy_validation_20261103';
+const restoreProject = kafkaImage
+  ? 'geoinflow-kafka-recovery-20261104'
+  : reviewImage
+    ? 'liekan_ch_review_recovery_20261103'
+    : finalImage
+      ? 'liekan_ch_final_recovery_20261103'
+      : 'liekan_ch_restore_validation_20261103_v2';
 const sourceOverride = `${directory}/${finalImage ? 'source.compose.json' : 'compose.yml'}`;
 const backup = `${directory}/backup`;
 const stateFile = `${directory}/recovery.json`;
@@ -48,6 +57,76 @@ const env = Object.fromEntries(
       return [line.slice(0, equal), line.slice(equal + 1)];
     }),
 );
+// Internal Docker networks can omit published host bindings. Keep the copy
+// isolated and use the same exec transport as the same-host test harness.
+const relays: ReturnType<typeof createServer>[] = [];
+const relayConnections = new Set<() => void>();
+async function isolatedRelays(project: string) {
+  if (!kafkaImage) return;
+  const [app, database] = JSON.parse(
+    execFileSync('docker', ['inspect', `${project}-app-1`, `${project}-db-1`], {
+      encoding: 'utf8',
+    }),
+  );
+  for (const [info, service] of [
+    [app, 'app'],
+    [database, 'db'],
+  ]) {
+    assert.equal(info.Config.Labels['com.docker.compose.project'], project);
+    assert.equal(info.Config.Labels['com.docker.compose.service'], service);
+    assert.equal(info.State.Running, true);
+  }
+  const networks = Object.keys(app.NetworkSettings.Networks);
+  assert.deepEqual(networks, Object.keys(database.NetworkSettings.Networks));
+  assert.equal(networks.length, 1);
+  const [network] = JSON.parse(
+    execFileSync('docker', ['network', 'inspect', networks[0]], { encoding: 'utf8' }),
+  );
+  assert.equal(network.Internal, true);
+  for (const [info, local, remote, host] of [
+    [app, 3002, 3000, '127.0.0.1'],
+    [database, 25479, 5432, 'db'],
+  ] as const) {
+    const bindings = info.NetworkSettings.Ports[`${remote}/tcp`];
+    if (bindings?.length) {
+      assert.ok(
+        bindings.some(
+          (b: { HostIp: string; HostPort: string }) =>
+            b.HostIp === '127.0.0.1' && Number(b.HostPort) === local,
+        ),
+      );
+      continue;
+    }
+    const code = `const s=require('node:net').connect(${remote},${JSON.stringify(host)});s.setTimeout(120000,()=>s.destroy());s.on('error',()=>process.exit(1));process.stdin.pipe(s);s.pipe(process.stdout);s.on('close',()=>process.exit());`;
+    const server = createServer(socket => {
+      if (relayConnections.size >= 4) return socket.destroy();
+      const child = spawn('docker', ['exec', '-i', app.Id, 'node', '-e', code], {
+        stdio: ['pipe', 'pipe', 'ignore'],
+      });
+      let closed = false;
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        relayConnections.delete(close);
+        socket.destroy();
+        child.kill('SIGTERM');
+      };
+      relayConnections.add(close);
+      socket.setTimeout(120000, close);
+      socket.on('error', close).on('close', close);
+      child.on('error', close).on('exit', close);
+      child.stdin.on('error', close);
+      child.stdout.on('error', close);
+      socket.pipe(child.stdin);
+      child.stdout.pipe(socket);
+    });
+    relays.push(server);
+    await new Promise<void>((done, reject) => {
+      server.once('error', reject);
+      server.listen(local, '127.0.0.1', done);
+    });
+  }
+}
 const sourceCompose = [
   'compose',
   '--env-file',
@@ -221,6 +300,8 @@ async function pageviews(token: string) {
 }
 try {
   await save();
+  if (stage === 'prepare' || stage === 'verify')
+    await isolatedRelays(stage === 'prepare' ? sourceProject : restoreProject);
   if (stage === 'prepare') {
     const token = await owner();
     if (!state.steps.site) {
@@ -339,6 +420,9 @@ try {
           app: { ports: ['127.0.0.1:3002:3000'] },
           db: { ports: ['127.0.0.1:25479:5432'] },
         },
+        ...(kafkaImage
+          ? { networks: { default: { ipam: { config: [{ subnet: '10.253.72.0/24' }] } } } }
+          : {}),
       }),
       { mode: 0o600 },
     );
@@ -406,4 +490,7 @@ try {
 } catch (error) {
   console.error(error instanceof Error ? error.message : 'Docker recovery failed');
   process.exitCode = 1;
+} finally {
+  for (const close of [...relayConnections]) close();
+  await Promise.all(relays.map(server => new Promise<void>(done => server.close(() => done()))));
 }

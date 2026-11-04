@@ -1,6 +1,8 @@
 # ClickHouse 候选版：独立测试服务器部署与 PG 迁移演练
 
-本文用于手动部署 `feature/ch-isolated-prototype` 候选版，在独立服务器上恢复一份 PostgreSQL 备份，演练历史迁移、切换、回退与结束过渡同步。全程保留原备份与 PG 数据，不连接生产数据库。运行原理和命令说明见 [warehouse.md](warehouse.md)。
+若测试环境与生产在同一台主机，优先使用 [同机测试脚本](warehouse-same-host-test.md)，自动在线备份并恢复到独立资源。
+
+本文用于手动部署 `feature/geoinflow-unified` 候选版，在独立服务器上恢复一份 PostgreSQL 备份，演练历史迁移、切换、回退与结束过渡同步。全程保留原备份与 PG 数据，不连接生产数据库。运行原理和命令说明见 [warehouse.md](warehouse.md)。
 
 ## 适用范围与版本边界
 
@@ -8,7 +10,7 @@
 
 旧版下载备份约 172 万条原始日志的 26 类事实回填、独立核验、PG → CH → PG → CH 和退出过渡同步已通过隔离验收。本次整合另外验证了真实备份账本的 main→CH、CH→新 main 两种顺序、旧/新源结构续传以及新版完整示例。账本未知、校验值变化或只完成部分迁移时必须停止，不能删账本或改校验值。
 
-迁移结束后的职责为：PG 保存账号、网站、权限、配置及运行控制；CH 保存分析事实；Redpanda 保存待处理输入。切换后的回退窗口存在临时结果同步，执行 `exit-complete` 后结束，不保留永久 PG 分析事实双写。
+迁移结束后的职责为：PG 保存账号、网站、权限、配置及运行控制；CH 保存分析事实；Kafka 保存待处理输入。切换后的回退窗口存在临时结果同步，执行 `exit-complete` 后结束，不保留永久 PG 分析事实双写。
 
 ## 1. 准备独立服务器和材料
 
@@ -27,8 +29,8 @@
 在测试服务器执行；以下假设当前用户可以运行 Docker：
 
 ```bash
-git clone --branch feature/ch-isolated-prototype --single-branch \
-  https://github.com/majin72/GEOInflow.git geoinflow-ch-test
+git clone --branch feature/geoinflow-unified --single-branch \
+  https://github.com/yaojingang/GEOInflow.git geoinflow-ch-test
 cd geoinflow-ch-test
 git rev-parse HEAD
 docker version

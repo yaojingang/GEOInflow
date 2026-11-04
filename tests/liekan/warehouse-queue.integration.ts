@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { Kafka, logLevel } from 'kafkajs';
+import kafkaJS from 'kafkajs';
+import { queueTopicConfig } from '../../src/lib/liekan/warehouse/queue-policy';
 import {
   type InputEnvelope,
   route,
@@ -36,7 +38,7 @@ try {
           { name: 'retention.ms', value: '-1' },
           { name: 'retention.bytes', value: '-1' },
           { name: 'cleanup.policy', value: 'delete' },
-          { name: 'write.caching', value: 'false' },
+          { name: 'flush.messages', value: '1' },
         ],
       },
     ],
@@ -122,6 +124,81 @@ try {
     await invalid.close();
   }
   cases.push({ name: 'registered partition mismatch rejected', status: 'pass' });
+  for (const [name, value, safe] of [
+    ['flush.messages', '1000', '1'],
+    ['retention.ms', '60000', '-1'],
+    ['retention.bytes', '1048576', '-1'],
+    ['cleanup.policy', 'compact', 'delete'],
+    ['unclean.leader.election.enable', 'true', 'false'],
+  ]) {
+    const change = (value: string) =>
+      admin.alterConfigs({
+        validateOnly: false,
+        resources: [
+          {
+            type: kafkaJS.ConfigResourceTypes.TOPIC,
+            name: run,
+            configEntries: [
+              { name: 'retention.ms', value: '-1' },
+              { name: 'retention.bytes', value: '-1' },
+              { name: 'cleanup.policy', value: 'delete' },
+              { name: 'flush.messages', value: '1' },
+              { name: 'unclean.leader.election.enable', value: 'false' },
+            ].map(e => (e.name === name ? { name, value } : e)),
+          },
+        ],
+      });
+    await change(value);
+    const unsafe = new WarehouseQueue(options, installation);
+    try {
+      await assert.rejects(
+        () => unsafe.connect(),
+        new RegExp(`warehouse-unsafe-queue-policy:${name}`),
+      );
+    } finally {
+      await unsafe.close();
+      await change(safe);
+    }
+  }
+  cases.push({
+    name: 'unsafe durability, retention and compaction policies fail closed',
+    status: 'pass',
+  });
+  const pressureTopic = `${run}_pressure`;
+  await admin.createTopics({
+    waitForLeaders: true,
+    topics: [
+      {
+        topic: pressureTopic,
+        numPartitions: 1,
+        replicationFactor: 1,
+        configEntries: queueTopicConfig(1),
+      },
+    ],
+  });
+  const pressureIdentity = await inspectQueueTopic(options, pressureTopic);
+  const pressure = new WarehouseQueue(
+    { ...options, storagePath: `/nonexistent-geoinflow-test-${run}` },
+    pressureIdentity,
+  );
+  try {
+    await pressure.connect();
+    await assert.rejects(
+      () => pressure.enqueue({ ...events[0], topicId: pressureIdentity.topicId }),
+      /warehouse-queue-storage-unavailable/,
+    );
+    assert.equal((await pressure.highWatermarks())[0].offset, '0');
+    await pressure.enqueueResultFrame(
+      JSON.stringify({ format: 'authority-frame-v1', sequence: '1', part: 0 }),
+    );
+    assert.equal((await pressure.highWatermarks())[0].offset, '1');
+  } finally {
+    await pressure.close();
+  }
+  cases.push({
+    name: 'missing storage mount blocks new input while durable result drain remains possible',
+    status: 'pass',
+  });
   console.log(`PASS ${cases.length} formal warehouse queue cases`);
 } catch (error) {
   cases.push({ status: 'failed', error: error instanceof Error ? error.message : 'unknown' });

@@ -145,6 +145,13 @@ def verify_running_mounts(service, configured, actual, volumes):
         expected[mount['target']] = (kind, source, not mount.get('read_only', False))
     observed = {}
     for mount in actual:
+        # Kafka's image declares these generated-config directories as volumes.
+        # Compose explicitly makes them disposable tmpfs; facts/cluster identity
+        # must remain in the backed-up /var/lib/kafka/data named volume.
+        if service == 'warehouse-queue' and mount['Type'] == 'tmpfs' and mount['Destination'] in ('/etc/kafka/secrets', '/mnt/shared/config'):
+            declared = {item.split(':', 1)[0] for item in configured.get('tmpfs', [])}
+            if mount['Destination'] in declared:
+                continue
         # Redis is explicitly disposable in this stack (AOF and RDB disabled).
         if service == 'analytics-cache' and mount['Destination'] == '/data' and '/data' not in expected:
             continue

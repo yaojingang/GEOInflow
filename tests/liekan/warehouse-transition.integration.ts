@@ -1,4 +1,8 @@
-import { testClickHouseURL } from './warehouse-test-target';
+import {
+  testClickHouseURL,
+  testPostgresPort,
+  testPostgresPasswordFile,
+} from './warehouse-test-target';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, readdir, writeFile } from 'node:fs/promises';
@@ -29,10 +33,10 @@ import {
 
 assert.equal(process.env.WAREHOUSE_SCHEMA_TEST, 'isolated-round2');
 const run = `warehouse_transition_${Date.now()}`,
-  password = (await readFile('.local/ch-prototype-round2/pg-password', 'utf8')).trim();
-const connection = { host: '127.0.0.1', port: 25459, user: 'liekan_ch_proto', password };
+  password = (await readFile(testPostgresPasswordFile, 'utf8')).trim();
+const connection = { host: '127.0.0.1', port: testPostgresPort, user: 'liekan_ch_proto', password };
 const admin = new pg.Client({ ...connection, database: 'liekan_ch_proto' }),
-  url = new URL(`postgresql://127.0.0.1:25459/${run}`);
+  url = new URL(`postgresql://127.0.0.1:${testPostgresPort}/${run}`);
 url.username = connection.user;
 url.password = password;
 const db = new ControlDatabase(url.toString()),
@@ -100,7 +104,7 @@ try {
         configEntries: [
           { name: 'retention.ms', value: '-1' },
           { name: 'retention.bytes', value: '-1' },
-          { name: 'write.caching', value: 'false' },
+          { name: 'flush.messages', value: '1' },
           { name: 'max.message.bytes', value: String(12 * 1024 * 1024) },
         ],
       },

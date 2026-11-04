@@ -6,7 +6,11 @@ import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import pg from 'pg';
-import { testClickHouseURL } from './warehouse-test-target';
+import {
+  testClickHouseURL,
+  testPostgresPort,
+  testPostgresPasswordFile,
+} from './warehouse-test-target';
 import { checkPassword, hashPassword } from '../../src/lib/password';
 import { createWarehouseClient } from '../../src/lib/liekan/warehouse/client';
 import { ControlDatabase } from '../../src/lib/liekan/warehouse/control-db';
@@ -38,13 +42,13 @@ const state = await readFile(stateFile, 'utf8')
 assert.match(state.run, /^warehouse_fresh_\d+$/);
 const save = () => writeFile(stateFile, JSON.stringify(state, null, 2), { mode: 0o600 });
 await save();
-const password = (await readFile('.local/ch-prototype-round2/pg-password', 'utf8')).trim();
-const target = new URL(`postgresql://127.0.0.1:25459/${state.run}`);
+const password = (await readFile(testPostgresPasswordFile, 'utf8')).trim();
+const target = new URL(`postgresql://127.0.0.1:${testPostgresPort}/${state.run}`);
 target.username = 'liekan_ch_proto';
 target.password = password;
 const admin = new pg.Client({
   host: '127.0.0.1',
-  port: 25459,
+  port: testPostgresPort,
   user: 'liekan_ch_proto',
   password,
   database: 'liekan_ch_proto',

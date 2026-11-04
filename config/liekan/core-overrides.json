@@ -350,27 +350,15 @@
       "removalCondition": "Remove when an equivalent maintained deployment contract replaces these warehouse services"
     },
     {
-      "path": "docker/warehouse/redpanda-bootstrap.yaml",
-      "purpose": "Pinned ClickHouse and durable queue deployment for Liekan analytical storage",
+      "path": "docker/warehouse/kafka-start.sh",
+      "purpose": "Start the pinned Kafka KRaft queue with a persistent cluster identity and refuse foreign engine data",
       "tests": [
-        "tests/liekan/warehouse-fresh.integration.ts",
-        "tests/liekan/warehouse-docker-recovery.integration.ts",
-        "tests/liekan/warehouse-backup.test.py"
+        "tests/liekan/warehouse-kafka-start.integration.py",
+        "tests/liekan/warehouse-queue-restart.integration.ts",
+        "tests/liekan/warehouse-docker-recovery.integration.ts"
       ],
       "owner": "Liekan warehouse maintenance",
-      "constraint": "Preserve private credentials, require explicit installation mode and retain queue durability and isolated storage identities",
-      "removalCondition": "Remove when an equivalent maintained deployment contract replaces these warehouse services"
-    },
-    {
-      "path": "docker/warehouse/redpanda.yaml",
-      "purpose": "Pinned ClickHouse and durable queue deployment for Liekan analytical storage",
-      "tests": [
-        "tests/liekan/warehouse-fresh.integration.ts",
-        "tests/liekan/warehouse-docker-recovery.integration.ts",
-        "tests/liekan/warehouse-backup.test.py"
-      ],
-      "owner": "Liekan warehouse maintenance",
-      "constraint": "Preserve private credentials, require explicit installation mode and retain queue durability and isolated storage identities",
+      "constraint": "Preserve the queue cluster ID, retry interrupted first initialization only on an otherwise empty volume, and never adopt Redpanda or another Kafka cluster",
       "removalCondition": "Remove when an equivalent maintained deployment contract replaces these warehouse services"
     },
     {

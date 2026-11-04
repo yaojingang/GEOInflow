@@ -1,4 +1,8 @@
-import { testClickHouseURL } from './warehouse-test-target';
+import {
+  testClickHouseURL,
+  testPostgresPort,
+  testPostgresPasswordFile,
+} from './warehouse-test-target';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, readdir, writeFile } from 'node:fs/promises';
@@ -46,10 +50,10 @@ import { WarehouseQueue, inspectQueueTopic } from '../../src/lib/liekan/warehous
 
 assert.equal(process.env.WAREHOUSE_SCHEMA_TEST, 'isolated-round2');
 const run = `warehouse_baseline_${Date.now()}`,
-  password = (await readFile('.local/ch-prototype-round2/pg-password', 'utf8')).trim();
-const connection = { host: '127.0.0.1', port: 25459, user: 'liekan_ch_proto', password };
+  password = (await readFile(testPostgresPasswordFile, 'utf8')).trim();
+const connection = { host: '127.0.0.1', port: testPostgresPort, user: 'liekan_ch_proto', password };
 const url = (database: string) => {
-  const u = new URL(`postgresql://127.0.0.1:25459/${database}`);
+  const u = new URL(`postgresql://127.0.0.1:${testPostgresPort}/${database}`);
   u.username = connection.user;
   u.password = password;
   return u.toString();
@@ -100,7 +104,7 @@ try {
       configEntries: [
         { name: 'retention.ms', value: '-1' },
         { name: 'retention.bytes', value: '-1' },
-        { name: 'write.caching', value: 'false' },
+        { name: 'flush.messages', value: '1' },
         { name: 'segment.bytes', value: '1048576' },
       ],
     })),

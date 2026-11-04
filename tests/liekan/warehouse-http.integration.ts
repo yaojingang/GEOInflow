@@ -8,16 +8,21 @@ import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ControlDatabase } from '../../src/lib/liekan/warehouse/control-db';
 import { createWarehouseClient } from '../../src/lib/liekan/warehouse/client';
-import { testClickHouseURL } from './warehouse-test-target';
+import {
+  testClickHouseURL,
+  testPostgresPort,
+  testPostgresPasswordFile,
+} from './warehouse-test-target';
 
 assert.equal(process.env.WAREHOUSE_SCHEMA_TEST, 'isolated-round2');
-const directory = resolve('.local/ch-fresh-validation');
+const directory = resolve(process.env.WAREHOUSE_FRESH_DIRECTORY ?? '.local/ch-fresh-validation');
+assert.ok(directory.startsWith(`${resolve('.local')}/`));
 const state = JSON.parse(await readFile(`${directory}/state.json`, 'utf8'));
 assert.match(state.run, /^warehouse_fresh_\d+$/);
 assert.ok(state.steps.install?.passed);
-const url = new URL(`postgresql://127.0.0.1:25459/${state.run}`);
+const url = new URL(`postgresql://127.0.0.1:${testPostgresPort}/${state.run}`);
 url.username = 'liekan_ch_proto';
-url.password = (await readFile('.local/ch-prototype-round2/pg-password', 'utf8')).trim();
+url.password = (await readFile(testPostgresPasswordFile, 'utf8')).trim();
 const db = new ControlDatabase(url.toString());
 const ch = createWarehouseClient({ url: testClickHouseURL, database: state.run });
 const environment = {
@@ -42,6 +47,7 @@ const environment = {
   REDIS_URL: '',
   LIEKAN_ANALYTICS_REDIS_URL: '',
   LIEKAN_AI_ENABLED: 'false',
+  LIEKAN_PUBLIC_URL: 'https://warehouse-http.fixture.invalid',
   CLOUD_MODE: '',
   LIEKAN_EXPORT_DIRECTORY: `${directory}/exports`,
 };
@@ -273,6 +279,45 @@ try {
     name: 'tracker is served and authenticated website deletion retains a durable CH tombstone',
     status: 'pass',
   });
+  if (process.env.WAREHOUSE_HTTP_LOGS === 'true') {
+    assert.equal(testPostgresPort, 25479, 'Log fixture uses the isolated Kafka PostgreSQL port');
+    await start('log-worker', ['dist/liekan-worker.mjs']);
+    await until(
+      async () =>
+        (
+          await db.read(
+            "SELECT 1 FROM liekan_worker_state WHERE heartbeat_at>now()-interval '120 seconds'",
+          )
+        ).length > 0,
+      'log worker registered heartbeat',
+    );
+    const log = await open(`${directory}/http-log-acceptance.log`, 'a', 0o600);
+    try {
+      const child = spawn(
+        process.execPath,
+        ['--import', 'tsx', 'tests/liekan/warehouse-log-http.integration.ts'],
+        {
+          env: {
+            ...environment,
+            WAREHOUSE_DOCKER_TEST: 'isolated-new-project',
+            WAREHOUSE_LOG_HTTP_FRESH_DIRECTORY: directory,
+          },
+          stdio: ['ignore', log.fd, log.fd],
+        },
+      );
+      const code = await new Promise<number | null>((done, reject) => {
+        child.once('error', reject);
+        child.once('exit', done);
+      });
+      assert.equal(code, 0, 'Real HTTP log upload and CH publication; see private log');
+      cases.push({
+        name: '10,000 HTTP log records collected and published through Kafka',
+        status: 'pass',
+      });
+    } finally {
+      await log.close();
+    }
+  }
   console.log(
     `PASS ${cases.length} warehouse HTTP cases; pending collection responses ${pendingResponses}`,
   );

@@ -147,6 +147,7 @@ export function warehouseRuntimeConfig() {
     clickhousePassword: process.env.LIEKAN_CLICKHOUSE_PASSWORD,
     queue: {
       brokers: (process.env.LIEKAN_QUEUE_BROKERS ?? '').split(',').filter(Boolean),
+      storagePath: process.env.LIEKAN_QUEUE_STORAGE_PATH || undefined,
     } as QueueOptions,
   };
   if (!config.databaseURL || !config.clickhouseURL || !config.queue.brokers.length)

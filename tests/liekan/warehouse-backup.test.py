@@ -14,6 +14,21 @@ spec.loader.exec_module(backup)
 
 
 class ConfigurationBackupTest(unittest.TestCase):
+    def test_kafka_generated_config_is_disposable_but_data_is_backed_up(self):
+        configured = {'volumes': [{'type': 'volume', 'source': 'liekan-warehouse-queue',
+                                  'target': '/var/lib/kafka/data'}],
+                      'tmpfs': ['/etc/kafka/secrets:rw,size=16m', '/mnt/shared/config:rw,size=16m']}
+        volumes = {'liekan-warehouse-queue': {'name': 'owned_queue'}}
+        actual = [{'Type': 'volume', 'Name': 'owned_queue', 'RW': True,
+                   'Destination': '/var/lib/kafka/data'},
+                  {'Type': 'tmpfs', 'Destination': '/etc/kafka/secrets'},
+                  {'Type': 'tmpfs', 'Destination': '/mnt/shared/config'}]
+        backup.verify_running_mounts('warehouse-queue', configured, actual, volumes)
+        for extra in [{'Type': 'tmpfs', 'Source': '', 'RW': True, 'Destination': '/unexpected'},
+                      {'Type': 'volume', 'Name': 'foreign', 'RW': True, 'Destination': '/mnt/shared/config'}]:
+            with self.assertRaises(RuntimeError):
+                backup.verify_running_mounts('warehouse-queue', configured, actual + [extra], volumes)
+
     def test_compose_shell_expansion_is_decoded_only_once(self):
         config = {'services': {'ch': {
             'healthcheck': {'test': ['CMD-SHELL', 'check "$${USER}"; echo $$$$']},
