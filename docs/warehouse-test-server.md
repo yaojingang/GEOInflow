@@ -30,7 +30,7 @@
 
 ```bash
 git clone --branch feature/geoinflow-unified --single-branch \
-  https://github.com/yaojingang/GEOInflow.git geoinflow-ch-test
+  https://gitee.com/liekan/liekan-statistics.git geoinflow-ch-test
 cd geoinflow-ch-test
 git rev-parse HEAD
 docker version
