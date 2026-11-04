@@ -20,6 +20,7 @@ test('secret scan exceptions match known metadata while new secrets remain detec
     'src/components/liekan/features/WorkspacePages.tsx',
     'docker-compose.test.yml',
     'tests/liekan/deployment.test.mjs',
+    'tests/liekan/warehouse-test.test.py',
     'src/lib/mcp/auth.test.ts',
   ];
   for (const file of files) {
