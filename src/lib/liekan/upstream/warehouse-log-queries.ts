@@ -271,14 +271,28 @@ export async function warehouseLogQuerySpec(
     ? ` AND (isNull({productForm:Nullable(String)}) OR ${form}={productForm:Nullable(String)})
       AND (isNull({category:Nullable(String)}) OR (bot_type NOT IN('训练','搜索','用户触发','传统搜索') AND ${form} NOT IN('workbench','personal_agent')))`
     : '';
+  const botColumns = [
+    'bot',
+    'vendor',
+    'bot_type',
+    'reporting_crawler_id',
+    'path',
+    'created_at',
+    'ai_eligible',
+    'recognition_state',
+    ...(forms ? ['reporting_catalog_version'] : []),
+  ];
   const botQuery = `SELECT bot AS name,vendor,bot_type AS type,reporting_crawler_id AS botId,${forms ? `arrayStringConcat(arraySort(groupUniqArray(coalesce(${form},'unknown'))),',') AS productForm,` : ''}
-      count() AS requests,countIf(${ai}) AS aiRequests,uniqExact(path) AS pages,toString(max(created_at)) AS lastVisit ${base} AND ${known}${formFilter} GROUP BY name,vendor,type,botId ORDER BY requests DESC,name,botId,vendor,type`;
+      count() AS requests,countIf(${ai}) AS aiRequests,uniqExact(path) AS pages,toString(max(created_at)) AS lastVisit ${scoped(metrics, botColumns)} AND ${known}${formFilter} GROUP BY name,vendor,type,botId ORDER BY requests DESC,name,botId,vendor,type`;
   const statements: Record<string, string> = {
     summary: `SELECT count() AS requests,countIf(${ai}) AS ai,uniqExactIf(path,${ai}) AS pages,countIf(status>=400) AS abnormal,
         uniqExact(coalesce(reporting_classification_version,'legacy')) AS classificationVersions,countIf(isNull(ai_eligible)) AS legacyRequests,countIf(${unknownCrawlerSql('l')}) AS unclassifiedRequests ${scoped(metrics, logSummaryColumns)}`,
     daily: `SELECT formatDateTime(created_at,'%Y-%m-%d',{timezone:String}) AS day,bot,vendor,reporting_crawler_id AS botId,count() AS count,countIf(${ai}) AS aiRequests ${scoped(metrics, ['created_at', 'bot', 'vendor', 'reporting_crawler_id', 'ai_eligible', 'bot_type', 'recognition_state'])} AND ${known} GROUP BY day,bot,vendor,botId ORDER BY day`,
     bots: botQuery,
-    pages: `SELECT path,bot,reporting_crawler_id AS botId,count() AS requests,toString(max(created_at)) AS lastCrawled ${base} AND ${ai}${
+    pages: `SELECT path,bot,reporting_crawler_id AS botId,count() AS requests,toString(max(created_at)) AS lastCrawled ${scoped(
+      metrics,
+      botColumns.filter(column => column !== 'vendor'),
+    )} AND ${ai}${
       forms
         ? ` AND ${known}${formFilter}
         AND (isNull({botType:Nullable(String)}) OR bot_type={botType:Nullable(String)}) AND (isNull({botId:Nullable(String)}) OR reporting_crawler_id={botId:Nullable(String)})
@@ -310,7 +324,17 @@ export async function warehouseLogQuerySpec(
       timezone,
     ),
   };
-  return { params, previousParams, base, ai, forms, botQuery, statements, filterSql, detailBase };
+  return {
+    params,
+    previousParams,
+    base,
+    ai,
+    forms,
+    botQuery,
+    statements,
+    filterSql,
+    detailBase,
+  };
 }
 
 export async function warehouseLogFacts(...args: Parameters<typeof import('./logs').getLogFacts>) {

@@ -3,7 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { expect, test, vi } from 'vitest';
 import { TransitionCoordinator } from './transition-coordinator';
 
-function fixture(status: 'pending' | 'confirmed' | 'published' | 'cancelled') {
+function fixture(
+  status: 'pending' | 'confirmed' | 'published' | 'cancelled',
+  partitions = 1,
+  authority = 'clickhouse',
+) {
   let taskStatus = status;
   let barrier: Record<string, unknown> | undefined;
   let installationLocked = false;
@@ -14,10 +18,10 @@ function fixture(status: 'pending' | 'confirmed' | 'published' | 'cancelled') {
       installationLocked = sql.includes('FOR UPDATE');
       rows = [
         {
-          authority: 'clickhouse',
+          authority,
           revision: '7',
           topic_id: topic,
-          partition_count: 1,
+          partition_count: partitions,
           facts_fenced: true,
           identity_bound: true,
         },
@@ -50,7 +54,7 @@ function fixture(status: 'pending' | 'confirmed' | 'published' | 'cancelled') {
     },
   };
   const queue = {
-    installation: { topicId: topic, partitions: 1 },
+    installation: { topicId: topic, partitions },
     assertIdentity: vi.fn(async () => {}),
     highWatermarks: vi.fn(async () => [{ partition: 0, offset: '10' }]),
   };
@@ -101,4 +105,83 @@ test('terminal tasks permit a barrier and stable operation retries preserve its 
   f.queue.highWatermarks.mockResolvedValueOnce([{ partition: 0, offset: '20' }]);
   expect(await f.coordinator.request('rollback', id)).toEqual(first);
   expect(f.barrier()?.boundary).toEqual([{ partition: 0, offset: '10' }]);
+});
+
+test('snapshot accepts Kafka partition order without changing offsets or the returned array', async () => {
+  const f = fixture('cancelled', 8, 'postgres');
+  const boundary = [7, 5, 6, 0, 3, 4, 1, 2].map(partition =>
+    Object.freeze({ partition, offset: String(9007199254740993n + BigInt(partition)) }),
+  );
+  Object.freeze(boundary);
+  f.queue.highWatermarks.mockResolvedValueOnce(boundary);
+  const result = await f.coordinator.request('snapshot');
+  expect(result.status).toBe('draining');
+  expect(result.boundary).toEqual(
+    Array.from({ length: 8 }, (_, partition) => ({
+      partition,
+      offset: String(9007199254740993n + BigInt(partition)),
+    })),
+  );
+  expect(boundary.map(row => row.partition)).toEqual([7, 5, 6, 0, 3, 4, 1, 2]);
+});
+
+test.each([
+  ['missing partition', [{ partition: 0, offset: '0' }]],
+  [
+    'duplicate partition',
+    [
+      { partition: 0, offset: '0' },
+      { partition: 0, offset: '0' },
+    ],
+  ],
+  [
+    'out-of-range partition',
+    [
+      { partition: 2, offset: '0' },
+      { partition: 0, offset: '0' },
+    ],
+  ],
+  [
+    'negative partition',
+    [
+      { partition: -1, offset: '0' },
+      { partition: 0, offset: '0' },
+    ],
+  ],
+  [
+    'fractional partition',
+    [
+      { partition: 0.5, offset: '0' },
+      { partition: 0, offset: '0' },
+    ],
+  ],
+  [
+    'negative offset',
+    [
+      { partition: 1, offset: '-1' },
+      { partition: 0, offset: '0' },
+    ],
+  ],
+  [
+    'fractional offset',
+    [
+      { partition: 1, offset: '1.5' },
+      { partition: 0, offset: '0' },
+    ],
+  ],
+  [
+    'scientific offset',
+    [
+      { partition: 1, offset: '1e3' },
+      { partition: 0, offset: '0' },
+    ],
+  ],
+] as const)('snapshot still refuses %s before writing a barrier', async (_, rows) => {
+  const f = fixture('cancelled', 2, 'postgres');
+  f.queue.highWatermarks.mockResolvedValueOnce([...rows]);
+  await expect(f.coordinator.request('snapshot')).rejects.toThrow(
+    'warehouse-transition-invalid-boundary',
+  );
+  expect(f.query).not.toHaveBeenCalled();
+  expect(f.barrier()).toBeUndefined();
 });

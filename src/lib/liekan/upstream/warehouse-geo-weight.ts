@@ -4,7 +4,7 @@ import {
   GEO_NON_CONTENT_EXTENSION,
   GEO_SCOPE,
 } from '../geo-weight/policy';
-import { factTable, identifier } from '../warehouse/catalog';
+import { identifier } from '../warehouse/catalog';
 import { warehouseTime } from '../warehouse/fact-input';
 import { factRelation } from '../warehouse/read';
 import { effectiveLogRelation } from '../warehouse/reporting-relations';
@@ -15,22 +15,61 @@ type Window = { asOf: string; startAt: number; endAt: number };
 const js = (v: string, ...keys: string[]) =>
   `JSONExtract(${v},${keys.map(k => `'${k}'`).join(',')},'Nullable(String)')`;
 const jb = (v: string, key: string) => `JSONExtract(${v},'${key}','Nullable(Bool)')`;
-const logs = () =>
-  effectiveLogRelation({
-    immutableTimeWindow: { start: 'geoStart', end: 'geoEnd', endExclusive: true },
-  });
-const raw = () => `(SELECT ${factTable('liekan_log')
-  .columns.map(c => `l.${identifier(c.name)} AS ${identifier(c.name)}`)
-  .join(
-    ',',
-  )},e.crawler_id AS crawler_id,e.catalog_version AS catalog_version,e.classification_version AS classification_version,
-  coalesce(e.measurement,'{}') AS measurement,coalesce(e.identity_evidence,'{}') AS identity_evidence,coalesce(e.edge_observation,'{}') AS edge_observation
-  FROM ${logs()} l LEFT JOIN ${factRelation('liekan_crawler_evidence')} e ON e.website_id=l.website_id AND e.log_id=l.id)`;
+const raw = (purpose: 'evaluation' | 'versions' | 'first' = 'evaluation') => {
+  const logColumns =
+    purpose === 'versions'
+      ? ['website_id', 'id', 'created_at', 'source_id', 'verification_version']
+      : purpose === 'first'
+        ? ['website_id', 'id', 'created_at', 'source_id', 'user_agent']
+        : [
+            'website_id',
+            'id',
+            'created_at',
+            'path',
+            'status',
+            'source_id',
+            'ai_eligible',
+            'recognition_state',
+            'verification',
+            'verification_version',
+            'verification_reason',
+            'verification_observed_at',
+            'method',
+            'user_agent',
+          ];
+  const evidenceColumns =
+    purpose === 'versions'
+      ? ['catalog_version']
+      : purpose === 'first'
+        ? ['catalog_version', 'classification_version', '_geo_host', '_geo_basis']
+        : [
+            'crawler_id',
+            'catalog_version',
+            'classification_version',
+            '_geo_host',
+            '_geo_basis',
+            '_geo_sampling_time',
+            '_geo_sampling_basis',
+            '_geo_sampling_rate',
+            '_geo_reason',
+            '_geo_mime_state',
+            '_geo_mime',
+          ];
+  return `(SELECT ${logColumns.map(c => `l.${identifier(c)} AS ${identifier(c)}`).join(',')},
+    ${evidenceColumns.map(c => `e.${identifier(c)} AS ${identifier(c)}`).join(',')}
+    FROM ${effectiveLogRelation({
+      immutableTimeWindow: { start: 'geoStart', end: 'geoEnd', endExclusive: true },
+      columns: logColumns,
+    })} l LEFT JOIN ${factRelation('liekan_crawler_evidence', {
+      columns: ['website_id', 'log_id', ...evidenceColumns],
+      ...(purpose !== 'versions' ? { geoEvidence: true } : {}),
+    })} e ON e.website_id=l.website_id AND e.log_id=l.id)`;
+};
 async function metadata(tx: AiTx, site: string, range: Record<string, unknown>) {
   // Only catalog/rule-version identifiers cross to PG; paths and log IDs remain in CH.
   const versions = await warehouseReportQuery<{ catalogs: string[]; verifications: string[] }>(
     site,
-    `SELECT groupUniqArray(catalog_version) AS catalogs,groupUniqArray(verification_version) AS verifications FROM ${raw()}`,
+    `SELECT groupUniqArray(catalog_version) AS catalogs,groupUniqArray(verification_version) AS verifications FROM ${raw('versions')}`,
     range,
   );
   const catalogs = await tx.query<{ version: string; payload: any }>(
@@ -77,20 +116,20 @@ const controls = `identities AS (SELECT JSONExtractString(j,'version') AS versio
   bindings AS (SELECT JSONExtractString(j,'catalog_version') AS catalog_version,JSONExtractString(j,'verification_version') AS verification_version,JSONExtractString(j,'crawler_id') AS crawler_id FROM (SELECT arrayJoin({geoBindings:Array(String)}) AS j)),
   policy AS (SELECT JSONExtractString(j,'id') AS id,JSONExtractString(j,'purpose') AS purpose,JSONExtractString(j,'platformId') AS platformId FROM (SELECT arrayJoin({geoPolicy:Array(String)}) AS j))`;
 function evaluated() {
-  const host = js('r.measurement', 'host'),
-    basis = js('r.measurement', 'hostBasis'),
-    mime = js('r.edge_observation', 'fields', 'EdgeResponseContentType', 'value'),
-    mimeState = js('r.edge_observation', 'fields', 'EdgeResponseContentType', 'state');
+  const host = 'r._geo_host',
+    basis = 'r._geo_basis',
+    mime = 'r._geo_mime',
+    mimeState = 'r._geo_mime_state';
   const form = js('i.identity', 'productForm'),
-    conflict = `${js('r.identity_evidence', 'reason')}='identity_conflict'`;
+    conflict = `r._geo_reason='identity_conflict'`;
   const history = `(has({geoCatalogs:Array(String)},toString(r.catalog_version)) AND coalesce(rv.version,'')=r.classification_version)`;
   return `(SELECT r.created_at AS created_at,r.path AS path,r.status AS status,r.source_id AS source_id,r.ai_eligible AS ai_eligible,
     r.recognition_state AS recognition_state,r.verification AS verification,r.verification_version AS verification_version,
     r.crawler_id AS crawler_id,r.catalog_version AS catalog_version,r.classification_version AS classification_version,
     r.user_agent LIKE 'Liekan-Crawler-Check/%' AS self_check,${mimeState} AS mime_state,
     ${host}={geoHostname:String} AS host_matches,coalesce(${basis},'')<>'request_host' AS inferred_host,
-    (coalesce(${js('r.measurement', 'samplingTimeBasis')},'')<>'event_time' OR coalesce(${js('r.measurement', 'samplingBasis')},'')<>'observed_provider_config'
-      OR coalesce(JSONExtract(r.measurement,'samplingRate','Nullable(Float64)'),-1)<>1) AS sampling_unknown,
+    (coalesce(r._geo_sampling_time,'')<>'event_time' OR coalesce(r._geo_sampling_basis,'')<>'observed_provider_config'
+      OR coalesce(r._geo_sampling_rate,-1)<>1) AS sampling_unknown,
     ${conflict} AS identity_conflict,p.purpose AS purpose,p.platformId AS platformId,${form} AS form,${history} AS history_available,
     multiIf(self_check,'self_check',isNull(${host}) OR lowerUTF8(${host})<>{geoHostname:String} OR coalesce(${basis},'') NOT IN('request_host','configured_host','declared_host'),'host',
       r.recognition_state='ambiguous' OR ${conflict},'ambiguous',isNull(p.id),'outside_scope',isNull(i.version) OR NOT ${history},'history',
@@ -249,11 +288,11 @@ export async function warehouseGeoWeightFirstEvidence(
     const [row] = await warehouseReportQuery<{ day: string | null }>(
       site,
       `WITH ${controls}
-      SELECT if(count()>0,toString(toDate(min(r.created_at),{geoTimezone:String})),NULL) AS day FROM ${raw()} r
+      SELECT if(count()>0,toString(toDate(min(r.created_at),{geoTimezone:String})),NULL) AS day FROM ${raw('first')} r
       INNER JOIN rules rv ON rv.version=r.classification_version AND rv.catalog_version=toString(r.catalog_version)
       WHERE has({geoCatalogs:Array(String)},toString(r.catalog_version)) AND r.user_agent NOT LIKE 'Liekan-Crawler-Check/%'
-        AND lowerUTF8(${js('r.measurement', 'host')})={geoHostname:String}
-        AND ${js('r.measurement', 'hostBasis')} IN('request_host','configured_host','declared_host')`,
+        AND lowerUTF8(r._geo_host)={geoHostname:String}
+        AND r._geo_basis IN('request_host','configured_host','declared_host')`,
       { ...range, ...control, geoHostname: hostname, geoTimezone: timezone },
     );
     return row?.day ?? undefined;

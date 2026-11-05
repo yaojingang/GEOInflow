@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { type ControlDatabase, type ControlSQL, WarehouseConflict } from './control-db';
 import type { WarehouseQueue } from './transport';
+
 type Barrier = {
   operation_id: string;
   kind: 'snapshot' | 'cutover' | 'rollback';
@@ -58,7 +59,12 @@ export class TransitionCoordinator {
     if (!['snapshot', 'cutover', 'rollback'].includes(kind))
       throw new Error('warehouse-transition-invalid-action');
     await this.queue.assertIdentity();
-    const boundary = await this.queue.highWatermarks();
+    // Kafka may return complete partition metadata in broker response order.
+    // Canonicalize without changing the offsets or the queue-owned array; the
+    // checks below still reject missing, duplicate and invalid partitions.
+    const boundary = [...(await this.queue.highWatermarks())].sort(
+      (a, b) => a.partition - b.partition,
+    );
     if (
       boundary.length !== this.queue.installation.partitions ||
       boundary.some((b, i) => b.partition !== i || !/^\d+$/.test(b.offset))

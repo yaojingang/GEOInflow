@@ -36,6 +36,9 @@ export type FactReadOptions = {
   recordKeysParameter?: string;
   sessionIdsParameter?: string;
   immutableTimeWindow?: { start: string; end: string; endExclusive?: boolean };
+  // GEO needs small, nullable evidence fields, not the complete proof documents
+  // in each latest-version aggregate and join. No evidence-time filter is added.
+  geoEvidence?: true;
   repairFields?: {
     name: string;
     column: 'after_value' | 'proof';
@@ -110,6 +113,22 @@ export function factRelation(name: string, options: FactReadOptions = {}): strin
       Has: `JSONHas(${json},'${field.key}')`,
     }[field.type];
     expressions[field.name] = expression;
+  }
+  if (options.geoEvidence) {
+    if (name !== 'liekan_crawler_evidence')
+      throw new Error('Invalid warehouse GEO evidence projection');
+    const measurement = `JSONExtract(coalesce(measurement,'{}'),'Tuple(host Nullable(String),hostBasis Nullable(String),samplingTimeBasis Nullable(String),samplingBasis Nullable(String),samplingRate Nullable(Float64))')`;
+    const mime = `JSONExtract(coalesce(edge_observation,'{}'),'fields','EdgeResponseContentType','Tuple(state Nullable(String),value Nullable(String))')`;
+    Object.assign(expressions, {
+      _geo_host: `tupleElement(${measurement},1)`,
+      _geo_basis: `tupleElement(${measurement},2)`,
+      _geo_sampling_time: `tupleElement(${measurement},3)`,
+      _geo_sampling_basis: `tupleElement(${measurement},4)`,
+      _geo_sampling_rate: `tupleElement(${measurement},5)`,
+      _geo_reason: "JSONExtract(coalesce(identity_evidence,'{}'),'reason','Nullable(String)')",
+      _geo_mime_state: `tupleElement(${mime},1)`,
+      _geo_mime: `tupleElement(${mime},2)`,
+    });
   }
   const availableColumns = [
     ...table.columns.map(c => c.name),
