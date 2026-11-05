@@ -101,21 +101,24 @@ export const warehouseLogDate = (value: string | null) =>
 function scoped(
   metrics: CrawlerMetricOptions = { crawlerIdentityScope: 'all' },
   columns?: readonly string[],
+  materialized = false,
 ) {
-  const relation = reportingLogRelation(
-    {
-      immutableTimeWindow: {
-        start: 'logStart',
-        end: 'logEnd',
-        endExclusive: metrics.crawlerMetricsVersion === 1,
-      },
-    },
-    columns && [
-      ...columns,
-      ...(metrics.crawlerIdentityScope !== 'all' ? ['verification'] : []),
-      ...(metrics.crawlerMetricsVersion === 1 ? ['user_agent'] : []),
-    ],
-  );
+  const relation = materialized
+    ? 'overview_logs'
+    : reportingLogRelation(
+        {
+          immutableTimeWindow: {
+            start: 'logStart',
+            end: 'logEnd',
+            endExclusive: metrics.crawlerMetricsVersion === 1,
+          },
+        },
+        columns && [
+          ...columns,
+          ...(metrics.crawlerIdentityScope !== 'all' ? ['verification'] : []),
+          ...(metrics.crawlerMetricsVersion === 1 ? ['user_agent'] : []),
+        ],
+      );
   return `FROM ${relation} l WHERE true ${crawlerIdentitySql(metrics.crawlerIdentityScope, 'l')}${metrics.crawlerMetricsVersion === 1 ? " AND l.user_agent NOT LIKE 'Liekan-Crawler-Check/%'" : ''}`;
 }
 const range = (start: Date, end: Date, timezone = 'UTC') => ({
@@ -230,7 +233,11 @@ export async function warehouseLogQuerySpec(
   search: string,
   previousBots: boolean,
   id: string,
+  reuseOverview = false,
 ) {
+  if (reuseOverview && metrics.resource !== 'overview')
+    throw new Error('warehouse-overview-reuse-scope-invalid');
+  const aggregateFrom = (columns: readonly string[]) => scoped(metrics, columns, reuseOverview);
   const params: Record<string, unknown> = range(start, end, timezone),
     base = scoped(metrics),
     ai = crawlerAiSql('l'),
@@ -283,14 +290,13 @@ export async function warehouseLogQuerySpec(
     ...(forms ? ['reporting_catalog_version'] : []),
   ];
   const botQuery = `SELECT bot AS name,vendor,bot_type AS type,reporting_crawler_id AS botId,${forms ? `arrayStringConcat(arraySort(groupUniqArray(coalesce(${form},'unknown'))),',') AS productForm,` : ''}
-      count() AS requests,countIf(${ai}) AS aiRequests,uniqExact(path) AS pages,toString(max(created_at)) AS lastVisit ${scoped(metrics, botColumns)} AND ${known}${formFilter} GROUP BY name,vendor,type,botId ORDER BY requests DESC,name,botId,vendor,type`;
+      count() AS requests,countIf(${ai}) AS aiRequests,uniqExact(path) AS pages,toString(max(created_at)) AS lastVisit ${aggregateFrom(botColumns)} AND ${known}${formFilter} GROUP BY name,vendor,type,botId ORDER BY requests DESC,name,botId,vendor,type`;
   const statements: Record<string, string> = {
     summary: `SELECT count() AS requests,countIf(${ai}) AS ai,uniqExactIf(path,${ai}) AS pages,countIf(status>=400) AS abnormal,
-        uniqExact(coalesce(reporting_classification_version,'legacy')) AS classificationVersions,countIf(isNull(ai_eligible)) AS legacyRequests,countIf(${unknownCrawlerSql('l')}) AS unclassifiedRequests ${scoped(metrics, logSummaryColumns)}`,
+        uniqExact(coalesce(reporting_classification_version,'legacy')) AS classificationVersions,countIf(isNull(ai_eligible)) AS legacyRequests,countIf(${unknownCrawlerSql('l')}) AS unclassifiedRequests ${aggregateFrom(logSummaryColumns)}`,
     daily: `SELECT formatDateTime(created_at,'%Y-%m-%d',{timezone:String}) AS day,bot,vendor,reporting_crawler_id AS botId,count() AS count,countIf(${ai}) AS aiRequests ${scoped(metrics, ['created_at', 'bot', 'vendor', 'reporting_crawler_id', 'ai_eligible', 'bot_type', 'recognition_state'])} AND ${known} GROUP BY day,bot,vendor,botId ORDER BY day`,
     bots: botQuery,
-    pages: `SELECT path,bot,reporting_crawler_id AS botId,count() AS requests,toString(max(created_at)) AS lastCrawled ${scoped(
-      metrics,
+    pages: `SELECT path,bot,reporting_crawler_id AS botId,count() AS requests,toString(max(created_at)) AS lastCrawled ${aggregateFrom(
       botColumns.filter(column => column !== 'vendor'),
     )} AND ${ai}${
       forms
@@ -332,6 +338,14 @@ export async function warehouseLogQuerySpec(
     forms,
     botQuery,
     statements,
+    // Materialize the version-pinned, narrow reporting relation once. Separate
+    // aggregate branches retain their original exact populations and ordering.
+    // Paths are streamed by the caller; no group-count cap or in-memory array.
+    overview: reuseOverview
+      ? `WITH overview_logs AS MATERIALIZED (SELECT * ${scoped(metrics, [...new Set([...logSummaryColumns, ...botColumns])])})
+          ${['summary', 'bots', 'pages'].map(key => `SELECT '${key}' AS section,formatRowNoNewline('JSONEachRow',*) AS row FROM (${statements[key]})`).join(' UNION ALL ')}
+          SETTINGS enable_materialized_cte=1`
+      : undefined,
     filterSql,
     detailBase,
   };

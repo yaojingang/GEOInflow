@@ -12,6 +12,7 @@ vi.mock('./warehouse-report-snapshot', () => ({
   warehouseReportQuery: mocks.query,
 }));
 import { warehouseLogFacts, warehouseLogQuerySpec } from './warehouse-log-queries';
+import { warehouseGeoWeightAggregate } from './warehouse-geo-weight';
 
 const start = new Date('2026-11-01T00:00:00Z');
 const end = new Date('2026-11-02T00:00:00Z');
@@ -93,4 +94,46 @@ it('retains product-form filtering and metric boundaries in separate aggregate q
     expect(sql).toContain('verification');
     expect(sql).not.toContain('identity_evidence');
   }
+});
+
+it('computes all overview log groups from a single accepted, narrow relation without grouping sets', async () => {
+  const spec = await warehouseLogQuerySpec(
+    start,
+    end,
+    'UTC',
+    { resource: 'overview', crawlerIdentityScope: 'verified_range', crawlerMetricsVersion: 1 },
+    '',
+    '',
+    false,
+    'site',
+    true,
+  );
+  expect(spec.overview).toContain('overview_logs AS MATERIALIZED');
+  expect(spec.overview).toContain('enable_materialized_cte=1');
+  expect(spec.overview.match(/FROM "warehouse_liekan_log" AS fact/g)).toHaveLength(1);
+  for (const key of ['summary', 'bots', 'pages']) {
+    expect(spec.overview).toContain(`'${key}' AS section`);
+    expect(spec.statements[key]).toContain('FROM overview_logs l');
+  }
+  expect(spec.overview).toContain("l.user_agent NOT LIKE 'Liekan-Crawler-Check/%'");
+  expect(spec.overview).toContain("_record_time < {logEnd:DateTime64(6,'UTC')}");
+  expect(spec.overview).not.toContain('GROUPING SETS');
+  expect(spec.overview).not.toContain('identity_evidence');
+});
+
+it('evaluates GEO classification once before expanding its overlapping windows', async () => {
+  mocks.query.mockResolvedValueOnce([{ catalogs: [], verifications: [] }]).mockResolvedValueOnce([]);
+  await warehouseGeoWeightAggregate({ query: async () => [], execute: async () => 0 }, 'site', 'fixture.invalid', 'UTC', [
+    { asOf: '2026-11-02', startAt: +start, endAt: +end },
+    { asOf: '2026-11-01', startAt: +start - 86400000, endAt: +end - 86400000 },
+  ]);
+  expect(mocks.query).toHaveBeenCalledTimes(2);
+  const sql = mocks.query.mock.calls[1][1];
+  expect(sql).toContain('evaluated_logs AS MATERIALIZED');
+  expect(sql).toContain('FROM evaluated_logs e');
+  expect(sql).toContain('GROUP BY memberships,kind,key1,key2');
+  expect(sql).toContain('FROM buckets ARRAY JOIN memberships AS asOf');
+  expect(sql).toContain('uniqExactIfMerge(units_state)');
+  expect(sql).toContain('enable_materialized_cte=1');
+  expect(mocks.query.mock.calls[1][2].geoDates).toEqual(['2026-11-02', '2026-11-01']);
 });

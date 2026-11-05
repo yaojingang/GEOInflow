@@ -15,6 +15,11 @@ import { currentCacheContext } from './cache-context';
 import { withinAnalysisPermit } from './analysis-permit-context';
 import { primaryMetadataClient } from './analytics-deadline';
 
+const warehouse = vi.hoisted(() => ({
+  report: vi.fn(async (work: () => Promise<unknown>, _options: unknown) => work()),
+}));
+vi.mock('./warehouse-report-snapshot', () => ({ withinWarehouseReport: warehouse.report }));
+
 vi.mock('./analytics-hot', () => ({
   rememberAnalyticsHot: vi.fn(async () => {}),
   reserveWorkerComputation: vi.fn(async () => true),
@@ -753,4 +758,107 @@ it('admits two dashboard computations and queues a third until a slot settles', 
     for (const release of releases) release();
     await Promise.allSettled([first, second, third]);
   }
+});
+
+it('runs CH computation outside PG transactions while fencing control versions before and after', async () => {
+  vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+  const cache = new QueryCache();
+  let active = 0;
+  const connection = primary();
+  const tx = vi.fn(async (work: any, options: any) => {
+    active++;
+    try {
+      return await connection.$transaction(work, options);
+    } finally {
+      active--;
+    }
+  });
+  installAnalyticsRuntime(cache, () => ({ $transaction: tx }), disabled());
+  const load = vi.fn(async () => {
+    expect(active).toBe(0);
+    expect(getQuerySnapshot()).toBeUndefined();
+    return { count: 3 };
+  });
+  const result = await cache.read('warehouse-no-long-pg-transaction', 30000, tags, load);
+  expect(result.value).toEqual({ count: 3 });
+  expect(warehouse.report).toHaveBeenCalledWith(
+    load,
+    expect.objectContaining({ deadline: expect.any(Number) }),
+  );
+  expect(tx.mock.calls.every(([, options]) => options.isolationLevel !== 'RepeatableRead')).toBe(
+    true,
+  );
+  const mutations = vi.fn(async () => {
+    if (mutations.mock.calls.length === 1) strong++;
+    return { revision: strong };
+  });
+  expect((await cache.read('warehouse-mutation', 30000, tags, mutations)).value).toEqual({
+    revision: 1,
+  });
+  expect(mutations).toHaveBeenCalledTimes(2);
+});
+
+it('does not cancel a shared CH computation when only its first viewer disconnects', async () => {
+  vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+  const cache = new QueryCache();
+  installAnalyticsRuntime(cache, primary, disabled());
+  let release!: () => void;
+  let signal!: AbortSignal;
+  const load = vi.fn(async () => {
+    signal = (warehouse.report.mock.lastCall[1] as { signal: AbortSignal }).signal;
+    return new Promise<number>((resolve, reject) => {
+      release = () => resolve(7);
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  });
+  const request = (abort: AbortController) =>
+    withQueryCacheHeaders(async () => {
+      bindCacheRequest(new Request('http://localhost', { signal: abort.signal }), { user: { id } });
+      return Response.json((await cache.read('shared-ch-disconnect', 30000, tags, load)).value);
+    });
+  const firstAbort = new AbortController(), secondAbort = new AbortController();
+  const first = request(firstAbort).catch(error => error);
+  await vi.waitFor(() => expect(load).toHaveBeenCalledOnce());
+  const second = request(secondAbort).catch(error => error);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  firstAbort.abort();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  try {
+    expect(signal.aborted).toBe(false);
+  } finally {
+    release();
+    await first;
+  }
+  expect((await second).status).toBe(200);
+  expect(load).toHaveBeenCalledOnce();
+});
+
+it('cancels CH work after its last viewer leaves and permits a subsequent retry', async () => {
+  vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+  const cache = new QueryCache();
+  installAnalyticsRuntime(cache, primary, disabled());
+  let signal!: AbortSignal;
+  let settle!: () => void;
+  const load = vi.fn(async () => {
+    signal = (warehouse.report.mock.lastCall[1] as { signal: AbortSignal }).signal;
+    return new Promise<number>((_, reject) => { settle = () => reject(signal.reason); });
+  });
+  const abort = new AbortController();
+  const first = withQueryCacheHeaders(async () => {
+    bindCacheRequest(new Request('http://localhost', { signal: abort.signal }), { user: { id } });
+    return Response.json((await cache.read('all-ch-disconnect', 30000, tags, load)).value);
+  }).catch(error => error);
+  await vi.waitFor(() => expect(load).toHaveBeenCalledOnce());
+  abort.abort();
+  await first;
+  expect(signal.aborted).toBe(true);
+  const next = withQueryCacheHeaders(async () => {
+    bindCacheRequest(new Request('http://localhost'), { user: { id } });
+    return Response.json((await cache.read('all-ch-disconnect', 30000, tags, async () => 9)).value);
+  });
+  const result = expect(next.then(response => response.json())).resolves.toBe(9);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  settle();
+  await result;
+  await vi.waitFor(() => expect(analyticsComputationGate().state.active).toBe(0));
 });

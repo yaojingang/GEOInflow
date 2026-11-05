@@ -165,6 +165,25 @@ async function compare(
     ),
     `${name}: narrow pages`,
   );
+  const shared = await warehouseLogQuerySpec(
+    new Date('2026-11-01T00:00:00Z'),
+    new Date('2026-11-02T00:00:00Z'),
+    'UTC',
+    { ...metrics, resource: 'overview' },
+    '',
+    '',
+    false,
+    site,
+    true,
+  );
+  const reused = await query(shared.overview);
+  for (const key of ['summary', 'bots', 'pages']) {
+    assert.deepEqual(
+      reused.filter(row => row.section === key).map(row => JSON.parse(row.row)),
+      await query(spec.statements[key]),
+      `${name}: materialized ${key} preserves values and ordering`,
+    );
+  }
   checks.push({ name, status: 'pass' });
   return expected;
 }

@@ -83,6 +83,13 @@ export const crawlerCountColumns = `count(*)::float8 AS requests,
   count(*) FILTER(WHERE method='HEAD')::float8 AS head,
   count(*) FILTER(WHERE method='GET' AND status>=200 AND status<300)::float8 AS "successfulGets"`;
 
+export interface CrawlerWindowVersions {
+  classes: number;
+  classification: string | null;
+  sources: number;
+  source: string | null;
+  legacy: number;
+}
 export async function crawlerWindowQuality(
   tx: AiTx,
   websiteId: string,
@@ -90,11 +97,14 @@ export async function crawlerWindowQuality(
   endAt: number,
   timezone: string,
   sourceId?: string,
+  acceptedVersions?: CrawlerWindowVersions,
 ): Promise<CrawlerObservationQuality> {
   const args = [websiteId, new Date(startAt), new Date(endAt), ...(sourceId ? [sourceId] : [])];
   const sourceFilter = sourceId ? ' AND source_id=$4::uuid' : '';
   const [versions] =
-    warehouseEnabled()
+    acceptedVersions !== undefined && warehouseEnabled() && !sourceId
+      ? [acceptedVersions]
+      : warehouseEnabled()
       ? [
           await (await import('../upstream/warehouse-geo-weight')).warehouseCrawlerWindowVersions(
             websiteId,

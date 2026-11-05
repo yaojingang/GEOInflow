@@ -145,7 +145,7 @@ export async function sourceWebsite(
   )[0];
 }
 export async function reportSnapshot<T>(work: () => Promise<T>, deadline?: number): Promise<T> {
-  if(warehouseEnabled())return (await import('./warehouse-report-snapshot')).withinWarehouseReport(work);
+  if(warehouseEnabled())return (await import('./warehouse-report-snapshot')).withinWarehouseReport(work, { deadline });
   const snapshot = getQuerySnapshot();
   const schema = new URL(process.env.DATABASE_URL).searchParams.get('schema') || 'public';
   if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schema)) throw new LiekanError('数据库 schema 无效', 500);

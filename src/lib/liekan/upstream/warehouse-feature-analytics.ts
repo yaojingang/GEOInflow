@@ -4,7 +4,7 @@ import { getClickHouseCountrySQL } from '@/lib/country';
 import { LiekanError } from './errors';
 import { warehouseNativeQuery, warehouseNativeStringStream } from './warehouse-native-query';
 import { warehouseRealtimeSources } from './warehouse-realtime-sources';
-import { currentCacheContext } from './cache-context';
+import { currentAnalyticsSignal } from './cache-context';
 
 const first = (column: string, alias = '') =>
   `if(count()=0,NULL,argMin(tuple(${alias}${column}),tuple(${alias}created_at,${alias}event_id)).1)`;
@@ -242,7 +242,7 @@ export async function warehouseFeatureAnalytics(websiteId: string, p: any, filte
       'SELECT url_path AS name,uniqExact(session_id) AS value FROM selected WHERE created_at>={cutoff:DateTime64(6)} AND event_type=1 GROUP BY name ORDER BY value DESC LIMIT 25',
       { cutoff },
     );
-    const signal = currentCacheContext()?.request?.signal;
+    const signal = currentAnalyticsSignal();
     const { ai, sources } = await warehouseRealtimeSources(
       emit =>
         warehouseNativeStringStream<{ id: string; referrer: string | null }>(

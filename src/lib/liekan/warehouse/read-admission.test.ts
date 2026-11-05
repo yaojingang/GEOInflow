@@ -49,3 +49,28 @@ describe('warehouse live read admission', () => {
     await expect(gate.run(work)).rejects.toThrow('warehouse-read-capacity-busy');
   });
 });
+
+it('removes canceled waiters immediately and never runs their work or leaks capacity', async () => {
+  const gate = new ReadAdmission(1, 1);
+  let release!: () => void;
+  const first = gate.run(
+    () =>
+      new Promise<void>(r => {
+        release = r;
+      }),
+  );
+  const abort = new AbortController(),
+    work = vi.fn();
+  const queued = gate.run(work, abort.signal);
+  const rejected = expect(queued).rejects.toThrow('request canceled');
+  abort.abort(new Error('request canceled'));
+  await rejected;
+  const next = gate.run(async () => 42);
+  release();
+  await first;
+  expect(await next).toBe(42);
+  expect(work).not.toHaveBeenCalled();
+  await expect(gate.run(work, abort.signal)).rejects.toThrow('request canceled');
+  expect(work).not.toHaveBeenCalled();
+  expect(await gate.run(async () => 43)).toBe(43);
+});

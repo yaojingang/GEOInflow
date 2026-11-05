@@ -197,12 +197,15 @@ async function calculateGeoWeightAtBoundary(
               );
               const points = [];
               for (const window of windows) {
+                const row = rows.find(r => r.asOf === window.asOf) || {};
                 const quality = await crawlerWindowQuality(
                   tx,
                   websiteId,
                   window.startAt,
                   window.endAt,
                   p.timezone,
+                  undefined,
+                  warehouseEnabled() ? row.qualityVersions : undefined,
                 );
                 const [coverage] = await tx.query(
                   `SELECT EXISTS(SELECT 1 FROM liekan_crawler_rule_version r
@@ -227,7 +230,6 @@ async function calculateGeoWeightAtBoundary(
                   quality.sourceVersion,
                 );
                 const covered = quality.state === 'complete' && coverage?.valid === true;
-                const row = rows.find(r => r.asOf === window.asOf) || {};
                 if (firstEvidenceDay && firstEvidenceDay <= window.asOf)
                   row.stats = { ...row.stats, firstEvidenceDay };
                 points.push(geoPoint(window, row, quality, catalog.state === 'fallback', covered));
@@ -379,7 +381,11 @@ export async function readGeoWeight(
 }
 
 export async function calculateGeoWeight(...args: Parameters<typeof calculateGeoWeightAtBoundary>) {
-  return warehouseEnabled()
-    ? withinWarehouseReport(() => calculateGeoWeightAtBoundary(...args))
-    : calculateGeoWeightAtBoundary(...args);
+  if (!warehouseEnabled()) return calculateGeoWeightAtBoundary(...args);
+  const [actor, websiteId, input, options = {}] = args;
+  const deadline = Math.min(Date.now() + 60000, options.deadline ?? Infinity);
+  return withinWarehouseReport(
+    () => calculateGeoWeightAtBoundary(actor, websiteId, input, { ...options, deadline }),
+    { deadline, signal: options.signal },
+  );
 }

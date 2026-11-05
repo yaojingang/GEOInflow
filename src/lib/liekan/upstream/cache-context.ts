@@ -20,6 +20,7 @@ interface CacheContext {
   actor?: string;
   scope?: unknown;
   request?: Request;
+  computationSignal?: AbortSignal;
   parameters?: Record<string, unknown>;
   versions?: Map<string, Promise<unknown>>;
   reauthorize?: (deadline?: number) => Promise<boolean>;
@@ -58,6 +59,14 @@ const contexts = state.contexts;
 export const bypassQueryCache = () => contexts.getStore()?.bypass;
 export const cacheHeadersEnabled = () => !!contexts.getStore() && !contexts.getStore()?.bypass;
 export const currentCacheContext = () => contexts.getStore();
+export const currentAnalyticsSignal = () =>
+  contexts.getStore()?.computationSignal ?? contexts.getStore()?.request?.signal;
+/** Coalesced work belongs to all its live viewers, not the initiating request. */
+export function withAnalyticsComputationSignal<T>(signal: AbortSignal, work: () => Promise<T>) {
+  const parent = contexts.getStore();
+  return contexts.run({ ...parent, results: parent?.results ?? [], computationSignal: signal }, work);
+}
+
 export function bindCacheRequest(
   request: Request,
   auth: any,

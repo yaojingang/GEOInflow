@@ -1,3 +1,4 @@
+import { currentAnalyticsSignal } from './cache-context';
 import { createHash, randomUUID } from 'node:crypto';
 import { EXPORT_MAX_BYTES, EXPORT_MAX_ROWS } from '../contracts/exports';
 import {
@@ -259,7 +260,7 @@ export async function readKeywordPage(
                   ),
                 );
               },
-              currentCacheContext()?.request?.signal,
+              currentAnalyticsSignal(),
             ),
           ),
         ),

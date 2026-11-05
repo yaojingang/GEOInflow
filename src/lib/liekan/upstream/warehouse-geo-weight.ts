@@ -170,33 +170,73 @@ export async function warehouseGeoWeightAggregate(
       geoEnd: warehouseTime(new Date(Math.max(...windows.map(w => w.endAt)))),
     };
     const control = await metadata(tx, site, range);
+    // Aggregate exact states by window membership before expanding the windows.
+    // This preserves distinct path/day units without multiplying raw evidence rows.
     const rows = await warehouseReportQuery<any>(
       site,
       `WITH ${controls},
-      windows AS (SELECT w.1 AS asOf,parseDateTime64BestEffort(w.2,6,'UTC') AS startAt,parseDateTime64BestEffort(w.3,6,'UTC') AS endAt FROM
-        (SELECT arrayJoin(arrayZip({geoDates:Array(String)},{geoStarts:Array(String)},{geoEnds:Array(String)})) AS w)),
-      scoped AS (SELECT e.*,w.asOf AS asOf,toDate(e.created_at,{geoTimezone:String}) AS day FROM ${evaluated()} e INNER JOIN windows w ON e.created_at>=w.startAt AND e.created_at<w.endAt),
-      grouped AS (SELECT *,arrayJoin(['stats','factor','operator','exclusion','identity','form']) AS kind FROM scoped)
-      SELECT asOf,kind,
-        multiIf(kind IN('factor','operator'),coalesce(purpose,''),kind='exclusion',coalesce(exclusion,''),kind='identity',coalesce(crawler_id,''),kind='form',coalesce(form,''),'') AS key1,
-        multiIf(kind='operator',coalesce(platformId,''),kind='identity',coalesce(exclusion,''),'') AS key2,
-        count() AS requests,countIf(isNull(exclusion)) AS accepted,countIf(verification='verified_range' AND recognition_state='recognized') AS verified,
-        uniqExactIf(tuple(platformId,path,day),kind IN('factor','operator')) AS units,
-        uniqExactIf(path,kind='factor') AS paths,uniqExactIf(day,kind IN('factor','operator')) AS days,
-        countIf(isNull(exclusion) AND status=200) AS status200,countIf(isNull(exclusion) AND status=304) AS status304,
-        countIf(isNull(exclusion) AND mime_state='present') AS mimeConfirmed,countIf(isNull(exclusion) AND coalesce(mime_state,'unknown')<>'present') AS pathInferred,
-        countIf(NOT self_check AND inferred_host) AS inferredHost,countIf(NOT self_check AND sampling_unknown) AS samplingUnknown,
-        countIf(NOT self_check AND (NOT history_available OR exclusion='history')) AS historyMissing,
-        countIf(NOT self_check AND (exclusion IN('ambiguous','history','semantics','verification') OR (coalesce(recognition_state,'')<>'recognized' AND coalesce(ai_eligible,true)))) AS identityMissing,
-        if(countIf(history_available AND NOT self_check AND host_matches)>0,toString(minIf(day,history_available AND NOT self_check AND host_matches)),NULL) AS firstEvidenceDay,
-        arraySort(groupUniqArrayIf(toString(catalog_version),NOT self_check)) AS catalogVersions,
-        arraySort(groupUniqArrayIf(classification_version,NOT self_check)) AS classificationVersions,
-        arraySort(groupUniqArrayIf(verification_version,NOT self_check)) AS verificationVersions,
-        arraySort(groupUniqArrayIf(coalesce(toString(source_id),'manual'),NOT self_check)) AS sources
-      FROM grouped WHERE kind='stats' OR (kind IN('factor','operator') AND isNull(exclusion)) OR (kind='exclusion' AND isNotNull(exclusion))
+      evaluated_logs AS MATERIALIZED (SELECT * FROM ${evaluated()}),
+      scoped AS (SELECT e.*,toDate(e.created_at,{geoTimezone:String}) AS day,
+        arrayMap(w -> w.1,arrayFilter(w -> e.created_at>=parseDateTime64BestEffort(w.2,6,'UTC') AND e.created_at<parseDateTime64BestEffort(w.3,6,'UTC'),
+          arrayZip({geoDates:Array(String)},{geoStarts:Array(String)},{geoEnds:Array(String)}))) AS memberships FROM evaluated_logs e),
+      grouped AS (SELECT *,arrayJoin(['stats','factor','operator','exclusion','identity','form']) AS kind FROM scoped),
+      buckets AS (SELECT memberships,kind,multiIf(kind IN('factor','operator'),coalesce(purpose,''),kind='exclusion',coalesce(exclusion,''),kind='identity',coalesce(crawler_id,''),kind='form',coalesce(form,''),'') AS key1,multiIf(kind='operator',coalesce(platformId,''),kind='identity',coalesce(exclusion,''),'') AS key2,
+        countState() AS requests_state,
+        countIfState(isNull(exclusion)) AS accepted_state,
+        countIfState(verification='verified_range' AND recognition_state='recognized') AS verified_state,
+        uniqExactIfState(tuple(platformId,path,day),kind IN('factor','operator')) AS units_state,
+        uniqExactIfState(path,kind='factor') AS paths_state,
+        uniqExactIfState(day,kind IN('factor','operator')) AS days_state,
+        countIfState(isNull(exclusion) AND status=200) AS status200_state,
+        countIfState(isNull(exclusion) AND status=304) AS status304_state,
+        countIfState(isNull(exclusion) AND mime_state='present') AS mimeConfirmed_state,
+        countIfState(isNull(exclusion) AND coalesce(mime_state,'unknown')<>'present') AS pathInferred_state,
+        countIfState(NOT self_check AND inferred_host) AS inferredHost_state,
+        countIfState(NOT self_check AND sampling_unknown) AS samplingUnknown_state,
+        countIfState(NOT self_check AND (NOT history_available OR exclusion='history')) AS historyMissing_state,
+        countIfState(NOT self_check AND (exclusion IN('ambiguous','history','semantics','verification') OR (coalesce(recognition_state,'')<>'recognized' AND coalesce(ai_eligible,true)))) AS identityMissing_state,
+        countIfState(history_available AND NOT self_check AND host_matches) AS evidenceCount_state,
+        minIfState(day,history_available AND NOT self_check AND host_matches) AS evidenceFirst_state,
+        groupUniqArrayIfState(toString(catalog_version),NOT self_check) AS catalogVersions_state,
+        groupUniqArrayIfState(classification_version,NOT self_check) AS classificationVersions_state,
+        groupUniqArrayIfState(verification_version,NOT self_check) AS verificationVersions_state,
+        groupUniqArrayIfState(coalesce(toString(source_id),'manual'),NOT self_check) AS sources_state,
+        uniqExactIfState(coalesce(classification_version,'legacy'),NOT self_check) AS qualityClasses_state,
+        minIfState(classification_version,NOT self_check) AS qualityClassification_state,
+        uniqExactIfState(coalesce(toString(source_id),'manual'),NOT self_check) AS qualitySources_state,
+        minIfState(toString(source_id),NOT self_check) AS qualitySource_state,
+        countIfState(isNull(classification_version) AND NOT self_check) AS qualityLegacy_state
+      FROM grouped WHERE notEmpty(memberships) AND (kind='stats' OR (kind IN('factor','operator') AND isNull(exclusion)) OR (kind='exclusion' AND isNotNull(exclusion))
         OR (kind='identity' AND isNotNull(crawler_id) AND NOT self_check) OR (kind='form' AND form IN('workbench','personal_agent') AND history_available
-          AND NOT self_check AND coalesce(exclusion,'')<>'host' AND recognition_state='recognized' AND NOT coalesce(identity_conflict,false))
-      GROUP BY asOf,kind,key1,key2 ORDER BY asOf,kind,key1,key2`,
+          AND NOT self_check AND coalesce(exclusion,'')<>'host' AND recognition_state='recognized' AND NOT coalesce(identity_conflict,false)))
+      GROUP BY memberships,kind,key1,key2)
+      SELECT asOf,kind,key1,key2,
+        countMerge(requests_state) AS requests,
+        countIfMerge(accepted_state) AS accepted,
+        countIfMerge(verified_state) AS verified,
+        uniqExactIfMerge(units_state) AS units,
+        uniqExactIfMerge(paths_state) AS paths,
+        uniqExactIfMerge(days_state) AS days,
+        countIfMerge(status200_state) AS status200,
+        countIfMerge(status304_state) AS status304,
+        countIfMerge(mimeConfirmed_state) AS mimeConfirmed,
+        countIfMerge(pathInferred_state) AS pathInferred,
+        countIfMerge(inferredHost_state) AS inferredHost,
+        countIfMerge(samplingUnknown_state) AS samplingUnknown,
+        countIfMerge(historyMissing_state) AS historyMissing,
+        countIfMerge(identityMissing_state) AS identityMissing,
+        arraySort(groupUniqArrayIfMerge(catalogVersions_state)) AS catalogVersions,
+        arraySort(groupUniqArrayIfMerge(classificationVersions_state)) AS classificationVersions,
+        arraySort(groupUniqArrayIfMerge(verificationVersions_state)) AS verificationVersions,
+        arraySort(groupUniqArrayIfMerge(sources_state)) AS sources,
+        uniqExactIfMerge(qualityClasses_state) AS qualityClasses,
+        minIfMerge(qualityClassification_state) AS qualityClassification,
+        uniqExactIfMerge(qualitySources_state) AS qualitySources,
+        minIfMerge(qualitySource_state) AS qualitySource,
+        countIfMerge(qualityLegacy_state) AS qualityLegacy,
+        if(countIfMerge(evidenceCount_state)>0,toString(minIfMerge(evidenceFirst_state)),NULL) AS firstEvidenceDay
+      FROM buckets ARRAY JOIN memberships AS asOf
+      GROUP BY asOf,kind,key1,key2 ORDER BY asOf,kind,key1,key2 SETTINGS enable_materialized_cte=1`,
       {
         ...range,
         ...control,
@@ -236,6 +276,15 @@ export async function warehouseGeoWeightAggregate(
       }
       return {
         asOf: w.asOf,
+        qualityVersions: stats
+          ? {
+              classes: Number(stats.qualityClasses),
+              classification: stats.qualityClassification,
+              sources: Number(stats.qualitySources),
+              source: stats.qualitySource,
+              legacy: Number(stats.qualityLegacy),
+            }
+          : { classes: 0, classification: null, sources: 0, source: null, legacy: 0 },
         stats: stats
           ? {
               ...numbers(stats, [

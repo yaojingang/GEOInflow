@@ -162,7 +162,12 @@ async function compare(name: string) {
     },
   };
   process.env.LIEKAN_ANALYTICS_BACKEND = 'postgresql';
-  const expected = await geoWeightAggregate(tx, site, 'fixture.invalid', 'Asia/Shanghai', [window]);
+  const windows = [0, 7, 14, 21, 28, 30].map(days => ({
+    asOf: new Date(Date.parse(window.asOf) - days * 86400000).toISOString().slice(0, 10),
+    startAt: window.startAt - days * 86400000,
+    endAt: window.endAt - days * 86400000,
+  }));
+  const expected = await geoWeightAggregate(tx, site, 'fixture.invalid', 'Asia/Shanghai', windows);
   const first = await geoWeightFirstEvidence(
     tx,
     site,
@@ -171,8 +176,17 @@ async function compare(name: string) {
     window.endAt,
   );
   process.env.LIEKAN_ANALYTICS_BACKEND = 'clickhouse';
-  const actual = await geoWeightAggregate(tx, site, 'fixture.invalid', 'Asia/Shanghai', [window]);
-  assert.deepEqual(actual, expected, name);
+  const actual = await geoWeightAggregate(tx, site, 'fixture.invalid', 'Asia/Shanghai', windows);
+  const byDate = (a: Record<string, any>, b: Record<string, any>) => a.asOf.localeCompare(b.asOf);
+  assert.deepEqual(actual.map((value: Record<string, any>) => {
+    const { qualityVersions: _quality, ...row } = value;
+    return row;
+  }).sort(byDate), [...expected].sort(byDate), name);
+  const { warehouseCrawlerWindowVersions } = await import('../../src/lib/liekan/upstream/warehouse-geo-weight');
+  for (const window of windows) {
+    const projected = actual.find(row => row.asOf === window.asOf).qualityVersions;
+    assert.deepEqual(projected, await warehouseCrawlerWindowVersions(site, window.startAt, window.endAt), name + ' quality versions');
+  }
   assert.equal(
     await geoWeightFirstEvidence(tx, site, 'fixture.invalid', 'Asia/Shanghai', window.endAt),
     first,

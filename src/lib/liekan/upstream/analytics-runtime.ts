@@ -1,3 +1,5 @@
+import { warehouseEnabled } from '../warehouse/authority-routing';
+import { withinWarehouseReport } from './warehouse-report-snapshot';
 import { analyticsCacheLimits } from './cache-policy';
 import { dashboardClock } from './dashboard-clock';
 import {
@@ -7,6 +9,8 @@ import {
 } from './analytics-budget';
 import {
   currentCacheContext,
+  currentAnalyticsSignal,
+  withAnalyticsComputationSignal,
   installVersionReader,
   installAuthorizationRunner,
   runCacheAuthorization,
@@ -37,6 +41,9 @@ interface Flight {
   forced: boolean;
   background: boolean;
   promise: Promise<CachedResult<any>>;
+  controller: AbortController;
+  viewers: number;
+  settled: boolean;
 }
 interface MetadataBatch {
   limit: number;
@@ -57,6 +64,24 @@ async function joinFlight<T>(promise: Promise<T>, deadline: number) {
     ]);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function observeFlight<T>(flight: Flight, deadline: number, signal?: AbortSignal): Promise<CachedResult<T>> {
+  flight.viewers++;
+  let detach: () => void = () => {};
+  try {
+    const canceled = new Promise<never>((_, reject) => {
+      const abort = () => reject(signal.reason);
+      signal?.addEventListener('abort', abort, { once: true });
+      detach = () => signal?.removeEventListener('abort', abort);
+      if (signal?.aborted) abort();
+    });
+    return await joinFlight(Promise.race([flight.promise, canceled]), deadline);
+  } finally {
+    detach();
+    if (--flight.viewers === 0 && !flight.settled)
+      flight.controller.abort(new DOMException('All analytics viewers disconnected', 'AbortError'));
   }
 }
 
@@ -208,27 +233,36 @@ export function installAnalyticsRuntime(
       const computeDeadline = Math.min(deadline, generatedAt + 60000);
       const remaining = () => analyticsRemaining(computeDeadline);
       let computing = false;
-      const value = await primary()
-        .$transaction(
-          async (transaction: any) => {
-            const tx = timedAnalyticsClient(transaction, computeDeadline);
-            await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${schema}"`);
-            await tx.$executeRawUnsafe('SET LOCAL jit=off');
-            // Ingestion can advance before snapshot acquisition; the result freshness check handles it.
-            if ((await readAnalyticsVersions(tx, tags)).strong !== expected.strong)
+      const value = await (warehouseEnabled()
+        ? (async () => {
+            if ((await versions(tags, true, computeDeadline, false)).strong !== expected.strong)
               throw new RevisionChanged();
             computing = true;
-            return withinQuerySnapshot(timedAnalyticsClient(tx, computeDeadline, true), load);
-          },
-          {
-            isolationLevel: 'RepeatableRead',
-            timeout: remaining(),
-            maxWait: Math.min(5000, remaining()),
-          },
-        )
-        .catch((error: unknown) => {
-          throw analyticsQueryFailure(error, computeDeadline, computing);
-        });
+            return withinWarehouseReport(load, {
+              deadline: computeDeadline,
+              signal: currentAnalyticsSignal(),
+            });
+          })()
+        : primary().$transaction(
+            async (transaction: any) => {
+              const tx = timedAnalyticsClient(transaction, computeDeadline);
+              await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${schema}"`);
+              await tx.$executeRawUnsafe('SET LOCAL jit=off');
+              // Ingestion can advance before snapshot acquisition; the result freshness check handles it.
+              if ((await readAnalyticsVersions(tx, tags)).strong !== expected.strong)
+                throw new RevisionChanged();
+              computing = true;
+              return withinQuerySnapshot(timedAnalyticsClient(tx, computeDeadline, true), load);
+            },
+            {
+              isolationLevel: 'RepeatableRead',
+              timeout: remaining(),
+              maxWait: Math.min(5000, remaining()),
+            },
+          )
+      ).catch((error: unknown) => {
+        throw analyticsQueryFailure(error, computeDeadline, computing);
+      });
       const current = await versions(tags, true, computeDeadline, false);
       if (current.strong !== expected.strong) throw new RevisionChanged();
       // Ingestion advances independently of this immutable snapshot. Its TTL starts at completion;
@@ -301,6 +335,12 @@ export function installAnalyticsRuntime(
             if (local) return await finish(local);
           }
           let existing = flights.get(key);
+          if (existing?.controller.signal.aborted) {
+            // Keep the old permit/reference until its canceled read settles, then
+            // allow a new viewer to retry instead of joining the abandoned result.
+            await joinFlight(existing.promise.catch(() => {}), deadline);
+            existing = flights.get(key);
+          }
           if (
             existing &&
             forced &&
@@ -314,7 +354,7 @@ export function installAnalyticsRuntime(
           }
           if (existing)
             return await finish({
-              ...(await joinFlight(existing.promise, deadline)),
+              ...(await observeFlight<T>(existing, deadline, currentAnalyticsSignal())),
               status: 'coalesced',
             });
           if (forced && attempt === 0 && !context?.background) {
@@ -325,8 +365,8 @@ export function installAnalyticsRuntime(
             refreshes.set(refreshKey, { at: Date.now(), round: refreshRound });
             while (refreshes.size > 128) refreshes.delete(refreshes.keys().next().value!);
           }
-          const flight: Flight = { forced, background: !!context?.background, promise: undefined! };
-          flight.promise = (async () => {
+          const flight: Flight = { forced, background: !!context?.background, promise: undefined!, controller: new AbortController(), viewers: 0, settled: false };
+          flight.promise = withAnalyticsComputationSignal(flight.controller.signal, async () => {
             if (!forced) {
               const shared = await redis.read<T>(key);
               if (shared && typeof shared !== 'string') {
@@ -414,19 +454,20 @@ export function installAnalyticsRuntime(
                 await redis.publish(key, owner as string, cacheable ? result : 'unshareable');
               return result;
             } catch (error) {
-              if (owns && !(error instanceof RevisionChanged))
+              if (owns && !flight.controller.signal.aborted && !(error instanceof RevisionChanged))
                 await redis.publish(key, owner as string, 'error');
               throw error;
             } finally {
               clearInterval(renewal);
               if (typeof owner === 'string') await redis.release(key, owner);
             }
-          })().finally(() => {
+          }).finally(() => {
+            flight.settled = true;
             if (flights.get(key) === flight) flights.delete(key);
           });
           // Distinct overflow requests still use the global compute gate.
           if (flights.size < 128) flights.set(key, flight);
-          return await finish(await flight.promise);
+          return await finish(await observeFlight<T>(flight, deadline, currentAnalyticsSignal()));
         } catch (error) {
           if (error instanceof RevisionChanged && context?.prepared) throw new AnalyticsRestart();
           if (error instanceof RevisionChanged && attempt === 0 && Date.now() < deadline) continue;

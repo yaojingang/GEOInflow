@@ -8,13 +8,17 @@ import { addReportAiPage, compareReportAiPages, reportLogRange } from '../report
 import type { PreparedReport } from '../report-prepared';
 import { getHumanFacts, type HumanFact } from './analytics';
 import { readBrowserPopulation } from './browser-population';
-import { currentCacheContext } from './cache-context';
+import { currentAnalyticsSignal } from './cache-context';
 import { getLogFacts } from './logs';
 import { humanPathFromEncoded } from './paths';
 import { warehouseBrowserParameters, warehouseVisitsSQL } from './warehouse-browser-queries';
 import { type EvidenceProducer, WarehouseEvidenceSpool } from './warehouse-evidence-spool';
-import { warehouseLogQuerySpec, warehouseNumbers } from './warehouse-log-queries';
-import { warehouseReportQuery, warehouseReportStream } from './warehouse-report-snapshot';
+import { warehouseLogDate, warehouseLogQuerySpec, warehouseNumbers } from './warehouse-log-queries';
+import {
+  warehouseReportQuery,
+  warehouseReportStream,
+  warehouseReportSignal,
+} from './warehouse-report-snapshot';
 
 const lexical = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 const pct = (n: number, d: number) => (d ? Math.round((n / d) * 10000) / 100 : null);
@@ -61,7 +65,7 @@ async function streamBrowser(
     async batch => {
       for (const row of batch) await emit(numeric(row));
     },
-    currentCacheContext()?.request?.signal,
+    currentAnalyticsSignal(),
   );
 }
 
@@ -288,7 +292,12 @@ export async function prepareWarehouseBrowserPageReport(
     p.seek,
     parts.logs.filter(
       field =>
-        !['pages', 'catalog', ...(p.resource === 'human/sources' ? ['daily'] : [])].includes(field),
+        ![
+          'pages',
+          'catalog',
+          ...(p.resource === 'overview' ? ['summary', 'bots'] : []),
+          ...(p.resource === 'human/sources' ? ['daily'] : []),
+        ].includes(field),
     ),
     p,
   );
@@ -311,8 +320,45 @@ export async function prepareWarehouseBrowserPageReport(
       spec.params,
     );
   }
-  const spool = await WarehouseEvidenceSpool.create(currentCacheContext()?.request?.signal);
+  const spool = await WarehouseEvidenceSpool.create(warehouseReportSignal());
   try {
+    const overviewPages =
+      p.resource === 'overview'
+        ? await spool.write<any>(async emit => {
+            const spec = await warehouseLogQuerySpec(
+              start,
+              end,
+              p.timezone,
+              p,
+              p.filter,
+              p.search,
+              false,
+              site,
+              true,
+            );
+            let summarySeen = false;
+            await warehouseReportStream<{ section: string; row: string }>(
+              site,
+              spec.overview,
+              spec.params,
+              async batch => {
+                for (const item of batch) {
+                  const row = warehouseNumbers(JSON.parse(item.row));
+                  if (item.section === 'summary') {
+                    if (summarySeen) throw new Error('warehouse-overview-duplicate-summary');
+                    summarySeen = true;
+                    logs.summary = row;
+                  } else if (item.section === 'bots')
+                    logs.bots.push({ ...row, lastVisit: warehouseLogDate(row.lastVisit) });
+                  else if (item.section === 'pages') await emit(row);
+                  else throw new Error('warehouse-overview-section-invalid');
+                }
+              },
+              currentAnalyticsSignal(),
+            );
+            if (!summarySeen) throw new Error('warehouse-overview-summary-missing');
+          })
+        : undefined;
     const pageData =
       p.resource !== 'human/sources'
         ? await buildWarehouseBrowserPages(
@@ -320,6 +366,10 @@ export async function prepareWarehouseBrowserPageReport(
             p,
             emit => streamBrowser(site, start, end, p.timezone, pageTail, emit),
             async emit => {
+              if (overviewPages) {
+                for await (const row of overviewPages.iterate()) await emit(row);
+                return;
+              }
               const spec = await warehouseLogQuerySpec(
                 start,
                 end,
@@ -337,11 +387,12 @@ export async function prepareWarehouseBrowserPageReport(
                 async batch => {
                   for (const row of warehouseNumbers(batch)) await emit(row);
                 },
-                currentCacheContext()?.request?.signal,
+                currentAnalyticsSignal(),
               );
             },
           )
         : undefined;
+    await overviewPages?.remove();
     const previousStart = new Date(Math.max(0, +start - (+end - +start + 1))),
       previousEnd = new Date(+start - 1);
     const sources =
