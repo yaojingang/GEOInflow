@@ -1,0 +1,22 @@
+services:
+  app:
+    networks:
+      - default
+      - traefik
+    environment:
+      LIEKAN_PUBLIC_URL: https://${GEOINFLOW_DOMAIN:?GEOINFLOW_DOMAIN required for Traefik deployment}
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik
+      - traefik.http.routers.geoinflow.rule=Host(`${GEOINFLOW_DOMAIN:?GEOINFLOW_DOMAIN required for Traefik deployment}`)
+      - traefik.http.routers.geoinflow.entrypoints=websecure
+      - traefik.http.routers.geoinflow.tls=true
+      - traefik.http.routers.geoinflow.tls.certresolver=letsencrypt
+      - traefik.http.routers.geoinflow.service=geoinflow
+      - traefik.http.services.geoinflow.loadbalancer.server.port=3000
+  log-worker:
+    environment:
+      LIEKAN_PUBLIC_URL: https://${GEOINFLOW_DOMAIN:?GEOINFLOW_DOMAIN required for Traefik deployment}
+networks:
+  traefik:
+    external: true

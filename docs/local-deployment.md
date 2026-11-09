@@ -6,6 +6,14 @@
 
 安装并启动 Docker 与 Docker Compose 后，在项目根目录运行 `sh scripts/liekan-deploy.sh`。服务器无需安装 Node.js 或 pnpm，镜像内使用固定版本完成构建。首次运行生成权限为 0600 的 `.env`，分别创建独立随机数据库密码、应用密钥和 2FA 密钥；配置与密钥不会打印。随后构建镜像、启动服务并等待健康检查。应用默认绑定 `127.0.0.1:3002`，公网通过反向代理配置域名与 HTTPS。
 
+### 使用现有 Traefik 发布公网域名
+
+目标机器已有名为 `traefik` 的外部 Docker 网络、`websecure` 入口和 `letsencrypt` 证书解析器时，在 GEOInflow 项目自己的 `.env` 中填写 `GEOINFLOW_DOMAIN=stats.example.com`（替换成实际域名，不含协议或路径），再运行 `sh scripts/liekan-deploy.sh --traefik`。也可与 ClickHouse 组合为 `sh scripts/liekan-deploy.sh --with-clickhouse --traefik`。运行前将该域名的 DNS 指向目标机器，确认 Traefik 已在该网络运行。部署脚本会检查网络是否存在；缺少域名时 Compose 会拒绝启动。
+
+`--traefik` 额外加载 `docker-compose.liekan.traefik.yml`，使 `app` 同时加入内部网络与 Traefik 网络，并自动把 `LIEKAN_PUBLIC_URL` 设为 `https://GEOINFLOW_DOMAIN`。只有应用容器加入 Traefik 网络；PostgreSQL、Redis 与后台 worker 不暴露给反向代理。原有 `127.0.0.1:3002` 保留用于服务器本机检查。之后升级同一实例继续使用 `--traefik`。不要以根目录的上游 `docker-compose.yml` 部署 GEOInflow。
+
+验证：`docker compose -f docker-compose.liekan.yml -f docker-compose.liekan.traefik.yml config --quiet`，运行部署脚本后检查 `docker compose -f docker-compose.liekan.yml -f docker-compose.liekan.traefik.yml ps`、`curl -fsS http://127.0.0.1:3002/api/heartbeat` 和 `curl -fsS https://stats.example.com/api/heartbeat`（域名替换成实际值）。Traefik 路由只解决 HTTPS 可达性；访问者 IP 的可信采集仍须按下文“浏览器身份的可信入口”核对代理边界和头覆盖规则，不能仅凭 `--traefik` 启用 `CLIENT_IP_HEADER`。
+
 重复执行保留 `.env` 和已有数据库、账号与自定义密码。检测到既有数据库卷却没有 `.env` 时停止，要求恢复原配置，避免替换旧应用与 2FA 密钥。部署失败保留已生成配置供重试。构建依赖 Docker 镜像源与依赖下载源可达；脚本不会安装或调整宿主机的 Docker、反向代理与网络。
 
 升级时按当前 Compose 项目识别已有数据库与缓存容器，保留其容器、镜像、配置和数据卷。已停止的原容器会先启动并通过健康检查；依赖服务异常时停止应用更新。已有数据库卷且原容器缺失时，在构建前停止，需按原 PostgreSQL 大版本恢复容器。首次安装按 Compose 默认版本创建数据库，缺失的缓存单独创建。应用通过健康检查后更新后台处理服务。直接执行全栈 `docker compose up` 会绕过这些升级保护，请使用上述部署脚本。

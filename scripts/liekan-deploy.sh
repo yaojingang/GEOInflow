@@ -2,19 +2,35 @@
 set -eu
 with_clickhouse=0
 if [ "${1:-}" = '--with-clickhouse' ]; then with_clickhouse=1; shift; fi
+with_traefik=0
+if [ "${1:-}" = '--traefik' ]; then with_traefik=1; shift; fi
 
 if [ "${1:-}" = '--help' ]; then
-  printf '%s\n' '用法：sh scripts/liekan-deploy.sh [--with-clickhouse] [--check]' '需要 Docker 和 Docker Compose，源码构建要求 Docker 至少配置 6 GiB 内存，建议 8 GiB 或以上并预留空闲内存。' '首次生成私有配置，构建并启动GEOInflow；再次运行保留配置与数据。--check 只检查 Docker 和构建内存门槛。' '可选 ClickHouse 使用独立内部服务和数据卷，后台完成同步对账后启用。'
+  printf '%s\n' '用法：sh scripts/liekan-deploy.sh [--with-clickhouse] [--traefik] [--check]' '需要 Docker 和 Docker Compose，源码构建要求 Docker 至少配置 6 GiB 内存，建议 8 GiB 或以上并预留空闲内存。' '首次生成私有配置，构建并启动GEOInflow；再次运行保留配置与数据。--check 只检查 Docker 和构建内存门槛。' '--traefik 使用现有外部 traefik 网络和 GEOINFLOW_DOMAIN HTTPS 路由。'
   exit 0
 fi
 check_only=0
 if [ "$#" -eq 1 ] && [ "$1" = '--check' ]; then
   check_only=1
 elif [ "$#" -ne 0 ]; then
-  printf '%s\n' '用法：sh scripts/liekan-deploy.sh [--with-clickhouse] [--check]' >&2
+  printf '%s\n' '用法：sh scripts/liekan-deploy.sh [--with-clickhouse] [--traefik] [--check]' >&2
   exit 1
 fi
 cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+base_compose() {
+  if [ "$with_traefik" -eq 1 ]; then
+    docker compose -f docker-compose.liekan.yml -f docker-compose.liekan.traefik.yml "$@"
+  else
+    docker compose -f docker-compose.liekan.yml "$@"
+  fi
+}
+clickhouse_compose() {
+  if [ "$with_traefik" -eq 1 ]; then
+    docker compose -f docker-compose.liekan.yml -f docker-compose.liekan.traefik.yml -f docker-compose.liekan-clickhouse.yml "$@"
+  else
+    docker compose -f docker-compose.liekan.yml -f docker-compose.liekan-clickhouse.yml "$@"
+  fi
+}
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
   printf '%s\n' '请先安装并启动 Docker 和 Docker Compose。' >&2
   exit 1
@@ -112,8 +128,14 @@ EOF
   printf '%s\n' '首次安装配置已生成并保存在私有 .env 中。'
 fi
 
-docker compose -f docker-compose.liekan.yml config --quiet
-compose_configuration=$(docker compose -f docker-compose.liekan.yml config --format yaml)
+if [ "$with_traefik" -eq 1 ]; then
+  if ! docker network inspect traefik >/dev/null 2>&1; then
+    printf '%s\n' '未找到外部 Docker 网络 traefik，请先在目标机器创建或恢复现有 Traefik 网络。' >&2
+    exit 1
+  fi
+fi
+base_compose config --quiet
+compose_configuration=$(base_compose config --format yaml)
 compose_project=$(printf '%s\n' "$compose_configuration" | awk '/^name: / { sub(/^name: /, ""); print; exit }' | tr -d "\"'")
 application_image=$(printf '%s\n' "$compose_configuration" | awk '
   /^services:$/ { in_services=1; next }
@@ -142,8 +164,8 @@ case "$application_image" in
     exit 1
     ;;
 esac
-database_container=$(docker compose -f docker-compose.liekan.yml ps --all --quiet db)
-cache_container=$(docker compose -f docker-compose.liekan.yml ps --all --quiet analytics-cache)
+database_container=$(base_compose ps --all --quiet db)
+cache_container=$(base_compose ps --all --quiet analytics-cache)
 for container_id in "$database_container" "$cache_container"; do
   case "$container_id" in
     *[!a-zA-Z0-9_.-]*)
@@ -220,8 +242,8 @@ if [ "$with_clickhouse" = 1 ] || grep -Eq '^LIEKAN_ANALYTICS_CLICKHOUSE_URL=http
     temporary=''
     unset clickhouse_password
   fi
-  docker compose -f docker-compose.liekan.yml -f docker-compose.liekan-clickhouse.yml config --quiet
-  clickhouse_container=$(docker compose -f docker-compose.liekan.yml -f docker-compose.liekan-clickhouse.yml ps --all --quiet analytics-clickhouse)
+  clickhouse_compose config --quiet
+  clickhouse_container=$(clickhouse_compose ps --all --quiet analytics-clickhouse)
   case "$clickhouse_container" in *[!a-zA-Z0-9_.-]*) printf '%s\n' 'ClickHouse 容器无法识别，部署已停止。' >&2; exit 1 ;; esac
   if [ -n "$clickhouse_container" ]; then
     start_existing_dependency 'ClickHouse' "$clickhouse_container"
@@ -229,7 +251,7 @@ if [ "$with_clickhouse" = 1 ] || grep -Eq '^LIEKAN_ANALYTICS_CLICKHOUSE_URL=http
     printf '%s\n' '发现 ClickHouse 数据卷，但原容器缺失。请先恢复原容器并检查数据。' >&2
     exit 1
   else
-    docker compose -f docker-compose.liekan.yml -f docker-compose.liekan-clickhouse.yml up -d --no-deps --wait --wait-timeout 300 analytics-clickhouse
+    clickhouse_compose up -d --no-deps --wait --wait-timeout 300 analytics-clickhouse
   fi
 fi
 
@@ -279,7 +301,13 @@ services:
         io.liekan.source.state: "$source_state"
         io.liekan.source.difference: "$source_difference"
 EOF
-candidate_compose() { docker compose -f docker-compose.liekan.yml -f "$candidate_override" "$@"; }
+candidate_compose() {
+  if [ "$with_traefik" -eq 1 ]; then
+    docker compose -f docker-compose.liekan.yml -f docker-compose.liekan.traefik.yml -f "$candidate_override" "$@"
+  else
+    docker compose -f docker-compose.liekan.yml -f "$candidate_override" "$@"
+  fi
+}
 candidate_compose build --build-arg "LIEKAN_REVISION=$source_revision" app
 candidate_image=$(docker image inspect --format '{{.Id}}' "$candidate_tag")
 case "$candidate_image" in
@@ -354,14 +382,14 @@ stop_candidate_workers() {
 if [ -n "$database_container" ]; then
   start_existing_dependency '数据库' "$database_container"
 else
-  docker compose -f docker-compose.liekan.yml up -d --no-build --no-deps --wait --wait-timeout 300 db
+  base_compose up -d --no-build --no-deps --wait --wait-timeout 300 db
 fi
 if [ -n "$cache_container" ]; then
   start_existing_dependency '缓存' "$cache_container"
 else
-  docker compose -f docker-compose.liekan.yml up -d --no-build --no-deps --wait --wait-timeout 300 analytics-cache
+  base_compose up -d --no-build --no-deps --wait --wait-timeout 300 analytics-cache
 fi
-docker compose -f docker-compose.liekan.yml stop log-worker analytics-worker
+base_compose stop log-worker analytics-worker
 workers_stopped=1
 trap 'stop_candidate_workers; exit 130' INT
 trap 'stop_candidate_workers; exit 143' TERM HUP
