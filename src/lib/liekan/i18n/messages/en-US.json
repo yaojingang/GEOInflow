@@ -4949,6 +4949,7 @@
   "m_93a4479fc219": "Calculating statistics. Results will appear automatically.",
   "m_64fb25f68c46": "The last calculation timed out. A scheduled retry is in progress.",
   "m_b4dc4e200b77": "Statistics are queued. The status will update automatically.",
+  "m_73c733a24f3c": "Data through {v0}",
   "m_be53c055d4d7": "Data through {v0}. Updates are checked every 30 seconds.",
   "m_7a48adabdd3e": "Statistics could not finish. Retry manually, or wait for the data or accelerated coverage to change.",
   "m_d129981d8a96": "Statistics are temporarily unavailable. A retry is scheduled; you can also retry manually.",

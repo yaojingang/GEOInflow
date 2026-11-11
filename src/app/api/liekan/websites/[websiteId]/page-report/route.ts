@@ -6,6 +6,11 @@ import { requestApi } from '@/lib/liekan/http';
 import { readPageReport } from '@/lib/liekan/upstream/page-report';
 import { authorize } from '@/lib/liekan/upstream/server';
 import { noteCacheResult } from '@/lib/liekan/upstream/cache-context';
+import { warehouseEnabled } from '@/lib/liekan/warehouse/authority-routing';
+import {
+  requestWarehouseOverview,
+  warehouseOverviewAsyncRequested,
+} from '@/lib/liekan/upstream/warehouse-overview-snapshots';
 import {
   captureReportTimings,
   reportServerTiming,
@@ -25,16 +30,18 @@ export async function GET(
     request,
     async () => {
       const { websiteId } = await params;
+      const query = new URL(request.url).searchParams;
       if (
         analysisAsyncRequested(request, 'feature:page-report') &&
-        !['logs', 'human/keywords'].includes(new URL(request.url).searchParams.get('resource'))
+        !['logs', 'human/keywords'].includes(query.get('resource'))
       )
         return asyncAnalysisResponse(request, websiteId, 'feature:page-report');
       const authStart = performance.now();
       const access = await authorize(request, websiteId).finally(() => {
         authMs = performance.now() - authStart;
       });
-      const query = new URL(request.url).searchParams;
+      if (warehouseEnabled() && warehouseOverviewAsyncRequested(request, query))
+        return requestWarehouseOverview(access, Object.fromEntries(query));
       const reportStart = performance.now();
       const result = await captureReportTimings(
         () =>

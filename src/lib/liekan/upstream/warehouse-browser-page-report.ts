@@ -13,7 +13,12 @@ import { getLogFacts } from './logs';
 import { humanPathFromEncoded } from './paths';
 import { warehouseBrowserParameters, warehouseVisitsSQL } from './warehouse-browser-queries';
 import { type EvidenceProducer, WarehouseEvidenceSpool } from './warehouse-evidence-spool';
-import { warehouseLogDate, warehouseLogQuerySpec, warehouseNumbers } from './warehouse-log-queries';
+import {
+  warehouseLogDate,
+  warehouseLogQuerySpec,
+  warehouseLogWindowHasFacts,
+  warehouseNumbers,
+} from './warehouse-log-queries';
 import {
   warehouseReportQuery,
   warehouseReportStream,
@@ -280,6 +285,19 @@ export async function prepareWarehouseBrowserPageReport(
     p.timezone,
     parts.human.filter(field => !skipped.has(field)) as readonly HumanFact[],
   );
+  const population = human.totals.population;
+  // The observed population includes every event eligible for the qualified
+  // visit streams. Only a proved empty, identical window can skip those reads.
+  const emptyBrowserWindow =
+    p.resource === 'overview' &&
+    population?.resourceId === site &&
+    population.identity.eligibleEvents === 0 &&
+    population.range.startAt === +start &&
+    population.range.endAt === +end &&
+    population.range.timezone === p.timezone &&
+    !population.range.endExclusive;
+  const streamCurrentBrowser = (sql: string, emit: (row: any) => Promise<void>) =>
+    emptyBrowserWindow ? Promise.resolve() : streamBrowser(site, start, end, p.timezone, sql, emit);
   const logs = await getLogFacts(
     site,
     start,
@@ -325,6 +343,18 @@ export async function prepareWarehouseBrowserPageReport(
     const overviewPages =
       p.resource === 'overview'
         ? await spool.write<any>(async emit => {
+            if (!(await warehouseLogWindowHasFacts(site, start, end, range.halfOpen))) {
+              logs.summary = {
+                requests: 0,
+                ai: 0,
+                pages: 0,
+                abnormal: 0,
+                classificationVersions: 0,
+                legacyRequests: 0,
+                unclassifiedRequests: 0,
+              };
+              return;
+            }
             const spec = await warehouseLogQuerySpec(
               start,
               end,
@@ -364,7 +394,7 @@ export async function prepareWarehouseBrowserPageReport(
         ? await buildWarehouseBrowserPages(
             spool,
             p,
-            emit => streamBrowser(site, start, end, p.timezone, pageTail, emit),
+            emit => streamCurrentBrowser(pageTail, emit),
             async emit => {
               if (overviewPages) {
                 for await (const row of overviewPages.iterate()) await emit(row);
@@ -400,7 +430,7 @@ export async function prepareWarehouseBrowserPageReport(
         ? await buildWarehouseBrowserSources(
             spool,
             p,
-            emit => streamBrowser(site, start, end, p.timezone, sourceTail, emit),
+            emit => streamCurrentBrowser(sourceTail, emit),
             emit =>
               p.resource === 'human/sources'
                 ? streamBrowser(site, previousStart, previousEnd, p.timezone, sourceTail, emit)

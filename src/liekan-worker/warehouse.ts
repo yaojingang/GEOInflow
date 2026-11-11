@@ -75,6 +75,8 @@ let closing = false,
   checking: Promise<void> | undefined;
 async function health() {
   try {
+    // Keep the consumer stopped until the claim guard migration is available.
+    await runtime.db.read('SELECT 1 FROM liekan_warehouse_claim_guard LIMIT 1');
     await runtime.queue.assertIdentity();
     await supervisor.refresh();
     const mode = supervisor.authority;
@@ -82,7 +84,6 @@ async function health() {
       await recoverWarehouseTasks(runtime);
     }
     if (mode === 'clickhouse' || mode === 'postgres') await recoverWarehouseDeletions(runtime);
-    await runtime.db.read('SELECT 1');
     if (mode === 'clickhouse') {
       const ping = await runtime.ch.ping();
       if (!ping.success) throw new Error('warehouse-unavailable');

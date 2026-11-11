@@ -74,6 +74,44 @@ export class ControlDatabase {
     }
   }
 
+  async withAdvisoryLock<T>(
+    namespace: number,
+    key: number,
+    work: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T | undefined> {
+    const client = await this.pool.connect().catch(error => {
+      throw controlFailure(error) ?? error;
+    });
+    const lost = new AbortController();
+    const onError = (error: Error) => lost.abort(controlFailure(error) ?? error);
+    client.on('error', onError);
+    let discard = true;
+    try {
+      const {
+        rows: [lock],
+      } = await client.query('SELECT pg_try_advisory_lock($1,$2) AS acquired', [namespace, key]);
+      if (!lock.acquired) {
+        discard = false;
+        return;
+      }
+      try {
+        return await work(lost.signal);
+      } finally {
+        if (!lost.signal.aborted) {
+          const {
+            rows: [lock],
+          } = await client.query('SELECT pg_advisory_unlock($1,$2) AS released', [namespace, key]);
+          discard = !lock.released;
+        }
+      }
+    } catch (error) {
+      throw controlFailure(error) ?? error;
+    } finally {
+      client.release(discard || lost.signal.aborted);
+      client.off('error', onError);
+    }
+  }
+
   async transaction<T>(work: (tx: ControlSQL) => Promise<T>): Promise<T> {
     const client = await this.pool.connect().catch(error => {
       throw controlFailure(error) ?? error;

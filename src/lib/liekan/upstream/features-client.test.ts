@@ -18,6 +18,38 @@ import {
 } from './features-client';
 import { freshnessExpiry, withClientFreshness } from './client-freshness';
 
+it('waits for a scheduled overview by rereading the same report', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+  const fetcher = vi
+    .fn()
+    .mockResolvedValueOnce(
+      Response.json(
+        { status: 'scheduled' },
+        { status: 202, headers: { 'X-Liekan-Read-Path': 'scheduled', 'Retry-After': '5' } },
+      ),
+    )
+    .mockResolvedValueOnce(Response.json({ report: 'published' }));
+  vi.stubGlobal('fetch', fetcher);
+  try {
+    const pending = featureApi.get(
+      '/liekan/websites/11111111-1111-4111-8111-111111111111/page-report',
+      { resource: 'overview', startAt: 1, endAt: 2, refresh: '1' },
+    );
+    const checked = expect(pending).resolves.toEqual({ report: 'published' });
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await checked;
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[1][0].href).toBe(fetcher.mock.calls[0][0].href);
+    expect(fetcher.mock.calls.map(([, init]) => init.method)).toEqual(['GET', 'GET']);
+  } finally {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  }
+});
+
 it.each([true, false])(
   'resumes an idle handle once and bounds rapid repeated idle failures: %s',
   async success => {

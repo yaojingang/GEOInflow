@@ -110,5 +110,7 @@
   "067_robots_management.sql": "a25cd64b9bd54816de76acf14dbbc77d61a2b30e762c2fb1b61ab4497634e34a",
   "068_optional_analytics_engine.sql": "50af561c083939236cda8f3a3c23678325d977b48ede8e26dc53571a311b94f1",
   "069_report_fragments.sql": "2fec0a333e012cec6106ca0de8f944edb9bae68cfd4c7db44c775d3cb9f9f2b9",
-  "070_analytics_input_summary.sql": "5d16b0660ecb38480a4d443a46840d546585e1d0f356668071dee5df474eb5e0"
+  "070_analytics_input_summary.sql": "5d16b0660ecb38480a4d443a46840d546585e1d0f356668071dee5df474eb5e0",
+  "092_warehouse_overview_snapshots.sql": "2a1327a138592b4de0c2406f4c22e1255916ff64e67b5215e2da79716c76e22d",
+  "093_warehouse_claim_guard.sql": "aa93c91e421678d02941c7c919bc20dfc22257cf2f2a7484ea2f84050a790df7"
 }

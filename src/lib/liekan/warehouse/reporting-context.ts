@@ -8,7 +8,17 @@ export async function readReportingMetadata(
   db: Pick<ControlDatabase, 'read'>,
   websiteId: string,
 ): Promise<ReportingMetadata> {
-  const [row] = await db.read<{
+  const [metadata] = await readReportingMetadataForSites(db, [websiteId]);
+  if (!metadata) throw new WarehouseConflict('warehouse-report-boundary-unavailable');
+  return metadata;
+}
+
+export async function readReportingMetadataForSites(
+  db: Pick<ControlDatabase, 'read'>,
+  websiteIds: string[],
+): Promise<ReportingMetadata[]> {
+  const rows = await db.read<{
+    website_id: string;
     epoch: string;
     publication: string;
     deletion_revision: string;
@@ -26,7 +36,7 @@ export async function readReportingMetadata(
     repair_generation: string | null;
     exclusions: string[];
   }>(
-    `SELECT s.epoch::text,s.publication::text,s.deletion_revision::text,s.resource_type,s.catalog_revision::text,coalesce(to_jsonb(s)->>'bookmark_revision','0') AS bookmark_revision,
+    `SELECT s.website_id,s.epoch::text,s.publication::text,s.deletion_revision::text,s.resource_type,s.catalog_revision::text,coalesce(to_jsonb(s)->>'bookmark_revision','0') AS bookmark_revision,
     concat_ws(':',coalesce(p.revision,0),coalesce(ls.policy_revision,0),coalesce(r.active_revision,0),coalesce((SELECT revision FROM liekan_traffic_governance g WHERE g.website_id=s.website_id),0)) AS control_revision,
     jsonb_build_object('resourceKind',s.resource_type,'policyRevision',coalesce(p.revision,0)::text,'epoch',coalesce(ls.epoch,1)::text,
       'historyActiveGeneration',r.active_generation,'historyRevision',coalesce(r.active_revision,0)::text,
@@ -42,16 +52,15 @@ export async function readReportingMetadata(
     FROM liekan_warehouse_site s LEFT JOIN liekan_collection_policy p ON p.website_id=s.website_id
     LEFT JOIN liekan_log_state ls ON ls.website_id=s.website_id
     LEFT JOIN liekan_history_repair_run r ON r.website_id=s.website_id AND r.campaign_id='traffic-quality-repair-20261022-v1'
-    WHERE s.website_id=$1::uuid AND s.state='active' AND (
+    WHERE s.website_id=ANY($1::uuid[]) AND s.state='active' AND (
       (s.resource_type='website' AND EXISTS(SELECT 1 FROM website WHERE website_id=s.website_id AND deleted_at IS NULL)) OR
       (s.resource_type='link' AND EXISTS(SELECT 1 FROM link WHERE link_id=s.website_id AND deleted_at IS NULL)) OR
       (s.resource_type='pixel' AND EXISTS(SELECT 1 FROM pixel WHERE pixel_id=s.website_id AND deleted_at IS NULL)))`,
-    [websiteId],
+    [websiteIds],
   );
-  if (!row) throw new WarehouseConflict('warehouse-report-boundary-unavailable');
-  return {
+  return rows.map(row => ({
     boundary: {
-      websiteId,
+      websiteId: row.website_id,
       epoch: row.epoch,
       publication: row.publication,
       deletionRevision: row.deletion_revision,
@@ -69,5 +78,5 @@ export async function readReportingMetadata(
     repairRunId: row.repair_run_id,
     repairGeneration: row.repair_generation,
     exclusions: row.exclusions,
-  };
+  }));
 }

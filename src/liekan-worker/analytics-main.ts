@@ -42,6 +42,7 @@ import {
 } from '../lib/liekan/warehouse/authority-routing';
 import { pumpStorageRetention } from '../lib/liekan/upstream/storage-retention';
 import { maintainAnalyticsInputSummaries } from '../lib/liekan/upstream/analytics-input-summary';
+import { drainWarehouseOverview } from '../lib/liekan/upstream/warehouse-overview-snapshots';
 
 const boss = new PgBoss({
   connectionString: process.env.DATABASE_URL,
@@ -52,29 +53,29 @@ const boss = new PgBoss({
   supervise: true,
 });
 boss.on('error', () => console.error('Liekan analytics queue unavailable'));
-let stopped = false,
-  pumping = false;
+let stopped = false;
+const shutdown = new AbortController();
+let pumping: Promise<void> | undefined;
 async function pump() {
-  return withinWarehouseAuthority(pumpSelected).catch(() => {});
+  if (stopped || pumping) return;
+  pumping = withinWarehouseAuthority(pumpSelected)
+    .catch(() => console.info('analytics_maintenance_deferred'))
+    .finally(() => {
+      pumping = undefined;
+    });
 }
 async function pumpSelected() {
-  if (stopped || pumping || warehouseEnabled()) return;
-  pumping = true;
-  try {
-    await pumpAnalysisQueries(boss);
-    await bootstrapAnalysisHistory();
-    await pumpAnalysisQueries(boss);
-    await reconcileAnalysisRollups();
-    await pumpDashboardDemand(() => pumpAnalysisQueries(boss));
-    await pumpAnalysisQueries(boss);
-    await pumpAnalysisBuilds(boss);
-    await pumpAnalyticsHot(boss, readAnalyticsHotStrongVersion);
-    await maintainAnalyticsInputSummaries();
-  } catch {
-    /* A maintenance failure leaves persistent hot demand for the next pass. */
-  } finally {
-    pumping = false;
-  }
+  if (stopped) return;
+  if (warehouseEnabled()) return drainWarehouseOverview(shutdown.signal);
+  await pumpAnalysisQueries(boss);
+  await bootstrapAnalysisHistory();
+  await pumpAnalysisQueries(boss);
+  await reconcileAnalysisRollups();
+  await pumpDashboardDemand(() => pumpAnalysisQueries(boss));
+  await pumpAnalysisQueries(boss);
+  await pumpAnalysisBuilds(boss);
+  await pumpAnalyticsHot(boss, readAnalyticsHotStrongVersion);
+  await maintainAnalyticsInputSummaries();
 }
 await boss.start();
 let storageScheduledAt = Date.now();
@@ -160,12 +161,14 @@ for (const signal of ['SIGINT', 'SIGTERM'])
   process.on(signal, async () => {
     if (stopped) return;
     stopped = true;
+    shutdown.abort();
     clearInterval(maintenance);
     clearInterval(engineMaintenance);
     clearInterval(geoMaintenance);
     clearInterval(heartbeat);
     clearInterval(storageMaintenance);
     await boss.stop({ graceful: true });
+    await pumping;
     analyticsRedis.close();
     await Promise.all([closeWarehouseProcessResources(), closeQueue()]);
     await prisma.client.$disconnect();

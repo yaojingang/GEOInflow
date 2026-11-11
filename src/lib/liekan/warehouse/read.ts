@@ -36,6 +36,9 @@ export type FactReadOptions = {
   recordKeysParameter?: string;
   sessionIdsParameter?: string;
   immutableTimeWindow?: { start: string; end: string; endExclusive?: boolean };
+  // Log ingestion deduplicates IDs instead of changing their event time. Use
+  // their physical day/key order for version aggregation in large overviews.
+  orderedLogVersions?: true;
   // GEO needs small, nullable evidence fields, not the complete proof documents
   // in each latest-version aggregate and join. No evidence-time filter is added.
   geoEvidence?: true;
@@ -47,6 +50,8 @@ export type FactReadOptions = {
   }[];
 };
 export function factRelation(name: string, options: FactReadOptions = {}): string {
+  if (options.orderedLogVersions && (name !== 'liekan_log' || !options.immutableTimeWindow))
+    throw new Error('Invalid warehouse ordered log read');
   if (options.sessionIdsParameter && !/^[a-z][a-zA-Z0-9_]*$/.test(options.sessionIdsParameter))
     throw new Error('Invalid warehouse session parameter');
   if (options.recordKeysParameter && !/^[a-z][a-zA-Z0-9_]*$/.test(options.recordKeysParameter))
@@ -232,7 +237,7 @@ export function factRelation(name: string, options: FactReadOptions = {}): strin
   return `(
     SELECT ${selected}
     FROM (
-      SELECT ${keys.map(identifier).join(', ')}, ${
+      SELECT ${keys.map(key => (options.orderedLogVersions ? `any(${identifier(key)}) AS ${identifier(key)}` : identifier(key))).join(', ')}, ${
         options.columns
           ? `argMax(tuple(${values.map(column => expressions[column] ?? identifier(column)).join(', ')}),tuple(_version,_ordinal)) AS latest_values`
           : values
@@ -269,7 +274,7 @@ export function factRelation(name: string, options: FactReadOptions = {}): strin
             FROM warehouse_deletion
             WHERE website_id = {wh_site:UUID} AND epoch = {wh_epoch:UInt64}
               AND revision <= {wh_deletion:UInt64}))
-      GROUP BY ${keys.map(identifier).join(', ')}
+      GROUP BY ${options.orderedLogVersions ? 'toDate32(_record_time),_record_key' : keys.map(identifier).join(', ')}
     )
     WHERE NOT ${latest('_deleted')}
   )`;

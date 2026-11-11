@@ -96,6 +96,12 @@ try {
     ownerId = randomUUID(),
     topic = original.topic_id;
   await c.query('INSERT INTO liekan_warehouse_site(website_id) VALUES($1)', [site]);
+  await db.transaction(async tx => {
+    await tx.query(await readFile('db/liekan/migrations/093_warehouse_claim_guard.sql', 'utf8'));
+  });
+  assert.deepEqual((await c.query('SELECT website_id FROM liekan_warehouse_claim_guard')).rows, [
+    { website_id: site },
+  ]);
   await c.query(
     `INSERT INTO liekan_warehouse_partition(topic_id,partition,owner_id,generation,lease_until) VALUES($1,0,$2,1,now()+interval '1 hour')`,
     [topic, ownerId],
@@ -126,6 +132,34 @@ try {
   await other.query('ROLLBACK');
   report.cases.push({
     name: 'Discovery, decision and confirmation coexist with upload FK locks',
+    status: 'pass',
+  });
+  await control.discover(
+    owner,
+    [
+      {
+        offset: '60001',
+        inputId: randomUUID(),
+        websiteId: site,
+        sessionId: null,
+        identityKey: 'claim-guard-probe',
+      },
+    ],
+    '60001',
+  );
+  await other.query('BEGIN');
+  try {
+    await other.query('UPDATE liekan_warehouse_site SET version=version WHERE website_id=$1', [
+      site,
+    ]);
+    const independent = await control.intent(owner, site, ['60001'], 'a'.repeat(64));
+    assert.equal(independent.status, 'intent');
+    await control.abort(owner, independent.attempt_id);
+  } finally {
+    await other.query('ROLLBACK');
+  }
+  report.cases.push({
+    name: 'Incremental claim guard backfills existing sites and claims coexist with counter writes',
     status: 'pass',
   });
   await c.query('BEGIN');
@@ -235,12 +269,22 @@ try {
       id,
       kind,
     ]);
+    assert.equal(
+      (await c.query('SELECT 1 FROM liekan_warehouse_claim_guard WHERE website_id=$1', [id]))
+        .rowCount,
+      1,
+    );
     await c.query(
       `INSERT INTO liekan_warehouse_publication(operation_id,website_id,epoch,publication,manifest,manifest_digest,status) VALUES($1,$2,0,1,'[]',$3,'published')`,
       [randomUUID(), id, 'b'.repeat(64)],
     );
     assert.equal((await c.query('SELECT 1 FROM website WHERE website_id=$1', [id])).rowCount, 0);
     await c.query('DELETE FROM liekan_warehouse_site WHERE website_id=$1', [id]);
+    assert.equal(
+      (await c.query('SELECT 1 FROM liekan_warehouse_claim_guard WHERE website_id=$1', [id]))
+        .rowCount,
+      0,
+    );
     assert.equal(
       (await c.query('SELECT 1 FROM liekan_warehouse_publication WHERE website_id=$1', [id]))
         .rowCount,

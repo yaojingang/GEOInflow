@@ -317,8 +317,22 @@ export class WarehouseControl {
           throw new WarehouseConflict('warehouse-attempt-conflict');
         return attempt;
       }
+      // Take the attempt foreign key's lock before the lifecycle guard. It is
+      // compatible with the ordinary confirmation and publication counter writes.
+      const siteKey = await tx.query(
+        'SELECT website_id FROM liekan_warehouse_site WHERE website_id=$1::uuid FOR KEY SHARE',
+        [websiteId],
+      );
+      if (!siteKey.rowCount) throw new WarehouseConflict('warehouse-site-frozen');
+      const guard = await tx.query(
+        'SELECT website_id FROM liekan_warehouse_claim_guard WHERE website_id=$1::uuid FOR SHARE',
+        [websiteId],
+      );
+      if (!guard.rowCount) throw new WarehouseConflict('warehouse-claim-guard-missing');
+      // Take the state snapshot after acquiring the guard, in case it waited for
+      // a deletion or policy change to commit.
       const { rows: sites } = await tx.query<SiteState>(
-        'SELECT * FROM liekan_warehouse_site WHERE website_id=$1::uuid FOR NO KEY UPDATE',
+        'SELECT * FROM liekan_warehouse_site WHERE website_id=$1::uuid',
         [websiteId],
       );
       const site = sites[0];
@@ -344,7 +358,7 @@ export class WarehouseControl {
       const busy = await tx.query(
         // Materialize one active-key summary. With stale idle-queue statistics,
         // correlated probes can scan all pending work once per selected key,
-        // holding the site's publication lock until the statement times out.
+        // holding the partition and claim guard until the statement times out.
         // The keys and offsets come from the same already-locked rows, and the
         // topic-wide scope preserves ordering across partitions.
         `WITH active AS MATERIALIZED (

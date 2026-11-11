@@ -27,6 +27,25 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
 });
+it('reads a shared overview job without releasing it for other viewers', async () => {
+  const overview = {
+    ...job,
+    resultUrl: `/liekan/websites/${site}/overview-jobs/${id}/result`,
+  };
+  const fetchJob = vi
+    .fn()
+    .mockResolvedValueOnce(Response.json({ analysisJob: { ...overview, status: 'ready' } }))
+    .mockResolvedValueOnce(Response.json({ pageviews: 12 }));
+  const releaseJob = vi.fn();
+  const pending = followAnalysisJob({ analysisJob: overview }, { fetchJob, releaseJob });
+  await vi.advanceTimersByTimeAsync(3000);
+  await expect(pending).resolves.toMatchObject({ data: { pageviews: 12 } });
+  expect(fetchJob.mock.calls.map(([path]) => path)).toEqual([
+    overview.resultUrl.replace(/\/result$/, ''),
+    overview.resultUrl,
+  ]);
+  expect(releaseJob).not.toHaveBeenCalled();
+});
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();

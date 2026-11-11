@@ -181,7 +181,7 @@ async function compare(
     assert.deepEqual(
       reused.filter(row => row.section === key).map(row => JSON.parse(row.row)),
       await query(spec.statements[key]),
-      `${name}: materialized ${key} preserves values and ordering`,
+      `${name}: single-scan ${key} preserves values and ordering`,
     );
   }
   checks.push({ name, status: 'pass' });
@@ -218,6 +218,13 @@ try {
     });
   }
   await put('liekan_log', { ...baseLog, id: 'unpublished', path: '/unpublished' }, false);
+  // A retried physical write must not count twice; an unpublished newer
+  // candidate must not replace the accepted identity in the ordered reader.
+  await ch.command({
+    query:
+      "INSERT INTO warehouse_liekan_log SELECT * FROM warehouse_liekan_log WHERE id='known' LIMIT 1",
+  });
+  await put('liekan_log', { ...baseLog, id: 'known', bot: 'Unpublished replacement' }, false);
   await put('liekan_log', { ...baseLog, id: 'deleted', path: '/deleted' });
   await put('liekan_log', { ...baseLog, id: 'deleted', path: '/deleted' }, true, true);
   await put('liekan_history_repair_result', {
@@ -237,7 +244,7 @@ try {
     created_at: '2026-11-04T00:00:00Z',
   });
   const legacy = await compare(
-    'mixed identities, late evidence, repair, unpublished rows and tombstones',
+    'mixed identities, late evidence, repair, retries, unpublished replacements and tombstones',
   );
   assert.equal(legacy.summary[0].requests, '8'); // Unselected automatic source is excluded.
   assert.equal(legacy.summary[0].unclassifiedRequests, '3');

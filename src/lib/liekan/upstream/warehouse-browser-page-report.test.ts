@@ -14,6 +14,7 @@ vi.mock('./warehouse-report-snapshot', () => ({
   warehouseReportStream: vi.fn(),
   warehouseReportQuery: vi.fn(),
   warehouseReportMetadata: vi.fn(),
+  warehouseReportSignal: vi.fn(),
 }));
 vi.mock('./warehouse-browser-queries', () => ({
   warehouseBrowserParameters: vi.fn(),
@@ -22,13 +23,17 @@ vi.mock('./warehouse-browser-queries', () => ({
 
 import { parseReportQuery } from '../contracts/query';
 import { addReportAiPage, compareReportAiPages } from '../report-log-tables';
+import * as analytics from './analytics';
 import { sourceFacts } from './analytics';
+import { getLogFacts } from './logs';
 import { humanPathFromEncoded } from './paths';
 import {
   buildWarehouseBrowserPages,
   buildWarehouseBrowserSources,
+  prepareWarehouseBrowserPageReport,
 } from './warehouse-browser-page-report';
 import { WarehouseEvidenceSpool } from './warehouse-evidence-spool';
+import { warehouseReportQuery, warehouseReportStream } from './warehouse-report-snapshot';
 
 const params = (extra = {}) =>
   parseReportQuery({
@@ -52,6 +57,34 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   await rm(directory, { recursive: true, force: true });
 });
+
+it.each([0, 1])('reuses evidence only for a proved empty overview visit window (%s)', async n => {
+  const p = params({ resource: 'overview' });
+  vi.spyOn(analytics, 'getHumanFacts').mockResolvedValue({
+    totals: {
+      population: {
+        resourceId: 'site',
+        identity: { eligibleEvents: n, status: n ? 'complete' : 'empty' },
+        range: { startAt: p.startAt, endAt: p.endAt, timezone: p.timezone },
+      },
+    },
+  } as Awaited<ReturnType<typeof analytics.getHumanFacts>>);
+  vi.mocked(getLogFacts).mockResolvedValue({
+    summary: {},
+    bots: [],
+  } as Awaited<ReturnType<typeof getLogFacts>>);
+  vi.mocked(warehouseReportQuery).mockResolvedValue([]);
+  vi.mocked(warehouseReportStream).mockClear();
+  const prepared = await prepareWarehouseBrowserPageReport('site', p);
+  try {
+    expect(warehouseReportStream).toHaveBeenCalledTimes(n ? 2 : 0);
+    expect(prepared.logs.summary.requests).toBe(0);
+    expect(prepared.human.pages).toEqual([]);
+  } finally {
+    await prepared.dispose();
+  }
+});
+
 it('matches complete sourceFacts grouping, weighted duration, evidence union, stable ties and selected previous groups', async () => {
   const raw = [
     {

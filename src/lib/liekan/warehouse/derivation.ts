@@ -64,21 +64,6 @@ export class WarehouseDeriver {
           throw new WarehouseConflict('warehouse-derivation-conflict');
       });
       await this.writer.append(entry.family, groups.get(entry.family));
-      await this.writer.verify(
-        entry.family,
-        attempt.website_id,
-        attempt.epoch,
-        entry.candidateId,
-        Number(entry.rowCount),
-        entry.digest,
-      );
-      await this.db.transaction(tx =>
-        tx.query(
-          `UPDATE liekan_warehouse_candidate SET status='verified',updated_at=clock_timestamp()
-        WHERE candidate_id=$1::uuid AND status='building'`,
-          [entry.candidateId],
-        ),
-      );
     }
     await projectRiskProofs(this.ch, attempt, decisions, manifest);
     await projectLogScopeProofs(this.ch, attempt, decisions, manifest);

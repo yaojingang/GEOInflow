@@ -51,6 +51,7 @@ try {
   for (const table of [
     'installation',
     'site',
+    'claim_guard',
     'partition',
     'attempt',
     'work',
@@ -67,6 +68,7 @@ try {
     ownerId = randomUUID(),
     topic = original.topic_id;
   await c.query('INSERT INTO liekan_warehouse_site(website_id) VALUES($1)', [site]);
+  await c.query('INSERT INTO liekan_warehouse_claim_guard(website_id) VALUES($1)', [site]);
   await c.query(
     `INSERT INTO liekan_warehouse_partition(topic_id,partition,owner_id,generation,lease_until)
     VALUES($1,0,$2,1,now()+interval '1 hour')`,

@@ -21,11 +21,13 @@ import { dashboardClock } from './dashboard-clock';
 import { DASHBOARD_INTERVAL } from './dashboard-snapshot-model';
 import { warehouseEnabled } from '../warehouse/runtime';
 import { withReportFragments } from './report-fragments';
+type PageReportWebsite = { id: string; name: string; domain: string };
 
 async function readPageReportSnapshot(
-  website: { id: string; name: string; domain: string },
+  website: PageReportWebsite,
   input: unknown,
   refresh = false,
+  uncached = false,
 ): Promise<CachedResult<LiekanPageReport>> {
   const parsed = parseReportQuery(input);
   if (!parsed.success) throw new LiekanError('统计参数无效');
@@ -104,7 +106,7 @@ async function readPageReportSnapshot(
       },
     }) as LiekanPageReport;
   };
-  if (!ttl) {
+  if (!ttl || uncached) {
     const value = await load();
     return {
       value,
@@ -137,17 +139,19 @@ async function readPageReportSnapshot(
   return result;
 }
 
-export const readPageReport: typeof readPageReportSnapshot = async (...args) => {
-  const load = () =>
-    warehouseEnabled()
-      ? readPageReportSnapshot(...args)
-      : withReportFragments(args[0].id, () => readPageReportSnapshot(...args));
+export async function readPageReport(website: PageReportWebsite, input: unknown, refresh = false) {
+  const read = () => readPageReportSnapshot(website, input, refresh);
+  const load = () => (warehouseEnabled() ? read() : withReportFragments(website.id, read));
   const result = process.env.CLICKHOUSE_URL ? await load() : await withPublishedRegistry(load);
   // The inner cache bypass owns its context; publish validated evidence to the caller's envelope.
   for (const population of [result.value.meta.population, result.value.meta.trendPopulation])
-    if (population) noteBrowserPopulation(args[0].id, population);
+    if (population) noteBrowserPopulation(website.id, population);
   return result;
-};
+}
+
+export async function computeWarehouseOverview(website: PageReportWebsite, input: unknown) {
+  return (await readPageReportSnapshot(website, input, false, true)).value;
+}
 
 /** A private async request checks the identical cache identity without starting SQL. */
 export async function peekPageReport(website: { id: string }, input: unknown) {

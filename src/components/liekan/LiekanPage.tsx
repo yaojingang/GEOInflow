@@ -935,7 +935,7 @@ export function LiekanPage({ resource }: { resource: Resource }) {
       <div className={styles.analysisTools}>
         {report?.meta.snapshot && (
           <span>
-            {i18n.text('数据截至 {v0}，后台每 30 秒检查更新', [
+            {i18n.text('数据截至 {v0}', [
               new Date(report.meta.snapshot.dataThrough).toLocaleString(i18n.locale, {
                 timeZone: report.range.timezone,
                 hour12: false,

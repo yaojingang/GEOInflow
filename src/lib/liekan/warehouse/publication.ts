@@ -191,6 +191,14 @@ export class WarehousePublisher {
         [websiteId],
       );
       if (pending.rows.length) throw new WarehouseConflict('warehouse-publication-pending');
+      // The readback above is shared by derivation and publication. Advance
+      // candidate state in the same transaction as the durable reservation.
+      await tx.query(
+        `UPDATE liekan_warehouse_candidate SET status='verified',updated_at=clock_timestamp()
+        WHERE candidate_id=ANY($1::uuid[]) AND website_id=$2::uuid AND epoch=$3::bigint
+          AND status='building'`,
+        [entries.map(entry => entry.candidateId), websiteId, epoch],
+      );
       return (
         await tx.query<Publication>(
           `INSERT INTO liekan_warehouse_publication

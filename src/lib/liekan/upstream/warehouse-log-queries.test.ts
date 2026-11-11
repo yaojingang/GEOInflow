@@ -11,8 +11,13 @@ vi.mock('./warehouse-report-snapshot', () => ({
   warehouseReportMetadata: async () => ({ boundary: { epoch: '1', deletionRevision: '0' } }),
   warehouseReportQuery: mocks.query,
 }));
-import { warehouseLogFacts, warehouseLogQuerySpec } from './warehouse-log-queries';
+import {
+  warehouseLogFacts,
+  warehouseLogQuerySpec,
+  warehousePlotLogs,
+} from './warehouse-log-queries';
 import { warehouseGeoWeightAggregate } from './warehouse-geo-weight';
+import { factRelation } from '../warehouse/read';
 
 const start = new Date('2026-11-01T00:00:00Z');
 const end = new Date('2026-11-02T00:00:00Z');
@@ -36,10 +41,47 @@ const bot = {
   lastVisit: '2026-11-01 12:00:00',
 };
 
+it('limits ordered version reads to event-time-bounded logs', () => {
+  expect(() =>
+    factRelation('liekan_crawler_evidence', {
+      orderedLogVersions: true,
+      immutableTimeWindow: { start: 'start', end: 'end' },
+    }),
+  ).toThrow('Invalid warehouse ordered log read');
+  expect(() => factRelation('liekan_log', { orderedLogVersions: true })).toThrow(
+    'Invalid warehouse ordered log read',
+  );
+});
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.query.mockResolvedValue([]);
   mocks.read.mockResolvedValue([]);
+});
+
+it('skips the evidence join for an empty log chart window with the exact endpoint rule', async () => {
+  expect(
+    await warehousePlotLogs('site', start, end, 'UTC', true, {
+      crawlerIdentityScope: 'all',
+      crawlerMetricsVersion: 1,
+    }),
+  ).toEqual([]);
+  expect(mocks.query).toHaveBeenCalledTimes(1);
+  const [, sql] = mocks.query.mock.calls[0];
+  expect(sql).toContain('SELECT 1 AS present FROM warehouse_liekan_log');
+  expect(sql).toContain('toDate32(_record_time) BETWEEN');
+  expect(sql).toContain("_record_time < {logEnd:DateTime64(6,'UTC')}");
+  expect(sql).not.toContain('warehouse_liekan_crawler_evidence');
+});
+
+it('keeps publication and crawler filtering for a log chart with raw input', async () => {
+  const sample = { day: '2026-11-01', bot: 'fixture', type: '搜索', count: 2, aiRequests: 1 };
+  mocks.query.mockResolvedValueOnce([{ present: 1 }]).mockResolvedValueOnce([sample]);
+  expect(await warehousePlotLogs('site', start, end, 'UTC')).toEqual([sample]);
+  expect(mocks.query).toHaveBeenCalledTimes(2);
+  expect(mocks.query.mock.calls[0][1]).toContain("_record_time <= {logEnd:DateTime64(6,'UTC')}");
+  expect(mocks.query.mock.calls[1][1]).toContain('warehouse_publication');
+  expect(mocks.query.mock.calls[1][1]).toContain('GROUP BY day,bot,type');
 });
 
 it('keeps exact aggregates sequential and reads only ranking fields', async () => {
@@ -96,7 +138,7 @@ it('retains product-form filtering and metric boundaries in separate aggregate q
   }
 });
 
-it('computes all overview log groups from a single accepted, narrow relation without grouping sets', async () => {
+it('streams all overview groups from one accepted relation without retaining raw logs', async () => {
   const spec = await warehouseLogQuerySpec(
     start,
     end,
@@ -108,12 +150,17 @@ it('computes all overview log groups from a single accepted, narrow relation wit
     'site',
     true,
   );
-  expect(spec.overview).toContain('overview_logs AS MATERIALIZED');
-  expect(spec.overview).toContain('enable_materialized_cte=1');
+  expect(spec.overview).toContain('ARRAY JOIN arrayFilter');
+  expect(spec.overview).toContain('GROUP BY section,name,vendor,type,botId,path');
+  expect(spec.overview).toContain('countIf(l._present) AS requests');
+  expect(spec.overview).toContain('0 AS _present');
+  expect(spec.overview).toContain('GROUP BY toDate32(_record_time),_record_key');
+  expect(spec.overview).toContain('optimize_aggregation_in_order=1');
+  expect(spec.overview).not.toContain('AS MATERIALIZED');
   expect(spec.overview.match(/FROM "warehouse_liekan_log" AS fact/g)).toHaveLength(1);
   for (const key of ['summary', 'bots', 'pages']) {
-    expect(spec.overview).toContain(`'${key}' AS section`);
-    expect(spec.statements[key]).toContain('FROM overview_logs l');
+    expect(spec.overview).toContain(`'${key}'`);
+    expect(spec.statements[key]).toContain('FROM "warehouse_liekan_log" AS fact');
   }
   expect(spec.overview).toContain("l.user_agent NOT LIKE 'Liekan-Crawler-Check/%'");
   expect(spec.overview).toContain("_record_time < {logEnd:DateTime64(6,'UTC')}");
@@ -122,11 +169,19 @@ it('computes all overview log groups from a single accepted, narrow relation wit
 });
 
 it('evaluates GEO classification once before expanding its overlapping windows', async () => {
-  mocks.query.mockResolvedValueOnce([{ catalogs: [], verifications: [] }]).mockResolvedValueOnce([]);
-  await warehouseGeoWeightAggregate({ query: async () => [], execute: async () => 0 }, 'site', 'fixture.invalid', 'UTC', [
-    { asOf: '2026-11-02', startAt: +start, endAt: +end },
-    { asOf: '2026-11-01', startAt: +start - 86400000, endAt: +end - 86400000 },
-  ]);
+  mocks.query
+    .mockResolvedValueOnce([{ catalogs: [], verifications: [] }])
+    .mockResolvedValueOnce([]);
+  await warehouseGeoWeightAggregate(
+    { query: async () => [], execute: async () => 0 },
+    'site',
+    'fixture.invalid',
+    'UTC',
+    [
+      { asOf: '2026-11-02', startAt: +start, endAt: +end },
+      { asOf: '2026-11-01', startAt: +start - 86400000, endAt: +end - 86400000 },
+    ],
+  );
   expect(mocks.query).toHaveBeenCalledTimes(2);
   const sql = mocks.query.mock.calls[1][1];
   expect(sql).toContain('evaluated_logs AS MATERIALIZED');

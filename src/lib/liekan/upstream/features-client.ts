@@ -5,6 +5,7 @@ import {
   followAnalysisJob,
   waitForAnalysisAdmission,
   waitForAnalysisVisibility,
+  waitForScheduledOverview,
 } from './analysis-query-client';
 import type { QueryClient } from '@tanstack/react-query';
 import { getApiUrl } from '@/lib/api-url';
@@ -207,6 +208,16 @@ export async function featureRequest<T = any>(
       });
     };
     let response = await send();
+    if (
+      attemptHeaders.Prefer === 'respond-async' &&
+      params?.resource === 'overview' &&
+      response.status === 202 &&
+      response.headers.get('X-Liekan-Read-Path') === 'scheduled'
+    ) {
+      response = await waitForScheduledOverview(response, send, retryAfter, requestSignal);
+      if (!response)
+        throw new FeatureApiError('数据仍在读取，请稍后重试', 503, 'warehouse-overview-pending');
+    }
     let data = await response.json().catch(() => null);
     if (
       attemptHeaders.Prefer === 'respond-async' &&
