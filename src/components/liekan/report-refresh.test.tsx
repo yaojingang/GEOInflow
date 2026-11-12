@@ -28,6 +28,7 @@ vi.mock('./LiekanShell', () => ({ useLiekanShell: () => null }));
 vi.mock('./chartRuntime', () => ({ loadEcharts: () => Promise.resolve({}) }));
 vi.mock('./AnalysisLoading', async () => {
   const { useReportActions } = await import('./ReportContext');
+  const { Overview } = await import('./pages/Overview');
   return {
     AnalysisLoading: () => {
       const actions = useReportActions();
@@ -40,6 +41,7 @@ vi.mock('./AnalysisLoading', async () => {
       );
     },
     reportViews: {
+      overview: Overview,
       'ai/overview': ({ report }: any) => <span>{report?.value}</span>,
       'ai/bots': ({ report }: any) => <span>{report?.value}</span>,
       'ai/pages': ({ report }: any) => <span>{report?.value}</span>,
@@ -144,6 +146,80 @@ beforeEach(() => {
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 });
 afterEach(() => client.clear());
+
+it('keeps the overview visible while the TOP table reads its next page', async () => {
+  const first = report('first');
+  const cutoff = first.range.endAt - 3600000;
+  const snapshot = (page: number, path: string) =>
+    freshAggregateFixture({
+      ...first,
+      range: { ...first.range, endAt: cutoff },
+      cards: [{ key: 'requests', label: '今日总请求', value: 8737, state: 'available' }],
+      charts: {},
+      insights: [],
+      tables: { topBody: [{ path, humanPv: 3 }] },
+      meta: {
+        ...first.meta,
+        generatedAt: cutoff,
+        snapshot: { dataThrough: cutoff, state: 'ready', intervalMs: 1800000 },
+        tablePages: { topBody: { page, pageSize: 20, total: 41 } },
+      },
+    });
+  const pending = deferred<ReturnType<typeof snapshot>>();
+  state.get.mockImplementation((_path, params) =>
+    params.tp_topBody === 2 ? pending.promise : Promise.resolve(snapshot(1, '/first-ranking')),
+  );
+  setTestUrl('/websites/site-a/geo?date=30day');
+  state.updateParams.mockReturnValue('/websites/site-a/geo?date=30day&tp_topBody=2');
+  const tree = () => (
+    <QueryClientProvider client={client}>
+      <ManualRefreshProvider>
+        <LiekanPage resource="overview" />
+      </ManualRefreshProvider>
+    </QueryClientProvider>
+  );
+  const view = render(tree());
+  await screen.findByText('/first-ranking');
+  const metrics = screen.getByText('8,737');
+  const trend = screen.getByText('AI 蜘蛛与浏览访问趋势');
+  const chart = document.querySelector('#d1');
+  expect(chart).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: '下一页' }));
+  const historyPage = new URLSearchParams(window.location.search).get('tp_topBody');
+  state.extraQuery = { tp_topBody: '2' };
+  setTestUrl('/websites/site-a/geo?date=30day&tp_topBody=2');
+  view.rerender(tree());
+  await waitFor(() =>
+    expect(state.get.mock.calls.some(([, params]) => params.tp_topBody === 2)).toBe(true),
+  );
+  expect(screen.getByText('8,737')).toBe(metrics);
+  expect(screen.getByText('AI 蜘蛛与浏览访问趋势')).toBe(trend);
+  expect(document.querySelector('#d1')).toBe(chart);
+  expect(chart).not.toHaveAttribute('aria-busy');
+  expect(document.querySelector('#topBody')).toHaveAttribute('aria-busy', 'true');
+  expect(screen.getByRole('button', { name: '下一页' })).toBeDisabled();
+  expect(historyPage).toBe('2');
+  expect(state.push).not.toHaveBeenCalled();
+
+  await act(async () => pending.resolve(snapshot(2, '/second-ranking')));
+  expect(await screen.findByText('/second-ranking')).toBeVisible();
+  expect(screen.getByText('8,737')).toBe(metrics);
+  expect(screen.getByText('AI 蜘蛛与浏览访问趋势')).toBe(trend);
+  expect(document.querySelector('#topBody')).not.toHaveAttribute('aria-busy');
+
+  state.updateParams.mockReturnValue('/websites/site-a/geo?date=30day');
+  fireEvent.click(screen.getByRole('button', { name: '上一页' }));
+  expect(new URLSearchParams(window.location.search).get('tp_topBody')).toBeNull();
+  state.extraQuery = {};
+  setTestUrl('/websites/site-a/geo?date=30day');
+  view.rerender(tree());
+  expect(screen.getByText('/first-ranking')).toBeVisible();
+  expect(
+    state.get.mock.calls
+      .filter(([path]) => path.endsWith('/page-report'))
+      .map(([, params]) => params.tp_topBody),
+  ).toEqual([undefined, 2]);
+});
 
 it.each([
   [

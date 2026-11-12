@@ -90,6 +90,37 @@ it('reads the requested ranking slice and retains crawler counts from encoded pa
   expect(await readdir(directory)).toEqual([]);
 });
 
+it('retains the first three overview pages and matches their crawler rows in one pass', async () => {
+  const p = params({ resource: 'overview' });
+  const paths = Array.from({ length: 75 }, (_, i) => ({
+    path: i === 20 ? '/中' : `/rank-${i + 1}`,
+    pv: 75 - i,
+  }));
+  const logs = vi.fn(
+    producer([
+      { path: '/%E4%B8%AD', requests: 3, bot: 'A' },
+      { path: '/中', requests: 2, bot: 'B' },
+      { path: '/rank-60', requests: 1, bot: 'B' },
+      { path: '/rank-61', requests: 10, bot: 'A' },
+    ]),
+  );
+  const spool = await WarehouseEvidenceSpool.create();
+  try {
+    const snapshot = await buildWarehouseBrowserPages(spool, p, producer(paths), logs, true);
+    expect(snapshot.total).toBe(75);
+    expect(snapshot.rows.topBody).toEqual(paths.slice(0, 60));
+    expect(snapshot.rows.visitorTopBody).toEqual(paths.slice(0, 60));
+    expect(new Set(snapshot.ai.keys())).toEqual(new Set(['/rank-60', '/中']));
+    expect(snapshot.ai.get('/中')).toMatchObject({ requests: 5, bot: 'A' });
+    expect(logs).toHaveBeenCalledTimes(1);
+
+    const ordinary = await buildWarehouseBrowserPages(spool, p, producer(paths), none);
+    expect(ordinary.rows.topBody).toEqual(paths.slice(0, 20));
+  } finally {
+    await spool.dispose();
+  }
+});
+
 it.each([0, 1])('reuses evidence only for a proved empty overview visit window (%s)', async n => {
   const p = params({ resource: 'overview' });
   vi.spyOn(analytics, 'getHumanFacts').mockResolvedValue({

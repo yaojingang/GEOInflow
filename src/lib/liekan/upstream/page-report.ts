@@ -1,33 +1,38 @@
-import { withPublishedRegistry } from './crawler-registry-context';
-import { getPublishedCatalog } from '../crawlers/published';
-import { CRAWLER_POPULATION_VERSION } from '../rules/population';
-import { geographyVersion } from '../contracts/geography';
 import { formatInTimeZone, fromZonedTime } from 'date-fns-tz';
+import { geographyVersion } from '../contracts/geography';
 import { type LiekanPageReport, pageReportParts, pageReportSchema } from '../contracts/page-report';
 import { parseReportQuery } from '../contracts/query';
+import type { Row } from '../contracts/report';
+import { getPublishedCatalog } from '../crawlers/published';
 import { buildReport } from '../report';
-import { readKeywordPage } from './keywords';
-import { withoutQueryCache, noteBrowserPopulation } from './cache-context';
+import { CRAWLER_POPULATION_VERSION } from '../rules/population';
+import { warehouseEnabled } from '../warehouse/runtime';
+import { noteBrowserPopulation, withoutQueryCache } from './cache-context';
+import { withPublishedRegistry } from './crawler-registry-context';
+import { dashboardClock } from './dashboard-clock';
+import { DASHBOARD_INTERVAL } from './dashboard-snapshot-model';
 import { LiekanError } from './errors';
+import { readKeywordPage } from './keywords';
 import {
   analyticsCache,
   analyticsCacheKey,
   type CachedResult,
   websiteCacheTag,
 } from './query-cache';
-import { query, reportSnapshot } from './server';
 import { attachReportEvidenceView } from './report-evidence-view';
-import { dashboardClock } from './dashboard-clock';
-import { DASHBOARD_INTERVAL } from './dashboard-snapshot-model';
-import { warehouseEnabled } from '../warehouse/runtime';
 import { withReportFragments } from './report-fragments';
+import { query, reportSnapshot } from './server';
+
 type PageReportWebsite = { id: string; name: string; domain: string };
+export type WarehouseOverviewResult = LiekanPageReport & {
+  overviewRanking?: { table: 'topBody' | 'visitorTopBody'; rows: Row[] };
+};
 
 async function readPageReportSnapshot(
   website: PageReportWebsite,
   input: unknown,
   refresh = false,
-  uncached = false,
+  overviewSnapshot = false,
 ): Promise<CachedResult<LiekanPageReport>> {
   const parsed = parseReportQuery(input);
   if (!parsed.success) throw new LiekanError('统计参数无效');
@@ -74,6 +79,7 @@ async function readPageReportSnapshot(
           ? await (await import('./warehouse-page-report')).prepareWarehousePageReport(
               website,
               parsed.data,
+              overviewSnapshot,
             )
           : undefined;
         try {
@@ -106,7 +112,7 @@ async function readPageReportSnapshot(
       },
     }) as LiekanPageReport;
   };
-  if (!ttl || uncached) {
+  if (!ttl || overviewSnapshot) {
     const value = await load();
     return {
       value,
@@ -149,8 +155,20 @@ export async function readPageReport(website: PageReportWebsite, input: unknown,
   return result;
 }
 
-export async function computeWarehouseOverview(website: PageReportWebsite, input: unknown) {
-  return (await readPageReportSnapshot(website, input, false, true)).value;
+export async function computeWarehouseOverview(
+  website: PageReportWebsite,
+  input: unknown,
+): Promise<WarehouseOverviewResult> {
+  const { value } = await readPageReportSnapshot(website, input, false, true);
+  const table = value.meta.aiCrawlerEnabled === false ? 'visitorTopBody' : 'topBody';
+  const paging = value.meta.tablePages?.[table];
+  if (paging?.page !== 1) return value;
+  const rows = value.tables[table];
+  return {
+    ...value,
+    tables: { ...value.tables, [table]: rows.slice(0, paging.pageSize) },
+    overviewRanking: { table, rows: rows.slice(paging.pageSize) },
+  };
 }
 
 /** A private async request checks the identical cache identity without starting SQL. */

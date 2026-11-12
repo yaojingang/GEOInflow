@@ -1,9 +1,9 @@
 import { readFile } from 'node:fs/promises';
 import { expect, it, vi } from 'vitest';
-import { ControlDatabase } from '../warehouse/control-db';
-import { featureDateRange } from '../contracts/analysis';
-import { readFeatureDateRange } from './date-range';
 import { readViewState } from '@/components/liekan/viewState';
+import { featureDateRange } from '../contracts/analysis';
+import { ControlDatabase } from '../warehouse/control-db';
+import { readFeatureDateRange } from './date-range';
 
 const harness = vi.hoisted(() => ({
   db: undefined as ControlDatabase | undefined,
@@ -82,15 +82,31 @@ it.skipIf(!database)(
     harness.db = db;
     const now = Date.now();
     const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
-    const compute = () => ({
-      cards: [{ value: 20 }],
-      tables: { topBody: [{ path: '/first' }] },
-      meta: {
-        generatedAt: Date.now(),
-        snapshot: { dataThrough: now },
-        tablePages: { topBody: { page: 1, pageSize: 20, total: 41 } },
-      },
-    });
+    const compute = (_site?: unknown, p?: { chartPeriod: string }) => {
+      const visitorOnly = p?.chartPeriod === '7d';
+      const table = visitorOnly ? 'visitorTopBody' : 'topBody';
+      const ranking = p?.chartPeriod === '30d' || visitorOnly;
+      return {
+        cards: [{ value: 20 }],
+        tables: { [table]: [{ path: '/first' }] },
+        meta: {
+          generatedAt: Date.now(),
+          aiCrawlerEnabled: !visitorOnly,
+          snapshot: { dataThrough: now },
+          tablePages: {
+            [table]: { page: 1, pageSize: 20, total: visitorOnly || !ranking ? 41 : 65 },
+          },
+        },
+        ...(ranking && {
+          overviewRanking: {
+            table,
+            rows: Array.from({ length: visitorOnly ? 21 : 40 }, (_, i) => ({
+              path: `/rank-${i + 21}`,
+            })),
+          },
+        }),
+      };
+    };
     let release: () => void;
     let running: ReturnType<typeof pumpWarehouseOverview> | undefined;
     try {
@@ -253,6 +269,42 @@ it.skipIf(!database)(
         new URLSearchParams('tp_topBody=2'),
       );
       expect(await polled.json()).toMatchObject({ tables: { topBody: [{ path: '/second' }] } });
+
+      harness.rankingPage.mockClear();
+      for (const [date, table, total] of [
+        ['30day', 'topBody', 65],
+        ['7day', 'visitorTopBody', 41],
+      ] as const) {
+        const params = reportRequest(date, now);
+        const firstPage = await requestWarehouseOverview(access, params);
+        expect(await firstPage.json()).not.toHaveProperty('overviewRanking');
+        for (const page of [2, 3]) {
+          const response = await requestWarehouseOverview(access, {
+            ...params,
+            [`tp_${table}`]: page,
+          });
+          expect(response.status).toBe(200);
+          expect(response.headers.get('X-Liekan-Overview-Ranking')).toBe('snapshot');
+          for (const header of ['X-Liekan-Data-Through', 'X-Liekan-Warehouse-Publication'])
+            expect(response.headers.get(header)).toBe(firstPage.headers.get(header));
+          const body = await response.json();
+          expect(body).not.toHaveProperty('overviewRanking');
+          expect(body.tables[table]).toEqual(
+            Array.from({ length: Math.min(20, total - (page - 1) * 20) }, (_, i) => ({
+              path: `/rank-${(page - 1) * 20 + 1 + i}`,
+            })),
+          );
+          expect(body.meta.tablePages[table]).toEqual({ page, pageSize: 20, total });
+        }
+      }
+      expect(harness.rankingPage).not.toHaveBeenCalled();
+      const deepPage = await requestWarehouseOverview(access, {
+        ...reportRequest('30day', now),
+        tp_topBody: 4,
+      });
+      expect(deepPage.headers.get('X-Liekan-Overview-Ranking')).toBe('warehouse');
+      expect(harness.rankingPage).toHaveBeenCalledTimes(1);
+      expect(await snapshots()).toEqual(beforePaging);
       harness.publication = '1';
 
       const [legacy] = await db.read<{ id: string }>(

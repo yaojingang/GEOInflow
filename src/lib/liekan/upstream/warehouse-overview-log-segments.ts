@@ -227,16 +227,25 @@ export async function prepareWarehouseOverviewLogSegments(
       end,
       metrics.crawlerMetricsVersion === 1,
     );
-    const edge = warehouseOverviewAggregateStates(
-      edgeStart,
-      end,
-      timezone,
-      metrics,
-      edgeWindow.restrictEvidenceToWindow,
-    );
+    const edge = edgeWindow.hasFacts
+      ? warehouseOverviewAggregateStates(
+          edgeStart,
+          end,
+          timezone,
+          metrics,
+          edgeWindow.restrictEvidenceToWindow,
+        )
+      : undefined;
+    // Keep a zero summary even when every covered day was empty. Once the raw
+    // probe proves the edge is empty, its joins cannot contribute to the result.
+    const edgeSql =
+      edge?.sql ??
+      `SELECT 'summary',NULL,NULL,NULL,NULL,NULL,toUInt64(0),toUInt64(0),
+        arrayReduce('uniqExactState',CAST([], 'Array(String)')),toUInt64(0),
+        arrayReduce('uniqExactState',CAST([], 'Array(String)')),toUInt64(0),toUInt64(0),NULL`;
     return {
       params: {
-        ...edge.params,
+        ...edge?.params,
         overviewControl,
         overviewFirstDay: days[0].key,
         overviewLastDay: days.at(-1).key,
@@ -253,7 +262,7 @@ export async function prepareWarehouseOverviewLogSegments(
           SELECT ${columns} FROM ${warehouseOverviewLogDays} WHERE ${scope}
             AND day BETWEEN {overviewFirstDay:Date32} AND {overviewLastDay:Date32}
             AND (day,build) IN arrayZip({overviewDays:Array(Date32)},{overviewBuilds:Array(UUID)})
-          UNION ALL ${edge.sql}
+          UNION ALL ${edgeSql}
         ) GROUP BY section,name,vendor,type,botId,path`),
     };
   } catch (error) {

@@ -617,7 +617,8 @@ export function ReportRows({
 }) {
   const i18n = useLiekanI18n();
   const a = useReportActions();
-  const loading = useDataLoading();
+  const pageRead = a.tablePageRead?.table === table ? a.tablePageRead : undefined;
+  const loading = useDataLoading() || pageRead?.loading;
   const fields = columns[table] || [];
   const meta = report?.meta;
   // 服务端分页模式：meta.tablePages 有键 = 该表已是服务端切片，页码/总数/页宽全部来自
@@ -682,7 +683,7 @@ export function ReportRows({
     <>
       <tbody className="divide-y divide-line/60" id={table} aria-busy={loading || undefined}>
         {loading ? (
-          Array.from({ length: 3 }, (_, i) => (
+          Array.from({ length: pageRead?.loading ? Math.max(rows.length, 1) : 3 }, (_, i) => (
             <tr key={i} aria-hidden="true">
               {fields.map(([field], j) => (
                 <td key={field} className={cellClasses[table]?.[j] || 'px-4 py-3'}>
@@ -767,7 +768,16 @@ export function ReportRows({
           <tfoot>
             <tr>
               <td colSpan={fields.length} className="border-t border-line p-0">
+                {pageRead?.retry && (
+                  <div role="alert" className="px-6 pt-3 text-[11px] text-faint">
+                    {i18n.text('更新失败，当前显示上次读取的数据')}{' '}
+                    <button type="button" className="text-brand" onClick={pageRead.retry}>
+                      {i18n.text('重试')}
+                    </button>
+                  </div>
+                )}
                 <Pager
+                  disabled={pageRead?.loading}
                   total={
                     serverPage
                       ? serverPage.total
@@ -775,7 +785,15 @@ export function ReportRows({
                         ? logsWindow.totalLogs
                         : selected.length
                   }
-                  page={serverPage ? serverPage.page : logsWindow ? desiredGlobal : safePage}
+                  page={
+                    pageRead?.loading
+                      ? pageRead.page
+                      : serverPage
+                        ? serverPage.page
+                        : logsWindow
+                          ? desiredGlobal
+                          : safePage
+                  }
                   pages={
                     serverPage
                       ? Math.max(1, Math.ceil(serverPage.total / serverPage.pageSize))
@@ -784,9 +802,11 @@ export function ReportRows({
                         : pages
                   }
                   label={
-                    serverPage && table !== 'cityBody' && (a.filter || a.sort.label || a.query)
-                      ? i18n.text('当前页内筛选')
-                      : undefined
+                    pageRead?.loading
+                      ? i18n.text('正在读取')
+                      : serverPage && table !== 'cityBody' && (a.filter || a.sort.label || a.query)
+                        ? i18n.text('当前页内筛选')
+                        : undefined
                   }
                   onPrev={
                     serverPage

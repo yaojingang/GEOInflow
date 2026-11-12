@@ -24,7 +24,7 @@ vi.mock('./report-evidence-view', () => ({
   attachReportEvidenceView: (report: unknown) => report,
 }));
 
-import { readPageReport } from './page-report';
+import { computeWarehouseOverview, readPageReport } from './page-report';
 
 const website = {
   id: '11111111-1111-4111-8111-111111111111',
@@ -65,7 +65,7 @@ it.each([true, false])(
     expect(result.value.meta.snapshot.updateError).toBe(true);
     if (warehouse) {
       expect(m.fragments).not.toHaveBeenCalled();
-      expect(m.prepare).toHaveBeenCalledWith(website, expect.objectContaining(input));
+      expect(m.prepare).toHaveBeenCalledWith(website, expect.objectContaining(input), false);
       expect(m.build.mock.calls[0][6]).toEqual({ dispose: m.dispose });
       expect(m.dispose).toHaveBeenCalledOnce();
     } else {
@@ -83,4 +83,20 @@ it('releases the ClickHouse page materialization when report assembly fails', as
   await expect(readPageReport(website, input)).rejects.toThrow('report assembly failed');
   expect(m.dispose).toHaveBeenCalledOnce();
   expect(m.fragments).not.toHaveBeenCalled();
+});
+
+it('stores later ranking rows separately from the first page of the report', async () => {
+  m.warehouse.mockReturnValue(true);
+  const report = await m.build();
+  const rows = Array.from({ length: 60 }, (_, i) => ({ path: `/rank-${i + 1}` }));
+  m.build.mockResolvedValue({
+    ...report,
+    tables: { topBody: rows },
+    meta: { ...report.meta, tablePages: { topBody: { page: 1, pageSize: 20, total: 75 } } },
+  });
+  const overview = { ...input, resource: 'overview' };
+  const result = await computeWarehouseOverview(website, overview);
+  expect(m.prepare).toHaveBeenCalledWith(website, expect.objectContaining(overview), true);
+  expect(result.tables.topBody).toEqual(rows.slice(0, 20));
+  expect(result.overviewRanking).toEqual({ table: 'topBody', rows: rows.slice(20) });
 });

@@ -9,6 +9,7 @@ const io = vi.hoisted(() => ({
   command: vi.fn(),
   metadata: vi.fn(),
   fingerprint: vi.fn(),
+  window: vi.fn(async () => ({ hasFacts: true, restrictEvidenceToWindow: true })),
 }));
 vi.mock('./warehouse-report-snapshot', () => ({
   warehouseReportQuery: io.query,
@@ -18,10 +19,7 @@ vi.mock('./warehouse-report-snapshot', () => ({
   warehouseReportSignal: () => undefined,
 }));
 vi.mock('./warehouse-log-queries', () => ({
-  warehouseOverviewLogWindow: vi.fn(async () => ({
-    hasFacts: true,
-    restrictEvidenceToWindow: true,
-  })),
+  warehouseOverviewLogWindow: io.window,
   warehouseOverviewAggregateStates: vi.fn(() => ({ sql: 'SELECT states', params: {} })),
   renderWarehouseOverviewAggregate: (sql: string) => sql,
 }));
@@ -61,6 +59,30 @@ it('publishes only completed days and keeps the cutoff day in the raw merge', as
   expect(result.params.overviewDays).toEqual(['2026-11-01', '2026-11-02']);
   expect(result.sql).toContain('uniqExactMerge(pages)');
   expect(result.sql).toContain('UNION ALL SELECT states');
+});
+
+it('merges covered days with a zero summary when the raw edge is empty', async () => {
+  io.query.mockResolvedValueOnce([
+    {
+      publication: '8',
+      payload: JSON.stringify([
+        ['2026-11-01', retained],
+        ['2026-11-02', retained],
+      ]),
+    },
+  ]);
+  io.window.mockResolvedValueOnce({ hasFacts: false, restrictEvidenceToWindow: false });
+  const result = await compute();
+  expect(io.window).toHaveBeenCalledExactlyOnceWith(
+    'site',
+    new Date('2026-11-03T05:00:00Z'),
+    end,
+    false,
+  );
+  expect(io.command).not.toHaveBeenCalled();
+  expect(result.params.overviewBuilds).toEqual([retained, retained]);
+  expect(result.sql).toContain("UNION ALL SELECT 'summary'");
+  expect(result.sql).not.toContain('SELECT states');
 });
 
 it('invalidates one affected day after evidence publication and reuses the other day', async () => {

@@ -9,7 +9,7 @@ import { useLiekanI18n } from '@/lib/liekan/i18n/client';
 
 import { EXPORT_MAX_BYTES, type ExportFrame } from '@/lib/liekan/contracts/exports';
 import { pageSearch, pageUrl } from '@/lib/liekan/contracts/page-url';
-import { useQueryClient } from '@tanstack/react-query';
+import { replaceEqualDeep, useQueryClient } from '@tanstack/react-query';
 import Link from '@/components/liekan/Link';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -246,7 +246,7 @@ export function LiekanPage({ resource }: { resource: Resource }) {
                 : endAt,
         }
       : {}),
-    ...(Object.keys(tablePages).length ? { tablePages } : {}),
+    ...(resource !== 'overview' && Object.keys(tablePages).length ? { tablePages } : {}),
     ...(resource === 'human/geo'
       ? {
           search: search.slice(0, 200),
@@ -349,7 +349,33 @@ export function LiekanPage({ resource }: { resource: Resource }) {
     endAt: shiftedRange.endAt,
     timezone,
   });
-  const restricted = [401, 403, 404].includes((query.error as any)?.status);
+  const rankingTable = query.data?.meta.aiCrawlerEnabled === false ? 'visitorTopBody' : 'topBody';
+  const rankingPage = tablePages[rankingTable] ?? 1;
+  const readRankingPage =
+    resource === 'overview' &&
+    !metadataLoading &&
+    rankingPage > 1 &&
+    !!query.data?.meta.tablePages?.[rankingTable];
+  const rankingOptions = pageReportQuery(
+    userId,
+    reportWebsiteId,
+    { ...reportInput, tablePages: { [rankingTable]: rankingPage } },
+    teamId,
+  );
+  const ranking = api.useQuery<LiekanReport>({
+    ...rankingOptions,
+    queryKey: [
+      ...rankingOptions.queryKey,
+      'overview-ranking',
+      query.data?.meta.snapshot?.dataThrough ?? query.dataUpdatedAt,
+    ],
+    enabled: readRankingPage,
+  });
+  const rankingRestricted =
+    readRankingPage && [401, 403, 404].includes((ranking.error as any)?.status);
+  const restricted = rankingRestricted || [401, 403, 404].includes((query.error as any)?.status);
+  const reportFailed = query.isError || rankingRestricted;
+  const reportError = rankingRestricted ? ranking.error : query.error;
   const previousRestricted = [401, 403, 404].includes((previous.error as any)?.status);
   const displayKey = ['liekan-feature', userId, 'website-display-settings', websiteId];
   const displayQuery = api.useQuery<{ aiCrawlerEnabled?: boolean }>({
@@ -388,7 +414,17 @@ export function LiekanPage({ resource }: { resource: Resource }) {
     displayQuery.isFetching,
     displayQuery.error,
   ]);
-  const report = restricted || metadataLoading || displayMismatch ? undefined : query.data;
+  const baseReport = restricted || metadataLoading || displayMismatch ? undefined : query.data;
+  const rankingReport =
+    readRankingPage && ranking.data?.meta.tablePages?.[rankingTable]?.page === rankingPage
+      ? ranking.data
+      : undefined;
+  const rankingReadFailed =
+    ranking.isError || (ranking.isSuccess && !ranking.isFetching && !rankingReport);
+  const report = useMemo(
+    () => (baseReport && rankingReport ? replaceEqualDeep(baseReport, rankingReport) : baseReport),
+    [baseReport, rankingReport],
+  );
   const keywordResetSeen = useRef('');
   useEffect(() => {
     if (
@@ -911,7 +947,21 @@ export function LiekanPage({ resource }: { resource: Resource }) {
         onAction,
         onLogsPage: gotoLogsPage,
         // 翻页只改本表页码；各表白名单独立，其他表已请求的页码保持不变。
-        onTablePage: (table, page) => updateView({ [`tp_${table}`]: page > 1 ? page : undefined }),
+        onTablePage: (table, page) => {
+          const change = { [`tp_${table}`]: page > 1 ? page : undefined };
+          if (resource === 'overview' && (table === 'topBody' || table === 'visitorTopBody'))
+            window.history.pushState(null, '', updateParams(change));
+          else updateView(change);
+        },
+        tablePageRead:
+          baseReport && readRankingPage && (!rankingReport || rankingReadFailed)
+            ? {
+                table: rankingTable,
+                page: rankingPage,
+                loading: !rankingReadFailed,
+                retry: rankingReadFailed ? () => void ranking.refetch() : undefined,
+              }
+            : undefined,
       }}
     >
       {shell?.websiteActionsTarget && createPortal(headerActions, shell.websiteActionsTarget)}
@@ -1024,23 +1074,26 @@ export function LiekanPage({ resource }: { resource: Resource }) {
           {i18n.text('已清除当前页面不支持的筛选，统计采用页面显示的条件。')}
         </div>
       )}
-      {(query.isError || actionError) && (
+      {(reportFailed || actionError) && (
         <div className={styles.notice} role="alert">
-          {query.isError
+          {reportFailed
             ? report
               ? i18n.text('更新失败，当前显示上次读取的数据')
               : query.isStaleAggregate && !restricted
-                ? i18n.system(query.error?.message) || i18n.text('统计数据已过期，请重试读取。')
-                : !restricted && query.error?.message
-                  ? i18n.system(query.error.message)
+                ? i18n.system(reportError?.message) || i18n.text('统计数据已过期，请重试读取。')
+                : !restricted && reportError?.message
+                  ? i18n.system(reportError.message)
                   : i18n.text('无法读取此范围的数据')
             : i18n.system(actionError)}
-          {query.isError && (
-            <button type="button" onClick={() => refresh()}>
+          {reportFailed && (
+            <button
+              type="button"
+              onClick={() => (rankingRestricted ? ranking.refetch() : refresh())}
+            >
               {i18n.text('重试')}
             </button>
           )}
-          {query.isError && !report && !restricted && !liveLogs && (
+          {reportFailed && !report && !restricted && !liveLogs && (
             <>
               <span>{i18n.text('也可缩小时间范围后重试：')}</span>
               {(
@@ -1082,7 +1135,7 @@ export function LiekanPage({ resource }: { resource: Resource }) {
           <button onClick={refresh}>{i18n.text('重新读取设置与报表')}</button>
         </div>
       )}
-      {query.isError && !report ? (
+      {reportFailed && !report ? (
         geoWeight && !restricted ? (
           <main className="max-w-[1200px] mx-auto px-8 py-6">
             <section className="grid grid-cols-2 lg:grid-cols-4 gap-3">

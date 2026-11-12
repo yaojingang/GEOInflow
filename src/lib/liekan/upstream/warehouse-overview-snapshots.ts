@@ -13,15 +13,15 @@ import {
   captureReportTimings,
   type ReportTimings,
 } from './analysis-diagnostics';
-import { analysisQueryLimits } from './analysis-query-model';
 import { analysisResponse } from './analysis-query-api';
+import { analysisQueryLimits } from './analysis-query-model';
 import { AnalyticsUnavailable } from './analytics-budget';
 import { noteBrowserPopulation } from './cache-context';
 import { loadPublishedRegistry, withPublishedRegistry } from './crawler-registry-context';
 import { withDashboardClock } from './dashboard-clock';
 import { dashboardWarmRanges } from './dashboard-snapshot-model';
 import { LiekanError } from './errors';
-import { computeWarehouseOverview } from './page-report';
+import { computeWarehouseOverview, type WarehouseOverviewResult } from './page-report';
 import type { authorize } from './server';
 import { warehouseLogWindowHasFacts } from './warehouse-log-queries';
 import { prepareWarehouseOverviewLogSegments } from './warehouse-overview-log-segments';
@@ -55,7 +55,7 @@ type Snapshot = {
   parameters: ReportQuery;
   control_version: string;
   publication: string | null;
-  result: LiekanPageReport | null;
+  result: WarehouseOverviewResult | null;
   generated_at: Date | null;
   queued_at: Date;
   started_at: Date | null;
@@ -247,7 +247,7 @@ function snapshotExpiry(row: Snapshot) {
 }
 
 function presented(row: Snapshot, access: Access, updating: boolean) {
-  const { result } = row;
+  const { overviewRanking: _overviewRanking, ...result } = row.result;
   return {
     ...result,
     website: access.website,
@@ -275,29 +275,43 @@ async function ready(
   const table = value.meta.aiCrawlerEnabled === false ? 'visitorTopBody' : 'topBody';
   const current = value.meta.tablePages?.[table];
   const page = tablePages[table];
+  let rankingSource: 'snapshot' | 'warehouse' | undefined;
   if (current && page && page !== current.page) {
     const site = row.website_id;
     const cutoff = value.meta.snapshot.dataThrough;
-    const rows =
-      (page - 1) * current.pageSize >= current.total
+    const offset = (page - 1) * current.pageSize;
+    const end = Math.min(offset + current.pageSize, current.total);
+    const ranking = row.result.overviewRanking;
+    // The stored rows begin at page two. Older snapshots and deeper pages use
+    // the original query under the same warehouse publication and cutoff.
+    const storedRows =
+      offset >= current.total
         ? []
-        : await withinWarehouseReport(
-            async () => {
-              if (!hasCurrentResult(row, await readOverviewControl(site)))
-                throw new LiekanError('统计条件已变更，请重新读取', 410, 'analysis-invalidated');
-              const { readWarehouseOverviewRankingPage } = await import(
-                './warehouse-browser-page-report'
-              );
-              return withDashboardClock(cutoff, () =>
-                readWarehouseOverviewRankingPage(site, row.parameters, value, table, page),
-              );
-            },
-            {
-              publication: { websiteId: site, publication: row.publication },
-              deadline: Date.now() + 55000,
-              signal,
-            },
+        : ranking?.table === table &&
+            offset >= current.pageSize &&
+            end <= current.pageSize + ranking.rows.length
+          ? ranking.rows.slice(offset - current.pageSize, end - current.pageSize)
+          : undefined;
+    rankingSource = storedRows ? 'snapshot' : 'warehouse';
+    const rows =
+      storedRows ??
+      (await withinWarehouseReport(
+        async () => {
+          if (!hasCurrentResult(row, await readOverviewControl(site)))
+            throw new LiekanError('统计条件已变更，请重新读取', 410, 'analysis-invalidated');
+          const { readWarehouseOverviewRankingPage } = await import(
+            './warehouse-browser-page-report'
           );
+          return withDashboardClock(cutoff, () =>
+            readWarehouseOverviewRankingPage(site, row.parameters, value, table, page),
+          );
+        },
+        {
+          publication: { websiteId: site, publication: row.publication },
+          deadline: Date.now() + 55000,
+          signal,
+        },
+      ));
     if (!hasCurrentResult(row, await readOverviewControl(site)))
       throw new LiekanError('统计条件已变更，请重新读取', 410, 'analysis-invalidated');
     value.tables = { ...value.tables, [table]: rows };
@@ -314,6 +328,7 @@ async function ready(
   response.headers.set('X-Liekan-Read-Path', 'published');
   response.headers.set('X-Liekan-Data-Through', String(value.meta.snapshot.dataThrough));
   response.headers.set('X-Liekan-Warehouse-Publication', row.publication);
+  if (rankingSource) response.headers.set('X-Liekan-Overview-Ranking', rankingSource);
   return response;
 }
 

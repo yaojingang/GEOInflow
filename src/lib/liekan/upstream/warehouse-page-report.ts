@@ -1,10 +1,10 @@
+import { pageReportParts } from '../contracts/page-report';
 import type { ReportQuery } from '../contracts/query';
+import { reportLogRange } from '../report-log-tables';
 import type { PreparedReport } from '../report-prepared';
 import { warehouseReader } from '../warehouse/reader-runtime';
-import { reportLogRange } from '../report-log-tables';
-import { prepareWarehouseAiPageReport } from './warehouse-ai-page-report';
-import { pageReportParts } from '../contracts/page-report';
 import { getLogFacts } from './logs';
+import { prepareWarehouseAiPageReport } from './warehouse-ai-page-report';
 import { warehouseReportMetadata } from './warehouse-report-snapshot';
 
 async function warehousePageCatalogCount(site: string) {
@@ -21,6 +21,7 @@ async function warehousePageCatalogCount(site: string) {
 export async function prepareWarehousePageReport(
   website: { id: string; domain: string },
   p: ReportQuery,
+  overviewSnapshot = false,
 ): Promise<PreparedReport | undefined> {
   const range = reportLogRange(p);
   if (['ai/pages', 'ai/bots', 'ai/overview'].includes(p.resource))
@@ -46,7 +47,13 @@ export async function prepareWarehousePageReport(
   const { prepareWarehouseBrowserPageReport } = await import('./warehouse-browser-page-report');
   if (p.resource === 'overview') await warehouseReportMetadata(website.id);
   const catalogCount = await warehousePageCatalogCount(website.id);
-  const prepared = await prepareWarehouseBrowserPageReport(website.id, p, range, catalogCount);
+  const prepared = await prepareWarehouseBrowserPageReport(
+    website.id,
+    p,
+    range,
+    catalogCount,
+    overviewSnapshot,
+  );
   prepared.range = range;
   try {
     const catalog = prepared.catalogCoverage ?? { catalogCount, blindCount: catalogCount };

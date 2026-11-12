@@ -1,16 +1,12 @@
 import { identityComplete, identityUsable } from '../contracts/browser-population';
 import { pageReportParts } from '../contracts/page-report';
 import { applyHumanFactsPopulation } from '../contracts/population-results';
-import { tablePageSize, type ReportQuery } from '../contracts/query';
+import { type ReportQuery, tablePageSize } from '../contracts/query';
 import type { LiekanReport, Row } from '../contracts/report';
 import { classifyEntrySourceForDisplay } from '../contracts/sources';
 import { addReportAiPage, compareReportAiPages, reportLogRange } from '../report-log-tables';
 import type { PreparedReport } from '../report-prepared';
 import { timeReportQuery } from './analysis-diagnostics';
-import {
-  countUncrawledCatalogPaths,
-  streamWarehouseCatalogPaths,
-} from './warehouse-page-path-summary';
 import { getHumanFacts, type HumanFact } from './analytics';
 import { readBrowserPopulation } from './browser-population';
 import { currentAnalyticsSignal } from './cache-context';
@@ -22,14 +18,18 @@ import {
   warehouseLogDate,
   warehouseLogQuerySpec,
   warehouseLogWindowHasFacts,
-  warehouseOverviewLogWindow,
   warehouseNumbers,
+  warehouseOverviewLogWindow,
 } from './warehouse-log-queries';
 import { prepareWarehouseOverviewLogSegments } from './warehouse-overview-log-segments';
 import {
+  countUncrawledCatalogPaths,
+  streamWarehouseCatalogPaths,
+} from './warehouse-page-path-summary';
+import {
   warehouseReportQuery,
-  warehouseReportStream,
   warehouseReportSignal,
+  warehouseReportStream,
 } from './warehouse-report-snapshot';
 
 const lexical = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
@@ -81,25 +81,30 @@ async function streamBrowser(
   );
 }
 
-/** Stream all human path groups for exact global cards, keeping only the current
- * table pages. Caller uses the same ordered page SQL as the legacy report. */
+/** Stream the ordered paths once for the global cards and the requested table rows. */
 export async function buildWarehouseBrowserPages(
   spool: WarehouseEvidenceSpool,
   p: ReportQuery,
   produce: EvidenceProducer<any>,
   logProduce: EvidenceProducer<any>,
+  overviewSnapshot = false,
 ) {
   const tables =
     p.resource === 'overview' ? ['topBody', 'visitorTopBody'] : ['pgBody', 'visitorPgBody'];
   const rows = Object.fromEntries(tables.map(table => [table, [] as any[]]));
+  const ranges = tables.map(table => {
+    const page = p.tablePages[table] ?? 1;
+    const start = (page - 1) * tablePageSize;
+    const pages = overviewSnapshot && p.resource === 'overview' && page === 1 ? 3 : 1;
+    return { table, start, end: start + pages * tablePageSize };
+  });
   let total = 0,
     entry: any,
     durationTotal = 0,
     durationSamples = 0;
   await produce(async row => {
-    for (const table of tables) {
-      const start = ((p.tablePages[table] ?? 1) - 1) * tablePageSize;
-      if (total >= start && total < start + tablePageSize) rows[table].push(row);
+    for (const { table, start, end } of ranges) {
+      if (total >= start && total < end) rows[table].push(row);
     }
     total++;
     if (!entry || row.entries > entry.entries) entry = row;
@@ -375,6 +380,7 @@ export async function prepareWarehouseBrowserPageReport(
   p: ReportQuery,
   range = reportLogRange(p),
   catalogCount = 0,
+  overviewSnapshot = false,
 ): Promise<
   (PreparedReport & { catalogCoverage?: { catalogCount: number; blindCount: number } }) | undefined
 > {
@@ -535,6 +541,7 @@ export async function prepareWarehouseBrowserPageReport(
                   currentAnalyticsSignal(),
                 );
               },
+              overviewSnapshot,
             ),
           )
         : undefined;
