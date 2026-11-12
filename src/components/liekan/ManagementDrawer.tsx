@@ -1,23 +1,23 @@
 'use client';
-import { useLiekanI18n } from '@/lib/liekan/i18n/client';
 
 import { fromZonedTime } from 'date-fns-tz';
 import { useEffect, useId, useRef, useState } from 'react';
-import { useApi, useNavigation } from '@/lib/liekan/upstream/client';
 import type { CatalogPayload } from '@/lib/liekan/contracts/crawler-registry';
-import { catalogBotRules } from './features/crawlerRegistryUi';
-import { featureHref } from './features/routes';
-import { getFeaturePreferences } from '@/lib/liekan/upstream/features-client';
 import { managementLabels, parseEditableAllowlist } from '@/lib/liekan/contracts/management';
-import { CrawlerCandidatesPanel } from './features/CrawlerCandidatesPanel';
-import { CrawlerRulesEditor } from './features/CrawlerRulesEditor';
-import { parseRuleEditorDraft, ruleEditorConfiguration } from '@/lib/liekan/rules/editor';
-import type { CrawlerRuleConfiguration } from '@/lib/liekan/rules/configuration';
+import { useLiekanI18n } from '@/lib/liekan/i18n/client';
 import type { BotRule } from '@/lib/liekan/rules/bots';
-import { Button, DialogActions, LiekanDialog } from './features/ui';
-import { useDialog } from './features/LiekanDialog';
+import type { CrawlerRuleConfiguration } from '@/lib/liekan/rules/configuration';
+import { parseRuleEditorDraft, ruleEditorConfiguration } from '@/lib/liekan/rules/editor';
+import { useApi, useNavigation } from '@/lib/liekan/upstream/client';
+import { getFeaturePreferences } from '@/lib/liekan/upstream/features-client';
 import styles from '@/styles/liekan/Shell.module.css';
 import { columns, downloadFile, formatMetricValue, formatValue, stateLabels } from './data';
+import { CrawlerCandidatesPanel } from './features/CrawlerCandidatesPanel';
+import { CrawlerRulesEditor } from './features/CrawlerRulesEditor';
+import { catalogBotRules } from './features/crawlerRegistryUi';
+import { useDialog } from './features/LiekanDialog';
+import { featureHref } from './features/routes';
+import { Button, DialogActions, LiekanDialog } from './features/ui';
 import { ReportRows, SortHeading } from './ReportComponents';
 import type { LiekanReport } from './types';
 
@@ -124,11 +124,13 @@ function ManagementDrawerContent({
   const initialDate = (value?: number) =>
     value ? new Intl.DateTimeFormat('sv-SE', { timeZone: timezone }).format(value) : '';
   const [start, setStart] = useState(initialDate(report?.range.startAt));
-  const [end, setEnd] = useState(initialDate(
-    report?.meta.crawlerMetrics?.timeBoundary === 'half_open'
-      ? Math.max(report.range.startAt, report.range.endAt - 1)
-      : report?.range.endAt,
-  ));
+  const [end, setEnd] = useState(
+    initialDate(
+      report?.meta.crawlerMetrics?.timeBoundary === 'half_open'
+        ? Math.max(report.range.startAt, report.range.endAt - 1)
+        : report?.range.endAt,
+    ),
+  );
   const settingsAction = ['robots.txt 编辑', '蜘蛛白名单', '特征库管理', '解析规则'].includes(
     action,
   );
@@ -550,11 +552,17 @@ function ManagementDrawerContent({
                   <span>
                     {isFetching
                       ? i18n.text('正在读取记录…')
-                      : i18n.text('共 ') +
-                        (report.meta.totalLogs ?? report.tables.logBody?.length ?? 0) +
-                        i18n.text(' 条 · 第 ') +
-                        (report.meta.page || 1) +
-                        i18n.text(' 页')}
+                      : report.meta.logReadBoundary && typeof report.meta.totalLogs !== 'number'
+                        ? i18n.text(
+                            report.meta.logParts?.count === 'failed'
+                              ? '无法读取此范围的数据'
+                              : '正在读取记录…',
+                          )
+                        : i18n.text('共 ') +
+                          (report.meta.totalLogs ?? report.tables.logBody?.length ?? 0) +
+                          i18n.text(' 条 · 第 ') +
+                          (report.meta.page || 1) +
+                          i18n.text(' 页')}
                   </span>
                   <Button
                     disabled={(report.meta.page || 1) <= 1 || isFetching}
@@ -564,8 +572,10 @@ function ManagementDrawerContent({
                   </Button>
                   <Button
                     disabled={
-                      (report.meta.page || 1) * (report.meta.pageSize || 100) >=
-                        (report.meta.totalLogs || 0) || isFetching
+                      (typeof report.meta.totalLogs === 'number'
+                        ? (report.meta.page || 1) * (report.meta.pageSize || 100) >=
+                          report.meta.totalLogs
+                        : !report.meta.logHasMore) || isFetching
                     }
                     onClick={() => onPage?.((report.meta.page || 1) + 1)}
                   >

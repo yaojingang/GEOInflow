@@ -1,12 +1,12 @@
-import { analysisTransaction } from './analysis-rollups-db';
-import { authorizeCrawler, type CrawlerActor } from './crawler-access';
 import { aiExecutor } from './ai-db';
-import { analysisQueryParameters } from './analysis-query-model';
 import { executeNativeAnalysis } from './analysis-native-execution';
-import { readPageReport } from './page-report';
-import { featureAnalytics, featureJourney } from './feature-analytics';
+import { analysisQueryParameters } from './analysis-query-model';
+import { analysisTransaction } from './analysis-rollups-db';
 import { noteCacheResult } from './cache-context';
+import { authorizeCrawler, type CrawlerActor } from './crawler-access';
 import { LiekanError } from './errors';
+import { featureAnalytics, featureJourney } from './feature-analytics';
+import { readPageReport } from './page-report';
 
 /** Closed registry of existing report functions; jobs never fetch a client-provided URL. */
 export async function executeAnalysisQuery(
@@ -19,6 +19,8 @@ export async function executeAnalysisQuery(
   const website = await analysisTransaction(tx =>
     authorizeCrawler(aiExecutor(tx), actor, websiteId),
   );
+  if (target === 'feature:log-count')
+    return (await import('./log-read')).readLogCount(websiteId, parameters);
   if (target === 'feature:page-report') {
     const result = await readPageReport(website, parameters);
     noteCacheResult(result);

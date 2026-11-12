@@ -1,15 +1,15 @@
 import { z } from 'zod';
 import type { requestAnalysisQuery } from './analysis-queries';
-import { noteCacheResult } from './cache-context';
-import { LiekanError } from './errors';
 import { analysisQueryParameters } from './analysis-query-model';
-import { processSingleton } from './process-singleton';
 import {
   analysisViewerId,
-  withAnalysisViewer,
   releaseAnalysisViewer,
   retainPublishedAnalysisViewer,
+  withAnalysisViewer,
 } from './analysis-viewers';
+import { noteCacheResult } from './cache-context';
+import { LiekanError } from './errors';
+import { processSingleton } from './process-singleton';
 
 const handoffs = processSingleton(
   'analysis-early-handoffs',
@@ -85,6 +85,28 @@ export function analysisResponse(value: Awaited<ReturnType<typeof requestAnalysi
       },
     },
   );
+}
+
+/** Register an independent private calculation without creating a dashboard snapshot. */
+export async function privateAnalysisResponse(
+  request: Request,
+  websiteId: string,
+  actor: import('./crawler-access').CrawlerActor,
+  target: string,
+  query: Record<string, unknown>,
+) {
+  const { requestAnalysisQuery } = await import('./analysis-queries');
+  const { readLocaleCookie } = await import('../i18n/locale');
+  const locale =
+    readLocaleCookie(request.headers.get('cookie') || '') ||
+    (request.headers.get('accept-language')?.startsWith('en') ? 'en-US' : 'zh-CN');
+  const value = await withAnalysisViewer(analysisViewerId(request), () =>
+    requestAnalysisQuery(websiteId, actor, target, query, locale),
+  );
+  if (value.ready === false) await earlyHandoff(value.analysisJob.id);
+  const response = analysisResponse(value);
+  response.headers.set('X-Liekan-Read-Path', value.ready ? 'published' : 'queued');
+  return response;
 }
 export async function asyncAnalysisResponse(request: Request, websiteId: string, target: string) {
   const { authenticateCrawlerMaintenance } = await import('./crawler-maintenance');

@@ -164,6 +164,7 @@ export function statisticsCacheTtl(end: number | Date, timezone = 'UTC', now = D
 }
 
 export function isAggregateRequest(path: string, params?: Record<string, any>) {
+  if (/^\/liekan\/websites\/[^/]+\/log-count$/.test(path)) return true;
   if (params?.resource === 'logs') return false;
   if (
     path.endsWith('/analytics') &&

@@ -1,16 +1,16 @@
 'use client';
-import { verificationReasonLabel } from '@/lib/liekan/rules/verification-labels';
-import { useLiekanI18n } from '@/lib/liekan/i18n/client';
-
-import { geographyEmptyText } from '@/lib/liekan/contracts/geography';
 import { useEffect, useRef, useState } from 'react';
-import styles from '@/styles/liekan/Shell.module.css';
 import {
   countryName,
+  type GeographyDisplay,
+  geographyEmptyText,
   geographyLabel,
   regionName,
-  type GeographyDisplay,
 } from '@/lib/liekan/contracts/geography';
+import { pageUrl } from '@/lib/liekan/contracts/page-url';
+import { useLiekanI18n } from '@/lib/liekan/i18n/client';
+import { verificationReasonLabel } from '@/lib/liekan/rules/verification-labels';
+import styles from '@/styles/liekan/Shell.module.css';
 import { chartOptions } from './chartOptions';
 import { loadEcharts } from './chartRuntime';
 import { ChartLoading, LoadingLines, Skeleton, useDataLoading } from './DataLoading';
@@ -27,9 +27,8 @@ import {
 } from './data';
 import { Button } from './features/ui';
 import { observeChartLayout } from './mobileChart';
-import { useReportActions } from './ReportContext';
 import { pageLink, pageSequence } from './PageLink';
-import { pageUrl } from '@/lib/liekan/contracts/page-url';
+import { useReportActions } from './ReportContext';
 import type { DataState, LiekanReport, Row } from './types';
 
 function reportState(report: LiekanReport, table?: string): DataState {
@@ -648,14 +647,21 @@ export function ReportRows({
   // 按 pageSize 切窗呈现全局页码；批内翻页本地完成，跨批边界经 onLogsPage 换批，
   // pendingBatch 记录跨批目标页，等新批到达后落到批内对应位置。
   const logsWindow =
-    paged && table === 'logBody' && typeof meta?.totalLogs === 'number' ? meta : null;
+    paged && table === 'logBody' && (typeof meta?.totalLogs === 'number' || meta?.logReadBoundary)
+      ? meta
+      : null;
   const batchPage = logsWindow ? logsWindow.page || 1 : 0;
   const batchPerPages = logsWindow
     ? Math.max(1, Math.ceil((logsWindow.pageSize || 100) / perPage))
     : 0;
   const batchFirstGlobal = logsWindow ? (batchPage - 1) * batchPerPages + 1 : 0;
   const batchLastGlobal = logsWindow ? batchFirstGlobal + batchPerPages - 1 : 0;
-  const globalPages = logsWindow ? Math.max(1, Math.ceil(logsWindow.totalLogs / perPage)) : 0;
+  const totalKnown = typeof logsWindow?.totalLogs === 'number';
+  const globalPages = logsWindow
+    ? totalKnown
+      ? Math.max(1, Math.ceil(logsWindow.totalLogs / perPage))
+      : batchFirstGlobal + pages - 1 + (logsWindow.logHasMore ? 1 : 0)
+    : 0;
   const desiredGlobal = logsWindow
     ? pendingBatch
       ? Math.min(pendingBatch.target, globalPages)
@@ -762,7 +768,9 @@ export function ReportRows({
         (serverPage
           ? serverPage.total > serverPage.pageSize
           : logsWindow
-            ? logsWindow.totalLogs > perPage
+            ? totalKnown
+              ? logsWindow.totalLogs > perPage
+              : selected.length > perPage || batchPage > 1 || logsWindow.logHasMore
             : selected.length > perPage) && (
           <tfoot>
             <tr>
@@ -780,8 +788,16 @@ export function ReportRows({
                     serverPage
                       ? Math.max(1, Math.ceil(serverPage.total / serverPage.pageSize))
                       : logsWindow
-                        ? globalPages
+                        ? totalKnown
+                          ? globalPages
+                          : undefined
                         : pages
+                  }
+                  pending={!!logsWindow && !totalKnown && logsWindow.logParts?.count !== 'failed'}
+                  hasNext={
+                    logsWindow && !totalKnown
+                      ? safePage < pages || !!logsWindow.logHasMore
+                      : undefined
                   }
                   label={
                     serverPage && table !== 'cityBody' && (a.filter || a.sort.label || a.query)
@@ -817,7 +833,12 @@ export function ReportRows({
                               return;
                             }
                             if (!a.onLogsPage || !logsWindow.nextCursor) return;
-                            if (batchLastGlobal + 1 > globalPages) return;
+                            if (
+                              totalKnown
+                                ? batchLastGlobal + 1 > globalPages
+                                : !logsWindow.logHasMore
+                            )
+                              return;
                             setPendingBatch({
                               target: batchLastGlobal + 1,
                               batchPage: batchPage + 1,
@@ -840,12 +861,16 @@ function Pager({
   pages,
   label,
   disabled,
+  pending,
+  hasNext,
   onPrev,
   onNext,
 }: {
-  total: number;
+  total?: number;
   page: number;
-  pages: number;
+  pages?: number;
+  pending?: boolean;
+  hasNext?: boolean;
   label?: string;
   disabled?: boolean;
   onPrev: () => void;
@@ -856,20 +881,34 @@ function Pager({
     <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-3" data-report-pager>
       <span className="text-[11px] text-faint">
         {label ? `${label} · ` : ''}
-        {i18n.fragment('共 ', true, true)}
-        {formatValue(total)}
-        {i18n.unit(' 条', formatValue(total), true, false)}
+        {total === undefined ? (
+          pending ? (
+            i18n.text('正在读取')
+          ) : (
+            i18n.system(stateLabels.unavailable)
+          )
+        ) : (
+          <>
+            {i18n.fragment('共 ', true, true)}
+            {formatValue(total)}
+            {i18n.unit(' 条', formatValue(total), true, false)}
+          </>
+        )}
       </span>
       <div className="flex items-center gap-2">
         <span className="num text-[11px] text-faint">
           {i18n.fragment('第 ', false, true)}
-          {formatValue(page)} / {formatValue(pages)}
+          {formatValue(page)} /{' '}
+          {pages === undefined ? <Skeleton width="1.5em" /> : formatValue(pages)}
           {i18n.unit(' 页', formatValue(pages), true, false)}
         </span>
         <Button disabled={disabled || page <= 1} onClick={onPrev}>
           {i18n.text('上一页')}
         </Button>
-        <Button disabled={disabled || page >= pages} onClick={onNext}>
+        <Button
+          disabled={disabled || (hasNext === undefined ? page >= pages : !hasNext)}
+          onClick={onNext}
+        >
           {i18n.text('下一页')}
         </Button>
       </div>

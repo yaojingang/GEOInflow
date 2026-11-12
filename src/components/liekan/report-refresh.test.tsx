@@ -1,12 +1,12 @@
+import { onlineManager, QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { QueryClient, QueryClientProvider, onlineManager, useQuery } from '@tanstack/react-query';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { LiekanPage } from './LiekanPage';
-import { freshAggregateFixture } from '@/test/liekan-freshness';
-import { ManualRefreshProvider } from '@/lib/liekan/contracts/manual-refresh';
-import { setTestUrl } from '@/test/navigation';
-import { LiekanLocaleContext } from '@/lib/liekan/i18n/client';
 import { featureDateRange } from '@/lib/liekan/contracts/analysis';
+import { ManualRefreshProvider } from '@/lib/liekan/contracts/manual-refresh';
+import { LiekanLocaleContext } from '@/lib/liekan/i18n/client';
+import { freshAggregateFixture } from '@/test/liekan-freshness';
+import { setTestUrl } from '@/test/navigation';
+import { LiekanPage } from './LiekanPage';
 
 const state = vi.hoisted(() => ({
   get: vi.fn(),
@@ -46,7 +46,13 @@ vi.mock('./AnalysisLoading', async () => {
       'ai/preference': ({ report }: any) => <span>{report?.value}</span>,
       'human/overview': ({ report }: any) => <span>{report?.value}</span>,
       'human/geo': ({ report }: any) => <span>{report?.value}</span>,
-      logs: ({ report }: any) => <span>{report?.value}</span>,
+      logs: ({ report }: any) => (
+        <>
+          <span>{report?.value}</span>
+          <output data-test="log-count">{report?.meta?.totalLogs ?? 'pending-count'}</output>
+          <output data-test="log-summary">{report?.cards?.[0]?.value ?? 'pending-summary'}</output>
+        </>
+      ),
       content: ({ report }: any) => {
         const actions = useReportActions();
         return (
@@ -145,6 +151,69 @@ beforeEach(() => {
 });
 afterEach(() => client.clear());
 
+it('delivers log rows before the independent count and summary finish', async () => {
+  const count = deferred<any>(),
+    summary = deferred<any>();
+  const boundary = 'a'.repeat(64);
+  state.get.mockImplementation((path: string, parameters: any) => {
+    if (path.endsWith('/log-count')) return count.promise;
+    if (path.endsWith('/log-summary')) return summary.promise;
+    if (path.endsWith('/log-entries')) {
+      const entries = report('visible-log-rows', parameters);
+      Object.assign(entries.meta, { logReadBoundary: boundary });
+      return Promise.resolve(entries);
+    }
+    return new Promise(() => {});
+  });
+  render(
+    <QueryClientProvider client={client}>
+      <LiekanPage resource="logs" />
+    </QueryClientProvider>,
+  );
+  expect(await screen.findByText('visible-log-rows')).toBeVisible();
+  await waitFor(() =>
+    expect(state.get.mock.calls.some(([path]) => path.endsWith('/log-count'))).toBe(true),
+  );
+  expect(screen.getByTestId('log-count')).toHaveTextContent('pending-count');
+  await act(async () => {
+    count.resolve({ readBoundary: boundary, total: 9876 });
+  });
+  await waitFor(() => expect(screen.getByTestId('log-count')).toHaveTextContent('9876'));
+  expect(screen.getByText('visible-log-rows')).toBeVisible();
+  await act(async () => {
+    summary.resolve({
+      readBoundary: boundary,
+      cards: [],
+      tables: {},
+      states: { logs: 'available', catalog: 'empty' },
+      meta: {},
+    });
+  });
+});
+
+it('hides independently loaded rows when the count read discovers revoked permission', async () => {
+  const count = deferred<any>();
+  state.get.mockImplementation((path: string, parameters: any) => {
+    if (path.endsWith('/log-count')) return count.promise;
+    if (path.endsWith('/log-summary')) return new Promise(() => {});
+    const entries = report('private-log-rows', parameters);
+    Object.assign(entries.meta, { logReadBoundary: 'a'.repeat(64) });
+    return Promise.resolve(entries);
+  });
+  render(
+    <QueryClientProvider client={client}>
+      <LiekanPage resource="logs" />
+    </QueryClientProvider>,
+  );
+  expect(await screen.findByText('private-log-rows')).toBeVisible();
+  await act(async () => {
+    count.promise.catch(() => {});
+    count.resolve(Promise.reject(Object.assign(new Error('权限已撤销'), { status: 403 })));
+  });
+  await waitFor(() => expect(screen.queryByText('private-log-rows')).not.toBeInTheDocument());
+  expect(await screen.findByText('无法读取此范围的数据')).toBeVisible();
+});
+
 it.each([
   [
     'zh-CN',
@@ -242,17 +311,17 @@ it('resets a rolling log cursor before reading the refreshed window and fetches 
   );
   const view = render(tree());
   await screen.findByText('loaded-log-batch');
-  const initial = state.get.mock.calls.filter(call => call[1]?.resource === 'logs');
+  const initial = state.get.mock.calls.filter(call => call[0].endsWith('/log-entries'));
   expect(initial).toHaveLength(1);
   expect(initial[0][1]).toMatchObject({ page: 3, cursor: 'old-log-cursor', seek: 'after' });
   fireEvent.click(screen.getByRole('button', { name: '刷新' }));
   await waitFor(() =>
-    expect(state.get.mock.calls.filter(call => call[1]?.resource === 'logs')).toHaveLength(2),
+    expect(state.get.mock.calls.filter(call => call[0].endsWith('/log-entries'))).toHaveLength(2),
   );
-  const refreshed = state.get.mock.calls.filter(call => call[1]?.resource === 'logs')[1][1];
+  const refreshed = state.get.mock.calls.filter(call => call[0].endsWith('/log-entries'))[1][1];
   expect(refreshed.page).toBe(1);
   expect(refreshed.cursor).toBeFalsy();
-  expect(refreshed.seek).toBeFalsy();
+  expect(refreshed.seek).toBe('after');
   expect(refreshed.endAt).toBeGreaterThanOrEqual(initial[0][1].endAt);
   expect(refreshed.startAt).toBe(refreshed.endAt - 30 * 86400000);
   expect(state.updateParams).toHaveBeenCalledWith(
@@ -262,20 +331,22 @@ it('resets a rolling log cursor before reading the refreshed window and fetches 
   setTestUrl('/websites/site-a/geo/logs?dateMode=default&live=1');
   view.rerender(tree());
   await waitFor(() => expect(screen.getByRole('button', { name: '刷新' })).toBeEnabled());
-  expect(state.get.mock.calls.filter(call => call[1]?.resource === 'logs')).toHaveLength(2);
+  expect(state.get.mock.calls.filter(call => call[0].endsWith('/log-entries'))).toHaveLength(2);
   state.extraQuery = { live: '1', page: '2', cursor: 'old-log-cursor', seek: 'after' };
   setTestUrl(
     '/websites/site-a/geo/logs?dateMode=default&live=1&page=2&cursor=old-log-cursor&seek=after',
   );
   view.rerender(tree());
   await waitFor(() =>
-    expect(state.get.mock.calls.filter(call => call[1]?.resource === 'logs')).toHaveLength(3),
+    expect(state.get.mock.calls.filter(call => call[0].endsWith('/log-entries'))).toHaveLength(3),
   );
-  expect(state.get.mock.calls.filter(call => call[1]?.resource === 'logs')[2][1]).toMatchObject({
-    page: 2,
-    cursor: 'old-log-cursor',
-    seek: 'after',
-  });
+  expect(state.get.mock.calls.filter(call => call[0].endsWith('/log-entries'))[2][1]).toMatchObject(
+    {
+      page: 2,
+      cursor: 'old-log-cursor',
+      seek: 'after',
+    },
+  );
 });
 describe('GEO refresh after a successful write', () => {
   it.each([false, true])(
@@ -655,4 +726,50 @@ it.each([
   expect(state.push).toHaveBeenCalledWith('/next-range', {
     scroll: false,
   });
+});
+
+it('keeps exact count and summary visible while refreshing the same log boundary', async () => {
+  const boundary = 'c'.repeat(64),
+    count = deferred<any>(),
+    summary = deferred<any>();
+  let refreshing = false;
+  const summaryValue = {
+    readBoundary: boundary,
+    cards: [{ key: 'value', label: 'value', value: 42, state: 'available' }],
+    tables: {},
+    states: { logs: 'available', catalog: 'empty' },
+    meta: {},
+  };
+  state.get.mockImplementation((path: string, parameters: any) => {
+    if (path.endsWith('/log-count'))
+      return refreshing ? count.promise : Promise.resolve({ readBoundary: boundary, total: 9876 });
+    if (path.endsWith('/log-summary'))
+      return refreshing ? summary.promise : Promise.resolve(summaryValue);
+    const entries = report('retained-log-rows', parameters);
+    Object.assign(entries.meta, { logReadBoundary: boundary });
+    return Promise.resolve(entries);
+  });
+  render(
+    <QueryClientProvider client={client}>
+      <ManualRefreshProvider>
+        <LiekanPage resource="logs" />
+      </ManualRefreshProvider>
+    </QueryClientProvider>,
+  );
+  await waitFor(() => expect(screen.getByTestId('log-count')).toHaveTextContent('9876'));
+  expect(screen.getByTestId('log-summary')).toHaveTextContent('42');
+  await waitFor(() => expect(screen.getByRole('button', { name: '刷新' })).toBeEnabled());
+  refreshing = true;
+  fireEvent.click(screen.getByRole('button', { name: '刷新' }));
+  await waitFor(() =>
+    expect(state.get.mock.calls.filter(([path]) => path.endsWith('/log-count')).length).toBe(2),
+  );
+  expect(screen.getByTestId('log-count')).toHaveTextContent('9876');
+  expect(screen.getByTestId('log-summary')).toHaveTextContent('42');
+  expect(screen.getByRole('button', { name: '正在读取' })).toBeDisabled();
+  await act(async () => {
+    count.resolve({ readBoundary: boundary, total: 9876 });
+    summary.resolve(summaryValue);
+  });
+  await waitFor(() => expect(screen.getByRole('button', { name: '刷新' })).toBeEnabled());
 });

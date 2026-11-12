@@ -2,11 +2,53 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./server', () => ({ query: vi.fn(), LiekanError: class extends Error {} }));
 
+import { waitForLogStatisticsReads } from './ai-log-read-priority';
 import { getContentImpact, getLogFacts, getMonthlyAiShare, isStaticRequestPath } from './logs';
 import { query } from './server';
-import { waitForLogStatisticsReads } from './ai-log-read-priority';
 
 beforeEach(() => vi.resetAllMocks());
+
+it('uses a validated split-read scope without scanning classification or evaluating empty text search', async () => {
+  vi.mocked(query).mockResolvedValue([]);
+  await getLogFacts(
+    'site',
+    new Date(1),
+    new Date(1000),
+    'UTC',
+    1,
+    '',
+    '',
+    '',
+    'after',
+    ['recent'],
+    { crawlerMetricsVersion: 1, crawlerIdentityScope: 'all' },
+    false,
+    undefined,
+    { cursorScope: 'a'.repeat(64), limit: 101 },
+  );
+  const calls = vi.mocked(query).mock.calls;
+  expect(calls).toHaveLength(1);
+  expect(calls[0][0]).toContain('LIMIT 101');
+  expect(calls[0][0]).not.toContain('concat_ws');
+  await getLogFacts(
+    'site',
+    new Date(1),
+    new Date(1000),
+    'UTC',
+    1,
+    '',
+    'needle',
+    '',
+    'after',
+    ['recent'],
+    { crawlerMetricsVersion: 1, crawlerIdentityScope: 'all' },
+    false,
+    undefined,
+    { cursorScope: 'a'.repeat(64), limit: 101 },
+  );
+  expect(vi.mocked(query).mock.calls[1][0]).toContain('concat_ws');
+  expect(vi.mocked(query).mock.calls[1][5]).toBe('needle');
+});
 
 it('resolves current-window report aggregates with one reporting-log scan', async () => {
   vi.mocked(query).mockResolvedValue([]);
@@ -80,9 +122,17 @@ describe('monthly AI share calendar', () => {
     vi.mocked(query).mockResolvedValue([]);
     const end = new Date('2026-10-31T16:00:00Z');
     const rows = await getMonthlyAiShare('site', end, 'Asia/Shanghai', {
-      crawlerIdentityScope: 'all', crawlerMetricsVersion: 1,
+      crawlerIdentityScope: 'all',
+      crawlerMetricsVersion: 1,
     });
-    expect(rows.map(row => row.month)).toEqual(['2026-05', '2026-06', '2026-07', '2026-08', '2026-09', '2026-10']);
+    expect(rows.map(row => row.month)).toEqual([
+      '2026-05',
+      '2026-06',
+      '2026-07',
+      '2026-08',
+      '2026-09',
+      '2026-10',
+    ]);
     const [sql, , upperBound, , monthAnchor] = vi.mocked(query).mock.calls[0];
     expect(sql).toContain('created_at<$2');
     expect(sql).toContain("date_trunc('month',$4::timestamptz");

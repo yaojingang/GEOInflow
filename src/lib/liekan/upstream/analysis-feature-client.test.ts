@@ -25,3 +25,50 @@ it('queues five cold modules within two active durable submissions until each re
  await vi.advanceTimersByTimeAsync(10000);
  expect(await complete).toHaveLength(5);expect(maximum).toBe(2);expect(submitted).toBe(5);expect(active).toBe(0);
 });
+
+it('uses one private viewer for log count submission, polling and cancellation', async () => {
+  vi.useFakeTimers();
+  const id = 'aaaaaaaa-aaaa-4aaa-8aaa-111111111111';
+  const job = {
+    id,
+    websiteId: site,
+    status: 'queued',
+    queuedAt: '2026-10-01',
+    startedAt: null,
+    completedAt: null,
+    generatedAt: null,
+    expiresAt: null,
+    errorCode: null,
+    retryAfterMs: 1000,
+    resultUrl: `/liekan/websites/${site}/analytics-jobs/${id}/result`,
+  };
+  const seen: { method: string; view: string }[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: any, init: any) => {
+      const url = new URL(String(input));
+      seen.push({ method: init.method || 'GET', view: init.headers['X-Liekan-View'] });
+      if (init.method === 'DELETE') return Response.json({ released: true });
+      if (url.pathname.endsWith('/log-count')) {
+        expect(init.headers.Prefer).toBe('respond-async');
+        return Response.json({ analysisJob: job }, { status: 202 });
+      }
+      return Response.json({ analysisJob: job });
+    }),
+  );
+  const abort = new AbortController();
+  const request = featureApi.get(
+    `/liekan/websites/${site}/log-count`,
+    { startAt: 0, endAt: 1000, readBoundary: 'a'.repeat(64) },
+    abort.signal,
+  );
+  const result = request.catch(error => error);
+  await vi.advanceTimersByTimeAsync(1200);
+  abort.abort();
+  await vi.advanceTimersByTimeAsync(10);
+  expect(await result).toMatchObject({ name: 'AbortError' });
+  expect(seen.some(x => x.method === 'DELETE')).toBe(true);
+  expect(seen.filter(x => x.method === 'GET').length).toBeGreaterThan(1);
+  expect(seen[0].view).toMatch(/^[a-f0-9-]{36}$/);
+  expect(new Set(seen.map(x => x.view)).size).toBe(1);
+});

@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { beforeEach, expect, it, vi } from 'vitest';
+
 const m = vi.hoisted(() => ({
   authenticate: vi.fn(),
   authorize: vi.fn(),
@@ -27,12 +28,15 @@ vi.mock('./dashboard-snapshots', () => ({
 }));
 vi.mock('./page-report', () => ({ peekPageReport: m.peek }));
 vi.mock('./analysis-fast-read', () => ({ tryFastAnalysis: m.fast }));
-import * as viewers from './analysis-viewers';
+
 import {
-  asyncAnalysisResponse,
-  analysisJobResponse,
   analysisAsyncRequested,
+  analysisJobResponse,
+  asyncAnalysisResponse,
+  privateAnalysisResponse,
 } from './analysis-query-api';
+import * as viewers from './analysis-viewers';
+
 const site = '11111111-1111-4111-8111-111111111111',
   id = '22222222-2222-4222-8222-222222222222';
 const request = () =>
@@ -332,4 +336,24 @@ it('rejects an invalid viewer identifier before registering any task', async () 
     status: 400,
   });
   expect(m.request).not.toHaveBeenCalled();
+});
+
+it('registers the independent log count under the same browser viewer used by polling and cancellation', async () => {
+  const viewer = '33333333-3333-4333-8333-333333333333';
+  m.request.mockImplementation(async () => {
+    expect(viewers.currentAnalysisViewer()).toBe(viewer);
+    return { ready: false, analysisJob: { id, websiteId: site, status: 'queued' } };
+  });
+  const response = await privateAnalysisResponse(
+    new Request('https://analytics.test/log-count', {
+      headers: { 'X-Liekan-View': viewer },
+    }),
+    site,
+    { id: 'actor', role: 'user' },
+    'feature:log-count',
+    {},
+  );
+  expect(response.status).toBe(202);
+  expect(m.request).toHaveBeenCalledTimes(1);
+  expect(viewers.currentAnalysisViewer()).toBeUndefined();
 });

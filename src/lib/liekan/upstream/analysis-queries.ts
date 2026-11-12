@@ -1,58 +1,58 @@
 import { randomUUID } from 'node:crypto';
+import type { JobAttempt, PgBoss } from 'pg-boss';
 import { hasPermission } from '@/lib/auth';
 import { PERMISSIONS, ROLES } from '@/lib/constants';
-import type { JobAttempt, PgBoss } from 'pg-boss';
 import type { AnalysisJob } from '../contracts/analysis-acceleration';
+import { pageReportParts } from '../contracts/page-report';
 import { getPublishedCatalog } from '../crawlers/published';
-import { withPublishedRegistry } from './crawler-registry-context';
-import { analysisCapacity, analysisTransaction } from './analysis-rollups-db';
 import { aiExecutor } from './ai-db';
-import { authorizeCrawler, type CrawlerActor } from './crawler-access';
+import { withAnalysisPermit } from './analysis-background';
+import { analysisAttemptDiagnostics, noteAnalysisDelivery } from './analysis-diagnostics';
+import { canReadFirstPage, FIRST_PAGE_BUDGET_MS, firstPageRange } from './analysis-page-admission';
+import {
+  analysisPermitPredicate,
+  analysisPermitTable,
+  analysisPermitValues,
+} from './analysis-permit-context';
+import {
+  ANALYSIS_QUERY_QUEUE,
+  ANALYSIS_RESULT_FORMAT,
+  analysisAttemptPolicy,
+  analysisDigest,
+  analysisQueryLimits,
+  analysisQueryParameters,
+  analysisResultFresh,
+  decodeAnalysisEnvelope,
+  encodeAnalysisEnvelope,
+  liveAnalysisTargets,
+} from './analysis-query-model';
+import { analysisCapacity, analysisTransaction } from './analysis-rollups-db';
+import {
+  analysisConsumerDemandSql,
+  registerAnalysisViewer,
+  renewAnalysisViewer,
+} from './analysis-viewers';
 import { readAnalyticsVersions } from './analytics-revision';
-import { websiteCacheTag } from './query-cache';
 import {
   analyticsWorkerContext,
   captureBrowserPopulations,
   currentCacheContext,
   noteBrowserPopulation,
 } from './cache-context';
-import { withAnalysisPermit } from './analysis-background';
-import {
-  analysisPermitTable,
-  analysisPermitPredicate,
-  analysisPermitValues,
-} from './analysis-permit-context';
-import {
-  analysisConsumerDemandSql,
-  registerAnalysisViewer,
-  renewAnalysisViewer,
-} from './analysis-viewers';
-import { firstPageRange, canReadFirstPage, FIRST_PAGE_BUDGET_MS } from './analysis-page-admission';
+import { statisticsCacheTtl } from './cache-policy';
+import { authorizeCrawler, type CrawlerActor } from './crawler-access';
+import { withPublishedRegistry } from './crawler-registry-context';
 import {
   analysisForegroundDemandSql,
   dashboardAnalysisWorkSql,
-  dashboardRunnableHeadSql,
   dashboardFirstPageTurnSql,
+  dashboardRunnableHeadSql,
   pauseIdleDashboardRetries,
   preserveDashboardFailure,
   yieldIdleDashboard,
 } from './dashboard-demand';
-import {
-  analysisDigest,
-  decodeAnalysisEnvelope,
-  encodeAnalysisEnvelope,
-  analysisQueryParameters,
-  analysisResultFresh,
-  analysisQueryLimits,
-  ANALYSIS_QUERY_QUEUE,
-  ANALYSIS_RESULT_FORMAT,
-  liveAnalysisTargets,
-  analysisAttemptPolicy,
-} from './analysis-query-model';
-import { statisticsCacheTtl } from './cache-policy';
-import { pageReportParts } from '../contracts/page-report';
 import { LiekanError } from './errors';
-import { analysisAttemptDiagnostics, noteAnalysisDelivery } from './analysis-diagnostics';
+import { websiteCacheTag } from './query-cache';
 
 type Row = {
   id: string;
@@ -422,6 +422,10 @@ export async function readAnalysisQuery(
       actor.id,
     );
     if (!row) throw new LiekanError('统计任务不存在或已过期，请重新读取', 410, 'analysis-expired');
+    if (row.target === 'feature:log-count') {
+      const { logReadBoundary, parseLogRead } = await import('./log-read-boundary');
+      await logReadBoundary(tx, websiteId, parseLogRead(row.parameters));
+    }
     if (row.strong_version !== snapshot.strong || String(row.epoch) !== String(snapshot.epoch))
       throw new LiekanError('统计条件已变化，请重新读取', 410, 'analysis-invalidated');
     if (
@@ -668,6 +672,10 @@ export async function processAnalysisQuery(id: string, options: { firstPage?: bo
               String(snapshot.epoch) !== String(row.epoch)
             )
               throw new LiekanError('统计条件已变化', 410);
+            if (row.target === 'feature:log-count') {
+              const { logReadBoundary, parseLogRead } = await import('./log-read-boundary');
+              await logReadBoundary(tx, row.website_id, parseLogRead(row.parameters));
+            }
             const endAt = Number(
               row.parameters.endAt ?? +new Date(row.parameters.endDate as string),
             );
@@ -735,7 +743,12 @@ export async function processAnalysisQuery(id: string, options: { firstPage?: bo
       }, row.catalog_version || undefined);
     } catch (error) {
       failure = error || new Error('analysis-compute-failed');
-      const status = error instanceof LiekanError ? error.status : 500;
+      const status =
+        error instanceof LiekanError
+          ? error.code === 'log-read-boundary-conflict'
+            ? 410
+            : error.status
+          : 500;
       // Acquisition and publication failures remain retryable; budget failures carry an explicit code.
       const code = error instanceof LiekanError ? error.code : 'analysis-compute-failed';
       try {

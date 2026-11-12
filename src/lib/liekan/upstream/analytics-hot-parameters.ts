@@ -1,12 +1,13 @@
 import { z } from 'zod';
-import { CALENDAR_POLICY_VERSION } from '../contracts/calendar';
-import { ANALYTICS_READ_VERSION } from './analytics-revision';
 import * as schemas from '@/lib/analytics-schema';
 import { EVENT_COLUMNS, SESSION_COLUMNS } from '@/lib/constants';
 import { filterParams, withDateRange } from '@/lib/schema';
 import { analysisQuery, journeyQuery } from '../contracts/analysis';
+import { CALENDAR_POLICY_VERSION } from '../contracts/calendar';
+import { logCountQuery } from '../contracts/log-read';
 import { parseReportQuery } from '../contracts/query';
 import { sharedReportQuery } from '../contracts/shared-report';
+import { ANALYTICS_READ_VERSION } from './analytics-revision';
 
 export const analyticsRefreshJobSchema = z
   .object({
@@ -32,6 +33,7 @@ export const analyticsRefreshJobSchema = z
       'native:revenue/chart',
       'native:revenue/metrics',
       'native:utm/metrics',
+      'feature:log-count',
       'feature:page-report',
       'feature:shared-report',
       'feature:analytics',
@@ -56,7 +58,9 @@ export function analyticsHotCatalogVersion(strongVersion: string): string | unde
     if (
       (version.length === 7 ||
         (version.length === 8 && version[7] === CALENDAR_POLICY_VERSION) ||
-        (version.length === 9 && version[7] === ANALYTICS_READ_VERSION && version[8] === CALENDAR_POLICY_VERSION)) &&
+        (version.length === 9 &&
+          version[7] === ANALYTICS_READ_VERSION &&
+          version[8] === CALENDAR_POLICY_VERSION)) &&
       ['history-repair-v1.1', 'history-repair-v1.2'].includes(version[1]) &&
       z.uuid().safeParse(version[3]).success
     )
@@ -102,6 +106,7 @@ export function parseAnalyticsHotParameters(target: string, input: Record<string
     parameters.fields = JSON.stringify(parameters.fields);
   if (target === 'native:funnels/stats' && Array.isArray(parameters.steps))
     parameters.steps = JSON.stringify(parameters.steps);
+  if (target === 'feature:log-count') return logCountQuery.parse(parameters);
   if (target === 'feature:page-report') {
     const parsed = parseReportQuery(parameters);
     if (!parsed.success) throw parsed.error;
