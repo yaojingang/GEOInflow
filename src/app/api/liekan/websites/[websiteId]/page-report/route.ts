@@ -41,7 +41,7 @@ export async function GET(
         authMs = performance.now() - authStart;
       });
       if (warehouseEnabled() && warehouseOverviewAsyncRequested(request, query))
-        return requestWarehouseOverview(access, Object.fromEntries(query));
+        return requestWarehouseOverview(access, Object.fromEntries(query), request.signal);
       const reportStart = performance.now();
       const result = await captureReportTimings(
         () =>

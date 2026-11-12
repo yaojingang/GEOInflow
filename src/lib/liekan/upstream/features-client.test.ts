@@ -50,6 +50,50 @@ it('waits for a scheduled overview by rereading the same report', async () => {
   }
 });
 
+it('carries the overview page selection to the shared job result', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+  const site = '11111111-1111-4111-8111-111111111111';
+  const id = '22222222-2222-4222-8222-222222222222';
+  const job = {
+    id,
+    websiteId: site,
+    status: 'queued',
+    queuedAt: '2026-01-01',
+    startedAt: null,
+    completedAt: null,
+    generatedAt: null,
+    expiresAt: null,
+    errorCode: null,
+    retryAfterMs: 1000,
+    resultUrl: `/liekan/websites/${site}/overview-jobs/${id}/result`,
+  };
+  const fetcher = vi
+    .fn()
+    .mockResolvedValueOnce(Response.json({ analysisJob: job }, { status: 202 }))
+    .mockResolvedValueOnce(Response.json({ analysisJob: { ...job, status: 'ready' } }))
+    .mockResolvedValueOnce(Response.json({ tables: { topBody: [{ path: '/second' }] } }));
+  vi.stubGlobal('fetch', fetcher);
+  try {
+    const pending = featureApi.get(`/liekan/websites/${site}/page-report`, {
+      resource: 'overview',
+      startAt: 1,
+      endAt: 2,
+      tp_topBody: 2,
+    });
+    const checked = expect(pending).resolves.toMatchObject({
+      tables: { topBody: [{ path: '/second' }] },
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    await checked;
+    expect(fetcher.mock.calls[1][0].search).toBe('');
+    expect(fetcher.mock.calls[2][0].searchParams.get('tp_topBody')).toBe('2');
+  } finally {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  }
+});
+
 it.each([true, false])(
   'resumes an idle handle once and bounds rapid repeated idle failures: %s',
   async success => {

@@ -31,6 +31,7 @@ import {
   buildWarehouseBrowserPages,
   buildWarehouseBrowserSources,
   prepareWarehouseBrowserPageReport,
+  readWarehouseOverviewRankingPage,
 } from './warehouse-browser-page-report';
 import { WarehouseEvidenceSpool } from './warehouse-evidence-spool';
 import { warehouseReportQuery, warehouseReportStream } from './warehouse-report-snapshot';
@@ -58,6 +59,37 @@ afterEach(async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
+it('reads the requested ranking slice and retains crawler counts from encoded path aliases', async () => {
+  const p = params({ resource: 'overview' });
+  vi.mocked(warehouseReportQuery)
+    .mockResolvedValueOnce([{ path: '/中', pv: '12', uv: '6' }])
+    .mockResolvedValueOnce([{ present: 1 }]);
+  vi.mocked(warehouseReportStream).mockImplementationOnce(async (_site, _sql, _params, consume) => {
+    await consume([
+      { path: '/%E4%B8%AD', requests: '3', bot: 'A' },
+      { path: '/中', requests: '2', bot: 'B' },
+      { path: '/unrelated%20path', requests: '100', bot: 'C' },
+    ]);
+  });
+  const snapshot = { tables: { topBody: [{ aiRequests: 0 }] }, meta: {} };
+  expect(await readWarehouseOverviewRankingPage('site', p, snapshot, 'topBody', 2)).toEqual([
+    {
+      path: '/中',
+      humanPv: 12,
+      aiRequests: 5,
+      ratio: 0.42,
+      bot: 'A',
+      evaluation: '已被抓取',
+    },
+  ]);
+  expect(warehouseReportQuery).toHaveBeenCalledWith(
+    'site',
+    expect.stringContaining('ORDER BY pv DESC,path LIMIT 20 OFFSET'),
+    expect.objectContaining({ overviewOffset: '20' }),
+  );
+  expect(await readdir(directory)).toEqual([]);
+});
+
 it.each([0, 1])('reuses evidence only for a proved empty overview visit window (%s)', async n => {
   const p = params({ resource: 'overview' });
   vi.spyOn(analytics, 'getHumanFacts').mockResolvedValue({
@@ -73,7 +105,9 @@ it.each([0, 1])('reuses evidence only for a proved empty overview visit window (
     summary: {},
     bots: [],
   } as Awaited<ReturnType<typeof getLogFacts>>);
-  vi.mocked(warehouseReportQuery).mockResolvedValue([]);
+  vi.mocked(warehouseReportQuery)
+    .mockResolvedValueOnce([{ count: '0' }])
+    .mockResolvedValue([]);
   vi.mocked(warehouseReportStream).mockClear();
   const prepared = await prepareWarehouseBrowserPageReport('site', p);
   try {

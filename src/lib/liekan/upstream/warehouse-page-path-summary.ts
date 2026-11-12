@@ -1,8 +1,8 @@
 import { compareReportAiPages } from '../report-log-tables';
 import { warehouseReader } from '../warehouse/reader-runtime';
-import {
-  type EvidenceProducer,
-  type SpoolRows,
+import type {
+  EvidenceProducer,
+  SpoolRows,
   WarehouseEvidenceSpool,
 } from './warehouse-evidence-spool';
 
@@ -20,6 +20,48 @@ export async function streamWarehouseCatalogPaths(
     if (!rows.length) return;
     for (const row of rows) await emit(row);
     after = rows.at(-1).path;
+  }
+}
+
+/** Match encoded paths exactly, as the warehouse catalog projection does. */
+export async function countUncrawledCatalogPaths(
+  spool: WarehouseEvidenceSpool,
+  pages: SpoolRows<{ path: string }>,
+  produceCatalog: EvidenceProducer<{ path: string }>,
+) {
+  const smallLimit = 4096;
+  const pending = new Set<string>();
+  let large = false;
+  await produceCatalog(async ({ path }) => {
+    if (large) return;
+    pending.add(path);
+    if (pending.size > smallLimit) large = true;
+  });
+  if (!large) {
+    const catalogCount = pending.size;
+    for await (const { path } of pages.iterate()) {
+      pending.delete(path);
+      if (!pending.size) break;
+    }
+    return { catalogCount, blindCount: pending.size };
+  }
+  const compare = (a: { path: string }, b: { path: string }) => lexical(a.path, b.path);
+  const catalog = await spool.sort(produceCatalog, compare);
+  const paths = await spool.sort<{ path: string }>(async emit => {
+    for await (const { path } of pages.iterate()) await emit({ path });
+  }, compare);
+  const iterator = paths.iterate();
+  let blindCount = 0;
+  try {
+    let current = await iterator.next();
+    for await (const item of catalog.iterate()) {
+      while (!current.done && compare(current.value, item) < 0) current = await iterator.next();
+      if (current.done || compare(current.value, item) !== 0) blindCount++;
+    }
+    return { catalogCount: catalog.total, blindCount };
+  } finally {
+    await iterator.return(undefined);
+    await Promise.all([paths.remove(), catalog.remove()]);
   }
 }
 

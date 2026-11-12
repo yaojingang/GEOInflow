@@ -110,3 +110,40 @@ export const journalDDL = [
 // Destructive retention is opt-in and requires separate validation of proof/lease references.
 // A fresh installation and a historical import never add an implicit 90-day TTL.
 export const warehouseDDL = () => [...journalDDL, ...factTables.map(t => factDDL(t.name))];
+
+// Rebuildable results are separate from the sealed source-fact schema and
+// its checksum. Replacing the app leaves old warehouse binaries compatible.
+export const warehouseLogTrendTable = 'warehouse_log_hourly_trend';
+export const warehouseLogTrendDDL = `CREATE TABLE IF NOT EXISTS ${warehouseLogTrendTable} (
+  website_id UUID, epoch UInt64, control FixedString(64), hour UInt32, build UUID,
+  publication UInt64, payload String, recorded_at DateTime64(6,'UTC') DEFAULT now64(6)
+) ENGINE = MergeTree PARTITION BY toYYYYMM(recorded_at)
+ORDER BY (website_id,epoch,control,hour,publication,recorded_at,build)
+TTL recorded_at + INTERVAL 45 DAY`;
+
+export const warehouseOverviewLogDays = 'warehouse_overview_log_days';
+export const warehouseOverviewLogCoverage = 'warehouse_overview_log_coverage';
+export const warehouseAnalyticsTables = [
+  warehouseLogTrendTable,
+  warehouseOverviewLogDays,
+  warehouseOverviewLogCoverage,
+];
+export const warehouseOverviewLogDDL = [
+  `CREATE TABLE IF NOT EXISTS ${warehouseOverviewLogDays} (
+  website_id UUID, epoch UInt64, control FixedString(64), build UUID, day Date32,
+  section LowCardinality(String), name Nullable(String), vendor Nullable(String), type Nullable(String),
+  botId Nullable(String), path Nullable(String), requests UInt64, ai UInt64,
+  pages AggregateFunction(uniqExact,String), abnormal UInt64,
+  classificationVersions AggregateFunction(uniqExact,String), legacyRequests UInt64,
+  unclassifiedRequests UInt64, lastTime Nullable(DateTime64(6,'UTC')),
+  recorded_at DateTime64(6,'UTC') DEFAULT now64(6)
+) ENGINE = MergeTree PARTITION BY toYYYYMM(recorded_at)
+ORDER BY (website_id,epoch,control,day,build,section)
+TTL recorded_at + INTERVAL 45 DAY`,
+  `CREATE TABLE IF NOT EXISTS ${warehouseOverviewLogCoverage} (
+  website_id UUID, epoch UInt64, control FixedString(64), publication UInt64,
+  checkpoint UUID, payload String, recorded_at DateTime64(6,'UTC') DEFAULT now64(6)
+) ENGINE = MergeTree PARTITION BY toYYYYMM(recorded_at)
+ORDER BY (website_id,epoch,control,publication,recorded_at,checkpoint)
+TTL recorded_at + INTERVAL 45 DAY`,
+];

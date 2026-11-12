@@ -14,6 +14,7 @@ vi.mock('./warehouse-report-snapshot', () => ({
 import {
   warehouseLogFacts,
   warehouseLogQuerySpec,
+  warehouseOverviewLogWindow,
   warehousePlotLogs,
 } from './warehouse-log-queries';
 import { warehouseGeoWeightAggregate } from './warehouse-geo-weight';
@@ -51,6 +52,12 @@ it('limits ordered version reads to event-time-bounded logs', () => {
   expect(() => factRelation('liekan_log', { orderedLogVersions: true })).toThrow(
     'Invalid warehouse ordered log read',
   );
+  expect(
+    factRelation('liekan_log', {
+      orderedLogVersions: true,
+      immutableTimeWindow: { start: 'start', end: 'end', hours: 'hours' },
+    }),
+  ).toContain('SELECT _attempt_id FROM "warehouse_liekan_log"');
 });
 
 beforeEach(() => {
@@ -158,6 +165,8 @@ it('streams all overview groups from one accepted relation without retaining raw
   expect(spec.overview).toContain('optimize_aggregation_in_order=1');
   expect(spec.overview).not.toContain('AS MATERIALIZED');
   expect(spec.overview.match(/FROM "warehouse_liekan_log" AS fact/g)).toHaveLength(1);
+  expect(spec.overview).toContain('SELECT _attempt_id FROM "warehouse_liekan_log"');
+  expect(spec.overview).toContain('SELECT attempt_id, argMax(candidate_id, publication)');
   for (const key of ['summary', 'bots', 'pages']) {
     expect(spec.overview).toContain(`'${key}'`);
     expect(spec.statements[key]).toContain('FROM "warehouse_liekan_log" AS fact');
@@ -166,6 +175,42 @@ it('streams all overview groups from one accepted relation without retaining raw
   expect(spec.overview).toContain("_record_time < {logEnd:DateTime64(6,'UTC')}");
   expect(spec.overview).not.toContain('GROUPING SETS');
   expect(spec.overview).not.toContain('identity_evidence');
+});
+
+it('bounds the short-window evidence key set and uses the log timestamps', async () => {
+  const to = new Date(+start + 3600000);
+  mocks.query
+    .mockResolvedValueOnce([{ count: '100001' }])
+    .mockResolvedValueOnce([{ count: '100000' }]);
+  await expect(warehouseOverviewLogWindow('site', start, to, true)).resolves.toEqual({
+    hasFacts: true,
+    restrictEvidenceToWindow: false,
+  });
+  await expect(warehouseOverviewLogWindow('site', start, to, true)).resolves.toEqual({
+    hasFacts: true,
+    restrictEvidenceToWindow: true,
+  });
+  expect(mocks.query.mock.calls[0][1]).toContain('LIMIT 100001');
+  const spec = await warehouseLogQuerySpec(
+    start,
+    to,
+    'UTC',
+    { resource: 'overview', crawlerIdentityScope: 'all', crawlerMetricsVersion: 1 },
+    '',
+    '',
+    false,
+    'site',
+    true,
+    true,
+  );
+  const keySet = spec.overview.slice(spec.overview.indexOf('AND "log_id" IN'));
+  expect(spec.overview).not.toContain('SELECT _attempt_id FROM "warehouse_liekan_log"');
+  expect(spec.overview).toContain(
+    `AND "run_id"={wh_repair_run:UUID} AND "generation"={wh_repair_generation:UUID} AND "kind"='log'`,
+  );
+  expect(keySet).toContain('SELECT id FROM warehouse_liekan_log');
+  expect(keySet).toContain("_record_time < {logEnd:DateTime64(6,'UTC')}");
+  expect(keySet).toContain("family = 'liekan_log' AND publication <= {wh_publication:UInt64}");
 });
 
 it('evaluates GEO classification once before expanding its overlapping windows', async () => {

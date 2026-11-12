@@ -112,5 +112,6 @@
   "069_report_fragments.sql": "2fec0a333e012cec6106ca0de8f944edb9bae68cfd4c7db44c775d3cb9f9f2b9",
   "070_analytics_input_summary.sql": "5d16b0660ecb38480a4d443a46840d546585e1d0f356668071dee5df474eb5e0",
   "092_warehouse_overview_snapshots.sql": "2a1327a138592b4de0c2406f4c22e1255916ff64e67b5215e2da79716c76e22d",
-  "093_warehouse_claim_guard.sql": "aa93c91e421678d02941c7c919bc20dfc22257cf2f2a7484ea2f84050a790df7"
+  "093_warehouse_claim_guard.sql": "aa93c91e421678d02941c7c919bc20dfc22257cf2f2a7484ea2f84050a790df7",
+  "094_log_import_time_index.sql": "ac0ab3d9d4cc700411a2845559b5a53fe3be7fa6c1a4ee1b8e2732cea2dab797"
 }

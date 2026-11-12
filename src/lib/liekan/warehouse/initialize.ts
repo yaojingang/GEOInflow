@@ -1,6 +1,16 @@
 import { createHash } from 'node:crypto';
 import type { ClickHouseClient } from '@clickhouse/client';
-import { WAREHOUSE_SCHEMA_VERSION, warehouseDDL } from './schema';
+import {
+  WAREHOUSE_SCHEMA_VERSION,
+  warehouseDDL,
+  warehouseLogTrendDDL,
+  warehouseOverviewLogDDL,
+} from './schema';
+
+export async function initializeWarehouseAnalytics(client: ClickHouseClient) {
+  for (const query of [warehouseLogTrendDDL, ...warehouseOverviewLogDDL])
+    await client.command({ query });
+}
 
 function definition(ddl: string) {
   const match =
@@ -95,5 +105,6 @@ export async function initializeWarehouse(client: ClickHouseClient) {
       ],
       format: 'JSONEachRow',
     });
+  await initializeWarehouseAnalytics(client);
   return { version: WAREHOUSE_SCHEMA_VERSION, checksum, tables: statements.length };
 }

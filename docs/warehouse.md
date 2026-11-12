@@ -20,6 +20,7 @@ GEOInflow 的 ClickHouse 版本将日志、浏览器事件及关联分析证据�
 | --- | --- |
 | `LIEKAN_INSTALL_MODE=fresh` | 空库新装，分析权威直接为 CH |
 | `LIEKAN_CH_QUERY_MEMORY_BYTES=1073741824` | 单查询内存保护，默认 1 GiB，最小 64 MiB；聚合、排序和关联在更低阈值落盘，不限制数据保留总量 |
+| `LIEKAN_CH_READ_CONCURRENCY=1` | analytics worker 的 CH 读取并发。设为 `2` 可让不同站点的首次总览同时生成，最多同时计算一份近 30 天总览。常规刷新、自选区间和历史回填保持串行 |
 | `LIEKAN_INSTALL_MODE=pg-transition` | 已有 PG 升级，完成明确切换前 PG 仍为权威 |
 | `LIEKAN_CLICKHOUSE_DATABASE`、`LIEKAN_CLICKHOUSE_USERNAME`、`LIEKAN_CLICKHOUSE_PASSWORD` | 独立 Liekan CH 仓库 |
 | `LIEKAN_QUEUE_PARTITIONS` | 首次创建输入主题时固定的分区数，默认 8；安装后不能直接改变 |

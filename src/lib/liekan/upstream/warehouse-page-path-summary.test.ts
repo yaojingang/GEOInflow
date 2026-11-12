@@ -4,7 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { WarehouseEvidenceSpool } from './warehouse-evidence-spool';
-import { summarizeWarehousePagePaths } from './warehouse-page-path-summary';
+import {
+  countUncrawledCatalogPaths,
+  summarizeWarehousePagePaths,
+} from './warehouse-page-path-summary';
 
 let directory: string;
 beforeEach(async () => {
@@ -16,6 +19,25 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   await rm(directory, { recursive: true, force: true });
 });
+
+it.each([0, 4100])(
+  'counts uncrawled encoded paths using the full groups with %s extra paths',
+  async extra => {
+    const spool = await WarehouseEvidenceSpool.create();
+    try {
+      const pages = await spool.write<{ path: string }>(async emit => {
+        for (const path of ['/a%20b', '/other', '/a%20b', '/z']) await emit({ path });
+      });
+      const result = await countUncrawledCatalogPaths(spool, pages, async emit => {
+        for (const path of ['/z', '/a%20b', '/a b', '/missing']) await emit({ path });
+        for (let i = 0; i < extra; i++) await emit({ path: `/extra/${i}` });
+      });
+      expect(result).toEqual({ catalogCount: 4 + extra, blindCount: 2 + extra });
+    } finally {
+      await spool.dispose();
+    }
+  },
+);
 
 it('keeps full-population cards, directory tie order, nullable depths and original catalog order', async () => {
   const spool = await WarehouseEvidenceSpool.create();

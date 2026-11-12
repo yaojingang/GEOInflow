@@ -2,19 +2,12 @@ import type { ReportQuery } from '../contracts/query';
 import type { PreparedReport } from '../report-prepared';
 import { warehouseReader } from '../warehouse/reader-runtime';
 import { reportLogRange } from '../report-log-tables';
-import { warehouseCatalogProjection, warehouseCatalogPaths } from './warehouse-catalog';
-import { warehouseLogQuerySpec } from './warehouse-log-queries';
-import { warehouseReportQuery } from './warehouse-report-snapshot';
 import { prepareWarehouseAiPageReport } from './warehouse-ai-page-report';
 import { pageReportParts } from '../contracts/page-report';
 import { getLogFacts } from './logs';
+import { warehouseReportMetadata } from './warehouse-report-snapshot';
 
-export async function warehousePageCatalogCoverage(
-  site: string,
-  p: ReportQuery,
-  countCoverage: boolean,
-  range = reportLogRange(p),
-) {
+async function warehousePageCatalogCount(site: string) {
   const [row] = await warehouseReader().db.read<{ count: string }>(
     'SELECT count(*)::text AS count FROM liekan_catalog WHERE website_id=$1::uuid',
     [site],
@@ -22,28 +15,7 @@ export async function warehousePageCatalogCoverage(
   const catalogCount = Number(row.count);
   if (!Number.isSafeInteger(catalogCount) || catalogCount < 0)
     throw new Error('warehouse-catalog-count-out-of-range');
-  if (!catalogCount || !countCoverage) return { catalogCount, blindCount: catalogCount };
-  const { start, end } = range;
-  const spec = await warehouseLogQuerySpec(
-    start,
-    end,
-    p.timezone,
-    p,
-    p.filter,
-    p.search,
-    false,
-    site,
-  );
-  const projection = await warehouseCatalogProjection(site);
-  const [coverage] = await warehouseReportQuery<{ blind: string }>(
-    site,
-    `SELECT countIf(path NOT IN (SELECT path FROM (${spec.statements.pages}))) AS blind FROM ${warehouseCatalogPaths}`,
-    { ...spec.params, ...projection },
-  );
-  const blindCount = Number(coverage.blind);
-  if (!Number.isSafeInteger(blindCount) || blindCount < 0 || blindCount > catalogCount)
-    throw new Error('warehouse-catalog-coverage-out-of-range');
-  return { catalogCount, blindCount };
+  return catalogCount;
 }
 
 export async function prepareWarehousePageReport(
@@ -67,20 +39,17 @@ export async function prepareWarehousePageReport(
       pageReportParts[p.resource].logs.filter(field => field !== 'catalog'),
       p,
     );
-    const { catalogCount } = await warehousePageCatalogCoverage(website.id, p, false, range);
+    const catalogCount = await warehousePageCatalogCount(website.id);
     return { range, logs, catalogCount };
   }
   if (!['overview', 'content', 'human/sources'].includes(p.resource)) return undefined;
   const { prepareWarehouseBrowserPageReport } = await import('./warehouse-browser-page-report');
-  const prepared = await prepareWarehouseBrowserPageReport(website.id, p, range);
+  if (p.resource === 'overview') await warehouseReportMetadata(website.id);
+  const catalogCount = await warehousePageCatalogCount(website.id);
+  const prepared = await prepareWarehouseBrowserPageReport(website.id, p, range, catalogCount);
   prepared.range = range;
   try {
-    const catalog = await warehousePageCatalogCoverage(
-      website.id,
-      p,
-      p.resource === 'overview' && !!prepared.logs?.latest,
-      range,
-    );
+    const catalog = prepared.catalogCoverage ?? { catalogCount, blindCount: catalogCount };
     prepared.catalogCount = catalog.catalogCount;
     const decorate = prepared.decorate;
     prepared.decorate = report => {

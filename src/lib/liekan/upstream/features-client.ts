@@ -268,14 +268,24 @@ export async function featureRequest<T = any>(
                   }),
               }
             : {}),
-          fetchJob: taskPath =>
-            fetch(new URL(getApiUrl(taskPath), window.location.origin), {
+          fetchJob: taskPath => {
+            const taskUrl = new URL(getApiUrl(taskPath), window.location.origin);
+            if (
+              params?.resource === 'overview' &&
+              /\/overview-jobs\/[^/]+\/result$/.test(taskPath)
+            ) {
+              for (const key of ['tp_topBody', 'tp_visitorTopBody']) {
+                if (params[key] != null) taskUrl.searchParams.set(key, String(params[key]));
+              }
+            }
+            return fetch(taskUrl, {
               headers: Object.fromEntries(
                 Object.entries(attemptHeaders).filter(([key]) => key !== 'Prefer'),
               ),
               signal: requestSignal,
               cache: 'no-store',
-            }),
+            });
+          },
         });
         response = result.response;
         data = result.data;

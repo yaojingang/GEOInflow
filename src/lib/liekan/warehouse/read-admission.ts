@@ -16,7 +16,7 @@ export class ReadAdmission {
     cleanup: () => void;
   }[] = [];
   constructor(
-    private readonly concurrency: number,
+    readonly concurrency: number,
     private readonly maxWaiting = 64,
     private readonly waitMs = 5000,
   ) {

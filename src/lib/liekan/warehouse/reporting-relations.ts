@@ -110,6 +110,7 @@ export const logSummaryColumns = [
 export function reportingLogRelation(
   options: FactReadOptions = {},
   projection?: readonly string[],
+  restrictEvidenceToWindow = false,
 ) {
   const overrides: Record<string, string> = {};
   for (const [column, key] of Object.entries({
@@ -163,14 +164,22 @@ export function reportingLogRelation(
     needed[alias].add(alias === 'e' ? 'log_id' : 'record_id');
   }
   if (needed.r.size) for (const c of ['run_id', 'generation', 'kind']) needed.r.add(c);
-  const logOptions = projection ? { ...options, columns: [...needed.l] } : options;
-  // Evidence and repairs use independent timestamps. Scan their narrow accepted
-  // columns and join the windowed logs directly: constructing a log-ID set for
-  // each family/publication branch multiplies scans and aggregate memory for
-  // ordinary weekly reports.
-  const evidence = projection ? { columns: [...needed.e] } : {};
+  const logOptions = projection
+    ? {
+        ...options,
+        columns: [...needed.l],
+        ...(restrictEvidenceToWindow ? { narrowLogWindow: true as const } : {}),
+      }
+    : options;
+  // For a small window, restrict evidence by log ID before building its join
+  // state. A wide window keeps the ordinary join and avoids a large key set.
+  const evidence = {
+    ...(projection ? { columns: [...needed.e] } : {}),
+    ...(restrictEvidenceToWindow ? { evidenceLogWindow: options.immutableTimeWindow } : {}),
+  };
   const repair = factRelation('liekan_history_repair_result', {
     ...(projection ? { columns: [...needed.r] } : {}),
+    ...(restrictEvidenceToWindow ? { activeLogRepair: true as const } : {}),
     repairFields: projection ? repairFields.filter(f => needed.r.has(f.name)) : repairFields,
   });
   return `(SELECT ${selected.map(c => `${outputs[c]} AS ${identifier(c)}`).join(',')}

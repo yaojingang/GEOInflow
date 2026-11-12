@@ -122,6 +122,7 @@ services:
   analytics-worker:
     environment:
       <<: *warehouse-environment
+      LIEKAN_CH_READ_CONCURRENCY: ${LIEKAN_CH_READ_CONCURRENCY:-1}
     volumes:
       - liekan-warehouse-queue:/app/warehouse-queue-storage:ro
   warehouse-worker:

@@ -11,8 +11,10 @@ import {
   websiteEventRelation,
 } from '../warehouse/reporting-relations';
 import { LiekanError } from './errors';
+import { dashboardClock } from './dashboard-clock';
 import { logInputConnectedSql } from './log-input';
 import { staticRequestExtensionPattern } from './logs';
+import { type LogTrendRow, readWarehouseLogTrend } from './warehouse-log-trend';
 import {
   warehouseReportMetadata,
   warehouseReportQuery,
@@ -102,6 +104,8 @@ function scoped(
   metrics: CrawlerMetricOptions = { crawlerIdentityScope: 'all' },
   columns?: readonly string[],
   orderedLogVersions = false,
+  window?: { endExclusive: boolean; hours?: boolean },
+  restrictEvidenceToWindow = false,
 ) {
   const relation = reportingLogRelation(
     {
@@ -109,7 +113,8 @@ function scoped(
       immutableTimeWindow: {
         start: 'logStart',
         end: 'logEnd',
-        endExclusive: metrics.crawlerMetricsVersion === 1,
+        endExclusive: window?.endExclusive ?? metrics.crawlerMetricsVersion === 1,
+        ...(window?.hours ? { hours: 'logHours' } : {}),
       },
     },
     columns && [
@@ -117,6 +122,7 @@ function scoped(
       ...(metrics.crawlerIdentityScope !== 'all' ? ['verification'] : []),
       ...(metrics.crawlerMetricsVersion === 1 ? ['user_agent'] : []),
     ],
+    restrictEvidenceToWindow,
   );
   return `FROM ${relation} l WHERE true ${crawlerIdentitySql(metrics.crawlerIdentityScope, 'l')}${metrics.crawlerMetricsVersion === 1 ? " AND l.user_agent NOT LIKE 'Liekan-Crawler-Check/%'" : ''}`;
 }
@@ -126,26 +132,63 @@ const range = (start: Date, end: Date, timezone = 'UTC') => ({
   timezone: Intl.DateTimeFormat(undefined, { timeZone: timezone }).resolvedOptions().timeZone,
 });
 
+const logBotColumns = [
+  'bot',
+  'vendor',
+  'bot_type',
+  'reporting_crawler_id',
+  'path',
+  'created_at',
+  'ai_eligible',
+  'recognition_state',
+];
+const overviewLogColumns = [...new Set([...logSummaryColumns, ...logBotColumns])];
+
+function rawLogWindow(endExclusive: boolean) {
+  return `FROM warehouse_liekan_log
+     PREWHERE _website_id={wh_site:UUID} AND _epoch={wh_epoch:UInt64}
+       AND toDate32(_record_time) BETWEEN toDate32({logStart:DateTime64(6,'UTC')})
+         AND toDate32({logEnd:DateTime64(6,'UTC')})
+     WHERE _record_time >= {logStart:DateTime64(6,'UTC')}
+       AND _record_time ${endExclusive ? '<' : '<='} {logEnd:DateTime64(6,'UTC')}`;
+}
+
 export async function warehouseLogWindowHasFacts(
   site: string,
   start: Date,
   end: Date,
   endExclusive = false,
 ) {
-  // The reporting relation uses this same immutable record-time window. An
-  // empty raw window proves that the accepted, filtered report is empty too.
+  // An empty raw window proves that the accepted, filtered report is empty too.
   const rows = await warehouseReportQuery(
     site,
-    `SELECT 1 AS present FROM warehouse_liekan_log
-     PREWHERE _website_id={wh_site:UUID} AND _epoch={wh_epoch:UInt64}
-       AND toDate32(_record_time) BETWEEN toDate32({logStart:DateTime64(6,'UTC')})
-         AND toDate32({logEnd:DateTime64(6,'UTC')})
-     WHERE _record_time >= {logStart:DateTime64(6,'UTC')}
-       AND _record_time ${endExclusive ? '<' : '<='} {logEnd:DateTime64(6,'UTC')}
-     LIMIT 1`,
+    `SELECT 1 AS present ${rawLogWindow(endExclusive)} LIMIT 1`,
     range(start, end),
   );
   return rows.length > 0;
+}
+
+export async function warehouseOverviewLogWindow(
+  site: string,
+  start: Date,
+  end: Date,
+  endExclusive: boolean,
+) {
+  if (+end - +start > 26 * 3600000)
+    return {
+      hasFacts: await warehouseLogWindowHasFacts(site, start, end, endExclusive),
+      restrictEvidenceToWindow: false,
+    };
+  // The raw window bounds the accepted immutable IDs at the pinned
+  // publication. A new publication cannot enlarge this report's key set.
+  const limit = 100000;
+  const [result] = await warehouseReportQuery<{ count: string }>(
+    site,
+    `SELECT count() AS count FROM (SELECT 1 ${rawLogWindow(endExclusive)} LIMIT ${limit + 1})`,
+    range(start, end),
+  );
+  const count = exactCount(result.count);
+  return { hasFacts: count > 0, restrictEvidenceToWindow: count > 0 && count <= limit };
 }
 export async function warehouseLogToday(id: string, start: Date, end: Date) {
   return withinWarehouseReport(async () => {
@@ -172,16 +215,40 @@ export async function warehousePlotLogs(
   metrics: CrawlerMetricOptions = { crawlerIdentityScope: 'all' },
 ) {
   return withinWarehouseReport(async () => {
-    if (!(await warehouseLogWindowHasFacts(id, start, end, metrics.crawlerMetricsVersion === 1)))
-      return [];
-    return warehouseNumbers(
-      await warehouseReportQuery<any>(
-        id,
-        `SELECT formatDateTime(created_at,'${hour ? '%Y-%m-%d %H:00' : '%Y-%m-%d'}',{timezone:String}) AS day,bot,bot_type AS type,
-    count() AS count,countIf(${crawlerAiSql('l')}) AS aiRequests ${scoped(metrics, ['created_at', 'bot', 'bot_type', 'ai_eligible'])} GROUP BY day,bot,type ORDER BY day`,
-        range(start, end, timezone),
-      ),
-    );
+    const columns = ['created_at', 'bot', 'bot_type', 'ai_eligible'];
+    const counts = `count() AS count,countIf(${crawlerAiSql('l')}) AS aiRequests`;
+    const readChart = async (from: Date, to: Date, endExclusive: boolean) => {
+      if (!(await warehouseLogWindowHasFacts(id, from, to, endExclusive))) return [];
+      return warehouseNumbers(
+        await warehouseReportQuery<LogTrendRow>(
+          id,
+          `SELECT formatDateTime(created_at,'${hour ? '%Y-%m-%d %H:00' : '%Y-%m-%d'}',{timezone:String}) AS day,bot,bot_type AS type,
+       ${counts} ${scoped(metrics, columns, false, { endExclusive })} GROUP BY day,bot,type ORDER BY day`,
+          range(from, to, timezone),
+        ),
+      );
+    };
+    if (dashboardClock()?.scheduledOverview) {
+      const result = await readWarehouseLogTrend(id, start, end, timezone, hour, metrics, {
+        edge: readChart,
+        async hours(logHours) {
+          const from = new Date(logHours[0] * 1000);
+          const to = new Date((logHours.at(-1) + 3600) * 1000);
+          if (!(await warehouseLogWindowHasFacts(id, from, to, true))) return [];
+          return warehouseNumbers(
+            await warehouseReportQuery<Omit<LogTrendRow, 'day'> & { hour: number }>(
+              id,
+              `SELECT toUnixTimestamp(toStartOfHour(created_at,'UTC')) AS hour,bot,bot_type AS type,
+               ${counts} ${scoped(metrics, columns, true, { endExclusive: true, hours: true })}
+               GROUP BY hour,bot,type SETTINGS optimize_aggregation_in_order=1`,
+              { ...range(from, to), logHours },
+            ),
+          );
+        },
+      });
+      if (result) return result;
+    }
+    return readChart(start, end, metrics.crawlerMetricsVersion === 1);
   });
 }
 export async function warehouseMonthlyAiShare(
@@ -259,6 +326,7 @@ export async function warehouseLogQuerySpec(
   previousBots: boolean,
   id: string,
   reuseOverview = false,
+  restrictEvidenceToWindow = false,
 ) {
   if (reuseOverview && metrics.resource !== 'overview')
     throw new Error('warehouse-overview-reuse-scope-invalid');
@@ -303,17 +371,7 @@ export async function warehouseLogQuerySpec(
     ? ` AND (isNull({productForm:Nullable(String)}) OR ${form}={productForm:Nullable(String)})
       AND (isNull({category:Nullable(String)}) OR (bot_type NOT IN('训练','搜索','用户触发','传统搜索') AND ${form} NOT IN('workbench','personal_agent')))`
     : '';
-  const botColumns = [
-    'bot',
-    'vendor',
-    'bot_type',
-    'reporting_crawler_id',
-    'path',
-    'created_at',
-    'ai_eligible',
-    'recognition_state',
-    ...(forms ? ['reporting_catalog_version'] : []),
-  ];
+  const botColumns = [...logBotColumns, ...(forms ? ['reporting_catalog_version'] : [])];
   const botQuery = `SELECT bot AS name,vendor,bot_type AS type,reporting_crawler_id AS botId,${forms ? `arrayStringConcat(arraySort(groupUniqArray(coalesce(${form},'unknown'))),',') AS productForm,` : ''}
       count() AS requests,countIf(${ai}) AS aiRequests,uniqExact(path) AS pages,toString(max(created_at)) AS lastVisit ${aggregateFrom(botColumns)} AND ${known}${formFilter} GROUP BY name,vendor,type,botId ORDER BY requests DESC,name,botId,vendor,type`;
   const statements: Record<string, string> = {
@@ -367,39 +425,71 @@ export async function warehouseLogQuerySpec(
     // once. A materialized CTE retained every log row alongside join/group states
     // and exhausted the query budget even when those operators spilled to disk.
     overview: reuseOverview
-      ? overviewAggregate(metrics, [...new Set([...logSummaryColumns, ...botColumns])])
+      ? renderWarehouseOverviewAggregate(
+          overviewAggregateRows(metrics, restrictEvidenceToWindow, 'counts'),
+        )
       : undefined,
     filterSql,
     detailBase,
   };
 }
 
-function overviewAggregate(metrics: CrawlerMetricOptions, columns: string[]) {
-  const ai = crawlerAiSql('l');
-  const unknown = unknownCrawlerSql('l');
-  // One zero-weight seed preserves the empty aggregate row without another fact
-  // scan. It contributes to no count, distinct value, bot or path group.
+export function warehouseOverviewAggregateStates(
+  start: Date,
+  end: Date,
+  timezone: string,
+  metrics: CrawlerMetricOptions,
+  restrictEvidenceToWindow: boolean,
+  days?: string[],
+) {
+  return {
+    sql: overviewAggregateRows(metrics, restrictEvidenceToWindow, days ? 'days' : 'states'),
+    params: { ...range(start, end, timezone), ...(days ? { overviewDays: days } : {}) },
+  };
+}
+
+export function renderWarehouseOverviewAggregate(source: string) {
   return `SELECT section,multiIf(section='summary',
     toJSONString(map('requests',toString(requests),'ai',toString(ai),'pages',toString(pages),'abnormal',toString(abnormal),
       'classificationVersions',toString(classificationVersions),'legacyRequests',toString(legacyRequests),'unclassifiedRequests',toString(unclassifiedRequests))),
     section='bots',toJSONString(map('name',name,'vendor',vendor,'type',type,'botId',botId,'requests',toString(requests),'aiRequests',toString(ai),'pages',toString(pages),'lastVisit',toString(lastTime))),
     toJSONString(map('path',path,'bot',name,'botId',botId,'requests',toString(requests),'lastCrawled',toString(lastTime)))) AS row
-  FROM (SELECT section,
+  FROM (${source})
+  ORDER BY section,requests DESC,if(section='pages',path,name),if(section='pages',name,''),botId,vendor,type
+  SETTINGS optimize_aggregation_in_order=1`;
+}
+
+function overviewAggregateRows(
+  metrics: CrawlerMetricOptions,
+  restrictEvidenceToWindow: boolean,
+  output: 'counts' | 'states' | 'days',
+) {
+  const ai = crawlerAiSql('l');
+  const unknown = unknownCrawlerSql('l');
+  const columns = overviewLogColumns;
+  const groupDay = output === 'days';
+  const day = 'toDate32(assumeNotNull(l.created_at),{timezone:String})';
+  const unique = (value: string, condition: string) =>
+    output === 'counts'
+      ? `uniqExactIf(${value},${condition})`
+      : `uniqExactStateIf(assumeNotNull(${value}),toUInt8(isNotNull(${value}) AND ${condition}))`;
+  // One zero-weight seed preserves the empty aggregate row without another fact
+  // scan. A complete day with no rows is recorded in the coverage checkpoint.
+  return `SELECT ${groupDay ? `${day} AS day,` : ''}section,
     if(section='summary',NULL,l.bot) AS name,if(section='bots',l.vendor,NULL) AS vendor,
     if(section='bots',l.bot_type,NULL) AS type,if(section='summary',NULL,l.reporting_crawler_id) AS botId,
     if(section='pages',l.path,NULL) AS path,
     countIf(l._present) AS requests,countIf(l._present AND ${ai}) AS ai,
-    uniqExactIf(l.path,l._present AND (section='bots' OR (section='summary' AND ${ai}))) AS pages,
+    ${unique('l.path', `l._present AND (section='bots' OR (section='summary' AND ${ai}))`)} AS pages,
     countIf(l._present AND l.status>=400) AS abnormal,
-    uniqExactIf(coalesce(l.reporting_classification_version,'legacy'),l._present AND section='summary') AS classificationVersions,
+    ${unique("coalesce(l.reporting_classification_version,'legacy')", "l._present AND section='summary'")} AS classificationVersions,
     countIf(l._present AND isNull(l.ai_eligible)) AS legacyRequests,
     countIf(l._present AND ${unknown}) AS unclassifiedRequests,max(l.created_at) AS lastTime
-    FROM (SELECT ${columns.map(c => `l.${c}`).join(',')},1 AS _present ${scoped(metrics, columns, true)}
+    FROM (SELECT ${columns.map(c => `l.${c}`).join(',')},1 AS _present ${scoped(metrics, columns, true, groupDay ? { endExclusive: true } : undefined, restrictEvidenceToWindow)}
       UNION ALL SELECT ${columns.map(() => 'NULL').join(',')},0 AS _present) l
     ARRAY JOIN arrayFilter(k -> k='summary' OR (l._present AND ((k='bots' AND NOT ${unknown}) OR (k='pages' AND ${ai}))),['summary','bots','pages']) AS section
-    GROUP BY section,name,vendor,type,botId,path)
-  ORDER BY section,requests DESC,if(section='pages',path,name),if(section='pages',name,''),botId,vendor,type
-  SETTINGS optimize_aggregation_in_order=1`;
+    ${groupDay ? `WHERE l._present AND ${day} IN {overviewDays:Array(Date32)}` : ''}
+    GROUP BY ${groupDay ? 'day,' : ''}section,name,vendor,type,botId,path`;
 }
 
 export async function warehouseLogFacts(...args: Parameters<typeof import('./logs').getLogFacts>) {

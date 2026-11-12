@@ -4,6 +4,7 @@ import { factTables, identifier } from './catalog';
 import { type ControlDatabase, WarehouseConflict } from './control-db';
 import type { DeletionOperation } from './deletions';
 import { verifyBoundWarehouse } from './installation-identity';
+import { warehouseAnalyticsTables } from './schema';
 
 /** Physical reclamation follows a durable logical deletion. It never expires
  * live facts. Canonical receipt journals remain protected for session deletes;
@@ -43,7 +44,7 @@ export class WarehouseDeletionGC {
     );
     let tables = 0,
       completed = 0;
-    for (const job of jobs) {
+    operations: for (const job of jobs) {
       const owner = randomUUID();
       const claimed = await this.db.transaction(async tx => {
         // New report pins and GEO proofs take the same site lock. Once this
@@ -90,17 +91,21 @@ export class WarehouseDeletionGC {
           );
         const table = familyTables[op.table_cursor];
         if (!table) throw new WarehouseConflict('warehouse-deletion-gc-cursor-invalid');
-        const pending = await this.ch
-          .query({
-            query:
-              'SELECT 1 FROM system.mutations WHERE database=currentDatabase() AND table={table:String} AND NOT is_done LIMIT 1',
-            query_params: { table: table.name },
-            format: 'JSONEachRow',
-          })
-          .then(result => result.json());
-        // A lost synchronous reply may leave a mutation running. Poll it on the
-        // next pass instead of enqueueing an unbounded series of duplicate jobs.
-        if (pending.length) continue;
+        const done = op.table_cursor + 1 === familyTables.length;
+        const targets = [table];
+        if (done && op.kind !== 'session') {
+          // Reclaim analytics by the same fenced epoch. Keep the durable cursor
+          // compatible with older workers that can resume an interrupted pass.
+          const derived = await this.ch
+            .query({
+              query:
+                'SELECT name FROM system.tables WHERE database=currentDatabase() AND name IN {names:Array(String)}',
+              query_params: { names: warehouseAnalyticsTables },
+              format: 'JSONEachRow',
+            })
+            .then(result => result.json<{ name: string }>());
+          targets.push(...derived.map(({ name }) => ({ name, fact: false })));
+        }
         const params = {
           site: op.website_id,
           epoch: op.epoch,
@@ -110,19 +115,30 @@ export class WarehouseDeletionGC {
           partitions: op.boundary.map(p => p.partition),
           offsets: op.boundary.map(p => p.offset),
         };
-        const scope = `${table.fact ? '_website_id' : 'website_id'}={site:UUID} AND ${table.fact ? '_epoch' : 'epoch'}={epoch:UInt64}`;
         const deleted =
           op.kind === 'session'
             ? ` AND _session_id={session:Nullable(UUID)} AND (_version<{version:UInt64} OR
              (_topic_id={topic:String} AND arrayExists(p->_partition=p.1 AND _offset<p.2,arrayZip({partitions:Array(UInt32)},arrayMap(x->toUInt64(x),{offsets:Array(String)})))))`
             : '';
-        await this.ch.command({
-          query: `ALTER TABLE ${identifier(table.name)} DELETE WHERE ${scope}${deleted}`,
-          query_params: params,
-          clickhouse_settings: { mutations_sync: '1' },
-        });
-        tables++;
-        const done = op.table_cursor + 1 === familyTables.length;
+        for (const target of targets) {
+          const pending = await this.ch
+            .query({
+              query:
+                'SELECT 1 FROM system.mutations WHERE database=currentDatabase() AND table={table:String} AND NOT is_done LIMIT 1',
+              query_params: { table: target.name },
+              format: 'JSONEachRow',
+            })
+            .then(result => result.json());
+          // A lost synchronous reply can leave a mutation running.
+          if (pending.length) continue operations;
+          const scope = `${target.fact ? '_website_id' : 'website_id'}={site:UUID} AND ${target.fact ? '_epoch' : 'epoch'}={epoch:UInt64}`;
+          await this.ch.command({
+            query: `ALTER TABLE ${identifier(target.name)} DELETE WHERE ${scope}${deleted}`,
+            query_params: params,
+            clickhouse_settings: { mutations_sync: '1' },
+          });
+          tables++;
+        }
         const changed = await this.db.read(
           `UPDATE liekan_warehouse_deletion_gc SET table_cursor=$3,completed_at=CASE WHEN $4 THEN clock_timestamp() ELSE NULL END,
              pass=pass+CASE WHEN $4 THEN 1 ELSE 0 END,owner_id=NULL,lease_until=NULL,updated_at=clock_timestamp()

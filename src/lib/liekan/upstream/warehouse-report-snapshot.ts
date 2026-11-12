@@ -1,4 +1,5 @@
 import { WarehouseReadReferences } from '../warehouse/read-reference';
+import type { ReadBoundary } from '../warehouse/read';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { WarehouseReadBusy } from '../warehouse/read-admission';
@@ -18,6 +19,7 @@ const snapshots = processSingleton(
       references: WarehouseReadReferences;
       signal: AbortSignal;
       deadline?: number;
+      publication?: Pick<ReadBoundary, 'websiteId' | 'publication'>;
       pending: Set<Promise<unknown>>;
     }>(),
 );
@@ -29,6 +31,15 @@ export async function warehouseReportMetadata(site: string) {
   if (!pending) {
     pending = readReportingMetadata(warehouseReader().db, site).then(async metadata => {
       context.signal.throwIfAborted();
+      const pin = context.publication;
+      if (pin?.websiteId === site) {
+        if (BigInt(pin.publication) > BigInt(metadata.boundary.publication))
+          throw new AnalyticsRestart();
+        metadata = {
+          ...metadata,
+          boundary: { ...metadata.boundary, publication: pin.publication },
+        };
+      }
       await context.references.pin(metadata.boundary);
       return metadata;
     });
@@ -50,12 +61,15 @@ export function warehouseReportSignal() {
 interface ReportDeadline {
   deadline?: number;
   signal?: AbortSignal;
+  publication?: Pick<ReadBoundary, 'websiteId' | 'publication'>;
 }
 export async function withinWarehouseReport<T>(
   work: () => Promise<T>,
   options: ReportDeadline = {},
 ): Promise<T> {
   const parent = snapshots.getStore();
+  if (parent && options.publication)
+    throw new Error('warehouse-report-publication-must-be-pinned-at-entry');
   const deadline = Math.min(
     parent?.deadline ?? Infinity,
     options.deadline ?? Infinity,
@@ -85,6 +99,7 @@ export async function withinWarehouseReport<T>(
     pending: parent?.pending ?? new Set<Promise<unknown>>(),
     references,
     deadline: Number.isFinite(deadline) ? deadline : undefined,
+    publication: parent?.publication ?? options.publication,
     signal: AbortSignal.any([
       controller.signal,
       references.signal,
@@ -151,6 +166,34 @@ function trackRead<T>(work: () => Promise<T>): Promise<T> {
   pending.add(promise);
   void promise.finally(() => pending.delete(promise)).catch(() => {});
   return promise;
+}
+
+/** Derived tables share the report's pinned publication, deadline and admission. */
+export async function warehouseReportCommand(
+  site: string,
+  sql: string,
+  params: Record<string, unknown>,
+  timeoutSeconds: number,
+) {
+  return withinWarehouseReport(() =>
+    trackRead(async () => {
+      const metadata = await warehouseReportMetadata(site);
+      const reader = warehouseReader();
+      const context = snapshots.getStore();
+      const { readonly: _readonly, ...settings } = querySettings(timeoutSeconds);
+      await reader.admission.run(
+        () =>
+          reader.ch.command({
+            query: sql,
+            query_params: { ...params, ...reportingParameters(metadata) },
+            abort_signal: context.signal,
+            clickhouse_settings: { ...settings, wait_end_of_query: 1, async_insert: 0 },
+          }),
+        context.signal,
+        context.deadline,
+      );
+    }),
+  );
 }
 export async function warehouseReportQuery<T = Record<string, unknown>>(
   site: string,

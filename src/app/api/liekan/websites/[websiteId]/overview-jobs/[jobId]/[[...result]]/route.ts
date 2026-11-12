@@ -17,6 +17,12 @@ export async function GET(
       (result && (result.length !== 1 || result[0] !== 'result'))
     )
       throw new LiekanError('统计任务不存在', 404);
-    return readWarehouseOverviewJob(access, jobId, result?.[0] === 'result');
+    return readWarehouseOverviewJob(
+      access,
+      jobId,
+      result?.[0] === 'result',
+      new URL(request.url).searchParams,
+      request.signal,
+    );
   });
 }

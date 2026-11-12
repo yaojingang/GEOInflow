@@ -1,11 +1,16 @@
 import { identityComplete, identityUsable } from '../contracts/browser-population';
 import { pageReportParts } from '../contracts/page-report';
 import { applyHumanFactsPopulation } from '../contracts/population-results';
-import type { ReportQuery } from '../contracts/query';
-import type { LiekanReport } from '../contracts/report';
+import { tablePageSize, type ReportQuery } from '../contracts/query';
+import type { LiekanReport, Row } from '../contracts/report';
 import { classifyEntrySourceForDisplay } from '../contracts/sources';
 import { addReportAiPage, compareReportAiPages, reportLogRange } from '../report-log-tables';
 import type { PreparedReport } from '../report-prepared';
+import { timeReportQuery } from './analysis-diagnostics';
+import {
+  countUncrawledCatalogPaths,
+  streamWarehouseCatalogPaths,
+} from './warehouse-page-path-summary';
 import { getHumanFacts, type HumanFact } from './analytics';
 import { readBrowserPopulation } from './browser-population';
 import { currentAnalyticsSignal } from './cache-context';
@@ -17,8 +22,10 @@ import {
   warehouseLogDate,
   warehouseLogQuerySpec,
   warehouseLogWindowHasFacts,
+  warehouseOverviewLogWindow,
   warehouseNumbers,
 } from './warehouse-log-queries';
+import { prepareWarehouseOverviewLogSegments } from './warehouse-overview-log-segments';
 import {
   warehouseReportQuery,
   warehouseReportStream,
@@ -91,8 +98,8 @@ export async function buildWarehouseBrowserPages(
     durationSamples = 0;
   await produce(async row => {
     for (const table of tables) {
-      const start = ((p.tablePages[table] ?? 1) - 1) * 20;
-      if (total >= start && total < start + 20) rows[table].push(row);
+      const start = ((p.tablePages[table] ?? 1) - 1) * tablePageSize;
+      if (total >= start && total < start + tablePageSize) rows[table].push(row);
     }
     total++;
     if (!entry || row.entries > entry.entries) entry = row;
@@ -101,11 +108,25 @@ export async function buildWarehouseBrowserPages(
       durationSamples += row.samples;
     }
   });
-  const wanted = new Set(
+  const wanted = new Set<string>(
     Object.values(rows)
       .flat()
       .map(row => row.path),
   );
+  return {
+    rows,
+    total,
+    entryPath: entry?.path ?? null,
+    duration: durationSamples ? durationTotal / durationSamples : null,
+    ai: await browserPageCrawlerRows(spool, wanted, logProduce),
+  };
+}
+
+async function browserPageCrawlerRows(
+  spool: WarehouseEvidenceSpool,
+  wanted: ReadonlySet<string>,
+  logProduce: EvidenceProducer<any>,
+) {
   const ai = new Map<string, any>();
   if (wanted.size) {
     // Multiple encoded log paths can decode to one human path. Reduce complete
@@ -143,13 +164,93 @@ export async function buildWarehouseBrowserPages(
     flush();
     await sorted.remove();
   }
+  return ai;
+}
+
+function overviewRankingRow(
+  table: 'topBody' | 'visitorTopBody',
+  row: { path: string; pv: number; uv: number },
+  ai: { requests: number; bot?: string | null; botId?: string | null } | undefined,
+  hasLogs: boolean,
+  population: LiekanReport['meta']['population'],
+): Row {
+  if (table === 'visitorTopBody')
+    return {
+      path: row.path,
+      pv: row.pv,
+      uv: !population || identityUsable(population) ? row.uv : null,
+    };
   return {
-    rows,
-    total,
-    entryPath: entry?.path ?? null,
-    duration: durationSamples ? durationTotal / durationSamples : null,
-    ai,
+    path: row.path,
+    humanPv: row.pv,
+    aiRequests: hasLogs ? (ai?.requests ?? 0) : null,
+    ratio: hasLogs && identityComplete(population) ? ratio(ai?.requests ?? 0, row.pv) : null,
+    bot: ai?.bot ?? null,
+    ...(ai?.botId !== undefined ? { botId: ai.botId } : {}),
+    evaluation: !hasLogs ? '待接入日志' : ai ? '已被抓取' : '所选范围未被抓取',
   };
+}
+
+/** Read only the requested ranking slice under the overview's pinned report context. */
+export async function readWarehouseOverviewRankingPage(
+  site: string,
+  p: ReportQuery,
+  snapshot: {
+    tables: LiekanReport['tables'];
+    meta: Pick<LiekanReport['meta'], 'population'>;
+  },
+  table: 'topBody' | 'visitorTopBody',
+  page: number,
+) {
+  const { start, end, halfOpen } = reportLogRange(p);
+  const params = await warehouseBrowserParameters(site, start, end, p.timezone);
+  const rows = (
+    await warehouseReportQuery(
+      site,
+      `${warehouseVisitsSQL()}
+       SELECT e.url_path AS path,count() AS pv,uniqExact(e.session_id) AS uv
+       FROM window_events e WHERE e.event_type NOT IN(2,5) GROUP BY path
+       ORDER BY pv DESC,path LIMIT ${tablePageSize} OFFSET {overviewOffset:UInt64}`,
+      { ...params, overviewOffset: String((page - 1) * tablePageSize) },
+    )
+  ).map(numeric);
+  const population = snapshot.meta.population;
+  if (!rows.length || table === 'visitorTopBody')
+    return rows.map(row => overviewRankingRow(table, row, undefined, false, population));
+
+  const hasLogs = snapshot.tables.topBody?.[0]?.aiRequests != null;
+  if (!(await warehouseLogWindowHasFacts(site, start, end, halfOpen)))
+    return rows.map(row => overviewRankingRow(table, row, undefined, hasLogs, population));
+  const paths = new Set<string>(rows.map(row => row.path));
+  const spec = await warehouseLogQuerySpec(
+    start,
+    end,
+    p.timezone,
+    p,
+    p.filter,
+    p.search,
+    false,
+    site,
+  );
+  const spool = await WarehouseEvidenceSpool.create(warehouseReportSignal());
+  try {
+    const ai = await browserPageCrawlerRows(spool, paths, async emit => {
+      // Encoded aliases are verified by the same JS decoder used by the first page.
+      await warehouseReportStream(
+        site,
+        `SELECT * FROM (${spec.statements.pages})
+         WHERE path IN {overviewPaths:Array(String)} OR position(path,'%')>0`,
+        { ...spec.params, overviewPaths: [...paths] },
+        async batch => {
+          for (const row of warehouseNumbers(batch)) await emit(row);
+        },
+        currentAnalyticsSignal(),
+      );
+    });
+    return rows.map(row => overviewRankingRow(table, row, ai.get(row.path), hasLogs, population));
+  } finally {
+    await spool.dispose();
+  }
 }
 
 /** Complete source grouping is disk-based. Only requested source rows retain
@@ -273,7 +374,10 @@ export async function prepareWarehouseBrowserPageReport(
   site: string,
   p: ReportQuery,
   range = reportLogRange(p),
-): Promise<PreparedReport | undefined> {
+  catalogCount = 0,
+): Promise<
+  (PreparedReport & { catalogCoverage?: { catalogCount: number; blindCount: number } }) | undefined
+> {
   if (!['overview', 'content', 'human/sources'].includes(p.resource)) return;
   const parts = pageReportParts[p.resource],
     { start, end } = range;
@@ -342,84 +446,104 @@ export async function prepareWarehouseBrowserPageReport(
   try {
     const overviewPages =
       p.resource === 'overview'
-        ? await spool.write<any>(async emit => {
-            if (!(await warehouseLogWindowHasFacts(site, start, end, range.halfOpen))) {
-              logs.summary = {
-                requests: 0,
-                ai: 0,
-                pages: 0,
-                abnormal: 0,
-                classificationVersions: 0,
-                legacyRequests: 0,
-                unclassifiedRequests: 0,
-              };
-              return;
-            }
-            const spec = await warehouseLogQuerySpec(
-              start,
-              end,
-              p.timezone,
-              p,
-              p.filter,
-              p.search,
-              false,
-              site,
-              true,
-            );
-            let summarySeen = false;
-            await warehouseReportStream<{ section: string; row: string }>(
-              site,
-              spec.overview,
-              spec.params,
-              async batch => {
-                for (const item of batch) {
-                  const row = warehouseNumbers(JSON.parse(item.row));
-                  if (item.section === 'summary') {
-                    if (summarySeen) throw new Error('warehouse-overview-duplicate-summary');
-                    summarySeen = true;
-                    logs.summary = row;
-                  } else if (item.section === 'bots')
-                    logs.bots.push({ ...row, lastVisit: warehouseLogDate(row.lastVisit) });
-                  else if (item.section === 'pages') await emit(row);
-                  else throw new Error('warehouse-overview-section-invalid');
-                }
-              },
-              currentAnalyticsSignal(),
-            );
-            if (!summarySeen) throw new Error('warehouse-overview-summary-missing');
-          })
-        : undefined;
-    const pageData =
-      p.resource !== 'human/sources'
-        ? await buildWarehouseBrowserPages(
-            spool,
-            p,
-            emit => streamCurrentBrowser(pageTail, emit),
-            async emit => {
-              if (overviewPages) {
-                for await (const row of overviewPages.iterate()) await emit(row);
+        ? await timeReportQuery('overview-log-aggregate', () =>
+            spool.write<any>(async emit => {
+              const window = await warehouseOverviewLogWindow(site, start, end, range.halfOpen);
+              if (!window.hasFacts) {
+                logs.summary = {
+                  requests: 0,
+                  ai: 0,
+                  pages: 0,
+                  abnormal: 0,
+                  classificationVersions: 0,
+                  legacyRequests: 0,
+                  unclassifiedRequests: 0,
+                };
                 return;
               }
-              const spec = await warehouseLogQuerySpec(
-                start,
-                end,
-                p.timezone,
-                p,
-                p.filter,
-                p.search,
-                false,
+              const segments = await prepareWarehouseOverviewLogSegments(site, start, end, p);
+              const spec =
+                segments ??
+                (await warehouseLogQuerySpec(
+                  start,
+                  end,
+                  p.timezone,
+                  p,
+                  p.filter,
+                  p.search,
+                  false,
+                  site,
+                  true,
+                  window.restrictEvidenceToWindow,
+                ).then(({ overview, params }) => ({ sql: overview, params })));
+              let summarySeen = false;
+              await warehouseReportStream<{ section: string; row: string }>(
                 site,
-              );
-              await warehouseReportStream(
-                site,
-                spec.statements.pages,
+                spec.sql,
                 spec.params,
                 async batch => {
-                  for (const row of warehouseNumbers(batch)) await emit(row);
+                  for (const item of batch) {
+                    const row = warehouseNumbers(JSON.parse(item.row));
+                    if (item.section === 'summary') {
+                      if (summarySeen) throw new Error('warehouse-overview-duplicate-summary');
+                      summarySeen = true;
+                      logs.summary = row;
+                    } else if (item.section === 'bots')
+                      logs.bots.push({ ...row, lastVisit: warehouseLogDate(row.lastVisit) });
+                    else if (item.section === 'pages') await emit(row);
+                    else throw new Error('warehouse-overview-section-invalid');
+                  }
                 },
                 currentAnalyticsSignal(),
               );
-            },
+              if (!summarySeen) throw new Error('warehouse-overview-summary-missing');
+            }),
+          )
+        : undefined;
+    const pageData =
+      p.resource !== 'human/sources'
+        ? await timeReportQuery('overview-page-ranking', () =>
+            buildWarehouseBrowserPages(
+              spool,
+              p,
+              emit =>
+                timeReportQuery('overview-browser-paths', () =>
+                  streamCurrentBrowser(pageTail, emit),
+                ),
+              async emit => {
+                if (overviewPages) {
+                  for await (const row of overviewPages.iterate()) await emit(row);
+                  return;
+                }
+                const spec = await warehouseLogQuerySpec(
+                  start,
+                  end,
+                  p.timezone,
+                  p,
+                  p.filter,
+                  p.search,
+                  false,
+                  site,
+                );
+                await warehouseReportStream(
+                  site,
+                  spec.statements.pages,
+                  spec.params,
+                  async batch => {
+                    for (const row of warehouseNumbers(batch)) await emit(row);
+                  },
+                  currentAnalyticsSignal(),
+                );
+              },
+            ),
+          )
+        : undefined;
+    const catalogCoverage =
+      overviewPages && catalogCount && logs.latest && overviewPages.total
+        ? await timeReportQuery('overview-catalog-coverage', () =>
+            countUncrawledCatalogPaths(spool, overviewPages, emit =>
+              streamWarehouseCatalogPaths(site, emit),
+            ),
           )
         : undefined;
     await overviewPages?.remove();
@@ -457,6 +581,7 @@ export async function prepareWarehouseBrowserPageReport(
       range,
       human: masked,
       logs,
+      catalogCoverage,
       dispose: () => spool.dispose(),
       decorate(report: LiekanReport) {
         const setCard = (key: string, value: number | string | null) => {
@@ -514,20 +639,8 @@ export async function prepareWarehouseBrowserPageReport(
             if (!report.tables[table]) continue;
             report.tables[table] = rows.map(row => {
               const ai = pageData.ai.get(row.path);
-              if (table === 'visitorTopBody') return { path: row.path, pv: row.pv, uv: row.uv };
-              if (table === 'topBody')
-                return {
-                  path: row.path,
-                  humanPv: row.pv,
-                  aiRequests: logs.latest ? (ai?.requests ?? 0) : null,
-                  ratio:
-                    logs.latest && identityComplete(human.totals.population)
-                      ? ratio(ai?.requests ?? 0, row.pv)
-                      : null,
-                  bot: ai?.bot ?? null,
-                  ...(ai?.botId !== undefined ? { botId: ai.botId } : {}),
-                  evaluation: !logs.latest ? '待接入日志' : ai ? '已被抓取' : '所选范围未被抓取',
-                };
+              if (table === 'topBody' || table === 'visitorTopBody')
+                return overviewRankingRow(table, row, ai, !!logs.latest, human.totals.population);
               return {
                 path: row.path,
                 pv: row.pv,
@@ -542,7 +655,11 @@ export async function prepareWarehouseBrowserPageReport(
             });
             report.meta.tablePages = {
               ...report.meta.tablePages,
-              [table]: { page: p.tablePages[table] ?? 1, pageSize: 20, total: pageData.total },
+              [table]: {
+                page: p.tablePages[table] ?? 1,
+                pageSize: tablePageSize,
+                total: pageData.total,
+              },
             };
           }
         }

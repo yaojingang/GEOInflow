@@ -19,7 +19,9 @@ vi.mock('../warehouse/reader-runtime', () => ({
   }),
 }));
 vi.mock('../warehouse/reporting-context', () => ({ readReportingMetadata: mocks.metadata }));
-vi.mock('../warehouse/reporting-relations', () => ({ reportingParameters: () => ({}) }));
+vi.mock('../warehouse/reporting-relations', () => ({
+  reportingParameters: ({ boundary }) => ({ wh_publication: boundary.publication }),
+}));
 vi.mock('../warehouse/read-reference', () => ({
   WarehouseReadReferences: class {
     signal = new AbortController().signal;
@@ -98,6 +100,21 @@ it('still rejects a changed policy at the report publication fence', async () =>
   ).rejects.toBeInstanceOf(Error);
   expect(mocks.query).toHaveBeenCalledTimes(1);
   expect(mocks.close).toHaveBeenCalledTimes(1);
+});
+
+it('reads the snapshot publication after newer facts have been published', async () => {
+  mocks.metadata
+    .mockResolvedValueOnce({ boundary: { websiteId: 'site', publication: '8' }, policy: '1' })
+    .mockResolvedValueOnce({ boundary: { websiteId: 'site', publication: '9' }, policy: '1' });
+  await expect(
+    withinWarehouseReport(() => warehouseReportQuery('site', 'SELECT 1'), {
+      publication: { websiteId: 'site', publication: '5' },
+    }),
+  ).resolves.toEqual([{ count: 1 }]);
+  expect(mocks.pin).toHaveBeenCalledWith({ websiteId: 'site', publication: '5' });
+  expect(mocks.query).toHaveBeenCalledWith(
+    expect.objectContaining({ query_params: { wh_publication: '5' } }),
+  );
 });
 
 it('closes the stream on cancellation and does not consume another batch', async () => {
@@ -202,7 +219,11 @@ it('cancels and drains sibling queries before releasing a failed report referenc
 
 it('drains pending metadata before closing references when another report branch fails', async () => {
   let release!: (value: unknown) => void;
-  mocks.metadata.mockReturnValueOnce(new Promise(resolve => { release = resolve; }));
+  mocks.metadata.mockReturnValueOnce(
+    new Promise(resolve => {
+      release = resolve;
+    }),
+  );
   const report = withinWarehouseReport(async () => {
     void warehouseReportMetadata('site').catch(() => {});
     throw new Error('another branch failed');

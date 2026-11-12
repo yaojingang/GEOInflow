@@ -8,6 +8,11 @@ import { reportLogRange } from '../report-log-tables';
 import { warehouseReader } from '../warehouse/reader-runtime';
 import { readReportingMetadataForSites } from '../warehouse/reporting-context';
 import type { ReportingMetadata } from '../warehouse/reporting-relations';
+import {
+  analysisErrorReason,
+  captureReportTimings,
+  type ReportTimings,
+} from './analysis-diagnostics';
 import { analysisQueryLimits } from './analysis-query-model';
 import { analysisResponse } from './analysis-query-api';
 import { AnalyticsUnavailable } from './analytics-budget';
@@ -18,6 +23,8 @@ import { dashboardWarmRanges } from './dashboard-snapshot-model';
 import { LiekanError } from './errors';
 import { computeWarehouseOverview } from './page-report';
 import type { authorize } from './server';
+import { warehouseLogWindowHasFacts } from './warehouse-log-queries';
+import { prepareWarehouseOverviewLogSegments } from './warehouse-overview-log-segments';
 import {
   warehouseControlFingerprint,
   warehouseReportMetadata,
@@ -27,13 +34,17 @@ import {
 // Change when persisted results can no longer be read with the current report semantics.
 const formatVersion = 1;
 const intervalMs = 30 * 60 * 1000;
+const minimumPresetRefreshGap = '10 minutes';
 const discoveryIntervalMs = 30000;
 const discoveryBatch = 48;
+const claimsBetweenBackfills = 4;
 const controlScanIntervalMs = 10000;
+const withoutTablePages = "coalesce(parameters->'tablePages','{}'::jsonb)='{}'::jsonb";
 let nextDiscoveryAt = 0;
 let scheduledCatalog: string | undefined;
 let nextControlScanAt = 0;
 let lastScannedSite: string | null = null;
+let lastBackfillSnapshot: string | null = null;
 type Access = Awaited<ReturnType<typeof authorize>>;
 type Snapshot = {
   id: string;
@@ -52,10 +63,16 @@ type Snapshot = {
   lease_until: Date | null;
   error_code: string | null;
 };
+type OverviewClaim = { row: Snapshot; token: string };
 function overviewKey(p: ReportQuery, catalogVersion: string) {
   return createHash('sha256')
     .update(JSON.stringify([formatVersion, catalogVersion, p]))
     .digest('hex');
+}
+
+function presetRefreshPhase(websiteId: string) {
+  // Keep a site's timezones and preset ranges on the same recurring schedule.
+  return createHash('sha256').update(websiteId).digest().readUInt32BE() % intervalMs;
 }
 
 function presetParameters(timezone: string, now: number) {
@@ -138,7 +155,7 @@ async function readSnapshot(
   includeResult: boolean,
 ) {
   const [row] = await warehouseReader().db.read<Snapshot>(
-    `SELECT id,website_id,catalog_version,control_version,publication,generated_at,queued_at,started_at,
+    `SELECT id,website_id,parameters,preset,catalog_version,control_version,publication,generated_at,queued_at,started_at,
       next_attempt_at,lease_until,error_code,CASE WHEN $4 THEN result END AS result
       FROM liekan_warehouse_overview_snapshot WHERE website_id=$1 AND
       ${'id' in selector ? 'id=$2' : 'query_key=$2'} AND format_version=$3`,
@@ -224,6 +241,11 @@ function hasCurrentResult(row: Snapshot, control: Awaited<ReturnType<typeof read
   );
 }
 
+function snapshotExpiry(row: Snapshot) {
+  if (!row.generated_at) return null;
+  return row.preset ? +row.next_attempt_at : +row.generated_at + intervalMs;
+}
+
 function presented(row: Snapshot, access: Access, updating: boolean) {
   const { result } = row;
   return {
@@ -232,7 +254,7 @@ function presented(row: Snapshot, access: Access, updating: boolean) {
     meta: {
       ...result.meta,
       canManage: access.canManage,
-      expiresAt: updating || row.error_code ? Date.now() : result.meta.generatedAt + intervalMs,
+      expiresAt: updating || row.error_code ? Date.now() : snapshotExpiry(row),
       snapshot: {
         ...result.meta.snapshot,
         intervalMs,
@@ -243,8 +265,44 @@ function presented(row: Snapshot, access: Access, updating: boolean) {
   };
 }
 
-function ready(row: Snapshot, access: Access) {
+async function ready(
+  row: Snapshot,
+  access: Access,
+  tablePages: ReportQuery['tablePages'] = {},
+  signal?: AbortSignal,
+) {
   const value = presented(row, access, false);
+  const table = value.meta.aiCrawlerEnabled === false ? 'visitorTopBody' : 'topBody';
+  const current = value.meta.tablePages?.[table];
+  const page = tablePages[table];
+  if (current && page && page !== current.page) {
+    const site = row.website_id;
+    const cutoff = value.meta.snapshot.dataThrough;
+    const rows =
+      (page - 1) * current.pageSize >= current.total
+        ? []
+        : await withinWarehouseReport(
+            async () => {
+              if (!hasCurrentResult(row, await readOverviewControl(site)))
+                throw new LiekanError('统计条件已变更，请重新读取', 410, 'analysis-invalidated');
+              const { readWarehouseOverviewRankingPage } = await import(
+                './warehouse-browser-page-report'
+              );
+              return withDashboardClock(cutoff, () =>
+                readWarehouseOverviewRankingPage(site, row.parameters, value, table, page),
+              );
+            },
+            {
+              publication: { websiteId: site, publication: row.publication },
+              deadline: Date.now() + 55000,
+              signal,
+            },
+          );
+    if (!hasCurrentResult(row, await readOverviewControl(site)))
+      throw new LiekanError('统计条件已变更，请重新读取', 410, 'analysis-invalidated');
+    value.tables = { ...value.tables, [table]: rows };
+    value.meta.tablePages = { ...value.meta.tablePages, [table]: { ...current, page } };
+  }
   for (const population of [value.meta.population, value.meta.trendPopulation])
     if (population) noteBrowserPopulation(access.website.id, population);
   const response = analysisResponse({
@@ -268,7 +326,7 @@ function job(row: Snapshot, status: AnalysisJob['status']): AnalysisJob {
     startedAt: row.started_at?.toISOString() ?? null,
     completedAt: row.generated_at?.toISOString() ?? null,
     generatedAt: row.generated_at?.getTime() ?? null,
-    expiresAt: row.generated_at ? +row.generated_at + intervalMs : null,
+    expiresAt: snapshotExpiry(row),
     errorCode: status === 'failed' ? row.error_code : null,
     retryAfterMs: 3000,
     resultUrl: `/liekan/websites/${row.website_id}/overview-jobs/${row.id}/result`,
@@ -299,10 +357,16 @@ export function warehouseOverviewAsyncRequested(request: Request, query: URLSear
   );
 }
 
-export async function requestWarehouseOverview(access: Access, input: unknown) {
+export async function requestWarehouseOverview(
+  access: Access,
+  input: unknown,
+  signal?: AbortSignal,
+) {
   const parsed = parseReportQuery(input);
   if (!parsed.success || parsed.data.resource !== 'overview') throw new LiekanError('统计参数无效');
-  const { refresh, ...parameters } = parsed.data;
+  const { refresh, ...requested } = parsed.data;
+  const tablePages = requested.tablePages;
+  const parameters = { ...requested, tablePages: {} };
   reportLogRange(parameters);
   if (parameters.startAt >= Date.now()) throw new LiekanError('日期范围无效');
   const catalogVersion = getPublishedCatalog()?.version;
@@ -324,7 +388,7 @@ export async function requestWarehouseOverview(access: Access, input: unknown) {
         )
       ).length > 0)
   ) {
-    if (previous) return ready(previous, access);
+    if (previous) return ready(previous, access, tablePages, signal);
     if ((await loadPublishedRegistry()).version !== catalogVersion)
       throw new LiekanError('统计任务已过期，请重新读取', 410, 'analysis-expired');
     return Response.json(
@@ -340,7 +404,7 @@ export async function requestWarehouseOverview(access: Access, input: unknown) {
        WHERE id=$1 AND last_requested_at < now()-interval '5 minutes'`,
       [previous.id],
     );
-    return ready(previous, access);
+    return ready(previous, access, tablePages, signal);
   }
   const pending = await db.transaction(async tx => {
     // A short, separate lock serializes admission across app replicas while the
@@ -352,7 +416,7 @@ export async function requestWarehouseOverview(access: Access, input: unknown) {
       `SELECT count(*)::int AS total,count(*) FILTER(WHERE website_id=$1)::int AS site,
          coalesce(bool_or(website_id=$1 AND query_key=$2),false) AS "alreadyQueued"
        FROM liekan_warehouse_overview_snapshot
-       WHERE NOT preset AND format_version=$3 AND (
+       WHERE NOT preset AND format_version=$3 AND ${withoutTablePages} AND (
          lease_until>now() OR (last_requested_at>=now()-interval '1 day' AND error_code IS NULL
            AND (generated_at IS NULL OR queued_at>generated_at)))`,
       [site, queryKey, formatVersion],
@@ -403,12 +467,27 @@ export async function requestWarehouseOverview(access: Access, input: unknown) {
   // An old lease retains the global worker slot until its work settles, even after invalidation.
   if (pending.error_code && !previous)
     throw new LiekanError('后台统计计算失败，请稍后重试', 503, pending.error_code);
-  return accepted(pending, previous ? presented(previous, access, true) : undefined);
+  return accepted(
+    pending,
+    previous && !(tablePages.topBody > 1 || tablePages.visitorTopBody > 1)
+      ? presented(previous, access, true)
+      : undefined,
+  );
 }
 
-export async function readWarehouseOverviewJob(access: Access, id: string, result: boolean) {
+export async function readWarehouseOverviewJob(
+  access: Access,
+  id: string,
+  result: boolean,
+  query?: URLSearchParams,
+  signal?: AbortSignal,
+) {
   const row = await readSnapshot(access.website.id, { id }, result);
-  if (!row || row.catalog_version !== getPublishedCatalog()?.version)
+  if (
+    !row ||
+    row.catalog_version !== getPublishedCatalog()?.version ||
+    Object.keys(row.parameters.tablePages ?? {}).length
+  )
     throw new LiekanError('统计任务已过期，请重新读取', 410, 'analysis-expired');
   const control = await readOverviewControl(access.website.id);
   const sameControl = row.control_version === control.version;
@@ -424,7 +503,17 @@ export async function readWarehouseOverviewJob(access: Access, id: string, resul
           ? 'failed'
           : 'queued';
   if (!result) return Response.json({ analysisJob: job(row, status) });
-  if (status === 'ready') return ready(row, access);
+  if (status === 'ready') {
+    const topBody = query?.get('tp_topBody');
+    const visitorTopBody = query?.get('tp_visitorTopBody');
+    const input = parseReportQuery({
+      ...row.parameters,
+      ...(topBody == null ? {} : { tp_topBody: topBody }),
+      ...(visitorTopBody == null ? {} : { tp_visitorTopBody: visitorTopBody }),
+    });
+    if (!input.success) throw new LiekanError('统计参数无效');
+    return ready(row, access, input.data.tablePages, signal);
+  }
   if (status === 'queued' || status === 'running') return accepted(row);
   throw new LiekanError(
     '统计结果暂不可读取，请重新查询',
@@ -434,69 +523,224 @@ export async function readWarehouseOverviewJob(access: Access, id: string, resul
 }
 
 export async function pumpWarehouseOverview(signal?: AbortSignal) {
-  if (signal?.aborted) return false;
-  const db = warehouseReader().db;
-  // Use the same advisory key as older workers. Hold it for the entire calculation
-  // without keeping a database transaction open.
-  return db.withAdvisoryLock(12800001, 92, lockSignal =>
-    pumpOverviewWithLock(signal ? AbortSignal.any([signal, lockSignal]) : lockSignal),
-  );
+  return Boolean(await pumpOverviewBatch(1, 1, signal));
 }
 
 export async function drainWarehouseOverview(signal: AbortSignal) {
-  // Start the next due job immediately after the previous one settles. The
-  // maintenance timer remains the idle wake-up, and each job releases the lock.
-  for (let i = 0; i < discoveryBatch && !signal.aborted; i++) {
-    if (!(await pumpWarehouseOverview(signal))) break;
+  if (signal.aborted) return;
+  const lanes = Math.min(2, warehouseReader().admission.concurrency);
+  let nextBackfill = claimsBetweenBackfills;
+  for (let processed = 0; processed < discoveryBatch && !signal.aborted; ) {
+    const count = await pumpOverviewBatch(
+      Math.min(nextBackfill - processed, discoveryBatch - processed),
+      lanes,
+      signal,
+    );
+    processed += count;
+    if (!count || processed === nextBackfill) {
+      await pumpOverviewLogBackfill(signal);
+      nextBackfill += claimsBetweenBackfills;
+    }
+    if (!count) break;
   }
 }
 
-async function pumpOverviewWithLock(signal: AbortSignal) {
+async function pumpOverviewBatch(limit: number, lanes: number, signal?: AbortSignal) {
+  if (signal?.aborted) return 0;
+  // Older workers and the backfill use the same key. Release it only after
+  // every claimed computation has settled, even if its recovery lease expires.
+  return warehouseReader().db.withAdvisoryLock(12800001, 92, lockSignal =>
+    runOverviewBatch(limit, lanes, signal ? AbortSignal.any([signal, lockSignal]) : lockSignal),
+  );
+}
+
+async function runOverviewBatch(limit: number, lanes: number, signal: AbortSignal) {
+  const catalog = await prepareOverviewQueue(signal);
+  const first = await claimOverview(catalog, signal, [], false);
+  if (!first) return 0;
+  if (lanes === 1 || !first.row.preset || first.row.generated_at) {
+    await computeOverviewClaim(first, signal);
+    return 1;
+  }
+
+  type Settlement = { token: string; failure?: { error: unknown } };
+  const running = new Map<string, { claim: OverviewClaim; settled: Promise<Settlement> }>();
+  const start = (claim: OverviewClaim) => {
+    const { token } = claim;
+    running.set(token, {
+      claim,
+      settled: computeOverviewClaim(claim, signal).then(
+        () => ({ token }),
+        error => ({ token, failure: { error } }),
+      ),
+    });
+  };
+  let claimed = 1;
+  start(first);
+  try {
+    while (running.size) {
+      if (!signal.aborted && claimed < limit && running.size < lanes) {
+        const next = await claimOverview(
+          catalog,
+          signal,
+          [...running.values()].map(entry => entry.claim),
+          true,
+        );
+        if (next) {
+          start(next);
+          claimed++;
+          continue;
+        }
+      }
+      const settled = await Promise.race([...running.values()].map(entry => entry.settled));
+      running.delete(settled.token);
+      if (settled.failure) throw settled.failure.error;
+    }
+  } finally {
+    await Promise.all([...running.values()].map(entry => entry.settled));
+  }
+  return claimed;
+}
+
+async function pumpOverviewLogBackfill(signal: AbortSignal) {
+  if (signal.aborted || !scheduledCatalog) return;
+  const db = warehouseReader().db;
+  await db.withAdvisoryLock(12800001, 92, async lockSignal => {
+    const workSignal = AbortSignal.any([signal, lockSignal]);
+    const [row] = await db.read<Snapshot>(
+      `SELECT job.id,job.website_id,job.parameters,job.catalog_version,job.query_key
+       FROM liekan_warehouse_overview_snapshot job
+       JOIN liekan_warehouse_site s USING (website_id) JOIN website w USING (website_id)
+       WHERE job.preset AND job.format_version=$2 AND job.catalog_version=$3
+         AND job.parameters->>'chartPeriod'='30d'
+         AND (job.parameters->>'endAt')::bigint >= extract(epoch FROM now())*1000
+         AND NOT EXISTS (SELECT 1 FROM liekan_warehouse_overview_snapshot WHERE lease_until>now())
+         AND s.resource_type='website' AND s.state='active' AND w.deleted_at IS NULL
+         AND ${presetTimezoneForSite("job.parameters->>'timezone'")}
+         AND ($4::uuid IS NULL OR job.id>$4) ORDER BY job.id LIMIT 1`,
+      [ACCOUNT_DEFAULT_TIMEZONE, formatVersion, scheduledCatalog, lastBackfillSnapshot],
+    );
+    lastBackfillSnapshot = row?.id ?? null;
+    const cutoff = Date.now();
+    if (!row || !isCurrentPreset(row.parameters, row.catalog_version, row.query_key, cutoff))
+      return;
+    try {
+      await withinWarehouseReport(
+        () =>
+          withDashboardClock(
+            cutoff,
+            async () => {
+              const { start, end, halfOpen } = reportLogRange(row.parameters);
+              if (await warehouseLogWindowHasFacts(row.website_id, start, end, halfOpen))
+                await prepareWarehouseOverviewLogSegments(
+                  row.website_id,
+                  start,
+                  end,
+                  row.parameters,
+                  true,
+                );
+            },
+            'refresh',
+          ),
+        { signal: workSignal, deadline: cutoff + 40000 },
+      );
+    } catch (error) {
+      workSignal.throwIfAborted();
+      if (analysisErrorReason(error) !== 'timeout') throw error;
+      console.info(
+        JSON.stringify({ event: 'warehouse-overview-backfill-deferred', reason: 'timeout' }),
+      );
+    }
+  });
+}
+
+async function prepareOverviewQueue(signal: AbortSignal) {
   signal.throwIfAborted();
   const db = warehouseReader().db;
   const catalog = await scheduleOverviewPresets(Date.now());
-  await reconcileOverviewControls(catalog, signal);
-  signal.throwIfAborted();
-  const token = randomUUID();
   await db.read(`DELETE FROM liekan_warehouse_overview_snapshot WHERE id IN (
       SELECT id FROM liekan_warehouse_overview_snapshot
       WHERE last_requested_at<now()-interval '1 day'
         AND (NOT preset OR (parameters->>'endAt')::bigint < extract(epoch FROM now()-interval '1 day')*1000)
         AND (lease_until IS NULL OR lease_until<=now())
       ORDER BY last_requested_at LIMIT 100 FOR UPDATE SKIP LOCKED)`);
+  return catalog;
+}
+
+async function claimOverview(
+  catalog: string,
+  signal: AbortSignal,
+  running: OverviewClaim[],
+  coldOnly: boolean,
+) {
   signal.throwIfAborted();
+  await reconcileOverviewControls(catalog, signal);
+  signal.throwIfAborted();
+  const db = warehouseReader().db;
+  const token = randomUUID();
+  const longRunning = running.some(claim => claim.row.parameters.chartPeriod === '30d');
   const [row] = await db.read<Snapshot>(
     `WITH due AS (
         SELECT job.id FROM liekan_warehouse_overview_snapshot job
         JOIN liekan_warehouse_site s USING (website_id)
         JOIN website w USING (website_id)
-        WHERE format_version=$2 AND next_attempt_at<=now()
+        WHERE format_version=$2 AND next_attempt_at<=now() AND ${withoutTablePages}
           AND s.state='active' AND w.deleted_at IS NULL
           AND (
             (preset AND catalog_version=$4 AND ${presetTimezoneForSite("job.parameters->>'timezone'")}
-              AND (job.parameters->>'endAt')::bigint >= extract(epoch FROM now())*1000
-              AND (generated_at IS NULL OR queued_at>generated_at OR
-                generated_at<=now()-$5::bigint*interval '1 millisecond'))
+              AND (job.parameters->>'endAt')::bigint >= extract(epoch FROM now())*1000)
             OR (NOT preset AND error_code IS NULL AND last_requested_at>=now()-interval '1 day'
               AND (generated_at IS NULL OR queued_at>generated_at))
           )
-          AND NOT EXISTS (SELECT 1 FROM liekan_warehouse_overview_snapshot WHERE lease_until>now())
+          AND NOT (job.website_id=ANY($5::uuid[]))
+          AND NOT ($8::boolean AND job.preset AND job.generated_at IS NULL
+            AND job.parameters->>'chartPeriod'='30d')
+          AND NOT EXISTS (
+            SELECT 1 FROM liekan_warehouse_overview_snapshot active
+            WHERE active.lease_until>now() AND (
+              active.lease_token IS NULL OR NOT (active.lease_token=ANY($6::uuid[]))
+            )
+          )
         ORDER BY CASE
           WHEN preset AND generated_at IS NOT NULL AND queued_at>generated_at THEN 0
           WHEN preset AND generated_at IS NULL THEN 1
           WHEN preset THEN 2 ELSE 3 END,
           next_attempt_at,
+          CASE WHEN $9::boolean AND preset AND generated_at IS NULL
+            AND job.parameters->>'chartPeriod'='30d' THEN 0 ELSE 1 END,
+          CASE WHEN $9::boolean AND preset AND generated_at IS NULL
+            AND job.parameters->>'chartPeriod'='30d' THEN s.publication END DESC NULLS LAST,
           CASE WHEN preset THEN CASE job.parameters->>'chartPeriod'
             WHEN 'today' THEN 0 WHEN '7d' THEN 1 ELSE 2 END ELSE 0 END,
+          job.website_id,
           job.id
         LIMIT 1 FOR UPDATE OF job SKIP LOCKED
       ) UPDATE liekan_warehouse_overview_snapshot snapshot
       SET started_at=now(),lease_token=$3,lease_until=now()+interval '3 minutes',error_code=NULL
-      FROM due WHERE snapshot.id=due.id RETURNING snapshot.*`,
-    [ACCOUNT_DEFAULT_TIMEZONE, formatVersion, token, catalog, intervalMs],
+      FROM due WHERE snapshot.id=due.id
+        AND (NOT $7::boolean OR (snapshot.preset AND snapshot.generated_at IS NULL))
+      RETURNING snapshot.*`,
+    [
+      ACCOUNT_DEFAULT_TIMEZONE,
+      formatVersion,
+      token,
+      catalog,
+      running.map(claim => claim.row.website_id),
+      running.map(claim => claim.token),
+      coldOnly,
+      longRunning,
+      running.length > 0 && !longRunning,
+    ],
   );
-  if (!row) return false;
+  return row ? { row, token } : undefined;
+}
+
+async function computeOverviewClaim({ row, token }: OverviewClaim, signal: AbortSignal) {
+  const db = warehouseReader().db;
   const cutoff = Date.now();
+  const timings: ReportTimings = {};
+  const started = performance.now();
+  let outcome = 'discarded';
   const cleanup = async (errorCode: string | null, retire = false) =>
     db.read(
       `UPDATE liekan_warehouse_overview_snapshot SET lease_token=NULL,lease_until=NULL,
@@ -522,21 +766,27 @@ async function pumpOverviewWithLock(signal: AbortSignal) {
       await cleanup(null, true);
       return true;
     }
-    const { value, control } = await withPublishedRegistry(
+    const { value, control } = await captureReportTimings(
       () =>
-        withinWarehouseReport(
-          async () => {
-            const control = await readOverviewControl(site.id);
-            if (!scheduled && control.version !== row.control_version)
-              throw new LiekanError('统计条件已变更', 410, 'analysis-invalidated');
-            const value = await withDashboardClock(cutoff, () =>
-              computeWarehouseOverview(site, row.parameters),
-            );
-            return { value, control };
-          },
-          { deadline: cutoff + 75000, signal },
+        withPublishedRegistry(
+          () =>
+            withinWarehouseReport(
+              async () => {
+                const control = await readOverviewControl(site.id);
+                if (!scheduled && control.version !== row.control_version)
+                  throw new LiekanError('统计条件已变更', 410, 'analysis-invalidated');
+                const value = await withDashboardClock(
+                  cutoff,
+                  () => computeWarehouseOverview(site, row.parameters),
+                  scheduled ? (row.generated_at ? 'refresh' : 'first') : undefined,
+                );
+                return { value, control };
+              },
+              { deadline: cutoff + 75000, signal },
+            ),
+          row.catalog_version,
         ),
-      row.catalog_version,
+      timings,
     );
     signal.throwIfAborted();
     if ((await readOverviewControl(site.id)).version !== control.version)
@@ -546,7 +796,11 @@ async function pumpOverviewWithLock(signal: AbortSignal) {
       `UPDATE liekan_warehouse_overview_snapshot
        SET result=$4,publication=$5,generated_at=greatest(now(),queued_at),
          control_version=$7,preset=$8,
-         next_attempt_at=now()+$6::bigint*interval '1 millisecond',lease_token=NULL,lease_until=NULL,error_code=NULL
+         next_attempt_at=CASE WHEN $8 THEN
+           date_bin($6::bigint*interval '1 millisecond',
+             greatest(now(),queued_at)+$10::interval,to_timestamp($9::double precision/1000))
+           ELSE now() END+$6::bigint*interval '1 millisecond',
+         lease_token=NULL,lease_until=NULL,error_code=NULL
        WHERE id=$1 AND lease_token=$2 AND lease_until>now() AND control_version=$3
        RETURNING id`,
       [
@@ -558,10 +812,13 @@ async function pumpOverviewWithLock(signal: AbortSignal) {
         intervalMs,
         control.version,
         scheduled,
+        presetRefreshPhase(row.website_id),
+        minimumPresetRefreshGap,
       ],
     );
     // The publication fence can reject a result after a concurrent request invalidated it.
     if (!published.length) await cleanup(null);
+    if (published.length) outcome = 'ready';
   } catch (error) {
     const invalidated = error instanceof LiekanError && error.code === 'analysis-invalidated';
     await cleanup(
@@ -572,6 +829,19 @@ async function pumpOverviewWithLock(signal: AbortSignal) {
           : 'warehouse-overview-unavailable',
       invalidated && !row.preset,
     );
+    outcome = invalidated || signal?.aborted ? 'discarded' : 'failed';
+  } finally {
+    if (Object.keys(timings).length)
+      console.info(
+        JSON.stringify({
+          event: 'warehouse-overview-compute',
+          taskId: row.id,
+          period: row.parameters.chartPeriod,
+          outcome,
+          wallMs: Math.round(performance.now() - started),
+          queryGroups: timings,
+        }),
+      );
   }
   return true;
 }
