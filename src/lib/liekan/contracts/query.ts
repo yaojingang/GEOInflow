@@ -50,10 +50,15 @@ export const pagableTables = [
   'cityBody',
   'srcBody',
   'apBody',
+  'blindList',
 ] as const;
 export type PagableTable = (typeof pagableTables)[number];
 const pagableTableSet = new Set<string>(pagableTables);
 export const tablePageSize = 20;
+// Keep offset and offset + batch size safe, without imposing a group-count cap.
+export const tablePageMax = Math.floor(Number.MAX_SAFE_INTEGER / tablePageSize);
+// `page` is shared by 100-row log batches and 20-row keyword pages.
+export const reportPageMax = Math.floor(Number.MAX_SAFE_INTEGER / 100);
 
 export const reportQuery = z.object({
   ...crawlerMetricOptionsSchema.shape,
@@ -77,7 +82,7 @@ export const reportQuery = z.object({
   startAt: z.coerce.number().int().min(0),
   endAt: z.coerce.number().int().min(0),
   timezone: z.string().max(80).default('Asia/Shanghai'),
-  page: z.coerce.number().int().min(1).max(100000).default(1),
+  page: z.coerce.number().int().min(1).max(reportPageMax).default(1),
   cursor: z.string().max(512).default(''),
   seek: z.enum(['after', 'before']).default('after'),
   filter: z.enum(['', 'ai', 'abnormal', 'other']).default(''),
@@ -94,7 +99,7 @@ export const reportQuery = z.object({
     .regex(/^$|^[a-f0-9-]{36}$/)
     .default(''),
   chartPeriod: z.enum(['today', '30d', '7d', '24h']).default('30d'),
-  tablePages: z.record(z.string(), z.coerce.number().int().min(1).max(100000)).default({}),
+  tablePages: z.record(z.string(), z.coerce.number().int().min(1).max(tablePageMax)).default({}),
 });
 export type ReportQuery = z.output<typeof reportQuery>;
 export const isReportOwnedBy = (key: readonly unknown[], userId: string) =>

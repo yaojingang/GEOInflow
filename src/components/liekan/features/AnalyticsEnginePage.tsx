@@ -103,6 +103,48 @@ export function AnalyticsEnginePage() {
       {i18n.text(label)}
     </Button>
   );
+  if (status?.warehouse) {
+    const authority = status.warehouse.authority;
+    return (
+      <>
+        {(error || q.error) && <Notice tone="red">{i18n.system(error || q.error?.message)}</Notice>}
+        <Panel
+          title={i18n.text('分析引擎')}
+          subtitle={i18n.text('ClickHouse 保存分析明细，PostgreSQL 保存业务配置和任务状态。')}
+        >
+          <Body>
+            <Definition
+              items={[
+                [i18n.text('当前模式'), i18n.text('独立分析仓库')],
+                [
+                  i18n.text('当前数据读取'),
+                  authority === 'clickhouse'
+                    ? 'ClickHouse'
+                    : authority === 'postgres'
+                      ? 'PostgreSQL'
+                      : i18n.text(authority === 'frozen' ? '迁移切换中，读取暂停' : '未初始化'),
+                ],
+              ]}
+            />
+            <Notice tone="blue">
+              {i18n.text(
+                '读写切换由仓库迁移命令管理。此页面仅展示读取位置，连接和后台状态请通过仓库状态命令检查。',
+              )}
+            </Notice>
+            {status.warehouse.legacyCleanupPending && (
+              <Notice tone="blue">
+                {i18n.text(
+                  status.warehouse.legacyCleanupConfigured
+                    ? '旧分析副本仍有待清理数据，后台会继续执行已登记的删除任务。'
+                    : '旧分析副本仍有待清理数据。请由部署管理员恢复对应的旧副本连接，以继续删除任务。',
+                )}
+              </Notice>
+            )}
+          </Body>
+        </Panel>
+      </>
+    );
+  }
   return (
     <>
       {pollPaused && (

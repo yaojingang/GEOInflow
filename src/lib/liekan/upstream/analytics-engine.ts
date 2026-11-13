@@ -4,6 +4,7 @@ import {
   type AnalyticsEngineStatus,
   analyticsEngineActionSchema,
 } from '../contracts/analytics-engine';
+import { warehouseIntakeEnabled } from '../warehouse/authority-routing';
 import { CRAWLER_POPULATION_VERSION } from '../rules/population';
 import { analysisTransaction, findAnalysisVersions } from './analysis-rollups-db';
 import type { AnalysisTx } from './analysis-rollups-model';
@@ -48,6 +49,46 @@ export async function engineVersions(tx: AnalysisTx, websiteId: string) {
 export async function engineStatus(actor: string, cursor?: string): Promise<AnalyticsEngineStatus> {
   return analysisTransaction(async tx => {
     await engineAdmin(tx, actor);
+    if (warehouseIntakeEnabled()) {
+      const [installation] = await tx.$queryRawUnsafe<any[]>(
+        'SELECT authority,transition,revision,updated_at FROM liekan_warehouse_installation WHERE id=1',
+      );
+      let cleanupConnection: ReturnType<typeof engineConnection> = null;
+      try {
+        cleanupConnection = engineConnection();
+      } catch {
+        /* Invalid legacy configuration stays pending. */
+      }
+      const [cleanup] = await tx.$queryRawUnsafe<any[]>(
+        `WITH targets AS (SELECT DISTINCT unnest(
+          CASE WHEN purge_pending THEN pending_targets ELSE ARRAY[]::text[] END ||
+          CASE WHEN purge_through>0 AND purge_checked_at IS NULL THEN sweep_targets ELSE ARRAY[]::text[] END
+        ) AS target FROM liekan_analytics_engine_site)
+        SELECT count(*)>0 AS pending,coalesce(bool_and(target=$1::text),false) AS configured FROM targets`,
+        cleanupConnection?.key || '',
+      );
+      return {
+        warehouse: {
+          authority: installation?.authority || null,
+          transition: installation?.transition || null,
+          legacyCleanupPending: !!cleanup?.pending,
+          legacyCleanupConfigured: !!cleanup?.configured,
+        },
+        configured: !!installation,
+        supported: false,
+        connection: null,
+        enabled: installation?.authority === 'clickhouse',
+        syncing: false,
+        revision: Number(installation?.revision || 0),
+        checkedAt: null,
+        version: null,
+        healthy: false,
+        workerAt: null,
+        error: installation ? null : 'warehouse-not-initialized',
+        sites: [],
+        nextCursor: null,
+      };
+    }
     const [state] = await tx.$queryRawUnsafe<any[]>(
       'SELECT * FROM liekan_analytics_engine WHERE id=1',
     );
@@ -116,6 +157,12 @@ export async function changeAnalyticsEngine(request: Request, raw: unknown) {
     .digest('hex');
   await analysisTransaction(async tx => {
     await engineAdmin(tx, actor.id);
+    if (warehouseIntakeEnabled())
+      throw new LiekanError(
+        '当前使用独立分析仓库，请通过仓库迁移命令管理读写切换。',
+        409,
+        'engine-warehouse-managed',
+      );
     const [state] = await tx.$queryRawUnsafe<any[]>(
       'SELECT * FROM liekan_analytics_engine WHERE id=1 FOR UPDATE',
     );

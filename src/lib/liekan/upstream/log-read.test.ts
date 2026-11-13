@@ -6,7 +6,10 @@ const mocks = vi.hoisted(() => ({
   settings: vi.fn(),
   query: vi.fn(),
   statistics: vi.fn(),
+  warehouse: vi.fn(),
 }));
+vi.mock('../warehouse/authority-routing', () => ({ warehouseEnabled: mocks.warehouse }));
+vi.mock('./crawler-registry-context', () => ({ withPublishedRegistry: (work: any) => work() }));
 vi.mock('./log-statistics', () => ({ readLogStatistics: mocks.statistics }));
 vi.mock('./logs', () => ({ getLogFacts: mocks.facts, getLogToday: mocks.today }));
 vi.mock('../store', () => ({ getSettings: mocks.settings }));
@@ -44,6 +47,7 @@ const rows = Array.from({ length: 101 }, (_, i) => ({
 }));
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.warehouse.mockReturnValue(false);
   mocks.statistics.mockResolvedValue({
     requests: 9876,
     ai: 50,
@@ -121,6 +125,34 @@ it('keeps summary counters unfiltered and records the original displayed cursor 
   expect(value.tables.pipeList[2].detail).toBe('7 条目录记录');
   expect(value.evidence.query.cursor).toBe('fixture');
   expect(value.evidence.query.page).toBe(2);
+});
+
+it('reads independent ClickHouse log parts through the warehouse without PostgreSQL fact queries', async () => {
+  mocks.warehouse.mockReturnValue(true);
+  mocks.facts.mockResolvedValue({
+    connected: true,
+    latest: new Date(1),
+    recent: rows,
+    nextCursor: 'warehouse-next',
+    previousCursor: 'warehouse-previous',
+    totalLogs: 9876,
+    summary: { requests: 9876, classificationVersions: 1 },
+  });
+  const entries = await readLogEntries(website, { ...input, page: 2 }, false);
+  const count = await readLogCount(website.id, input);
+  const summary = await readLogSummary(website.id, input);
+  expect([entries.meta.nextCursor, entries.meta.previousCursor]).toEqual([
+    'warehouse-next',
+    'warehouse-previous',
+  ]);
+  expect(count.total).toBe(9876);
+  expect(summary.states.logs).toBe('available');
+  expect(mocks.statistics).not.toHaveBeenCalled();
+  expect(mocks.facts.mock.calls.map(args => args[9])).toEqual([
+    ['recent', 'latest'],
+    ['count'],
+    ['summary', 'latest'],
+  ]);
 });
 
 describe('independent response assembly', () => {

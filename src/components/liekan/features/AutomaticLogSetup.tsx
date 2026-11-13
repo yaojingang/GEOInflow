@@ -20,6 +20,41 @@ const setupLabels: Record<LogSetupCheckId, string> = {
   'cloudflare-oauth': 'Cloudflare 授权应用',
   'credentials-key': '凭据加密密钥',
 };
+
+function LatestLogBatch({
+  batch,
+}: {
+  batch: NonNullable<InstallationStatus['sources']>[number]['latestBatch'];
+}) {
+  const i18n = useLiekanI18n();
+  if (!batch) return i18n.text('暂无批次');
+  const status = {
+    registered: () => i18n.text('已登记，等待入队'),
+    queued: () => i18n.text('已入队'),
+    processing: () => i18n.text('处理中（{v0}/{v1} 条）', [batch.processed, batch.expected]),
+    published: () => i18n.text('已发布，可查询'),
+    processed: () =>
+      batch.expected === 0
+        ? i18n.text('没有有效日志')
+        : batch.inserted === 0
+          ? i18n.text('处理完成，无新增')
+          : i18n.text('已处理'),
+    failed: () => i18n.text('处理失败'),
+    cancelled: () => i18n.text('已取消'),
+  };
+  return (
+    <span title={new Date(batch.receivedAt).toLocaleString(i18n.locale)}>
+      {status[batch.state]()}
+      {batch.conflicts > 0 && (
+        <>
+          {' · '}
+          {i18n.text('冲突 {v0} 条', [batch.conflicts])}
+        </>
+      )}
+    </span>
+  );
+}
+
 function ReceiverSetupGuide({
   method,
   capability,
@@ -349,7 +384,7 @@ export function AutomaticLogSetup({
   };
   const follow = useTaskPolling(
     `${websiteId}:${method}`,
-    sources.some(source => source.state === 'configuring'),
+    sources.some(source => source.state === 'configuring' || source.backlog > 0),
     async signal => {
       const result = await c.api.get<{ sources: InstallationStatus['sources'] }>(
         `/liekan/websites/${websiteId}/log-sources`,
@@ -737,8 +772,8 @@ export function AutomaticLogSetup({
                 : i18n.text('等待连接')}{' '}
               {i18n.fragment('· 真实日志：', true, true)}
               {source.lastReceivedAt ? i18n.text('已接收') : i18n.text('等待接收')}
-              {i18n.fragment(' · 处理：', true, true)}
-              {source.lastProcessedAt ? i18n.text('已处理') : i18n.text('等待处理')}
+              {i18n.fragment(' · 最新批次：', true, true)}
+              <LatestLogBatch batch={source.latestBatch} />
               {i18n.fragment(' · 积压 ', true, true)}
               {source.backlog}
               {i18n.fragment(' 批', true, false)}
@@ -765,7 +800,9 @@ export function AutomaticLogSetup({
                     ? i18n.text('{v0} 次', [status.logs.ai.toLocaleString()])
                     : i18n.text('日志已收到，暂未匹配到 AI 蜘蛛请求。')
                   : source.lastReceivedAt
-                    ? i18n.text('日志已接收，等待处理后的匹配结果。')
+                    ? source.backlog > 0
+                      ? i18n.text('日志已接收，等待处理后的匹配结果。')
+                      : i18n.text('暂无数据')
                     : i18n.text('等待真实访问日志。')}
               </p>
             )}

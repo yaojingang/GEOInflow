@@ -553,6 +553,9 @@ test('activation records the final prerender route once', async () => {
 test.each([
   ['/verify?code=first', '/verify?code=second'],
   ['/verify#access_token=first', '/verify#access_token=second'],
+  ['/reset/first', '/reset/second'],
+  ['/#/verify/first', '/#/verify/second'],
+  ['/s/ffffffff-ffff-ffff-ffff-ffffffffffff', '/s/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'],
 ])('redacts outgoing credentials while preserving navigation identity: %s', async (from, to) => {
   const browser = createBrowser();
   browser.window.history.replaceState({}, '', from);
@@ -562,8 +565,46 @@ test.each([
   expect(browser.requests()).toHaveLength(2);
   for (const request of browser.requests()) {
     expect(request.payload.url).toContain('redacted');
-    expect(JSON.stringify(request.payload)).not.toMatch(/first|second/);
+    expect(JSON.stringify(request.payload)).not.toMatch(/first|second|ffffffff|aaaaaaaa/);
   }
+});
+
+test.each(['manual', 'before-send'])(
+  'redacts path secrets in %s URL and referrer overrides',
+  async mode => {
+    const browser = createBrowser();
+    const override = {
+      url: '/reset/url-secret?utm_source=google',
+      referrer: 'https://external.example/verify/referrer-secret?category=safe',
+    };
+    (browser.window as any).override = (_type: string, payload: any) => ({ ...payload, ...override });
+    browser.load({
+      'auto-track': 'false',
+      ...(mode === 'before-send' ? { 'before-send': 'override' } : {}),
+    });
+    await browser.window.umami.track(
+      mode === 'manual' ? { website: 'website-id', ...override } : undefined,
+    );
+    expect(browser.requests()).toHaveLength(1);
+    expect(browser.requests()[0].payload).toMatchObject({
+      url: '/reset/[redacted]?utm_source=google',
+      referrer: 'https://external.example/verify/[redacted]?category=safe',
+    });
+  },
+);
+
+test('initial pageviews protect the document referrer and retain its external domain', () => {
+  const browser = createBrowser();
+  Object.defineProperty(browser.window.document, 'referrer', {
+    value: 'https://external.example/reset/referrer-secret',
+  });
+  browser.window.history.replaceState({}, '', '/reset/url-secret');
+  browser.load();
+  expect(browser.requests()).toHaveLength(1);
+  expect(browser.requests()[0].payload).toMatchObject({
+    url: 'https://shop.example.com/reset/[redacted]',
+    referrer: 'https://external.example/reset/[redacted]',
+  });
 });
 
 test.each(['manual', 'before-send'])(

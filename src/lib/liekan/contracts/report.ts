@@ -52,6 +52,7 @@ export interface LiekanReport {
   meta: {
     snapshot?: {
       dataThrough: number;
+      version?: string;
       state: 'ready' | 'updating';
       intervalMs: number;
       updateError?: boolean;
@@ -191,6 +192,7 @@ export const liekanReportSchema = z.object({
     snapshot: z
       .object({
         dataThrough: z.number(),
+        version: z.string().optional(),
         state: z.enum(['ready', 'updating']),
         intervalMs: z.number(),
         updateError: z.boolean().optional(),

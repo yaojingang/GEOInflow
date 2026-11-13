@@ -86,15 +86,19 @@ function toOpenApiSegment(segment: string) {
   return name ? `{${name}}` : segment;
 }
 
-function getRoutePath(apiRoot: string, routeFile: string): `/${string}` {
+function getRoutePaths(apiRoot: string, routeFile: string): `/${string}`[] {
   const relativeDirectory = path.relative(apiRoot, path.dirname(routeFile));
-  const segments = relativeDirectory
-    .split(path.sep)
-    .filter(Boolean)
-    .map(toOpenApiSegment)
-    .filter((segment): segment is string => segment !== null);
-
-  return `/api${segments.length ? `/${segments.join('/')}` : ''}`;
+  const segments = relativeDirectory.split(path.sep).filter(Boolean);
+  return segments.reduce<`/${string}`[]>(
+    (paths, segment) => {
+      const parameter = toOpenApiSegment(segment);
+      if (parameter === null) return paths;
+      const extended = paths.map((prefix): `/${string}` => `${prefix}/${parameter}`);
+      // OpenAPI path parameters are required, so an optional segment also needs a path without it.
+      return segment.startsWith('[[...') ? [...paths, ...extended] : extended;
+    },
+    ['/api'],
+  );
 }
 
 export async function discoverApiOperations(
@@ -118,16 +122,14 @@ export async function discoverApiOperations(
         true,
         routeFile.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
       );
-    const routePath = getRoutePath(apiRoot, routeFile);
+    const routePaths = getRoutePaths(apiRoot, routeFile);
     const relativeSource = path.relative(projectRoot, routeFile).replaceAll(path.sep, '/');
 
     getExportedMethods(source).forEach(method => {
-      operations.push({
-        method,
-        path: routePath,
-        source: relativeSource,
-        analysis: analyzeSourceOperation(source, method, checker),
-      });
+      const analysis = analyzeSourceOperation(source, method, checker);
+      for (const routePath of routePaths) {
+        operations.push({ method, path: routePath, source: relativeSource, analysis });
+      }
     });
   }
 

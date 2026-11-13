@@ -10,7 +10,7 @@ import { saveAccountPreferences } from '@/lib/liekan/upstream/account-preference
 import { formatInTimeZone } from 'date-fns-tz';
 import Link from '@/components/liekan/Link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 import { useManualRefresh } from '@/lib/liekan/contracts/manual-refresh';
 import {
   type CoreFunnelStep,
@@ -29,6 +29,7 @@ import {
   qualifiedBrowserUnavailableReason,
 } from '@/lib/liekan/contracts/population-results';
 import { websiteHandle } from '@/lib/liekan/website-handle';
+import type { WebsiteSummary } from '@/lib/liekan/contracts/website-summary';
 import type { DataState, LiekanReport } from '@/lib/liekan/contracts/report';
 import {
   featureSiteQuery,
@@ -48,7 +49,7 @@ import {
   websiteDayWindow,
 } from '@/lib/liekan/upstream/website-day-metrics';
 import { TrafficQuality } from './TrafficQuality';
-import { Skeleton } from '../DataLoading';
+import { Skeleton, useDataLoading } from '../DataLoading';
 import { ManagementDrawer } from '../ManagementDrawer';
 import { CrawlerHandoffs } from './CrawlerHandoffs';
 import { CrawlerDialog } from './CrawlerDialog';
@@ -341,48 +342,112 @@ function InstallSteps({ query, websiteId }: { query: any; websiteId: string }) {
     </ul>
   );
 }
+type SummaryWindow = Pick<ReturnType<typeof websiteDayWindow>, 'startAt' | 'endAt' | 'timezone'>;
+type SummaryRead = {
+  row?: WebsiteSummary[number];
+  error?: { status?: number; message?: string };
+  pending: boolean;
+  fetching: boolean;
+  refetch: () => Promise<unknown>;
+};
+
+function WebsiteSummaryRead({
+  id,
+  range,
+  label,
+  queryKey,
+  readKey,
+  publish,
+}: {
+  id: string;
+  range: SummaryWindow;
+  label: string;
+  queryKey: unknown[];
+  readKey: string;
+  publish: (key: string, result?: SummaryRead) => void;
+}) {
+  const c = useFeature();
+  const query = useData(
+    [label, [id]],
+    signal => getFeatureWebsiteSummary([id], range, signal, c.api.get),
+    true,
+    { queryKey, staleTime: 0 },
+  );
+  const refetch = useRef(query.refetch);
+  refetch.current = query.refetch;
+  const row = query.data?.find(item => item.id === id);
+  const error = row?.error ?? query.error;
+  useEffect(() => {
+    publish(readKey, {
+      row: row?.error ? undefined : row,
+      error,
+      pending: query.isPending,
+      fetching: query.isFetching,
+      refetch: () => refetch.current(),
+    });
+  }, [readKey, publish, row, error, query.isPending, query.isFetching]);
+  useEffect(() => () => publish(readKey), [readKey, publish]);
+  return null;
+}
+
 function Websites() {
   const i18n = useLiekanI18n();
   const c = useFeature();
   const reading = useManualRefresh();
   const enteredAt = useRef(Date.now());
   const readAt = reading?.page.now ?? enteredAt.current;
-  const query = useData(
-    ['website-management-stats', c.sites.map(site => site.id)],
-    signal =>
-      getFeatureWebsiteSummary(
-        c.sites.map(site => site.id),
-        c.range,
-        signal,
-        c.api.get,
-      ),
-    c.sitesReady !== false,
-  );
-  // 今日窗口自带 compare=昨日，四个指标列共用一次请求。
+  const metadataLoading = useDataLoading();
+  const canRead = c.sitesReady !== false && !metadataLoading;
+  const [reads, setReads] = useState<Record<string, SummaryRead>>({});
+  const publish = useCallback((key: string, result?: SummaryRead) => {
+    setReads(previous => {
+      if (result) return { ...previous, [key]: result };
+      if (!(key in previous)) return previous;
+      const next = { ...previous };
+      delete next[key];
+      return next;
+    });
+  }, []);
   const todayWindow = websiteDayWindow(c.range.timezone, readAt);
-  const todayQuery = useData(
-    ['website-management-today', c.sites.map(site => site.id), todayWindow.startAt],
-    signal =>
-      getFeatureWebsiteSummary(
-        c.sites.map(site => site.id),
-        todayWindow,
-        signal,
-        c.api.get,
-      ),
-    c.sitesReady !== false,
-  );
-  const stats = query.data || [];
-  const todayStats = todayQuery.data || [];
-  const readable = stats.filter(row => !row.error);
-  const populations = [...readable, ...todayStats.filter(row => !row.error)]
-    .map(row => row.population)
+  const { startAt, endAt, timezone } = c.range;
+  const selectedWindow = { startAt, endAt, timezone };
+  const showsToday = startAt === todayWindow.startAt && endAt === todayWindow.endAt;
+  const scopeKey = [
+    'liekan-feature',
+    c.user?.id,
+    c.siteId,
+    c.route.teamId,
+    c.route.context,
+    c.query.scope,
+    c.route.id,
+  ];
+  const request = (id: string, range: SummaryWindow, label: string) => {
+    const queryKey = [...scopeKey, range, label, [id]];
+    const readKey = JSON.stringify(queryKey);
+    return { id, range, label, queryKey, readKey };
+  };
+  const siteRequests = c.sites.map(({ id }) => {
+    const daily = request(id, todayWindow, 'website-management-today');
+    const selected = showsToday ? daily : request(id, selectedWindow, 'website-management-stats');
+    return { daily, selected };
+  });
+  const result = ({ readKey }: { readKey: string }) => (canRead ? reads[readKey] : undefined);
+  const selected = siteRequests.map(site => result(site.selected));
+  const daily = siteRequests.map(site => result(site.daily));
+  const selectedPending = !canRead || selected.some(read => !read || read.pending);
+  const readable = selected.flatMap(read => (read?.row ? [read.row] : []));
+  const failures = (showsToday ? selected : [...daily, ...selected]).filter(read => read?.error);
+  const selectedFailure = selected.find(read => read?.error)?.error;
+  const retryFailures = () => Promise.allSettled(failures.map(read => read.refetch()));
+  const populations = (showsToday ? selected : [...selected, ...daily])
+    .map(read => read?.row?.population)
     .filter(population => population?.metricScope === 'qualified-browser');
   const populationNotice = populations.some(population => !identityUsable(population))
     ? qualifiedBrowserUnavailableReason
     : populations.some(population => population.identity.status === 'partial')
       ? qualifiedBrowserReason
       : null;
-  const ready = !query.isPending && !query.error && Array.isArray(query.data);
+  const ready = !selectedPending;
   const partial = ready && readable.length < c.sites.length;
   const scope = c.route.teamId
     ? i18n.text('{v0}空间', [
@@ -420,8 +485,14 @@ function Websites() {
     : i18n.text('所选 {v0} 个网站', [c.sites.length]);
   return (
     <>
+      {canRead &&
+        siteRequests.flatMap(({ daily, selected }) =>
+          (showsToday ? [daily] : [selected, daily]).map(request => (
+            <WebsiteSummaryRead key={request.readKey} {...request} publish={publish} />
+          )),
+        )}
       <Metrics
-        loading={[query.isPending, query.isPending, query.isPending, false]}
+        loading={[selectedPending, selectedPending, selectedPending, false]}
         items={[
           [
             i18n.text('全部网站访客'),
@@ -461,10 +532,11 @@ function Websites() {
           )
         }
       >
-        {/* Statistics report their own loading and failures; website metadata stays usable. */}
-        <QueryState query={query} readOnly>
-          {null}
-        </QueryState>
+        {ready && !readable.length && selectedFailure && (
+          <QueryState query={{ error: selectedFailure, refetch: retryFailures }} readOnly>
+            {null}
+          </QueryState>
+        )}
         <Table
           mobile
           rowKeys={c.sites.map(site => site.id)}
@@ -484,12 +556,20 @@ function Websites() {
           onRowClick={(_, index) =>
             c.navigate('overview', { websiteId: websiteHandle(c.sites[index]) })
           }
-          rows={c.sites.map(site => {
-            const stat =
-              stats.find(row => row.id === site.id) ||
-              (query.error ? { error: query.error } : undefined);
-            const day = todayStats.find(row => row.id === site.id);
-            const dayRead = day && !day.error ? day : null;
+          rows={c.sites.map((site, index) => {
+            const read = selected[index];
+            const day = daily[index];
+            const error = read?.error ?? day?.error;
+            const stat = read?.row;
+            const status = error
+              ? errorLabel(error)
+              : stat?.received
+                ? '已收到浏览数据'
+                : stat
+                  ? '待验证'
+                  : '等待查询';
+            const dayLoading = !day || day.pending;
+            const dayRead = day?.row;
             const yesterday = dayRead ? dayRead.comparison : null;
             return [
               <>
@@ -514,31 +594,12 @@ function Websites() {
                 {c.teams.find(team => team.id === site.teamId)?.name ||
                   (site.teamId ? i18n.text('团队空间') : i18n.text('个人空间'))}
               </TableCell>,
-              <TableCell
-                sortValue={
-                  stat?.error
-                    ? errorLabel(stat.error)
-                    : stat?.received
-                      ? i18n.source('已收到浏览数据')
-                      : stat
-                        ? i18n.source('待验证')
-                        : i18n.source('等待查询')
-                }
-                searchValue={i18n.english.system(
-                  stat?.error
-                    ? errorLabel(stat.error)
-                    : stat?.received
-                      ? i18n.english.text('已收到浏览数据')
-                      : stat
-                        ? i18n.english.text('待验证')
-                        : i18n.english.text('等待查询'),
-                )}
-              >
+              <TableCell sortValue={i18n.source(status)} searchValue={i18n.english.system(status)}>
                 <Badge
                   key="badge"
                   tone={
-                    stat?.error
-                      ? [401, 403].includes(stat.error.status)
+                    error
+                      ? [401, 403].includes(error.status)
                         ? 'gray'
                         : 'red'
                       : stat?.received
@@ -546,18 +607,12 @@ function Websites() {
                         : 'amber'
                   }
                 >
-                  {stat?.error
-                    ? errorLabel(stat.error)
-                    : stat?.received
-                      ? i18n.text('已收到浏览数据')
-                      : stat
-                        ? i18n.text('待验证')
-                        : i18n.text('等待查询')}
+                  {i18n.text(status)}
                 </Badge>
               </TableCell>,
               <MetricRows
                 key="views"
-                loading={todayQuery.isPending}
+                loading={dayLoading}
                 kind="count"
                 timezone={c.range.timezone}
                 readAt={readAt}
@@ -566,7 +621,7 @@ function Websites() {
               />,
               <MetricRows
                 key="visitors"
-                loading={todayQuery.isPending}
+                loading={dayLoading}
                 kind="count"
                 labels={false}
                 timezone={c.range.timezone}
@@ -576,7 +631,7 @@ function Websites() {
               />,
               <MetricRows
                 key="bounce"
-                loading={todayQuery.isPending}
+                loading={dayLoading}
                 kind="percent"
                 labels={false}
                 timezone={c.range.timezone}
@@ -586,7 +641,7 @@ function Websites() {
               />,
               <MetricRows
                 key="ai"
-                loading={todayQuery.isPending}
+                loading={dayLoading}
                 kind="count"
                 labels={false}
                 timezone={c.range.timezone}
@@ -620,13 +675,19 @@ function Websites() {
           {formatInTimeZone(readAt, c.range.timezone, 'yyyy-MM-dd')}。
         </p>
       </Panel>
-      {partial && (
+      {(partial || (failures.length > 0 && readable.length > 0)) && (
         <Notice tone="amber">
-          {i18n.fragment('统计汇总尚未读全。卡片仅统计已读取的 ', false, true)}
-          {readable.length} / {c.sites.length}{' '}
-          {i18n.fragment('个网站，未读取网站的数值显示“—”。', true, true)}
+          {partial ? (
+            <>
+              {i18n.fragment('统计汇总尚未读全。卡片仅统计已读取的 ', false, true)}
+              {readable.length} / {c.sites.length}{' '}
+              {i18n.fragment('个网站，未读取网站的数值显示“—”。', true, true)}
+            </>
+          ) : (
+            i18n.text('部分数据读取失败，请主动重试。')
+          )}
           <div className="form-actions">
-            <Button disabled={query.isFetching} onClick={() => query.refetch()}>
+            <Button disabled={failures.some(read => read.fetching)} onClick={retryFailures}>
               {i18n.text('重新读取统计')}
             </Button>
           </div>

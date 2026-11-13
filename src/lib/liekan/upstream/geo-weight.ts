@@ -2,30 +2,35 @@ import { createHash } from 'node:crypto';
 import { formatInTimeZone } from 'date-fns-tz';
 import type { GeoWeightResponse } from '../contracts/geo-weight';
 import { geoWeightQuerySchema } from '../contracts/geo-weight';
+import { crawlerWindowQuality } from '../crawlers/analysis';
+import { geoComparable, geoPoint } from '../geo-weight/evidence';
 import {
   GEO_ALGORITHM,
-  GEO_LEVEL_MINIMUMS,
+  GEO_COEFFICIENTS,
   GEO_CONTENT_TYPES,
   GEO_FORMULA,
+  GEO_LEVEL_MINIMUMS,
   GEO_METADATA_PATH,
   GEO_NON_CONTENT_EXTENSION,
   GEO_SCOPE,
   GEO_VERIFICATION,
-  GEO_COEFFICIENTS,
 } from '../geo-weight/policy';
 import { geoDateOffset, geoWindow } from '../geo-weight/window';
-import { geoComparable, geoPoint } from '../geo-weight/evidence';
-import { crawlerWindowQuality } from '../crawlers/analysis';
-import { withPublishedRegistry } from './crawler-registry-context';
-import { authorizeCrawler, crawlerTransaction, type CrawlerActor } from './crawler-access';
-import { geoWeightAggregate, geoWeightFirstEvidence } from './geo-weight-sql';
-import { LiekanError } from './errors';
-import { analyticsGate, AnalyticsUnavailable } from './analytics-budget';
-import { evidenceCache } from './evidence-cache';
-import { websiteCacheTag } from './query-cache';
-import { currentCacheContext, noteCacheResult } from './cache-context';
-import { cancellableEvidence } from './query-cancellation';
 import type { AiTx } from './ai-db';
+import { AnalyticsUnavailable, analyticsGate } from './analytics-budget';
+import { currentCacheContext, noteCacheResult } from './cache-context';
+import { authorizeCrawler, type CrawlerActor, crawlerTransaction } from './crawler-access';
+import { withPublishedRegistry } from './crawler-registry-context';
+import { LiekanError } from './errors';
+import { evidenceCache } from './evidence-cache';
+import { geoWeightAggregate, geoWeightFirstEvidence } from './geo-weight-sql';
+import { websiteCacheTag } from './query-cache';
+import { cancellableEvidence } from './query-cancellation';
+import { withinWarehouseReport } from './warehouse-report-snapshot';
+import { warehouseEnabled } from '../warehouse/runtime';
+import { warehouseControlRead } from './warehouse-control-read';
+import { warehouseReportMetadata } from './warehouse-report-snapshot';
+import type { ReadBoundary } from '../warehouse/read';
 
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 export const GEO_SCOPE_HASH = hash({
@@ -135,11 +140,11 @@ export function geoWeightTransaction<T>(
     throw error;
   });
 }
-export async function calculateGeoWeight(
+async function calculateGeoWeightAtBoundary(
   actor: CrawlerActor,
   websiteId: string,
   input: unknown,
-  options: { signal?: AbortSignal; fresh?: boolean; deadline?: number; globalLock?: boolean } = {},
+  options: { signal?: AbortSignal; fresh?: boolean; deadline?: number; globalLock?: boolean; onWarehouseBoundary?: (boundary: ReadBoundary) => void } = {},
 ): Promise<GeoWeightResponse> {
   const deadline = Math.min(Date.now() + 60000, options.deadline ?? Infinity);
   const p = parseGeoWeightQuery(input);
@@ -161,11 +166,11 @@ export async function calculateGeoWeight(
     const compute = (signal?: AbortSignal) =>
       analyticsGate.run(
         () =>
-          geoWeightTransaction(
+          (warehouseEnabled() ? warehouseGeoCompute : geoWeightTransaction)(
             deadline,
             signal,
             async tx => {
-              if (options.globalLock) {
+              if (options.globalLock && !warehouseEnabled()) {
                 const [lock] = await tx.query(
                   'SELECT pg_try_advisory_xact_lock(12800031) AS acquired',
                 );
@@ -173,6 +178,7 @@ export async function calculateGeoWeight(
               }
               computedHere = true;
               const currentAccess = await readAccess(tx, actor, websiteId);
+              if (warehouseEnabled()) options.onWarehouseBoundary?.((await warehouseReportMetadata(websiteId)).boundary);
               if (hash(accessBoundary(access)) !== hash(accessBoundary(currentAccess)))
                 throw new LiekanError('统计基准已变化，请重新读取', 409);
               const rows = await geoWeightAggregate(
@@ -191,12 +197,15 @@ export async function calculateGeoWeight(
               );
               const points = [];
               for (const window of windows) {
+                const row = rows.find(r => r.asOf === window.asOf) || {};
                 const quality = await crawlerWindowQuality(
                   tx,
                   websiteId,
                   window.startAt,
                   window.endAt,
                   p.timezone,
+                  undefined,
+                  warehouseEnabled() ? row.qualityVersions : undefined,
                 );
                 const [coverage] = await tx.query(
                   `SELECT EXISTS(SELECT 1 FROM liekan_crawler_rule_version r
@@ -221,7 +230,6 @@ export async function calculateGeoWeight(
                   quality.sourceVersion,
                 );
                 const covered = quality.state === 'complete' && coverage?.valid === true;
-                const row = rows.find(r => r.asOf === window.asOf) || {};
                 if (firstEvidenceDay && firstEvidenceDay <= window.asOf)
                   row.stats = { ...row.stats, firstEvidenceDay };
                 points.push(geoPoint(window, row, quality, catalog.state === 'fallback', covered));
@@ -351,6 +359,16 @@ export async function calculateGeoWeight(
 }
 
 export class GeoWeightLockBusy extends Error {}
+function warehouseGeoCompute<T>(deadline: number, signal: AbortSignal | undefined, work: (tx: AiTx) => Promise<T>, _repeatableRead = false) {
+  return warehouseControlRead(work, { deadline, signal, stable: (sql, values) => {
+    const rows = values as Record<string, unknown>[];
+    // New accepted log facts use the pinned CH publication. Their PG diagnostic
+    // revision may advance without changing the permissions or evidence policy.
+    if (/FROM liekan_log_state\b/.test(sql)) return rows.map(({data_revision: _data, ...row}) => row);
+    if (/FROM liekan_ingest_batch\b/.test(sql)) return rows.map(row => ({...row, count: Number(row.count) > 0}));
+    return rows;
+  } });
+}
 /** Compatibility callers share the durable daily publication path. */
 export async function readGeoWeight(
   actor: CrawlerActor,
@@ -360,4 +378,14 @@ export async function readGeoWeight(
 ): Promise<GeoWeightResponse> {
   const { readLegacyGeoWeight } = await import('./geo-weight-snapshots');
   return readLegacyGeoWeight(actor, websiteId, input, options);
+}
+
+export async function calculateGeoWeight(...args: Parameters<typeof calculateGeoWeightAtBoundary>) {
+  if (!warehouseEnabled()) return calculateGeoWeightAtBoundary(...args);
+  const [actor, websiteId, input, options = {}] = args;
+  const deadline = Math.min(Date.now() + 60000, options.deadline ?? Infinity);
+  return withinWarehouseReport(
+    () => calculateGeoWeightAtBoundary(actor, websiteId, input, { ...options, deadline }),
+    { deadline, signal: options.signal },
+  );
 }

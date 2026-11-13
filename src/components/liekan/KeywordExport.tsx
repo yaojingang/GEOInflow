@@ -60,7 +60,8 @@ export function KeywordExport({
           if (!ownsRun() || run.signal.aborted) return;
           if (frame.type === 'progress') setMessage(frame.stage);
           if (frame.type === 'file') {
-            if (frame.size > EXPORT_MAX_BYTES) throw new Error('下载文件超过 50 MiB');
+            if (!frame.downloadUrl && frame.size > EXPORT_MAX_BYTES)
+              throw new Error('下载文件超过 50 MiB');
             file = frame;
           }
           if (frame.type === 'chunk') {
@@ -73,13 +74,16 @@ export function KeywordExport({
         report.meta?.catalogVersion,
       );
       if (!ownsRun() || run.signal.aborted) return;
-      if (!file || file.size !== bytes) throw new Error('文件传输未完成，请重新生成');
-      const url = URL.createObjectURL(new Blob(chunks as BlobPart[], { type: file.mime }));
+      if (!file || (!file.downloadUrl && file.size !== bytes))
+        throw new Error('文件传输未完成，请重新生成');
+      const url =
+        file.downloadUrl ||
+        URL.createObjectURL(new Blob(chunks as BlobPart[], { type: file.mime }));
       const link = document.createElement('a');
       link.href = url;
       link.download = file.name;
       link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      if (url.startsWith('blob:')) setTimeout(() => URL.revokeObjectURL(url), 1000);
       setMessage('已导出全部筛选结果，文件包含统计读取时间');
     } catch (error) {
       if (ownsRun())

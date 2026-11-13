@@ -223,17 +223,6 @@
       "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
     },
     {
-      "path": "README.md",
-      "purpose": "Liekan branding, contributor attribution and third-party license documentation",
-      "tests": [
-        "pnpm liekan:verify",
-        "Liekan Docker and visual acceptance"
-      ],
-      "owner": "Liekan release maintenance",
-      "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Liekan branding, contributor attribution and third-party license documentation",
-      "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
-    },
-    {
       "path": "README.ja.md",
       "purpose": "Preserve the accepted Japanese community documentation and language navigation",
       "tests": [
@@ -243,6 +232,17 @@
       "owner": "Liekan documentation maintenance",
       "constraint": "Retain contributor attribution, project provenance and the accepted Japanese content",
       "removalCondition": "Remove when the project adopts a replacement documentation locale structure"
+    },
+    {
+      "path": "README.md",
+      "purpose": "Liekan branding, contributor attribution and third-party license documentation",
+      "tests": [
+        "pnpm liekan:verify",
+        "Liekan Docker and visual acceptance"
+      ],
+      "owner": "Liekan release maintenance",
+      "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Liekan branding, contributor attribution and third-party license documentation",
+      "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
     },
     {
       "path": "README.zh-CN.md",
@@ -280,6 +280,28 @@
       "removalCondition": "Remove when the upstream surface follows the same product and distribution boundaries"
     },
     {
+      "path": "compose.yml",
+      "purpose": "Expose the GEOInflow ClickHouse stack as the default Docker Compose project",
+      "tests": [
+        "docker compose config",
+        "python3 tests/liekan/warehouse-deploy.test.py"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Retain the warehouse service definitions, data volume names and deployment migration order",
+      "removalCondition": "Remove when the maintained warehouse stack has an equivalent default Compose entry"
+    },
+    {
+      "path": "docker-compose.liekan-clickhouse.yml",
+      "purpose": "Optional historical ClickHouse analytics deployment and administrator entry",
+      "tests": [
+        "pnpm test:analytics-engine",
+        "node --test tests/liekan/deployment.test.mjs"
+      ],
+      "owner": "Liekan analytics maintenance",
+      "constraint": "Keep PostgreSQL authoritative and default deployment compatible; preserve installation, source epoch, permissions and upstream ClickHouse behavior",
+      "removalCondition": "Remove when the supported analytics extension provides equivalent verified coverage and lifecycle behavior"
+    },
+    {
       "path": "docker-compose.liekan.yml",
       "purpose": "Isolate Liekan runtime, database and immutable image revision; pass optional AI settings and consistent analysis storage budgets to app and workers.",
       "tests": [
@@ -303,6 +325,34 @@
       "removalCondition": "Remove when upstream initialization supports the Liekan product default through an extension point"
     },
     {
+      "path": "docker-compose.yml",
+      "purpose": "Reserve the default Compose discovery path for the GEOInflow stack",
+      "tests": ["docker compose config --services"],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Retain the upstream Compose file as docker-compose.umami.yml",
+      "removalCondition": "Remove when the upstream stack is no longer distributed alongside GEOInflow"
+    },
+    {
+      "path": "docker-compose.umami.yml",
+      "purpose": "Retain the standalone upstream Umami Compose configuration",
+      "tests": ["docker compose -f docker-compose.umami.yml config --services"],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Preserve upstream service definitions and data volume names",
+      "removalCondition": "Remove when the upstream stack is no longer distributed alongside GEOInflow"
+    },
+    {
+      "path": "docker-compose.warehouse.yml",
+      "purpose": "Pinned ClickHouse and durable queue deployment for Liekan analytical storage",
+      "tests": [
+        "tests/liekan/warehouse-fresh.integration.ts",
+        "tests/liekan/warehouse-docker-recovery.integration.ts",
+        "tests/liekan/warehouse-backup.test.py"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Preserve private credentials, require explicit installation mode and retain queue durability and isolated storage identities",
+      "removalCondition": "Remove when an equivalent maintained deployment contract replaces these warehouse services"
+    },
+    {
       "path": "docker/proxy.ts",
       "purpose": "Chain the website handle rewrite into the Docker middleware pipeline alongside upstream CSP, collect-endpoint and tracker-script handling",
       "tests": [
@@ -313,6 +363,30 @@
       "owner": "Liekan compatibility adapters",
       "constraint": "The rewrite runs first and only rewrites numeric website handles on /api/websites, /api/realtime and compat paths; all other upstream middleware behavior is preserved",
       "removalCondition": "Remove when upstream analytics routes accept the site number handle natively"
+    },
+    {
+      "path": "docker/warehouse/clickhouse.xml",
+      "purpose": "Pinned ClickHouse and durable queue deployment for Liekan analytical storage",
+      "tests": [
+        "tests/liekan/warehouse-fresh.integration.ts",
+        "tests/liekan/warehouse-docker-recovery.integration.ts",
+        "tests/liekan/warehouse-backup.test.py"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Preserve private credentials, require explicit installation mode and retain queue durability and isolated storage identities",
+      "removalCondition": "Remove when an equivalent maintained deployment contract replaces these warehouse services"
+    },
+    {
+      "path": "docker/warehouse/kafka-start.sh",
+      "purpose": "Start the pinned Kafka KRaft queue with a persistent cluster identity and refuse foreign engine data",
+      "tests": [
+        "tests/liekan/warehouse-kafka-start.integration.py",
+        "tests/liekan/warehouse-queue-restart.integration.ts",
+        "tests/liekan/warehouse-docker-recovery.integration.ts"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Preserve the queue cluster ID, retry interrupted first initialization only on an otherwise empty volume, and never adopt Redpanda or another Kafka cluster",
+      "removalCondition": "Remove when an equivalent maintained deployment contract replaces these warehouse services"
     },
     {
       "path": "env.example",
@@ -329,15 +403,303 @@
       "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
     },
     {
+      "path": "experiments/ch-prototype/README.md",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/actor.ts",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/clickhouse.xml",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/clients.ts",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/compose-round2.yaml",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/compose.yaml",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/core.ts",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/integration.ts",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/npm-shrinkwrap.json",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/package.json",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/redpanda-round2.yaml",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/redpanda.yaml",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/round2-actor.ts",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/round2-backfill-test.ts",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/round2-data.ts",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/round2-integration.ts",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/round2-prepare.ts",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/round2-query.ts",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/round2-restore.py",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/round2-sample.py",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/round3-proof.ts",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/routing.ts",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/schema.ch.sql",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/schema.pg.sql",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/topic-identity.ts",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
+      "path": "experiments/ch-prototype/tsconfig.json",
+      "purpose": "Isolated ClickHouse protocol experiments and downloaded-backup parity fixtures; never loaded by the product runtime",
+      "tests": [
+        "pnpm --dir experiments/ch-prototype typecheck",
+        "Isolated protocol and immutable downloaded-backup acceptance documented in experiments/ch-prototype/README.md"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Use only explicitly isolated test databases and preserve the downloaded source backup; exclude experiments from production image",
+      "removalCondition": "Remove when formal warehouse regressions fully replace the isolated protocol evidence"
+    },
+    {
       "path": "next.config.ts",
-      "purpose": "Typed production build, local font/branding and explicit agent rule control; externalize the pg driver for the website handle proxy; preserve private no-store headers for crawler recognition, candidates, administrator source health, crawler context and private traffic evidence; preserve private no-store headers for browser cache authorization manifests; preserve private no-store responses for durable analysis tasks, acceleration management, instance and website storage cleanup, and opted-in native aggregates; preserve private no-store responses for robots drafts, server pairing credentials and deployment evidence",
+      "purpose": "Typed production build, local font/branding and explicit agent rule control; externalize the pg driver for the website handle proxy; preserve private no-store headers for crawler recognition, candidates, administrator source health, crawler context and private traffic evidence; preserve private no-store headers for browser cache authorization manifests; preserve private no-store responses for durable analysis tasks, acceleration management, instance and website storage cleanup, and opted-in native aggregates; preserve private no-store responses for robots drafts, server pairing credentials and deployment evidence; Typed production build, local font/branding and explicit agent rule control; externalize the pg driver for the website handle proxy; preserve private no-store headers for crawler recognition, candidates, administrator source health, crawler context and private traffic evidence; preserve private no-store headers for browser cache authorization manifests; preserve private no-store responses for durable analysis tasks, acceleration management and opted-in native aggregates; route Liekan collection and reads through versioned warehouse packages and reports",
       "tests": [
         "pnpm liekan:verify",
         "Liekan Docker and visual acceptance",
         "tests/liekan/ai/http.integration.ts",
         "src/proxy.test.ts",
         "src/lib/liekan/upstream/crawler-private-headers.test.ts",
-        "src/lib/liekan/upstream/analysis-private-headers.test.ts"
+        "src/lib/liekan/upstream/analysis-private-headers.test.ts",
+        "tests/liekan/warehouse-reporting.integration.ts",
+        "tests/liekan/warehouse-consumer.integration.ts"
       ],
       "owner": "Liekan release maintenance",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Typed production build, local font/branding and explicit agent rule control; externalize the pg driver for the website handle proxy",
@@ -356,18 +718,6 @@
       "owner": "Liekan release maintenance",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Pin reproducible toolchain, offline prototype charts and license-compatible browser detection Preserve upstream behavior and protocols outside this recorded purpose: Pin reproducible toolchain, offline prototype charts and license-compatible browser detection; Preserve upstream behavior and protocols outside this recorded purpose: Pin reproducible toolchain, offline prototype charts and license-compatible browser detection",
       "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
-    },
-    {
-      "path": "public/liekan-robots-agent.mjs",
-      "purpose": "Distribute the authorized single-file robots server helper with source and Docker builds",
-      "tests": [
-        "src/liekan-agent/robots-agent.test.ts",
-        "pnpm test:robots",
-        "node scripts/liekan-static-check.mjs"
-      ],
-      "owner": "Liekan crawler management maintenance",
-      "constraint": "Keep writes pinned to the authorized robots.txt, preserve durable receipts and backups, and reject untrusted filesystem paths",
-      "removalCondition": "Remove when an equivalent reviewed helper distribution replaces this asset"
     },
     {
       "path": "packages/api-client/README.md",
@@ -1268,6 +1618,18 @@
       "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
     },
     {
+      "path": "public/liekan-robots-agent.mjs",
+      "purpose": "Distribute the authorized single-file robots server helper with source and Docker builds",
+      "tests": [
+        "src/liekan-agent/robots-agent.test.ts",
+        "pnpm test:robots",
+        "node scripts/liekan-static-check.mjs"
+      ],
+      "owner": "Liekan crawler management maintenance",
+      "constraint": "Keep writes pinned to the authorized robots.txt, preserve durable receipts and backups, and reject untrusted filesystem paths",
+      "removalCondition": "Remove when an equivalent reviewed helper distribution replaces this asset"
+    },
+    {
       "path": "public/site.webmanifest",
       "purpose": "Liekan release, branding or compatibility integration",
       "tests": [
@@ -1300,6 +1662,16 @@
         "Supplemental UI/API regression and isolated Docker acceptance",
         "pnpm check:api:client"
       ]
+    },
+    {
+      "path": "scripts/liekan-deploy.sh",
+      "purpose": "Preserve existing deployment state while adding an optional historical analytics service",
+      "tests": [
+        "node --test tests/liekan/deployment.test.mjs"
+      ],
+      "owner": "Liekan analytics maintenance",
+      "constraint": "Keep PostgreSQL authoritative and preserve configuration, credentials, data volumes and immutable deployment candidates",
+      "removalCondition": "Remove when the supported deployment entrypoint covers these lifecycle guarantees"
     },
     {
       "path": "scripts/liekan-static-check.mjs",
@@ -1378,6 +1750,17 @@
       "owner": "Liekan interface integration",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Liekan release, branding or compatibility integration",
       "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
+    },
+    {
+      "path": "src/app/(main)/admin/analytics-engine/page.tsx",
+      "purpose": "Optional historical ClickHouse analytics deployment and administrator entry",
+      "tests": [
+        "pnpm test:analytics-engine",
+        "node --test tests/liekan/deployment.test.mjs"
+      ],
+      "owner": "Liekan analytics maintenance",
+      "constraint": "Keep PostgreSQL authoritative and default deployment compatible; preserve installation, source epoch, permissions and upstream ClickHouse behavior",
+      "removalCondition": "Remove when the supported analytics extension provides equivalent verified coverage and lifecycle behavior"
     },
     {
       "path": "src/app/(main)/admin/layout.tsx",
@@ -1801,28 +2184,36 @@
     },
     {
       "path": "src/app/api/2fa/verify/route.test.ts",
-      "purpose": "90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions",
+      "purpose": "90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions; Expire browser export credentials on every login attempt and completed 2FA identity change",
       "tests": [
         "src/lib/auth-session.test.ts",
         "src/app/api/auth/login/route.test.ts",
         "src/app/api/2fa/verify/route.test.ts",
-        "pnpm liekan:verify"
+        "pnpm liekan:verify",
+        "src/app/api/auth/logout/route.test.ts",
+        "src/app/api/auth/verify/route.test.ts",
+        "src/lib/liekan/upstream/warehouse-export-cookie.test.ts",
+        "src/app/api/liekan/websites/[websiteId]/exports/[exportId]/route.test.ts"
       ],
       "owner": "Liekan authentication compatibility",
-      "constraint": "Preserve opaque bearer token format, live account/password checks, five-minute partial 2FA challenge and existing SSO, API-key, share and tracker protocols",
+      "constraint": "Preserve opaque bearer token format, live account/password checks, five-minute partial 2FA challenge and existing SSO, API-key, share and tracker protocols; Preserve locale/preferences while removing only the known export session cookie",
       "removalCondition": "Remove when upstream exposes a session-lifetime setting and the registered regression tests pass"
     },
     {
       "path": "src/app/api/2fa/verify/route.ts",
-      "purpose": "90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions",
+      "purpose": "90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions; Expire browser export credentials on every login attempt and completed 2FA identity change",
       "tests": [
         "src/lib/auth-session.test.ts",
         "src/app/api/auth/login/route.test.ts",
         "src/app/api/2fa/verify/route.test.ts",
-        "pnpm liekan:verify"
+        "pnpm liekan:verify",
+        "src/app/api/auth/logout/route.test.ts",
+        "src/app/api/auth/verify/route.test.ts",
+        "src/lib/liekan/upstream/warehouse-export-cookie.test.ts",
+        "src/app/api/liekan/websites/[websiteId]/exports/[exportId]/route.test.ts"
       ],
       "owner": "Liekan authentication compatibility",
-      "constraint": "Preserve opaque bearer token format, live account/password checks, five-minute partial 2FA challenge and existing SSO, API-key, share and tracker protocols",
+      "constraint": "Preserve opaque bearer token format, live account/password checks, five-minute partial 2FA challenge and existing SSO, API-key, share and tracker protocols; Preserve locale/preferences while removing only the known export session cookie",
       "removalCondition": "Remove when upstream exposes a session-lifetime setting and the registered regression tests pass"
     },
     {
@@ -1849,31 +2240,91 @@
     },
     {
       "path": "src/app/api/auth/login/route.test.ts",
-      "purpose": "90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; 90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions; Expire browser export credentials on every login attempt and completed 2FA identity change",
       "tests": [
         "src/lib/auth-session.test.ts",
         "src/app/api/auth/login/route.test.ts",
         "src/app/api/2fa/verify/route.test.ts",
         "pnpm liekan:verify",
+        "src/app/api/auth/logout/route.test.ts",
+        "src/app/api/auth/verify/route.test.ts",
+        "src/lib/liekan/upstream/warehouse-export-cookie.test.ts",
+        "src/app/api/liekan/websites/[websiteId]/exports/[exportId]/route.test.ts",
         "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
       ],
       "owner": "Liekan authentication compatibility",
-      "constraint": "Preserve opaque bearer token format, live account/password checks, five-minute partial 2FA challenge and existing SSO, API-key, share and tracker protocols",
+      "constraint": "Preserve opaque bearer token format, live account/password checks, five-minute partial 2FA challenge and existing SSO, API-key, share and tracker protocols; Preserve locale/preferences while removing only the known export session cookie",
       "removalCondition": "Remove when upstream exposes a session-lifetime setting and the registered regression tests pass"
     },
     {
       "path": "src/app/api/auth/login/route.ts",
-      "purpose": "90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; 90-day complete sessions with matching atomic Redis TTL and issue-time limits for existing sessions; Expire browser export credentials on every login attempt and completed 2FA identity change",
       "tests": [
         "src/lib/auth-session.test.ts",
         "src/app/api/auth/login/route.test.ts",
         "src/app/api/2fa/verify/route.test.ts",
         "pnpm liekan:verify",
+        "src/app/api/auth/logout/route.test.ts",
+        "src/app/api/auth/verify/route.test.ts",
+        "src/lib/liekan/upstream/warehouse-export-cookie.test.ts",
+        "src/app/api/liekan/websites/[websiteId]/exports/[exportId]/route.test.ts",
         "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
       ],
       "owner": "Liekan authentication compatibility",
-      "constraint": "Preserve opaque bearer token format, live account/password checks, five-minute partial 2FA challenge and existing SSO, API-key, share and tracker protocols",
+      "constraint": "Preserve opaque bearer token format, live account/password checks, five-minute partial 2FA challenge and existing SSO, API-key, share and tracker protocols; Preserve locale/preferences while removing only the known export session cookie",
       "removalCondition": "Remove when upstream exposes a session-lifetime setting and the registered regression tests pass"
+    },
+    {
+      "path": "src/app/api/auth/logout/route.test.ts",
+      "purpose": "Expire browser export credentials on logout, invalid authentication and verified SSO identity changes",
+      "tests": [
+        "src/app/api/auth/logout/route.test.ts",
+        "src/app/api/auth/verify/route.test.ts",
+        "src/lib/liekan/upstream/warehouse-export-cookie.test.ts",
+        "src/app/api/liekan/websites/[websiteId]/exports/[exportId]/route.test.ts"
+      ],
+      "owner": "Liekan authentication compatibility",
+      "constraint": "Keep existing bearer, Redis, API-key and partial-2FA semantics; only the export download endpoint may consume the export cookie; preserve locale and other preferences",
+      "removalCondition": "Remove when upstream provides logout-aware export authentication and the registered regressions pass"
+    },
+    {
+      "path": "src/app/api/auth/logout/route.ts",
+      "purpose": "Expire browser export credentials on logout, invalid authentication and verified SSO identity changes",
+      "tests": [
+        "src/app/api/auth/logout/route.test.ts",
+        "src/app/api/auth/verify/route.test.ts",
+        "src/lib/liekan/upstream/warehouse-export-cookie.test.ts",
+        "src/app/api/liekan/websites/[websiteId]/exports/[exportId]/route.test.ts"
+      ],
+      "owner": "Liekan authentication compatibility",
+      "constraint": "Keep existing bearer, Redis, API-key and partial-2FA semantics; only the export download endpoint may consume the export cookie; preserve locale and other preferences",
+      "removalCondition": "Remove when upstream provides logout-aware export authentication and the registered regressions pass"
+    },
+    {
+      "path": "src/app/api/auth/verify/route.test.ts",
+      "purpose": "Expire browser export credentials on logout, invalid authentication and verified SSO identity changes",
+      "tests": [
+        "src/app/api/auth/logout/route.test.ts",
+        "src/app/api/auth/verify/route.test.ts",
+        "src/lib/liekan/upstream/warehouse-export-cookie.test.ts",
+        "src/app/api/liekan/websites/[websiteId]/exports/[exportId]/route.test.ts"
+      ],
+      "owner": "Liekan authentication compatibility",
+      "constraint": "Keep existing bearer, Redis, API-key and partial-2FA semantics; only the export download endpoint may consume the export cookie; preserve locale and other preferences",
+      "removalCondition": "Remove when upstream provides logout-aware export authentication and the registered regressions pass"
+    },
+    {
+      "path": "src/app/api/auth/verify/route.ts",
+      "purpose": "Expire browser export credentials on logout, invalid authentication and verified SSO identity changes",
+      "tests": [
+        "src/app/api/auth/logout/route.test.ts",
+        "src/app/api/auth/verify/route.test.ts",
+        "src/lib/liekan/upstream/warehouse-export-cookie.test.ts",
+        "src/app/api/liekan/websites/[websiteId]/exports/[exportId]/route.test.ts"
+      ],
+      "owner": "Liekan authentication compatibility",
+      "constraint": "Keep existing bearer, Redis, API-key and partial-2FA semantics; only the export download endpoint may consume the export cookie; preserve locale and other preferences",
+      "removalCondition": "Remove when upstream provides logout-aware export authentication and the registered regressions pass"
     },
     {
       "path": "src/app/api/boards/[boardId]/shares/route.ts",
@@ -1967,6 +2418,32 @@
       "removalCondition": "Remove when upstream provides equivalent source boundaries and identity coverage with these regression checks"
     },
     {
+      "path": "src/app/api/record/route.test.ts",
+      "purpose": "Regression coverage for upstream recorder compatibility and warehouse collection dispatch; Redact replay and heatmap URLs before buffering and fragmentation and at collector persistence; retain replay structure, geometry and legacy fragment compatibility",
+      "tests": [
+        "pnpm exec vitest run src/app/api/record/route.test.ts",
+        "pnpm exec vitest run src/recorder/privacy.test.ts src/app/api/record/route.test.ts src/lib/replay.test.ts",
+        "pnpm build:recorder"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Keep original recorder protocol compatible and do not allow public payloads to bypass source authority",
+      "removalCondition": "Remove when equivalent upstream recorder coverage includes the warehouse boundary"
+    },
+    {
+      "path": "src/app/api/record/route.ts",
+      "purpose": "Liekan warehouse collection and reporting adapter; route Liekan collection and reads through versioned warehouse packages and reports; Redact replay and heatmap URLs before buffering and fragmentation and at collector persistence; retain replay structure, geometry and legacy fragment compatibility",
+      "tests": [
+        "tests/liekan/warehouse-reporting.integration.ts",
+        "tests/liekan/warehouse-consumer.integration.ts",
+        "pnpm exec vitest run src/recorder/privacy.test.ts src/app/api/record/route.test.ts src/lib/replay.test.ts",
+        "pnpm build:recorder",
+        "WAREHOUSE_SCHEMA_TEST=isolated-round2 pnpm exec tsx tests/liekan/warehouse-privacy.integration.ts"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Preserve upstream API, UI and other database behavior; CH facts use accepted publication and quality boundaries",
+      "removalCondition": "Remove when an upstream extension provides the equivalent versioned warehouse boundary"
+    },
+    {
       "path": "src/app/api/send/contract.generated.ts",
       "purpose": "Expose optional collection UUID, boolean WebDriver evidence and conflict responses in the compatible generated contract",
       "tests": [
@@ -2003,11 +2480,12 @@
     },
     {
       "path": "src/app/api/send/route.test.ts",
-      "purpose": "Preserve cookieless Umami collection while verifying exact event deduplication and uniform traffic quality; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "Preserve cookieless Umami collection while verifying exact event deduplication and uniform traffic quality; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; redact sensitive URL and referrer path segments at browser send and collector storage boundaries while preserving raw navigation identity",
       "tests": [
         "pnpm liekan:verify",
         "Isolated traffic quality database integration",
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "pnpm exec vitest run src/tracker/privacy.test.ts src/tracker/index.test.ts src/app/api/send/route.test.ts"
       ],
       "owner": "Liekan collection compatibility",
       "constraint": "Preserve existing SDK fields, response shapes, legitimate refreshes and original raw analytics rows",
@@ -2015,12 +2493,15 @@
     },
     {
       "path": "src/app/api/send/route.ts",
-      "purpose": "Preserve cookieless collection, exact event deduplication and uniform quality; retain positive WebDriver and public request UA automation evidence; persist finite request-header observations atomically with existing public PV quality and optional UUID receipts; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "Preserve cookieless collection, exact event deduplication and uniform quality; retain positive WebDriver and public request UA automation evidence; persist finite request-header observations atomically with existing public PV quality and optional UUID receipts; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; Preserve cookieless collection, exact event deduplication and uniform quality; retain positive WebDriver and public request UA automation evidence; persist finite request-header observations atomically with existing public PV quality and optional UUID receipts; route authorized Liekan warehouse collection through durable full-package confirmation",
       "tests": [
         "pnpm liekan:verify",
         "Isolated traffic quality database integration",
         "pnpm test:crawler-evidence",
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "pnpm exec vitest run src/lib/liekan/upstream/warehouse-collection-package.test.ts",
+        "Isolated warehouse real collector and recovery integration",
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "WAREHOUSE_SCHEMA_TEST=isolated-round2 pnpm exec tsx tests/liekan/warehouse-privacy.integration.ts"
       ],
       "owner": "Liekan collection compatibility",
       "constraint": "Preserve old SDK payloads, response shapes, legitimate refreshes, authorized server transport and original raw analytics; missing automation evidence never proves human identity",
@@ -2194,6 +2675,18 @@
       "owner": "Liekan statistics maintenance",
       "constraint": "Preserve existing SQL semantics, live resource permissions, tracker protocols and original visual references",
       "removalCondition": "Remove when upstream provides equivalent bounded caching, invalidation and freshness extension points"
+    },
+    {
+      "path": "src/app/api/websites/[websiteId]/contract.ts",
+      "purpose": "Batch large website mutations inside one atomic live-authority transaction",
+      "tests": [
+        "src/queries/prisma/website.test.ts",
+        "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
+        "TypeScript and generated API consistency"
+      ],
+      "owner": "Liekan lifecycle compatibility",
+      "constraint": "Preserve source facts on failure, current website authority, source cleanup and soft-delete settings",
+      "removalCondition": "Remove when upstream provides bounded atomic large-site cleanup with equivalent permission and rollback regressions"
     },
     {
       "path": "src/app/api/websites/[websiteId]/event-data-pivot/array-series/route.ts",
@@ -2746,11 +3239,22 @@
       "removalCondition": "Remove when upstream provides equivalent source boundaries and identity coverage with these regression checks"
     },
     {
+      "path": "src/app/api/websites/[websiteId]/replays/saved/[replayId]/route.ts",
+      "purpose": "; bind warehouse lifecycle and replay bookmarks to durable authorized deletion with epoch fences",
+      "tests": [
+        "tests/liekan/warehouse-deletion.integration.ts"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Preserve upstream PostgreSQL behavior and public API authorization.",
+      "removalCondition": "Equivalent upstream lifecycle extension passes the registered regression checks."
+    },
+    {
       "path": "src/app/api/websites/[websiteId]/reset/route.ts",
-      "purpose": "Carry live user identity into reset transaction and return permission revocation errors",
+      "purpose": "Carry live user identity into reset transaction and return permission revocation errors; bind warehouse lifecycle and replay bookmarks to durable authorized deletion with epoch fences",
       "tests": [
         "pnpm liekan:verify",
-        "Liekan release acceptance"
+        "Liekan release acceptance",
+        "tests/liekan/warehouse-deletion.integration.ts"
       ],
       "owner": "Liekan interface integration",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Carry live user identity into reset transaction and return permission revocation errors",
@@ -2832,9 +3336,10 @@
     },
     {
       "path": "src/app/api/websites/[websiteId]/route.ts",
-      "purpose": "Account calendar and published share timezone compatibility; Batch large website mutations inside one atomic live-authority transaction",
+      "purpose": "Account calendar and published share timezone compatibility; Batch large website mutations inside one atomic live-authority transaction; Account calendar and published share timezone compatibility; bind warehouse lifecycle and replay bookmarks to durable authorized deletion with epoch fences",
       "tests": [
         "Today calendar, public share and native date parameter regression tests",
+        "tests/liekan/warehouse-deletion.integration.ts",
         "src/queries/prisma/website.test.ts",
         "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
         "TypeScript and generated API consistency"
@@ -3022,11 +3527,12 @@
     },
     {
       "path": "src/app/api/websites/[websiteId]/sessions/[sessionId]/route.ts",
-      "purpose": "Browser population isolation and identity availability across collection, analytics and generated contracts",
+      "purpose": "Browser population isolation and identity availability across collection, analytics and generated contracts; bind warehouse lifecycle and replay bookmarks to durable authorized deletion with epoch fences",
       "tests": [
         "pnpm liekan:verify",
         "pnpm test:history-repair",
-        "LIEKAN_HUMAN_TEST_DATABASE_URL=<isolated loopback database> pnpm exec tsx tests/liekan/browser-population.integration.ts"
+        "LIEKAN_HUMAN_TEST_DATABASE_URL=<isolated loopback database> pnpm exec tsx tests/liekan/browser-population.integration.ts",
+        "tests/liekan/warehouse-deletion.integration.ts"
       ],
       "owner": "Liekan analytics maintenance",
       "constraint": "Preserve cookieless tracking and ClickHouse, link and pixel compatibility; require trusted browser source for website identity metrics",
@@ -4553,12 +5059,14 @@
     },
     {
       "path": "src/lib/clickhouse.ts",
-      "purpose": "Inherited device/geography compatibility; Aggregate Taiwan geography under China and Taiwan province CN-71; normalize reviewed geography aliases at query/display boundaries while preserving stored source values",
+      "purpose": "Inherited device/geography compatibility; Aggregate Taiwan geography under China and Taiwan province CN-71; normalize reviewed geography aliases at query/display boundaries while preserving stored source values; route Liekan collection and reads through versioned warehouse packages and reports",
       "tests": [
         "src/lib/country.test.ts",
         "src/lib/detect.test.ts",
         "scripts/liekan-geography-clickhouse.mjs",
-        "src/lib/liekan/contracts/geography.test.ts"
+        "src/lib/liekan/contracts/geography.test.ts",
+        "tests/liekan/warehouse-reporting.integration.ts",
+        "tests/liekan/warehouse-consumer.integration.ts"
       ],
       "owner": "Liekan compatibility adapters",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Inherited device/geography compatibility",
@@ -4661,6 +5169,19 @@
       "removalCondition": "Remove when upstream supplies the same explicit read lifecycle and regression checks pass"
     },
     {
+      "path": "src/lib/db.ts",
+      "purpose": "Liekan warehouse collection and reporting adapter; route Liekan collection and reads through versioned warehouse packages and reports; bind warehouse authority transitions and durable resource lifecycle before legacy mutations",
+      "tests": [
+        "tests/liekan/warehouse-reporting.integration.ts",
+        "tests/liekan/warehouse-consumer.integration.ts",
+        "tests/liekan/warehouse-installation.integration.ts",
+        "tests/liekan/warehouse-deletion.integration.ts"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Preserve upstream API, UI and other database behavior; CH facts use accepted publication and quality boundaries",
+      "removalCondition": "Remove when an upstream extension provides the equivalent versioned warehouse boundary"
+    },
+    {
       "path": "src/lib/detect.test.ts",
       "purpose": "Inherited device/geography compatibility; Aggregate Taiwan geography under China and Taiwan province CN-71",
       "tests": [
@@ -4753,6 +5274,30 @@
       "owner": "Liekan analytics maintenance",
       "constraint": "Check current report, website, permission and configuration before every cached result; preserve population masking and query snapshot consistency",
       "removalCondition": "Remove when upstream provides equivalent saved-goal caching and permission regression coverage"
+    },
+    {
+      "path": "src/lib/liekan/upstream/lifecycle.ts",
+      "purpose": "Batch large website mutations inside one atomic live-authority transaction",
+      "tests": [
+        "src/queries/prisma/website.test.ts",
+        "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
+        "TypeScript and generated API consistency"
+      ],
+      "owner": "Liekan lifecycle compatibility",
+      "constraint": "Preserve source facts on failure, current website authority, source cleanup and soft-delete settings",
+      "removalCondition": "Remove when upstream provides bounded atomic large-site cleanup with equivalent permission and rollback regressions"
+    },
+    {
+      "path": "src/lib/liekan/upstream/website-mutation.integration.test.ts",
+      "purpose": "Batch large website mutations inside one atomic live-authority transaction",
+      "tests": [
+        "src/queries/prisma/website.test.ts",
+        "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
+        "TypeScript and generated API consistency"
+      ],
+      "owner": "Liekan lifecycle compatibility",
+      "constraint": "Preserve source facts on failure, current website authority, source cleanup and soft-delete settings",
+      "removalCondition": "Remove when upstream provides bounded atomic large-site cleanup with equivalent permission and rollback regressions"
     },
     {
       "path": "src/lib/mcp/dispatch.test.ts",
@@ -4881,6 +5426,18 @@
         "pnpm liekan:verify",
         "Supplemental UI/API regression and isolated Docker acceptance"
       ]
+    },
+    {
+      "path": "src/openapi/discover.ts",
+      "purpose": "Discover both forms of optional catch-all routes for the OpenAPI document",
+      "tests": [
+        "pnpm build:openapi",
+        "pnpm openapi:check --explicit",
+        "pnpm check:api:client"
+      ],
+      "owner": "Liekan API maintenance",
+      "constraint": "Keep existing route paths and method discovery while documenting the form without the optional segment",
+      "removalCondition": "Remove when upstream discovery covers both forms of optional catch-all routes"
     },
     {
       "path": "src/openapi/operation.ts",
@@ -5045,11 +5602,13 @@
     },
     {
       "path": "src/queries/prisma/link.ts",
-      "purpose": "Bounded analytics Redis caching, current primary authorization, transactional revision invalidation and response freshness propagation",
+      "purpose": "Bounded analytics Redis caching, current primary authorization, transactional revision invalidation and response freshness propagation; bind warehouse authority transitions and durable resource lifecycle before legacy mutations",
       "tests": [
         "pnpm liekan:verify --working-tree",
         "src/lib/liekan/upstream/analytics-runtime.test.ts",
-        "pnpm liekan:cache-benchmark"
+        "pnpm liekan:cache-benchmark",
+        "tests/liekan/warehouse-installation.integration.ts",
+        "tests/liekan/warehouse-deletion.integration.ts"
       ],
       "owner": "Liekan statistics maintenance",
       "constraint": "Preserve existing SQL semantics, live resource permissions, tracker protocols and original visual references",
@@ -5057,11 +5616,13 @@
     },
     {
       "path": "src/queries/prisma/pixel.ts",
-      "purpose": "Bounded analytics Redis caching, current primary authorization, transactional revision invalidation and response freshness propagation",
+      "purpose": "Bounded analytics Redis caching, current primary authorization, transactional revision invalidation and response freshness propagation; bind warehouse authority transitions and durable resource lifecycle before legacy mutations",
       "tests": [
         "pnpm liekan:verify --working-tree",
         "src/lib/liekan/upstream/analytics-runtime.test.ts",
-        "pnpm liekan:cache-benchmark"
+        "pnpm liekan:cache-benchmark",
+        "tests/liekan/warehouse-installation.integration.ts",
+        "tests/liekan/warehouse-deletion.integration.ts"
       ],
       "owner": "Liekan statistics maintenance",
       "constraint": "Preserve existing SQL semantics, live resource permissions, tracker protocols and original visual references",
@@ -5091,15 +5652,27 @@
     },
     {
       "path": "src/queries/prisma/session.ts",
-      "purpose": "Derived-statistics cache invalidation, original export bypass and shared metadata compatibility; serialize visitor deletion with website lifecycle before child mutation",
+      "purpose": "Derived-statistics cache invalidation, original export bypass and shared metadata compatibility; serialize visitor deletion with website lifecycle before child mutation; bind warehouse lifecycle and replay bookmarks to durable authorized deletion with epoch fences",
       "tests": [
         "pnpm liekan:verify --working-tree",
         "Liekan statistics cache and metadata regressions",
-        "src/lib/liekan/upstream/session-invalidation.test.ts"
+        "src/lib/liekan/upstream/session-invalidation.test.ts",
+        "tests/liekan/warehouse-deletion.integration.ts"
       ],
       "owner": "Liekan statistics maintenance",
       "constraint": "Preserve original SQL, live permission checks, source statistics and public-share compatibility",
       "removalCondition": "Remove when upstream supports equivalent cache and metadata integration"
+    },
+    {
+      "path": "src/queries/prisma/sessionReplay.ts",
+      "purpose": "; bind warehouse lifecycle and replay bookmarks to durable authorized deletion with epoch fences; bind warehouse authority transitions and durable resource lifecycle before legacy mutations",
+      "tests": [
+        "tests/liekan/warehouse-deletion.integration.ts",
+        "tests/liekan/warehouse-installation.integration.ts"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Preserve upstream PostgreSQL behavior and public API authorization.",
+      "removalCondition": "Equivalent upstream lifecycle extension passes the registered regression checks."
     },
     {
       "path": "src/queries/prisma/share.ts",
@@ -5115,13 +5688,15 @@
     },
     {
       "path": "src/queries/prisma/team.ts",
-      "purpose": "Bounded analytics Redis caching, current primary authorization, transactional revision invalidation and response freshness propagation AI 加密配置、实时测试、授权分析与生命周期事务集成; serialize team membership writes and cleanup and enforce live role assignment boundaries",
+      "purpose": "Bounded analytics Redis caching, current primary authorization, transactional revision invalidation and response freshness propagation AI 加密配置、实时测试、授权分析与生命周期事务集成; serialize team membership writes and cleanup and enforce live role assignment boundaries; bind warehouse authority transitions and durable resource lifecycle before legacy mutations",
       "tests": [
         "pnpm liekan:verify --working-tree",
         "src/lib/liekan/upstream/analytics-runtime.test.ts",
         "pnpm liekan:cache-benchmark",
         "AI backend integration and lifecycle tests",
-        "pnpm liekan:verify"
+        "pnpm liekan:verify",
+        "tests/liekan/warehouse-installation.integration.ts",
+        "tests/liekan/warehouse-deletion.integration.ts"
       ],
       "owner": "Liekan statistics maintenance",
       "constraint": "Preserve existing SQL semantics, live resource permissions, tracker protocols and original visual references 保留原统计、鉴权及返回契约；AI 数据使用自有扩展表",
@@ -5153,13 +5728,15 @@
     },
     {
       "path": "src/queries/prisma/user.ts",
-      "purpose": "Bounded analytics Redis caching, current primary authorization, transactional revision invalidation and response freshness propagation AI 加密配置、实时测试、授权分析与生命周期事务集成; serialize team membership writes and cleanup and enforce live role assignment boundaries",
+      "purpose": "Bounded analytics Redis caching, current primary authorization, transactional revision invalidation and response freshness propagation AI 加密配置、实时测试、授权分析与生命周期事务集成; serialize team membership writes and cleanup and enforce live role assignment boundaries; bind warehouse authority transitions and durable resource lifecycle before legacy mutations",
       "tests": [
         "pnpm liekan:verify --working-tree",
         "src/lib/liekan/upstream/analytics-runtime.test.ts",
         "pnpm liekan:cache-benchmark",
         "AI backend integration and lifecycle tests",
-        "pnpm liekan:verify"
+        "pnpm liekan:verify",
+        "tests/liekan/warehouse-installation.integration.ts",
+        "tests/liekan/warehouse-deletion.integration.ts"
       ],
       "owner": "Liekan statistics maintenance",
       "constraint": "Preserve existing SQL semantics, live resource permissions, tracker protocols and original visual references 保留原统计、鉴权及返回契约；AI 数据使用自有扩展表",
@@ -5182,7 +5759,7 @@
     },
     {
       "path": "src/queries/prisma/website.ts",
-      "purpose": "Fence automatic log sources when websites reset, change ownership/domain or are deleted; preserve upstream deletion order; coordinate statistics reset and deletion with Liekan AI lifecycle transactions and invalidate bounded statistics caches; resolve website lookups by UUID or short site number; Batch large website mutations inside one atomic live-authority transaction",
+      "purpose": "Fence automatic log sources when websites reset, change ownership/domain or are deleted; preserve upstream deletion order; coordinate statistics reset and deletion with Liekan AI lifecycle transactions and invalidate bounded statistics caches; resolve website lookups by UUID or short site number; Batch large website mutations inside one atomic live-authority transaction; Fence automatic log sources when websites reset, change ownership/domain or are deleted; preserve upstream deletion order; coordinate statistics reset and deletion with Liekan AI lifecycle transactions and invalidate bounded statistics caches; resolve website lookups by UUID or short site number; bind warehouse lifecycle and replay bookmarks to durable authorized deletion with epoch fences",
       "tests": [
         "pnpm test:log-ingestion",
         "node scripts/liekan-log-integration.mjs",
@@ -5191,6 +5768,7 @@
         "AI backend integration and lifecycle tests",
         "pnpm exec vitest run src/lib/liekan/upstream/query-cache.test.ts src/lib/liekan/upstream/page-report-route.test.ts",
         "src/queries/prisma/website.test.ts",
+        "tests/liekan/warehouse-deletion.integration.ts",
         "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
         "TypeScript and generated API consistency"
       ],
@@ -5460,7 +6038,7 @@
     },
     {
       "path": "src/queries/sql/heatmap/getHeatmap.ts",
-      "purpose": "Connect approved supplementary UI, exact filtered statistics, live share authorization or typed API responses; correlate device and dimension eligibility with candidate heatmap visits to bound reporting-view expansion",
+      "purpose": "Connect approved supplementary UI, exact filtered statistics, live share authorization or typed API responses; correlate device and dimension eligibility with candidate heatmap visits to bound reporting-view expansion; route Liekan collection and reads through versioned warehouse packages and reports",
       "owner": "Liekan upstream compatibility",
       "constraint": "Keep tracker, SDK identities, database schema and existing route behavior compatible; UI ownership remains in Liekan directories",
       "removalCondition": "Remove when the upstream exposes an equivalent extension point and regression checks pass",
@@ -5468,8 +6046,21 @@
         "pnpm liekan:verify",
         "Supplemental UI/API regression and isolated Docker acceptance",
         "src/queries/sql/heatmap/getHeatmap.test.ts",
-        "src/lib/liekan/upstream/heatmap-filter.integration.test.ts"
+        "src/lib/liekan/upstream/heatmap-filter.integration.test.ts",
+        "tests/liekan/warehouse-reporting.integration.ts",
+        "tests/liekan/warehouse-consumer.integration.ts"
       ]
+    },
+    {
+      "path": "src/queries/sql/heatmap/saveHeatmapEvents.ts",
+      "purpose": "Liekan warehouse collection and reporting adapter; route Liekan collection and reads through versioned warehouse packages and reports",
+      "tests": [
+        "tests/liekan/warehouse-reporting.integration.ts",
+        "tests/liekan/warehouse-consumer.integration.ts"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Preserve upstream API, UI and other database behavior; CH facts use accepted publication and quality boundaries",
+      "removalCondition": "Remove when an upstream extension provides the equivalent versioned warehouse boundary"
     },
     {
       "path": "src/queries/sql/journeys/getJourney.ts",
@@ -5567,16 +6158,40 @@
       "removalCondition": "Remove when upstream applies equivalent dataset filters and the registered regression checks pass"
     },
     {
+      "path": "src/queries/sql/replays/getReplayChunks.ts",
+      "purpose": "Liekan warehouse collection and reporting adapter; route Liekan collection and reads through versioned warehouse packages and reports",
+      "tests": [
+        "tests/liekan/warehouse-reporting.integration.ts",
+        "tests/liekan/warehouse-consumer.integration.ts"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Preserve upstream API, UI and other database behavior; CH facts use accepted publication and quality boundaries",
+      "removalCondition": "Remove when an upstream extension provides the equivalent versioned warehouse boundary"
+    },
+    {
       "path": "src/queries/sql/replays/getSessionReplays.ts",
-      "purpose": "Inherited device/geography compatibility; Bind PostgreSQL environment dimensions, filter candidates and recording labels to eligible event snapshots in the selected window",
+      "purpose": "Inherited device/geography compatibility; Bind PostgreSQL environment dimensions, filter candidates and recording labels to eligible event snapshots in the selected window; route Liekan collection and reads through versioned warehouse packages and reports",
       "tests": [
         "src/lib/country.test.ts",
         "src/lib/detect.test.ts",
-        "LIEKAN_HUMAN_TEST_DATABASE_URL=<isolated loopback database> pnpm exec tsx tests/liekan/browser-population.integration.ts"
+        "LIEKAN_HUMAN_TEST_DATABASE_URL=<isolated loopback database> pnpm exec tsx tests/liekan/browser-population.integration.ts",
+        "tests/liekan/warehouse-reporting.integration.ts",
+        "tests/liekan/warehouse-consumer.integration.ts"
       ],
       "owner": "Liekan compatibility adapters",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Inherited device/geography compatibility",
       "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
+    },
+    {
+      "path": "src/queries/sql/replays/saveRecording.ts",
+      "purpose": "Liekan warehouse collection and reporting adapter; route Liekan collection and reads through versioned warehouse packages and reports",
+      "tests": [
+        "tests/liekan/warehouse-reporting.integration.ts",
+        "tests/liekan/warehouse-consumer.integration.ts"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Preserve upstream API, UI and other database behavior; CH facts use accepted publication and quality boundaries",
+      "removalCondition": "Remove when an upstream extension provides the equivalent versioned warehouse boundary"
     },
     {
       "path": "src/queries/sql/retention/getRetention.test.ts",
@@ -5823,9 +6438,11 @@
     },
     {
       "path": "src/recorder/index.js",
-      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; Redact replay and heatmap URLs before buffering and fragmentation and at collector persistence; retain replay structure, geometry and legacy fragment compatibility",
       "tests": [
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "pnpm exec vitest run src/recorder/privacy.test.ts src/app/api/record/route.test.ts src/lib/replay.test.ts",
+        "pnpm build:recorder"
       ],
       "owner": "Liekan security maintenance",
       "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
@@ -5833,9 +6450,11 @@
     },
     {
       "path": "src/recorder/privacy.test.ts",
-      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; Redact replay and heatmap URLs before buffering and fragmentation and at collector persistence; retain replay structure, geometry and legacy fragment compatibility",
       "tests": [
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "pnpm exec vitest run src/recorder/privacy.test.ts src/app/api/record/route.test.ts src/lib/replay.test.ts",
+        "pnpm build:recorder"
       ],
       "owner": "Liekan security maintenance",
       "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
@@ -5898,11 +6517,12 @@
     },
     {
       "path": "src/tracker/index.test.ts",
-      "purpose": "Preserve cookieless collection, exact event deduplication and uniform quality; retain positive WebDriver and public request UA automation evidence; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "Preserve cookieless collection, exact event deduplication and uniform quality; retain positive WebDriver and public request UA automation evidence; Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; redact sensitive URL and referrer path segments at browser send and collector storage boundaries while preserving raw navigation identity",
       "tests": [
         "pnpm liekan:verify",
         "Isolated traffic quality database integration",
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "pnpm exec vitest run src/tracker/privacy.test.ts src/tracker/index.test.ts src/app/api/send/route.test.ts"
       ],
       "owner": "Liekan collection compatibility",
       "constraint": "Preserve old SDK payloads, response shapes, legitimate refreshes, authorized server transport and original raw analytics; missing automation evidence never proves human identity",
@@ -5921,10 +6541,22 @@
       "removalCondition": "Remove when upstream provides equivalent versioned quality and idempotency extension points"
     },
     {
-      "path": "src/tracker/privacy.test.ts",
-      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "path": "src/tracker/privacy.d.ts",
+      "purpose": "Generated declarations for the tracker and collector URL privacy helpers",
       "tests": [
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "pnpm build:tracker:types",
+        "Repeated declaration generation leaves the source tree unchanged"
+      ],
+      "owner": "Liekan tracker compatibility",
+      "constraint": "Keep declarations synchronized with privacy.ts and preserve the existing tracker SDK contract",
+      "removalCondition": "Remove when the privacy helper is removed or declaration output moves to an ignored build directory"
+    },
+    {
+      "path": "src/tracker/privacy.test.ts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; redact sensitive URL and referrer path segments at browser send and collector storage boundaries while preserving raw navigation identity",
+      "tests": [
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "pnpm exec vitest run src/tracker/privacy.test.ts src/tracker/index.test.ts src/app/api/send/route.test.ts"
       ],
       "owner": "Liekan security maintenance",
       "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
@@ -5932,9 +6564,11 @@
     },
     {
       "path": "src/tracker/privacy.ts",
-      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts",
+      "purpose": "Enforce private analytics membership, redact outbound sensitive data, default recorder masking and bound login attempts; redact sensitive URL and referrer path segments at browser send and collector storage boundaries while preserving raw navigation identity",
       "tests": [
-        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds"
+        "Targeted privacy, permission, login, recorder and tracker regression tests; TypeScript and tracker/recorder builds",
+        "pnpm exec vitest run src/tracker/privacy.test.ts src/tracker/index.test.ts src/app/api/send/route.test.ts",
+        "WAREHOUSE_SCHEMA_TEST=isolated-round2 pnpm exec tsx tests/liekan/warehouse-privacy.integration.ts"
       ],
       "owner": "Liekan security maintenance",
       "constraint": "Preserve tracker protocol, explicit recorder settings, existing authentication and authorized share behavior",
@@ -6274,6 +6908,16 @@
       "removalCondition": "Remove when an equivalent upstream layout regression check covers these loading states"
     },
     {
+      "path": "tests/liekan/fixtures/deployment-docker.sh",
+      "purpose": "Model optional analytics service lifecycle in isolated deployment verification",
+      "tests": [
+        "node --test tests/liekan/deployment.test.mjs"
+      ],
+      "owner": "Liekan analytics maintenance",
+      "constraint": "Keep PostgreSQL authoritative and preserve configuration, credentials, data volumes and immutable deployment candidates",
+      "removalCondition": "Remove when the supported deployment entrypoint covers these lifecycle guarantees"
+    },
+    {
       "path": "tsconfig.json",
       "purpose": "Exclude isolated rehearsal copies from the production type boundary",
       "tests": [
@@ -6295,93 +6939,27 @@
       "removalCondition": "Remove when the primary test configuration supports explicit multi-environment projects"
     },
     {
-      "path": "docker-compose.liekan-clickhouse.yml",
-      "purpose": "Optional historical ClickHouse analytics deployment and administrator entry",
+      "path": "src/recorder/privacy.ts",
+      "purpose": "Redact replay and heatmap URLs before buffering and fragmentation and at collector persistence; retain replay structure, geometry and legacy fragment compatibility",
       "tests": [
-        "pnpm test:analytics-engine",
-        "node --test tests/liekan/deployment.test.mjs"
+        "pnpm exec vitest run src/recorder/privacy.test.ts src/app/api/record/route.test.ts src/lib/replay.test.ts",
+        "pnpm build:recorder",
+        "WAREHOUSE_SCHEMA_TEST=isolated-round2 pnpm exec tsx tests/liekan/warehouse-privacy.integration.ts"
       ],
-      "owner": "Liekan analytics maintenance",
-      "constraint": "Keep PostgreSQL authoritative and default deployment compatible; preserve installation, source epoch, permissions and upstream ClickHouse behavior",
-      "removalCondition": "Remove when the supported analytics extension provides equivalent verified coverage and lifecycle behavior"
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve recorder masking, node IDs, geometry, fragment protocol and historical data; document incomplete legacy fragment limits",
+      "removalCondition": "Remove when upstream provides equivalent URL privacy with passing replay and heatmap regressions"
     },
     {
-      "path": "scripts/liekan-deploy.sh",
-      "purpose": "Preserve existing deployment state while adding an optional historical analytics service",
+      "path": "rollup.recorder.config.js",
+      "purpose": "Redact replay and heatmap URLs before buffering and fragmentation and at collector persistence; retain replay structure, geometry and legacy fragment compatibility",
       "tests": [
-        "node --test tests/liekan/deployment.test.mjs"
+        "pnpm exec vitest run src/recorder/privacy.test.ts src/app/api/record/route.test.ts src/lib/replay.test.ts",
+        "pnpm build:recorder"
       ],
-      "owner": "Liekan analytics maintenance",
-      "constraint": "Keep PostgreSQL authoritative and preserve configuration, credentials, data volumes and immutable deployment candidates",
-      "removalCondition": "Remove when the supported deployment entrypoint covers these lifecycle guarantees"
-    },
-    {
-      "path": "src/app/(main)/admin/analytics-engine/page.tsx",
-      "purpose": "Optional historical ClickHouse analytics deployment and administrator entry",
-      "tests": [
-        "pnpm test:analytics-engine",
-        "node --test tests/liekan/deployment.test.mjs"
-      ],
-      "owner": "Liekan analytics maintenance",
-      "constraint": "Keep PostgreSQL authoritative and default deployment compatible; preserve installation, source epoch, permissions and upstream ClickHouse behavior",
-      "removalCondition": "Remove when the supported analytics extension provides equivalent verified coverage and lifecycle behavior"
-    },
-    {
-      "path": "tests/liekan/fixtures/deployment-docker.sh",
-      "purpose": "Model optional analytics service lifecycle in isolated deployment verification",
-      "tests": [
-        "node --test tests/liekan/deployment.test.mjs"
-      ],
-      "owner": "Liekan analytics maintenance",
-      "constraint": "Keep PostgreSQL authoritative and preserve configuration, credentials, data volumes and immutable deployment candidates",
-      "removalCondition": "Remove when the supported deployment entrypoint covers these lifecycle guarantees"
-    },
-    {
-      "path": "src/app/api/websites/[websiteId]/contract.ts",
-      "purpose": "Batch large website mutations inside one atomic live-authority transaction",
-      "tests": [
-        "src/queries/prisma/website.test.ts",
-        "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
-        "TypeScript and generated API consistency"
-      ],
-      "owner": "Liekan lifecycle compatibility",
-      "constraint": "Preserve source facts on failure, current website authority, source cleanup and soft-delete settings",
-      "removalCondition": "Remove when upstream provides bounded atomic large-site cleanup with equivalent permission and rollback regressions"
-    },
-    {
-      "path": "src/lib/liekan/upstream/lifecycle.ts",
-      "purpose": "Batch large website mutations inside one atomic live-authority transaction",
-      "tests": [
-        "src/queries/prisma/website.test.ts",
-        "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
-        "TypeScript and generated API consistency"
-      ],
-      "owner": "Liekan lifecycle compatibility",
-      "constraint": "Preserve source facts on failure, current website authority, source cleanup and soft-delete settings",
-      "removalCondition": "Remove when upstream provides bounded atomic large-site cleanup with equivalent permission and rollback regressions"
-    },
-    {
-      "path": "src/lib/liekan/upstream/website-mutation.integration.test.ts",
-      "purpose": "Batch large website mutations inside one atomic live-authority transaction",
-      "tests": [
-        "src/queries/prisma/website.test.ts",
-        "Isolated PostgreSQL website-mutation integration with rollback and authority locks",
-        "TypeScript and generated API consistency"
-      ],
-      "owner": "Liekan lifecycle compatibility",
-      "constraint": "Preserve source facts on failure, current website authority, source cleanup and soft-delete settings",
-      "removalCondition": "Remove when upstream provides bounded atomic large-site cleanup with equivalent permission and rollback regressions"
-    },
-    {
-      "path": "src/tracker/privacy.d.ts",
-      "purpose": "Generated declarations for the tracker and collector URL privacy helpers",
-      "tests": [
-        "pnpm build:tracker:types",
-        "Repeated declaration generation leaves the source tree unchanged"
-      ],
-      "owner": "Liekan tracker compatibility",
-      "constraint": "Keep declarations synchronized with privacy.ts and preserve the existing tracker SDK contract",
-      "removalCondition": "Remove when the privacy helper is removed or declaration output moves to an ignored build directory"
+      "owner": "Liekan security maintenance",
+      "constraint": "Preserve recorder masking, node IDs, geometry, fragment protocol and historical data; document incomplete legacy fragment limits",
+      "removalCondition": "Remove when upstream provides equivalent URL privacy with passing replay and heatmap regressions"
     }
   ]
 }

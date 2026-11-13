@@ -76,3 +76,4 @@ yarn-error.log*
 
 # ZCode session-local working files (plans, scratch state) never enter the repo.
 /.zcode/
+__pycache__/

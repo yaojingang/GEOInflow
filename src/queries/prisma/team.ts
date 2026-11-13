@@ -1,3 +1,4 @@
+import { prepareWarehouseCascade } from '@/lib/liekan/upstream/warehouse-cascade';
 import { Prisma, type Team, type TeamUser } from '@/generated/prisma/client';
 import { ROLES } from '@/lib/constants';
 import { uuid } from '@/lib/crypto';
@@ -175,6 +176,10 @@ export async function deleteTeam(teamId: string) {
       ...pixels.map(pixel => pixel.id),
       ...boards.map(board => board.id),
     ];
+    await prepareWarehouseCascade(tx, [
+      ...links.map(w => ({ id: w.id, kind: 'link' as const })),
+      ...pixels.map(w => ({ id: w.id, kind: 'pixel' as const })),
+    ]);
     await (await import('@/lib/liekan/upstream/ai-lifecycle')).clearAiTeamInTransaction(tx, teamId);
     // Membership creation and deletion share this lock even without AI tables.
     await tx.$queryRawUnsafe('SELECT team_id FROM team WHERE team_id=$1::uuid FOR UPDATE', teamId);

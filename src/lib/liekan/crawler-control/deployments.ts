@@ -1,3 +1,5 @@
+import { warehouseEnabled } from '../warehouse/authority-routing';
+import { withinWarehouseReport } from '../upstream/warehouse-report-snapshot';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import {
@@ -266,7 +268,13 @@ async function historicalImpact(tx: AiTx, websiteId: string, body: CrawlerPolicy
     windowDays: 7,
   };
 }
-export async function previewCrawlerPolicy(
+async function warehouseHistoricalImpact(websiteId: string, body: CrawlerPolicyInput) {
+  return (await import('../upstream/warehouse-evidence-queries')).warehouseHistoricalImpact(
+    websiteId,
+    body,
+  );
+}
+async function previewCrawlerPolicySnapshot(
   actor: CrawlerActor,
   websiteId: string,
   policyId: string,
@@ -353,6 +361,9 @@ export async function previewCrawlerPolicy(
         }
       : { localOnly: true },
   };
+  const impact = warehouseEnabled()
+    ? await warehouseHistoricalImpact(websiteId, target.body)
+    : null;
   return crawlerTransaction(async tx => {
     const context = await controlContext(
       tx,
@@ -421,7 +432,7 @@ export async function previewCrawlerPolicy(
       impact: {
         searchBots,
         fullSite,
-        historicalRequests7d: await historicalImpact(tx, websiteId, target.body),
+        historicalRequests7d: impact ?? (await historicalImpact(tx, websiteId, target.body)),
         otherRules: 'unknown',
         otherRulesSummary: snapshot
           ? { readable: true, count: snapshot.rules.filter(r => r.ref !== policy.ref).length }
@@ -461,14 +472,15 @@ async function adoptionScope(tx: AiTx, actor: CrawlerActor, websiteId: string, p
     transfer: transferFor(context, policy, old, connection),
   };
 }
-export async function previewCrawlerAdoption(
+async function previewCrawlerAdoptionSnapshot(
   actor: CrawlerActor,
   websiteId: string,
   policyId: string,
 ) {
-  const prepared = await crawlerTransaction(async tx => ({
-    ...(await adoptionScope(tx, actor, websiteId, policyId)),
-  }));
+  const prepared = await crawlerTransaction(async tx => {
+    const scope = await adoptionScope(tx, actor, websiteId, policyId);
+    return { ...scope, selected: await targetBody(tx, scope.policy, { operation: 'stop' }) };
+  });
   const snapshot = await readCrawlerCloudflare(
       controlToken(prepared.connection),
       prepared.connection.zone_id,
@@ -476,6 +488,9 @@ export async function previewCrawlerAdoption(
     ),
     rule = selectOwned(snapshot, prepared.policy);
   if (!rule) conflict('原规则已缺失，需要先核对远端结果');
+  const impact = warehouseEnabled()
+    ? await warehouseHistoricalImpact(websiteId, prepared.selected.body)
+    : null;
   return crawlerTransaction(async tx => {
     const current = await adoptionScope(tx, actor, websiteId, policyId);
     if (
@@ -549,7 +564,7 @@ export async function previewCrawlerAdoption(
       impact: {
         searchBots,
         fullSite,
-        historicalRequests7d: await historicalImpact(tx, websiteId, target.body),
+        historicalRequests7d: impact ?? (await historicalImpact(tx, websiteId, target.body)),
         otherRules: 'unknown',
         otherRulesSummary: {
           readable: true,
@@ -1376,3 +1391,12 @@ export async function processCrawlerDeployment(workerId: string) {
     await crawlerTransaction(tx => releaseCrawlerLease(tx, claimed.leaseName, leaseOwner));
   }
 }
+
+export const previewCrawlerPolicy: typeof previewCrawlerPolicySnapshot = (...args) =>
+  warehouseEnabled()
+    ? withinWarehouseReport(() => previewCrawlerPolicySnapshot(...args))
+    : previewCrawlerPolicySnapshot(...args);
+export const previewCrawlerAdoption: typeof previewCrawlerAdoptionSnapshot = (...args) =>
+  warehouseEnabled()
+    ? withinWarehouseReport(() => previewCrawlerAdoptionSnapshot(...args))
+    : previewCrawlerAdoptionSnapshot(...args);

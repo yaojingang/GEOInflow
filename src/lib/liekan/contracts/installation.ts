@@ -129,6 +129,21 @@ export interface InstallationStatus {
     lastHeartbeatAt: string | null;
     lastReceivedAt: string | null;
     lastProcessedAt: string | null;
+    latestBatch?: {
+      receivedAt: string;
+      state:
+        | 'registered'
+        | 'queued'
+        | 'processing'
+        | 'published'
+        | 'processed'
+        | 'failed'
+        | 'cancelled';
+      expected: number;
+      processed: number;
+      inserted: number;
+      conflicts: number;
+    } | null;
     backlog: number;
     failed?: number;
     errorCode: string | null;

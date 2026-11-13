@@ -83,8 +83,13 @@ vi.mock('./context', () => ({
     const name = Array.isArray(key) ? key[0] : key;
     mocks.queries.push(key);
     mocks.loaders[name] = load;
+    const data =
+      typeof mocks.query[name] === 'function' ? mocks.query[name](key) : mocks.query[name];
     return {
-      data: typeof mocks.query[name] === 'function' ? mocks.query[name](key) : mocks.query[name],
+      data:
+        /^website-management-(stats|today)$/.test(name) && Array.isArray(data)
+          ? data.filter(row => key[1].includes(row.id))
+          : data,
       isPending: false,
       isFetching: false,
       error: null,

@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { websiteDayWindow } from '@/lib/liekan/upstream/website-day-metrics';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { DataLoading } from '../DataLoading';
 import { CorePages } from './CorePages';
@@ -24,6 +25,12 @@ const site = {
   domain: 'example.invalid',
   userId: 'owner',
 };
+const secondSite = {
+  ...site,
+  id: '22222222-2222-4222-8222-222222222222',
+  siteNumber: 102,
+  name: '后返回站',
+};
 const totals = { pageviews: 9, views: 9, visitors: 3, visits: 4, bounces: 1, aiVisits: 2 };
 const summary = [{ id: site.id, ...totals, received: true, comparison: totals }];
 let client: QueryClient;
@@ -39,25 +46,33 @@ beforeEach(() => {
 });
 afterEach(() => client.clear());
 
-function page(loading = false) {
+function page(
+  loading = false,
+  range = { startAt: 0, endAt: 1000, timezone: 'Asia/Shanghai' },
+  sites = [site],
+) {
   return (
     <QueryClientProvider client={client}>
-      <FeatureProvider value={{
-        user: { id: 'owner', role: 'user' },
-        route: { page: 'websites' },
-        sites: [site],
-        sitesReady: !loading,
-        teams: [],
-        siteId: '',
-        range: { startAt: 0, endAt: 1000, timezone: 'Asia/Shanghai' },
-        query: {},
-        filters: {},
-        api: { get: vi.fn() },
-        href: (page: string) => `/websites/101/${page}`,
-        navigate: vi.fn(),
-        notify: vi.fn(),
-        refresh: vi.fn(),
-      } as any}>
+      <FeatureProvider
+        value={
+          {
+            user: { id: 'owner', role: 'user' },
+            route: { page: 'websites' },
+            sites,
+            sitesReady: !loading,
+            teams: [],
+            siteId: '',
+            range,
+            query: {},
+            filters: {},
+            api: { get: vi.fn() },
+            href: (page: string) => `/websites/101/${page}`,
+            navigate: vi.fn(),
+            notify: vi.fn(),
+            refresh: vi.fn(),
+          } as any
+        }
+      >
         <DataLoading loading={loading}>
           <CorePages page="websites" />
         </DataLoading>
@@ -66,6 +81,50 @@ function page(loading = false) {
   );
 }
 
+it('shares a single natural-day request between the totals and the website rows', async () => {
+  const range = websiteDayWindow('Asia/Shanghai');
+  render(page(false, range));
+  await waitFor(() => expect(mocks.summary).toHaveBeenCalledTimes(1));
+  expect(mocks.summary.mock.calls[0][1]).toEqual(range);
+  await act(async () => resolveSummary(summary));
+  expect(await within(screen.getByRole('table')).findByText('已收到浏览数据')).toBeVisible();
+  expect(document.querySelectorAll('.metric')[1]).toHaveTextContent('9');
+  expect(mocks.summary).toHaveBeenCalledTimes(1);
+});
+
+it('renders a completed website independently and only retries the failed website', async () => {
+  const range = websiteDayWindow('Asia/Shanghai');
+  mocks.summary.mockImplementation(([id]) =>
+    id === site.id
+      ? Promise.resolve(summary)
+      : new Promise((_, reject) => {
+          rejectSummary = reject;
+        }),
+  );
+  render(page(false, range, [site, secondSite]));
+
+  const firstRow = within(screen.getByRole('link', { name: site.name }).closest('tr')!);
+  const secondRow = within(screen.getByRole('link', { name: secondSite.name }).closest('tr')!);
+  expect(await firstRow.findByText('已收到浏览数据')).toBeVisible();
+  expect(firstRow.getAllByText('9')[0]).toBeVisible();
+  expect(secondRow.getByText('等待查询')).toBeVisible();
+  expect(mocks.summary.mock.calls.map(([ids]) => ids)).toEqual([[site.id], [secondSite.id]]);
+
+  await act(async () => rejectSummary({ status: 503, message: '暂时不可用' }));
+  expect(await secondRow.findByText('读取失败')).toBeVisible();
+  expect(firstRow.getAllByText('9')[0]).toBeVisible();
+  expect(await screen.findByText(/已读取 1\/2 个网站/)).toBeVisible();
+
+  mocks.summary.mockResolvedValue([{ ...summary[0], id: secondSite.id }]);
+  await userEvent.click(screen.getByRole('button', { name: '重新读取统计' }));
+  expect(await secondRow.findByText('已收到浏览数据')).toBeVisible();
+  expect(mocks.summary.mock.calls.map(([ids]) => ids)).toEqual([
+    [site.id],
+    [secondSite.id],
+    [secondSite.id],
+  ]);
+});
+
 it('shows searchable website identities and actions while both statistics reads are pending', async () => {
   render(page());
   await waitFor(() => expect(mocks.summary).toHaveBeenCalledTimes(2));
@@ -73,7 +132,8 @@ it('shows searchable website identities and actions while both statistics reads 
   expect(within(table).getByRole('link', { name: site.name })).toBeVisible();
   expect(within(table).getByText(site.domain)).toBeVisible();
   expect(within(table).getByRole('link', { name: '网站设置' })).toHaveAttribute(
-    'href', '/websites/101/website-settings',
+    'href',
+    '/websites/101/website-settings',
   );
   expect(within(table).queryByText('0')).not.toBeInTheDocument();
   await userEvent.type(screen.getByRole('searchbox', { name: '搜索本页记录' }), '不存在');
@@ -94,9 +154,9 @@ it.each([500, 403])('keeps website links available when statistics fail with %s'
   );
   expect(screen.getByRole('link', { name: site.name })).toBeVisible();
   expect(screen.getByRole('link', { name: '网站设置' })).toBeVisible();
-  expect(within(screen.getByRole('table')).getByText(
-    status === 403 ? '无统计权限' : '读取失败',
-  )).toBeVisible();
+  expect(
+    within(screen.getByRole('table')).getByText(status === 403 ? '无统计权限' : '读取失败'),
+  ).toBeVisible();
 });
 
 it('fills daily metrics while the selected-period summary is still pending', async () => {

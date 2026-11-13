@@ -86,26 +86,63 @@ test('rerunning preserves existing configuration and credentials byte for byte',
   assert.deepEqual(await readFile(path.join(root, '.env')), original);
 });
 
-test('optional ClickHouse installation persists private credentials and survives a default rerun', async t => {
-  const {root,calls,run}=await installation(t);
-  const first=run(['--with-clickhouse']);
-  assert.equal(first.status,0,first.stderr);
-  const configuration=await readFile(path.join(root,'.env'),'utf8');
-  const password=configuration.match(/^LIEKAN_CLICKHOUSE_PASSWORD=([a-f0-9]{64})$/m)?.[1];
-  assert.ok(password);
-  assert.ok(!first.stdout.includes(password));
-  assert.ok(configuration.includes(`LIEKAN_ANALYTICS_CLICKHOUSE_URL=http://geoinflow_analytics:${password}@analytics-clickhouse:8123/geoinflow_analytics`));
-  assert.equal(run().status,0);
-  assert.equal(await readFile(path.join(root,'.env'),'utf8'),configuration);
-  assert.match(await readFile(`${calls}.raw`,'utf8'),/docker-compose\.liekan-clickhouse\.yml up -d --no-deps --wait --wait-timeout 300 analytics-clickhouse/);
+test('legacy deployment refuses warehouse configuration before Docker calls and preserves it', async t => {
+  const { root, calls, run } = await installation(t);
+  const text = 'POSTGRES_PASSWORD=private-fixture\nexport LIEKAN_INSTALL_MODE=pg-transition\n';
+  await writeFile(path.join(root, '.env'), text, { mode: 0o600 });
+  const result = run();
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /liekan-warehouse-deploy\.py/);
+  assert.ok(!result.stderr.includes('private-fixture'));
+  assert.equal(await readFile(path.join(root, '.env'), 'utf8'), text);
+  await assert.rejects(access(calls));
 });
 
-test('optional ClickHouse refuses replacing a missing password for an existing data volume',async t=>{
-  const {root,run}=await installation(t,{DEPLOY_TEST_VOLUME_EXISTS:'0',DEPLOY_TEST_VOLUME_NAME:'liekan_liekan-clickhouse-data'});
-  const result=run(['--with-clickhouse']);
-  assert.notEqual(result.status,0);
-  assert.match(result.stderr,/恢复原连接配置和密码/);
-  assert.doesNotMatch(await readFile(path.join(root,'.env'),'utf8'),/^LIEKAN_CLICKHOUSE_PASSWORD=/m);
+test('app checks persisted warehouse mode before migrations or opening the HTTP server', async () => {
+  const script = await readFile('scripts/liekan-start.sh', 'utf8');
+  const guard = script.indexOf('node dist/liekan-warehouse-start-check.mjs');
+  assert.ok(guard >= 0);
+  for (const command of [
+    'node scripts/check-db.js',
+    'node scripts/liekan-migrate.mjs',
+    'exec node server.js',
+  ])
+    assert.ok(guard < script.indexOf(command));
+});
+
+test('optional ClickHouse installation persists private credentials and survives a default rerun', async t => {
+  const { root, calls, run } = await installation(t);
+  const first = run(['--with-clickhouse']);
+  assert.equal(first.status, 0, first.stderr);
+  const configuration = await readFile(path.join(root, '.env'), 'utf8');
+  const password = configuration.match(/^LIEKAN_CLICKHOUSE_PASSWORD=([a-f0-9]{64})$/m)?.[1];
+  assert.ok(password);
+  assert.ok(!first.stdout.includes(password));
+  assert.ok(
+    configuration.includes(
+      `LIEKAN_ANALYTICS_CLICKHOUSE_URL=http://geoinflow_analytics:${password}@analytics-clickhouse:8123/geoinflow_analytics`,
+    ),
+  );
+  assert.equal(run().status, 0);
+  assert.equal(await readFile(path.join(root, '.env'), 'utf8'), configuration);
+  assert.match(
+    await readFile(`${calls}.raw`, 'utf8'),
+    /docker-compose\.liekan-clickhouse\.yml up -d --no-deps --wait --wait-timeout 300 analytics-clickhouse/,
+  );
+});
+
+test('optional ClickHouse refuses replacing a missing password for an existing data volume', async t => {
+  const { root, run } = await installation(t, {
+    DEPLOY_TEST_VOLUME_EXISTS: '0',
+    DEPLOY_TEST_VOLUME_NAME: 'liekan_liekan-clickhouse-data',
+  });
+  const result = run(['--with-clickhouse']);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /恢复原连接配置和密码/);
+  assert.doesNotMatch(
+    await readFile(path.join(root, '.env'), 'utf8'),
+    /^LIEKAN_CLICKHOUSE_PASSWORD=/m,
+  );
 });
 
 test('optional ClickHouse protects its existing volume when PostgreSQL uses a custom volume name', async t => {
@@ -117,31 +154,45 @@ test('optional ClickHouse protects its existing volume when PostgreSQL uses a cu
   const result = run(['--with-clickhouse']);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /恢复原连接配置和密码/);
-  assert.doesNotMatch(await readFile(path.join(root, '.env'), 'utf8'), /^LIEKAN_CLICKHOUSE_PASSWORD=/m);
+  assert.doesNotMatch(
+    await readFile(path.join(root, '.env'), 'utf8'),
+    /^LIEKAN_CLICKHOUSE_PASSWORD=/m,
+  );
 });
 
-test('the optional database stays on the internal network with its own bounded volume',async()=>{
-  const source=await readFile('docker-compose.liekan-clickhouse.yml','utf8');
-  assert.match(source,/image: clickhouse\/clickhouse-server:26\.8\.34\.13/);
-  assert.match(source,/liekan-clickhouse-data:\/var\/lib\/clickhouse/);
-  assert.match(source,/mem_limit: 4g/);
-  assert.doesNotMatch(source,/ports:|network_mode: host/);
+test('the optional database stays on the internal network with its own bounded volume', async () => {
+  const source = await readFile('docker-compose.liekan-clickhouse.yml', 'utf8');
+  assert.match(source, /image: clickhouse\/clickhouse-server:26\.8\.34\.13/);
+  assert.match(source, /liekan-clickhouse-data:\/var\/lib\/clickhouse/);
+  assert.match(source, /mem_limit: 4g/);
+  assert.doesNotMatch(source, /ports:|network_mode: host/);
 });
 
-test('bundled ClickHouse installation preserves an existing external analytics connection',async t=>{
-  const {root,run}=await installation(t);assert.equal(run().status,0);
-  const file=path.join(root,'.env');const original=await readFile(file,'utf8')+'\nLIEKAN_ANALYTICS_CLICKHOUSE_URL=https://analytics.example.invalid/analytics\n';
-  await writeFile(file,original);
-  const result=run(['--with-clickhouse']);assert.notEqual(result.status,0);assert.match(result.stderr,/当前已配置外部 ClickHouse/);
-  assert.equal(await readFile(file,'utf8'),original);
+test('bundled ClickHouse installation preserves an existing external analytics connection', async t => {
+  const { root, run } = await installation(t);
+  assert.equal(run().status, 0);
+  const file = path.join(root, '.env');
+  const original =
+    (await readFile(file, 'utf8')) +
+    '\nLIEKAN_ANALYTICS_CLICKHOUSE_URL=https://analytics.example.invalid/analytics\n';
+  await writeFile(file, original);
+  const result = run(['--with-clickhouse']);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /当前已配置外部 ClickHouse/);
+  assert.equal(await readFile(file, 'utf8'), original);
 });
 
-test('bundled ClickHouse installation preserves an existing password when the URL is missing',async t=>{
-  const {root,run}=await installation(t);assert.equal(run().status,0);
-  const file=path.join(root,'.env');const original=await readFile(file,'utf8')+'\nLIEKAN_CLICKHOUSE_PASSWORD='+ 'a'.repeat(64)+'\n';
-  await writeFile(file,original);
-  const result=run(['--with-clickhouse']);assert.notEqual(result.status,0);assert.match(result.stderr,/恢复完整的 ClickHouse 连接配置/);
-  assert.equal(await readFile(file,'utf8'),original);
+test('bundled ClickHouse installation preserves an existing password when the URL is missing', async t => {
+  const { root, run } = await installation(t);
+  assert.equal(run().status, 0);
+  const file = path.join(root, '.env');
+  const original =
+    (await readFile(file, 'utf8')) + '\nLIEKAN_CLICKHOUSE_PASSWORD=' + 'a'.repeat(64) + '\n';
+  await writeFile(file, original);
+  const result = run(['--with-clickhouse']);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /恢复完整的 ClickHouse 连接配置/);
+  assert.equal(await readFile(file, 'utf8'), original);
 });
 
 test('an existing database without its configuration is refused before a build', async t => {
@@ -641,4 +692,24 @@ test('Docker startup seeds the bundled official demo after migrations and before
   assert.match(dockerfile, /COPY --from=builder[^\n]+scripts/);
   const packageJson = JSON.parse(await readFile('package.json', 'utf8'));
   assert(packageJson.scripts['build:docker'].includes('liekan:check-demo'));
+});
+
+test('warehouse automatic startup honors the explicit demo opt-out before connecting to the database', async () => {
+  const result = spawnSync(process.execPath, ['scripts/liekan-seed-demo.mjs', '--automatic'], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      LIEKAN_SEED_DEMO: 'false',
+      DATABASE_URL: 'postgresql://unit:unit@127.0.0.1:1/no_database',
+      APP_SECRET: 'isolated-fixture',
+    },
+    timeout: 10000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { status: 'disabled', inserted: false });
+  const compose = await readFile('docker-compose.warehouse.yml', 'utf8');
+  assert.match(
+    compose.split('x-warehouse-worker:')[0],
+    /LIEKAN_SEED_DEMO: \$\{LIEKAN_SEED_DEMO:-true\}/,
+  );
 });

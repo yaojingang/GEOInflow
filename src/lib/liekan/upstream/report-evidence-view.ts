@@ -3,6 +3,8 @@ import { CRAWLER_METRIC_VERSION } from '../contracts/crawler-metrics';
 import type { ReportQuery } from '../contracts/query';
 import type { LiekanReport } from '../contracts/report';
 import { reportEvidenceViewPayload } from '../contracts/report-evidence-view';
+import { warehouseEnabled } from '../warehouse/runtime';
+import { warehouseEvidenceCatalog } from './warehouse-evidence-catalog';
 import { getPublishedCatalog } from '../crawlers/published';
 import { query } from './server';
 import { TRAFFIC_POLICY_VERSION } from './traffic-query';
@@ -34,10 +36,12 @@ export async function attachReportEvidenceView(report: LiekanReport, p: ReportQu
 
 export async function reportEvidencePolicy(websiteId: string) {
   const [catalog, policies, states, repairs] = await Promise.all([
-    query(
-      'SELECT path,updated_at AS "updatedAt" FROM liekan_catalog WHERE website_id=$1::uuid ORDER BY path',
-      websiteId,
-    ),
+    warehouseEnabled()
+      ? warehouseEvidenceCatalog(websiteId)
+      : query(
+          'SELECT path,updated_at AS "updatedAt" FROM liekan_catalog WHERE website_id=$1::uuid ORDER BY path',
+          websiteId,
+        ),
     query(
       'SELECT mode,revision::text,allowed_hostnames FROM liekan_collection_policy WHERE website_id=$1::uuid',
       websiteId,
@@ -49,7 +53,7 @@ export async function reportEvidencePolicy(websiteId: string) {
     ),
   ]);
   return hash({
-    catalog: hash(catalog),
+    catalog: Array.isArray(catalog) ? hash(catalog) : catalog.hash,
     registryVersion: getPublishedCatalog()?.version ?? null,
     populationVersion: TRAFFIC_POLICY_VERSION,
     policy: policies[0] || { mode: 'standard', revision: '0' },

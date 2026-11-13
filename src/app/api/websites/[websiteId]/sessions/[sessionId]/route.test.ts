@@ -174,7 +174,7 @@ test('DELETE returns unauthorized when the user cannot delete the website', asyn
 });
 
 test('DELETE returns not found when the session does not exist', async () => {
-  parseRequestMock.mockResolvedValue({ auth: {}, error: undefined });
+  parseRequestMock.mockResolvedValue({ auth: { user: { id: 'user-1' } }, error: undefined });
   isRelationalOnlyMock.mockReturnValue(true);
   canDeleteWebsiteMock.mockResolvedValue(true);
   deleteSessionMock.mockResolvedValue(null);
@@ -195,7 +195,7 @@ test('DELETE returns not found when the session does not exist', async () => {
 });
 
 test('DELETE removes the session when the request is valid', async () => {
-  parseRequestMock.mockResolvedValue({ auth: {}, error: undefined });
+  parseRequestMock.mockResolvedValue({ auth: { user: { id: 'user-1' } }, error: undefined });
   isRelationalOnlyMock.mockReturnValue(true);
   canDeleteWebsiteMock.mockResolvedValue(true);
   deleteSessionMock.mockResolvedValue({ id: 'session-1' });
@@ -209,7 +209,7 @@ test('DELETE removes the session when the request is valid', async () => {
 
   expect(response.status).toBe(200);
   await expect(response.json()).resolves.toEqual({ ok: true });
-  expect(deleteSessionMock).toHaveBeenCalledWith('website-1', 'session-1');
+  expect(deleteSessionMock).toHaveBeenCalledWith('website-1', 'session-1', { userId: 'user-1' });
 });
 
 test('GET does not stitch fallback associations when session identity is unavailable', async () => {

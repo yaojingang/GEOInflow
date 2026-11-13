@@ -5,8 +5,10 @@ import {
   isLiveLogView,
   previousWeekRange,
   readViewState,
+  readReportPage,
   resetViewParams,
 } from './viewState';
+import { parseReportQuery, tablePageMax, reportPageMax } from '@/lib/liekan/contracts/query';
 
 describe('shareable GEO view conditions', () => {
   it('restores old other-known links using the residual category and resets its owned condition', () => {
@@ -44,7 +46,7 @@ describe('shareable GEO view conditions', () => {
       cursor: 'opaque-log-cursor',
       seek: 'after',
     });
-    expect(readViewState({ ...params, page: '100001' }, 'logs').logPage).toBe(1);
+    expect(readViewState({ ...params, page: '100001' }, 'logs').logPage).toBe(100001);
     expect(readViewState({ ...params, cursor: 'x'.repeat(513) }, 'logs').cursor).toBe('');
     expect(readViewState({ ...params, seek: 'invalid' }, 'logs').seek).toBe('');
     expect(readViewState({ ...params, seek: 'before' }, 'logs').seek).toBe('before');
@@ -100,12 +102,82 @@ describe('shareable GEO view conditions', () => {
   });
 });
 
+it.each([100001, tablePageMax])(
+  'round-trips table page %s through URL, view state and report schema',
+  page => {
+    const url = new URL('https://example.test/report');
+    url.searchParams.set('tp_blindList', String(page));
+    url.searchParams.set('tp_apBody', '2');
+    const input = Object.fromEntries(url.searchParams);
+    const view = readViewState(input, 'ai/pages');
+    expect(view.tablePages).toEqual({ blindList: page, apBody: 2 });
+    const parsed = parseReportQuery({
+      ...input,
+      resource: 'ai/pages',
+      startAt: 0,
+      endAt: 1000,
+      timezone: 'UTC',
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data.tablePages).toEqual(view.tablePages);
+    expect(Number.isSafeInteger((page - 1) * 20 + 20)).toBe(true);
+  },
+);
+
+it.each([tablePageMax + 1, Number.MAX_SAFE_INTEGER + 1, 1.5])(
+  'rejects unsafe or out-of-range table page %s',
+  page => {
+    const input = { tp_blindList: String(page), resource: 'ai/pages', startAt: 0, endAt: 1000 };
+    expect(parseReportQuery(input).success).toBe(false);
+    expect(readViewState({ tp_blindList: String(page) }, 'ai/pages').tablePages).toEqual({});
+  },
+);
+
+it.each([100001, reportPageMax])(
+  'round-trips shared log/keyword page %s without the old fixed cap',
+  page => {
+    const query = Object.fromEntries(new URLSearchParams({ page: String(page) }));
+    expect(readReportPage(query.page)).toBe(page);
+    expect(readViewState(query, 'logs').logPage).toBe(page);
+    for (const resource of ['logs', 'human/keywords']) {
+      const parsed = parseReportQuery({
+        ...query,
+        resource,
+        startAt: 0,
+        endAt: 1000,
+        timezone: 'UTC',
+      });
+      expect(parsed.success).toBe(true);
+      if (parsed.success) expect(parsed.data.page).toBe(page);
+    }
+    expect(Number.isSafeInteger((page - 1) * 100 + 100)).toBe(true);
+  },
+);
+
+it.each([reportPageMax + 1, Number.MAX_SAFE_INTEGER + 1, 1.5, 0])(
+  'rejects shared log/keyword page %s beyond the safe range',
+  page => {
+    expect(readReportPage(String(page))).toBe(1);
+    expect(readViewState({ page: String(page) }, 'logs').logPage).toBe(1);
+    for (const resource of ['logs', 'human/keywords'])
+      expect(parseReportQuery({ page, resource, startAt: 0, endAt: 1000 }).success).toBe(false);
+  },
+);
+
 it('restores pagable table pages only for whitelisted tables and pages above 1', () => {
   const state = readViewState(
     { tp_topBody: '3', tp_pgBody: '2', tp_apBody: '1', tp_goalBody: '2', tp_srcBody: 'x' },
     'content',
   );
   expect(state.tablePages).toEqual({ topBody: 3, pgBody: 2 });
+  expect(readViewState({ tp_blindList: '5001', tp_apBody: '2' }, 'ai/pages').tablePages).toEqual({
+    blindList: 5001,
+    apBody: 2,
+  });
+  expect(clearTablePages({ blindList: 5001, apBody: 2 })).toEqual({
+    tp_blindList: undefined,
+    tp_apBody: undefined,
+  });
   // 日志资源不消费表分页参数，避免与日志批分页混淆。
   expect(readViewState({ tp_topBody: '3' }, 'logs').tablePages).toEqual({});
   expect(

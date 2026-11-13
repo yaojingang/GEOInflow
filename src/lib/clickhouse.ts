@@ -1,27 +1,28 @@
-import { readBrowserPopulation } from './liekan/upstream/browser-population';
-import { noteBrowserPopulation } from './liekan/upstream/cache-context';
-import {
-  cityNameSQL,
-  cityFilterValues,
-  citySearchSQL,
-  regionSearchSQL,
-  geographyQueryParams,
-  withClickHouseGeographySQL,
-} from './liekan/upstream/geography-query';
+import { warehouseEnabled } from '@/lib/liekan/warehouse/authority-routing';
 import { type ClickHouseClient, createClient } from '@clickhouse/client';
 import { formatInTimeZone } from 'date-fns-tz';
 import debug from 'debug';
 import { CLICKHOUSE } from '@/lib/db';
 import { DATA_TYPE, DEFAULT_PAGE_SIZE, FILTER_COLUMNS, OPERATORS } from './constants';
 import {
+  getClickHouseCountrySQL,
+  getClickHouseRegionSQL,
   getCountryFilterValues,
   getRegionFilterValues,
-  getClickHouseRegionSQL,
-  getClickHouseCountrySQL,
 } from './country';
+import { readBrowserPopulation } from './liekan/upstream/browser-population';
+import { noteBrowserPopulation } from './liekan/upstream/cache-context';
+import { channelFilterColumn } from './liekan/upstream/filter-extension';
+import {
+  cityFilterValues,
+  cityNameSQL,
+  citySearchSQL,
+  geographyQueryParams,
+  regionSearchSQL,
+  withClickHouseGeographySQL,
+} from './liekan/upstream/geography-query';
 import { filtersObjectToArray } from './params';
 import type { Operator, PropertyFilter, QueryFilters, QueryOptions } from './types';
-import { channelFilterColumn } from './liekan/upstream/filter-extension';
 
 export const CLICKHOUSE_DATE_FORMATS = {
   // %i is unsupported by ClickHouse before v23.4. %T and %R work on both
@@ -87,6 +88,8 @@ function getClient() {
 }
 
 function getUTCString(date?: Date | string | number) {
+  if (warehouseEnabled())
+    return new Date(date ?? Date.now()).toISOString().replace('T', ' ').replace('Z', '000');
   return formatInTimeZone(date || new Date(), 'UTC', 'yyyy-MM-dd HH:mm:ss');
 }
 
@@ -761,6 +764,13 @@ async function pagedRawQuery(
   filters: QueryFilters,
   name?: string,
 ) {
+  if (warehouseEnabled())
+    return (await import('./liekan/upstream/warehouse-native-query')).warehouseNativePage(
+      query,
+      queryParams,
+      filters,
+      name,
+    );
   const { page = 1, pageSize, orderBy, sortDescending = false, search } = filters;
   const size = +pageSize || DEFAULT_PAGE_SIZE;
   const offset = +size * (+page - 1);
@@ -797,6 +807,12 @@ async function rawQuery<T = unknown>(
   params: Record<string, unknown> = {},
   name?: string,
 ): Promise<T> {
+  if (warehouseEnabled())
+    return (await import('./liekan/upstream/warehouse-native-query')).warehouseNativeQuery<T>(
+      query,
+      params,
+      name,
+    );
   const scopedGeography = query.includes('_liekan_geography_city');
   query = withClickHouseGeographySQL(query);
   if (process.env.LOG_QUERY) {
@@ -844,6 +860,8 @@ async function rawQuery<T = unknown>(
 }
 
 async function insert(table: string, values: any[]) {
+  if (warehouseEnabled())
+    throw new Error('warehouse-direct-insert-forbidden');
   await connect();
 
   return clickhouse.insert({ table, values, format: 'JSONEachRow' });

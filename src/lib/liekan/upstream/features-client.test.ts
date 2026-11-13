@@ -18,6 +18,82 @@ import {
 } from './features-client';
 import { freshnessExpiry, withClientFreshness } from './client-freshness';
 
+it('waits for a scheduled overview by rereading the same report', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+  const fetcher = vi
+    .fn()
+    .mockResolvedValueOnce(
+      Response.json(
+        { status: 'scheduled' },
+        { status: 202, headers: { 'X-Liekan-Read-Path': 'scheduled', 'Retry-After': '5' } },
+      ),
+    )
+    .mockResolvedValueOnce(Response.json({ report: 'published' }));
+  vi.stubGlobal('fetch', fetcher);
+  try {
+    const pending = featureApi.get(
+      '/liekan/websites/11111111-1111-4111-8111-111111111111/page-report',
+      { resource: 'overview', startAt: 1, endAt: 2, refresh: '1' },
+    );
+    const checked = expect(pending).resolves.toEqual({ report: 'published' });
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await checked;
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[1][0].href).toBe(fetcher.mock.calls[0][0].href);
+    expect(fetcher.mock.calls.map(([, init]) => init.method)).toEqual(['GET', 'GET']);
+  } finally {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  }
+});
+
+it('carries the overview page selection to the shared job result', async () => {
+  vi.useFakeTimers();
+  vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+  const site = '11111111-1111-4111-8111-111111111111';
+  const id = '22222222-2222-4222-8222-222222222222';
+  const job = {
+    id,
+    websiteId: site,
+    status: 'queued',
+    queuedAt: '2026-01-01',
+    startedAt: null,
+    completedAt: null,
+    generatedAt: null,
+    expiresAt: null,
+    errorCode: null,
+    retryAfterMs: 1000,
+    resultUrl: `/liekan/websites/${site}/overview-jobs/${id}/result`,
+  };
+  const fetcher = vi
+    .fn()
+    .mockResolvedValueOnce(Response.json({ analysisJob: job }, { status: 202 }))
+    .mockResolvedValueOnce(Response.json({ analysisJob: { ...job, status: 'ready' } }))
+    .mockResolvedValueOnce(Response.json({ tables: { topBody: [{ path: '/second' }] } }));
+  vi.stubGlobal('fetch', fetcher);
+  try {
+    const pending = featureApi.get(`/liekan/websites/${site}/page-report`, {
+      resource: 'overview',
+      startAt: 1,
+      endAt: 2,
+      tp_topBody: 2,
+    });
+    const checked = expect(pending).resolves.toMatchObject({
+      tables: { topBody: [{ path: '/second' }] },
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    await checked;
+    expect(fetcher.mock.calls[1][0].search).toBe('');
+    expect(fetcher.mock.calls[2][0].searchParams.get('tp_topBody')).toBe('2');
+  } finally {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  }
+});
+
 it.each([true, false])(
   'resumes an idle handle once and bounds rapid repeated idle failures: %s',
   async success => {
@@ -351,6 +427,46 @@ it('isolates a revoked website within a summary batch while retaining accessible
   expect(rows.find(row => row.id === 'b').views).toBe(7);
   expect(rows.find(row => row.id === 'revoked').error.status).toBe(403);
 });
+
+it('bounds in-flight website summary requests and skips a cancelled queued website', async () => {
+  const completions = new Map<string, () => void>();
+  const fetcher = vi.fn(
+    (url: URL) =>
+      new Promise<Response>(resolve => {
+        const id = url.searchParams.get('ids')!;
+        completions.set(id, () => resolve(Response.json([{ id }])));
+      }),
+  );
+  vi.stubGlobal('fetch', fetcher);
+  try {
+    const range = { startAt: 1, endAt: 2, timezone: 'UTC' };
+    const controllers = Array.from({ length: 5 }, () => new AbortController());
+    const requests = controllers.map(({ signal }, index) =>
+      getFeatureWebsiteSummary([String(index)], range, signal),
+    );
+    const settled = Promise.allSettled(requests);
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(3));
+    expect([...completions.keys()]).toEqual(['0', '1', '2']);
+
+    controllers[3].abort();
+    completions.get('1')!();
+    await vi.waitFor(() => expect(completions.has('4')).toBe(true));
+    for (const complete of completions.values()) complete();
+
+    const results = await settled;
+    expect(results.map(result => result.status)).toEqual([
+      'fulfilled',
+      'fulfilled',
+      'fulfilled',
+      'rejected',
+      'fulfilled',
+    ]);
+    expect([...completions.keys()]).toEqual(['0', '1', '2', '4']);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
 it('cancels pre-save website reads so their late results cannot refresh the cache', async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const key = ['liekan', 'site', undefined, 'overview'];

@@ -1,3 +1,4 @@
+import { warehouseEnabled } from '@/lib/liekan/warehouse/authority-routing';
 import {
   HISTORY_REPAIR_ENGINE,
   historyRepairEvidenceSchema,
@@ -58,6 +59,12 @@ export async function ingestHistoryRepairEvidence(
   if (!parsed.success)
     throw new LiekanError('证据格式无效', 400, 'history-repair-invalid-evidence');
   const body = parsed.data;
+  if (warehouseEnabled())
+    return (await import('./warehouse-history-repair-evidence')).ingestWarehouseRepairEvidence(
+      websiteId,
+      body,
+      identity,
+    );
   // The route enforces the byte limit while streaming; this also bounds direct adapter callers.
   if (Buffer.byteLength(JSON.stringify(body), 'utf8') > 1024 * 1024)
     throw new LiekanError('每个证据分块上限为 1 MiB', 413, 'history-repair-evidence-too-large');

@@ -16,6 +16,7 @@ import {
   followAnalysisJob,
   waitForAnalysisAdmission,
   waitForAnalysisVisibility,
+  waitForScheduledOverview,
 } from './analysis-query-client';
 import { aggregateRequestResources, isAggregateRequest } from './cache-policy';
 import { clientCatalogVersion } from './catalog-client';
@@ -31,6 +32,7 @@ import { RequestPool, browserReads as reads } from './request-pool';
 
 // Keep initial task submissions within the server's per-consumer active quota.
 const analysisReads = new RequestPool(2);
+const websiteSummaryReads = new RequestPool(3);
 export async function streamFeatureExport(
   websiteId: string,
   body: ExportRequest,
@@ -75,6 +77,15 @@ export async function streamFeatureExport(
         if (!line) continue;
         const frame: ExportFrame = JSON.parse(line);
         if (frame.type === 'error') throw new FeatureApiError(frame.message, frame.status);
+        if (frame.type === 'file' && frame.downloadUrl) {
+          if (
+            !/^\/api\/liekan\/websites\/[a-f0-9-]{36}\/exports\/[a-f0-9-]{36}$/.test(
+              frame.downloadUrl,
+            )
+          )
+            throw new FeatureApiError('导出下载地址无效', 500);
+          frame.downloadUrl = getApiUrl(frame.downloadUrl.slice('/api'.length));
+        }
         if (frame.type === 'complete') complete = true;
         onFrame(frame);
       }
@@ -199,6 +210,16 @@ export async function featureRequest<T = any>(
       });
     };
     let response = await send();
+    if (
+      attemptHeaders.Prefer === 'respond-async' &&
+      params?.resource === 'overview' &&
+      response.status === 202 &&
+      response.headers.get('X-Liekan-Read-Path') === 'scheduled'
+    ) {
+      response = await waitForScheduledOverview(response, send, retryAfter, requestSignal);
+      if (!response)
+        throw new FeatureApiError('数据仍在读取，请稍后重试', 503, 'warehouse-overview-pending');
+    }
     let data = await response.json().catch(() => null);
     if (
       attemptHeaders.Prefer === 'respond-async' &&
@@ -249,14 +270,24 @@ export async function featureRequest<T = any>(
                   }),
               }
             : {}),
-          fetchJob: taskPath =>
-            fetch(new URL(getApiUrl(taskPath), window.location.origin), {
+          fetchJob: taskPath => {
+            const taskUrl = new URL(getApiUrl(taskPath), window.location.origin);
+            if (
+              params?.resource === 'overview' &&
+              /\/overview-jobs\/[^/]+\/result$/.test(taskPath)
+            ) {
+              for (const key of ['tp_topBody', 'tp_visitorTopBody']) {
+                if (params[key] != null) taskUrl.searchParams.set(key, String(params[key]));
+              }
+            }
+            return fetch(taskUrl, {
               headers: Object.fromEntries(
                 Object.entries(attemptHeaders).filter(([key]) => key !== 'Prefer'),
               ),
               signal: requestSignal,
               cache: 'no-store',
-            }),
+            });
+          },
         });
         response = result.response;
         data = result.data;
@@ -283,9 +314,15 @@ export async function featureRequest<T = any>(
       );
     return data;
   };
+  const readPool =
+    headers.Prefer === 'respond-async'
+      ? analysisReads
+      : path === '/liekan/websites/summary'
+        ? websiteSummaryReads
+        : reads;
   try {
     const data = await (method === 'GET'
-      ? (headers.Prefer === 'respond-async' ? analysisReads : reads).read(
+      ? readPool.read(
           JSON.stringify([
             url.href,
             Object.fromEntries(Object.entries(headers).filter(([key]) => key !== 'X-Liekan-View')),

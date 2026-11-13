@@ -117,23 +117,33 @@ it.each(['websites', 'segments', 'cohorts'])(
       await advance();
       const dependent = () =>
         records.filter(url => page === 'websites' || url.searchParams.has(type));
-      expect(dependent()).toHaveLength(2);
+      const initial = dependent();
+      if (page === 'websites') {
+        expect(initial.map(url => url.searchParams.get('ids')).sort()).toEqual(['a', 'a', 'b', 'b']);
+        expect(new Set(initial.map(url => url.href)).size).toBe(4);
+      } else {
+        expect(initial).toHaveLength(2);
+      }
       fireEvent.click(screen.getByRole('button', { name: '刷新' }));
       await advance(100);
       expect(definitions).toBe(2);
-      expect(dependent()).toHaveLength(2);
+      expect(dependent()).toEqual(initial);
       await act(async () => finish(Response.json(sources(['c', 'a']))));
       await advance(1);
       await advance();
       const forced = dependent().filter(url => url.searchParams.get('refresh') === '1');
-      expect(forced).toHaveLength(2);
-      const ids = forced.flatMap(url =>
-        url.searchParams.get(page === 'websites' ? 'ids' : type).split(','),
-      );
-      expect(ids).not.toContain('b');
-      expect(ids).toContain('a');
-      expect(ids).toContain('c');
-      expect(new Set(forced.map(url => url.href)).size).toBe(2);
+      if (page === 'websites') {
+        expect(forced.map(url => url.searchParams.get('ids')).sort()).toEqual(['a', 'a', 'c', 'c']);
+        expect(new Set(forced.map(url => url.href)).size).toBe(4);
+        expect(dependent().slice(initial.length)).toEqual(forced);
+      } else {
+        expect(forced).toHaveLength(2);
+        const ids = forced.flatMap(url => url.searchParams.get(type).split(','));
+        expect(ids).not.toContain('b');
+        expect(ids).toContain('a');
+        expect(ids).toContain('c');
+        expect(new Set(forced.map(url => url.href)).size).toBe(2);
+      }
       expect(screen.getByRole('button', { name: '刷新' })).toBeEnabled();
     } finally {
       client.clear();

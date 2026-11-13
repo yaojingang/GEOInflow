@@ -11,6 +11,11 @@ export const reportQueryGroups = [
   'monthly-ai',
   'plot-human',
   'plot-logs',
+  'overview-log-aggregate',
+  'overview-log-day-build',
+  'overview-page-ranking',
+  'overview-browser-paths',
+  'overview-catalog-coverage',
 ] as const;
 type QueryGroup = (typeof reportQueryGroups)[number];
 type GroupTiming = { wallMs: number; calls: number; failures: number };

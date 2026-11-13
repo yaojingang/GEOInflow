@@ -126,7 +126,11 @@ export function pageReportQuery(
           featureApi.get<LiekanPageReport>(
             `/liekan/websites/${websiteId}/${p.resource === 'logs' ? 'log-entries' : 'page-report'}`,
             p.resource === 'logs'
-              ? logReadQuery.parse({ ...p, seek: p.seek || 'after' })
+              ? logReadQuery.parse({
+                  ...p,
+                  seek: p.seek || 'after',
+                  ...(fresh?.() ? { refresh: '1' } : {}),
+                })
               : {
                   ...p,
                   tablePages: undefined,

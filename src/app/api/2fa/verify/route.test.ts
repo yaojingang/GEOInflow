@@ -180,6 +180,9 @@ test('POST accepts a token-only payload and completes 2FA verification', async (
   });
   expect(data.user).not.toHaveProperty('password');
   expect(response.status).toBe(200);
+  expect(response.headers.get('set-cookie')).toContain(
+    'liekan_export_session=; Path=/api; HttpOnly; SameSite=Strict; Max-Age=0',
+  );
 });
 
 test('Redis 2FA login uses the same 90-day session lifetime', async () => {
