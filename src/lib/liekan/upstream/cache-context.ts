@@ -22,6 +22,7 @@ interface CacheContext {
   request?: Request;
   computationSignal?: AbortSignal;
   parameters?: Record<string, unknown>;
+  allowWarehousePublicationAdvance?: boolean;
   versions?: Map<string, Promise<unknown>>;
   reauthorize?: (deadline?: number) => Promise<boolean>;
   prepared?: boolean;
@@ -72,6 +73,7 @@ export function bindCacheRequest(
   auth: any,
   parameters?: Record<string, unknown>,
   reauthorize?: (deadline?: number) => Promise<boolean>,
+  options?: { allowWarehousePublicationAdvance?: boolean },
 ) {
   const context = contexts.getStore();
   if (!context) return;
@@ -91,6 +93,7 @@ export function bindCacheRequest(
     : { private: true };
   context.parameters = parameters;
   context.reauthorize = reauthorize;
+  context.allowWarehousePublicationAdvance = options?.allowWarehousePublicationAdvance;
 }
 export function noteBrowserPopulation(resourceId: string, population: BrowserPopulation) {
   const context = contexts.getStore();

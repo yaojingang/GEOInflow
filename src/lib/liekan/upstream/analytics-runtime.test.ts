@@ -27,7 +27,9 @@ vi.mock('./analytics-hot', () => ({
 const id = '50000000-0000-4000-8000-000000000001';
 const tags = [`website:${id}`];
 let strong = 0,
-  data = 0;
+  data = 0,
+  publication = 0,
+  deletion = 0;
 const sql = vi.fn();
 function primary() {
   return {
@@ -40,6 +42,8 @@ function primary() {
         },
         $queryRawUnsafe: async (query: string) => {
           sql(query);
+          if (query.includes('LEFT JOIN liekan_warehouse_site'))
+            return [{ id, revision: String(strong - publication), deletion: String(deletion) }];
           if (query.includes('FROM liekan_analytics_revision'))
             return [{ type: 'website', id, revision: String(snapshot?.strong ?? strong) }];
           if (query.includes('FROM liekan_log_state'))
@@ -107,6 +111,8 @@ beforeEach(() => {
   vi.stubEnv('DATABASE_URL', 'postgresql://test:test@localhost/test');
   strong = 0;
   data = 0;
+  publication = 0;
+  deletion = 0;
   sql.mockClear();
 });
 afterEach(() => {
@@ -388,6 +394,46 @@ it('restarts the whole request when a definition changed after resolving filters
   });
   expect(await response.json()).toEqual({ version: 1 });
   expect(calls).toBe(2);
+});
+it('finishes a website summary during continuous publication and invalidates it after deletion', async () => {
+  vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(1000);
+  const cache = new QueryCache();
+  installAnalyticsRuntime(cache, primary, disabled());
+  const load = vi.fn(async () => {
+    const result = { publication, deletion };
+    strong++;
+    publication++;
+    return result;
+  });
+  const request = () =>
+    withQueryCacheHeaders(async () => {
+      bindCacheRequest(
+        new Request('http://localhost/api/liekan/websites/summary'),
+        { user: { id, role: 'admin' } },
+        undefined,
+        undefined,
+        { allowWarehousePublicationAdvance: true },
+      );
+      await prepareAnalyticsVersions(tags);
+      return Response.json((await cache.read('website-summary', 30000, tags, load)).value);
+    });
+  const initial = await request();
+  expect(initial.status).toBe(200);
+  expect(await initial.json()).toEqual({ publication: 0, deletion: 0 });
+  expect(await (await request()).json()).toEqual({ publication: 0, deletion: 0 });
+  expect(load).toHaveBeenCalledOnce();
+
+  vi.setSystemTime(31001);
+  expect(await (await request()).json()).toEqual({ publication: 1, deletion: 0 });
+  expect(load).toHaveBeenCalledTimes(2);
+
+  deletion++;
+  const afterDeletion = await request();
+  expect(afterDeletion.status).toBe(200);
+  expect(await afterDeletion.json()).toEqual({ publication: 2, deletion: 1 });
+  expect(load).toHaveBeenCalledTimes(3);
 });
 it('isolates public scopes and rechecks authorization before cached data is returned', async () => {
   const cache = new QueryCache();

@@ -114,6 +114,7 @@ export function installAnalyticsRuntime(
     limit: number,
     authorize: boolean,
     identity: { actor?: string; private: boolean },
+    allowWarehousePublicationAdvance: boolean,
   ): Promise<AnalyticsVersions> {
     return primary().$transaction(
       async (transaction: any) => {
@@ -144,7 +145,7 @@ export function installAnalyticsRuntime(
               throw new AnalyticsUnavailable('资源访问权限已变更', 0, 403);
           }
         }
-        return readAnalyticsVersions(tx, tags);
+        return readAnalyticsVersions(tx, tags, allowWarehousePublicationAdvance);
       },
       { timeout: analyticsRemaining(limit), maxWait: Math.min(5000, analyticsRemaining(limit)) },
     );
@@ -156,8 +157,9 @@ export function installAnalyticsRuntime(
     authorize = true,
   ): Promise<AnalyticsVersions> {
     const normalizedTags = [...new Set(tags)].sort();
-    const key = JSON.stringify(normalizedTags);
     const context = currentCacheContext();
+    const allowWarehousePublicationAdvance = !!context?.allowWarehousePublicationAdvance;
+    const key = JSON.stringify([normalizedTags, allowWarehousePublicationAdvance]);
     if (!fresh && context?.versions?.has(key))
       return context.versions.get(key) as Promise<AnalyticsVersions>;
     const limit = Math.min(deadline, Date.now() + 5000);
@@ -170,6 +172,7 @@ export function installAnalyticsRuntime(
         authorize,
         context.actor,
         context.scope,
+        allowWarehousePublicationAdvance,
       ]);
       const pending = batches.get(batchKey);
       if (pending) {
@@ -190,11 +193,23 @@ export function installAnalyticsRuntime(
         // Close before SQL starts: a later ready result must obtain its own current check.
         batches.delete(batchKey);
         if (!batches.size) metadataBatches.delete(context);
-        void readVersions(normalizedTags, batch.limit, authorize, identity).then(resolve, reject);
+        void readVersions(
+          normalizedTags,
+          batch.limit,
+          authorize,
+          identity,
+          allowWarehousePublicationAdvance,
+        ).then(resolve, reject);
       });
       return batch.promise;
     }
-    const promise = readVersions(normalizedTags, limit, authorize, identity);
+    const promise = readVersions(
+      normalizedTags,
+      limit,
+      authorize,
+      identity,
+      allowWarehousePublicationAdvance,
+    );
     if (!fresh) context?.versions?.set(key, promise);
     return promise;
   }

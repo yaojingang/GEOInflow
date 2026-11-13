@@ -43,10 +43,16 @@ export async function readWebsiteSummary(request: Request, input: unknown) {
   const auth = await checkAuth(request);
   if (!auth?.user || auth.user.deletedAt || ('shareToken' in auth && auth.shareToken))
     throw new LiekanError('需要完整登录', 401);
-  bindCacheRequest(request, auth, parsed.data, async () => {
-    const fresh = await checkAuth(request);
-    return !!fresh?.user && fresh.user.id === auth.user.id && fresh.user.role === auth.user.role;
-  });
+  bindCacheRequest(
+    request,
+    auth,
+    parsed.data,
+    async () => {
+      const fresh = await checkAuth(request);
+      return !!fresh?.user && fresh.user.id === auth.user.id && fresh.user.role === auth.user.role;
+    },
+    { allowWarehousePublicationAdvance: true },
+  );
   await prepareAnalyticsVersions(p.ids.map(websiteCacheTag));
   // Check current ownership and permissions before every cache read.
   const sites = await (
