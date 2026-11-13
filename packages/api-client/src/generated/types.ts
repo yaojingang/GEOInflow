@@ -936,6 +936,23 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/liekan/contributors': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read public GEOInflow GitHub contributors */
+    get: operations['getLiekanContributors'];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/liekan/crawler-handoffs': {
     parameters: {
       query?: never;
@@ -14132,6 +14149,46 @@ export interface operations {
           [name: string]: unknown;
         };
         content?: never;
+      };
+    };
+  };
+  getLiekanContributors: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description GitHub contributor profiles in contribution order */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': {
+            contributors: {
+              /** Format: uri */
+              avatarUrl: string;
+              login: string;
+              /** Format: uri */
+              profileUrl: string;
+            }[];
+          };
+        };
+      };
+      /** @description GitHub data is temporarily unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': {
+            /** @description Error details returned when the operation fails. */
+            error: string;
+          };
+        };
       };
     };
   };

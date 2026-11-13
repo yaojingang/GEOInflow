@@ -5160,5 +5160,10 @@
   "m_33e3ee659903": "Pairing code expires at:",
   "m_610d1cea9599": "The pairing code is valid for 10 minutes and can be used once; it becomes inert once the container starts and can be removed from .env. Restarts and upgrades never need a new code.",
   "m_ab9fd0f853c3": "Copy .env settings",
-  "m_959016724ac4": "Copy .env.example to .env, fill in the log directory, file name and log group GID, and paste the lines below."
+  "m_959016724ac4": "Copy .env.example to .env, fill in the log directory, file name and log group GID, and paste the lines below.",
+  "m_45205d416c5a": "Loading contributors…",
+  "m_7a4e52e14456": "Contributors are temporarily unavailable",
+  "m_8b7a812a5708": "No public contributors yet",
+  "m_a4328ba66777": "View all contributors",
+  "m_0785e90d146f": "{v0} on GitHub"
 }

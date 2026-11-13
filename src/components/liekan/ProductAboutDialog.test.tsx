@@ -1,7 +1,26 @@
-import { fireEvent, render, screen, within } from '@testing-library/react';
-import { expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { LiekanLocaleContext } from '@/lib/liekan/i18n/client';
 import { ProductAboutDialog } from './ProductAboutDialog';
+
+const contributors = [
+  {
+    login: 'yaojingang',
+    avatarUrl: 'https://avatars.githubusercontent.com/u/266242792?v=4&s=96',
+    profileUrl: 'https://github.com/yaojingang',
+  },
+  {
+    login: 'lluck42',
+    avatarUrl: 'https://avatars.githubusercontent.com/u/31329690?v=4&s=96',
+    profileUrl: 'https://github.com/lluck42',
+  },
+];
+const fetchContributors = vi.fn();
+beforeEach(() => {
+  vi.stubGlobal('fetch', fetchContributors);
+  fetchContributors.mockReset().mockResolvedValue(Response.json({ contributors }));
+});
+afterEach(() => vi.unstubAllGlobals());
 
 vi.mock('next/link', () => ({
   default: ({ children, prefetch: _prefetch, onClick, ...props }: any) => (
@@ -18,7 +37,7 @@ vi.mock('next/link', () => ({
 }));
 
 it.each(['zh-CN', 'en-US'] as const)(
-  'shows the pending contributor state and attributed publisher links in %s',
+  'shows GitHub contributors and attributed publisher links in %s',
   async locale => {
     const onClose = vi.fn();
     render(
@@ -27,11 +46,19 @@ it.each(['zh-CN', 'en-US'] as const)(
       </LiekanLocaleContext.Provider>,
     );
     const dialog = within(await screen.findByRole('dialog'));
-    expect(
-      dialog.getByText(
-        locale === 'zh-CN' ? 'GitHub 仓库待接入' : 'GitHub repository not connected',
-      ),
-    ).toBeVisible();
+    for (const contributor of contributors) {
+      const link = await dialog.findByRole('link', {
+        name:
+          locale === 'zh-CN'
+            ? `${contributor.login}的 GitHub 主页`
+            : `${contributor.login} on GitHub`,
+      });
+      expect(link).toHaveAttribute('href', contributor.profileUrl);
+      expect(link).toHaveAttribute('target', '_blank');
+      expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+      expect(link.querySelector('img')).toHaveAttribute('src', contributor.avatarUrl);
+      expect(link).toHaveTextContent(contributor.login);
+    }
     expect(dialog.getByText('v1.2')).toBeVisible();
     const biographies =
       locale === 'zh-CN'
@@ -70,7 +97,10 @@ it.each(['zh-CN', 'en-US'] as const)(
       expect(link).toHaveAttribute('rel', 'noopener noreferrer');
     }
     expect(dialog.queryByText(/贡献者 \d|Contributor \d|排版示意/)).toBeNull();
-    expect(dialog.queryByRole('link', { name: 'GitHub' })).toBeNull();
+    expect(dialog.getByRole('link', { name: 'GitHub' })).toHaveAttribute(
+      'href',
+      'https://github.com/yaojingang/GEOInflow',
+    );
     expect(dialog.queryByRole('link', { name: /MIT|Umami/ })).toBeNull();
     const about = dialog.getByRole('link', {
       name: locale === 'zh-CN' ? '项目说明' : 'About GEOInflow',
@@ -80,3 +110,81 @@ it.each(['zh-CN', 'en-US'] as const)(
     expect(onClose).toHaveBeenCalledOnce();
   },
 );
+
+it('distinguishes pending and empty results and includes the deployment base path', async () => {
+  let resolve: (response: Response) => void;
+  fetchContributors.mockReturnValue(
+    new Promise<Response>(done => {
+      resolve = done;
+    }),
+  );
+  vi.stubEnv('basePath', '/statistics');
+  try {
+    render(<ProductAboutDialog onClose={vi.fn()} />);
+    expect(await screen.findByRole('status')).toHaveTextContent('正在加载贡献者…');
+    expect(screen.queryByText('暂无公开贡献者')).toBeNull();
+    expect(fetchContributors).toHaveBeenCalledWith('/statistics/api/liekan/contributors', {
+      signal: expect.any(AbortSignal),
+    });
+    resolve(Response.json({ contributors: [] }));
+    expect(await screen.findByText('暂无公开贡献者')).toBeVisible();
+    expect(screen.queryByText('正在加载贡献者…')).toBeNull();
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+it.each(['zh-CN', 'en-US'] as const)(
+  'allows retry after GitHub is unavailable in %s',
+  async locale => {
+    fetchContributors.mockResolvedValueOnce(
+      Response.json({ error: 'unavailable' }, { status: 503 }),
+    );
+    render(
+      <LiekanLocaleContext.Provider value={locale}>
+        <ProductAboutDialog onClose={vi.fn()} />
+      </LiekanLocaleContext.Provider>,
+    );
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      locale === 'zh-CN' ? '暂时无法加载贡献者' : 'Contributors are temporarily unavailable',
+    );
+    const all = screen.getByRole('link', {
+      name: locale === 'zh-CN' ? '查看全部贡献者' : 'View all contributors',
+    });
+    expect(all).toHaveAttribute(
+      'href',
+      'https://github.com/yaojingang/GEOInflow/graphs/contributors',
+    );
+    fireEvent.click(screen.getByRole('button', { name: locale === 'zh-CN' ? '重试' : 'Retry' }));
+    expect(await screen.findByText('lluck42')).toBeVisible();
+    expect(fetchContributors).toHaveBeenCalledTimes(2);
+  },
+);
+
+it('cancels an in-flight read on close', async () => {
+  fetchContributors.mockReturnValue(new Promise(() => {}));
+  const view = render(<ProductAboutDialog onClose={vi.fn()} />);
+  await waitFor(() => expect(fetchContributors).toHaveBeenCalledOnce());
+  const signal = fetchContributors.mock.calls[0][1].signal;
+  view.unmount();
+  expect(signal.aborted).toBe(true);
+});
+
+it('keeps raw GitHub identity and the current read when switching locales', async () => {
+  const view = render(
+    <LiekanLocaleContext.Provider value="zh-CN">
+      <ProductAboutDialog onClose={vi.fn()} />
+    </LiekanLocaleContext.Provider>,
+  );
+  await screen.findByText('lluck42');
+  view.rerender(
+    <LiekanLocaleContext.Provider value="en-US">
+      <ProductAboutDialog onClose={vi.fn()} />
+    </LiekanLocaleContext.Provider>,
+  );
+  expect(screen.getByRole('link', { name: 'lluck42 on GitHub' })).toHaveAttribute(
+    'href',
+    'https://github.com/lluck42',
+  );
+  expect(fetchContributors).toHaveBeenCalledOnce();
+});

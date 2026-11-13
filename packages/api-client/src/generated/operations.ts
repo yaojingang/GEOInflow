@@ -1066,6 +1066,14 @@ export const operations = {
     ],
     hasBody: false,
   },
+  getLiekanContributors: {
+    operationId: 'getLiekanContributors',
+    method: 'get',
+    path: '/api/liekan/contributors',
+    pathParams: [],
+    queryParams: [],
+    hasBody: false,
+  },
   getLiekanFeatureAnalytics: {
     operationId: 'getLiekanFeatureAnalytics',
     method: 'get',
@@ -4834,6 +4842,17 @@ export abstract class GeneratedUmamiClient {
     options?: RequestOptions,
   ): Promise<OperationOutput<'getLiekanBrowserRisk'>> {
     return this.execute('getLiekanBrowserRisk', input, options);
+  }
+
+  /**
+   * Read public GEOInflow GitHub contributors
+   * `GET /api/liekan/contributors`
+   */
+  getLiekanContributors(
+    input?: OperationInput<'getLiekanContributors'>,
+    options?: RequestOptions,
+  ): Promise<OperationOutput<'getLiekanContributors'>> {
+    return this.execute('getLiekanContributors', input, options);
   }
 
   /**
