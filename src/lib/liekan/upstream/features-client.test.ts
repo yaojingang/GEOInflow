@@ -427,6 +427,46 @@ it('isolates a revoked website within a summary batch while retaining accessible
   expect(rows.find(row => row.id === 'b').views).toBe(7);
   expect(rows.find(row => row.id === 'revoked').error.status).toBe(403);
 });
+
+it('bounds in-flight website summary requests and skips a cancelled queued website', async () => {
+  const completions = new Map<string, () => void>();
+  const fetcher = vi.fn(
+    (url: URL) =>
+      new Promise<Response>(resolve => {
+        const id = url.searchParams.get('ids')!;
+        completions.set(id, () => resolve(Response.json([{ id }])));
+      }),
+  );
+  vi.stubGlobal('fetch', fetcher);
+  try {
+    const range = { startAt: 1, endAt: 2, timezone: 'UTC' };
+    const controllers = Array.from({ length: 5 }, () => new AbortController());
+    const requests = controllers.map(({ signal }, index) =>
+      getFeatureWebsiteSummary([String(index)], range, signal),
+    );
+    const settled = Promise.allSettled(requests);
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(3));
+    expect([...completions.keys()]).toEqual(['0', '1', '2']);
+
+    controllers[3].abort();
+    completions.get('1')!();
+    await vi.waitFor(() => expect(completions.has('4')).toBe(true));
+    for (const complete of completions.values()) complete();
+
+    const results = await settled;
+    expect(results.map(result => result.status)).toEqual([
+      'fulfilled',
+      'fulfilled',
+      'fulfilled',
+      'rejected',
+      'fulfilled',
+    ]);
+    expect([...completions.keys()]).toEqual(['0', '1', '2', '4']);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
 it('cancels pre-save website reads so their late results cannot refresh the cache', async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const key = ['liekan', 'site', undefined, 'overview'];

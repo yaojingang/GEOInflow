@@ -25,6 +25,12 @@ const site = {
   domain: 'example.invalid',
   userId: 'owner',
 };
+const secondSite = {
+  ...site,
+  id: '22222222-2222-4222-8222-222222222222',
+  siteNumber: 102,
+  name: '后返回站',
+};
 const totals = { pageviews: 9, views: 9, visitors: 3, visits: 4, bounces: 1, aiVisits: 2 };
 const summary = [{ id: site.id, ...totals, received: true, comparison: totals }];
 let client: QueryClient;
@@ -40,7 +46,11 @@ beforeEach(() => {
 });
 afterEach(() => client.clear());
 
-function page(loading = false, range = { startAt: 0, endAt: 1000, timezone: 'Asia/Shanghai' }) {
+function page(
+  loading = false,
+  range = { startAt: 0, endAt: 1000, timezone: 'Asia/Shanghai' },
+  sites = [site],
+) {
   return (
     <QueryClientProvider client={client}>
       <FeatureProvider
@@ -48,7 +58,7 @@ function page(loading = false, range = { startAt: 0, endAt: 1000, timezone: 'Asi
           {
             user: { id: 'owner', role: 'user' },
             route: { page: 'websites' },
-            sites: [site],
+            sites,
             sitesReady: !loading,
             teams: [],
             siteId: '',
@@ -80,6 +90,39 @@ it('shares a single natural-day request between the totals and the website rows'
   expect(await within(screen.getByRole('table')).findByText('已收到浏览数据')).toBeVisible();
   expect(document.querySelectorAll('.metric')[1]).toHaveTextContent('9');
   expect(mocks.summary).toHaveBeenCalledTimes(1);
+});
+
+it('renders a completed website independently and only retries the failed website', async () => {
+  const range = websiteDayWindow('Asia/Shanghai');
+  mocks.summary.mockImplementation(([id]) =>
+    id === site.id
+      ? Promise.resolve(summary)
+      : new Promise((_, reject) => {
+          rejectSummary = reject;
+        }),
+  );
+  render(page(false, range, [site, secondSite]));
+
+  const firstRow = within(screen.getByRole('link', { name: site.name }).closest('tr')!);
+  const secondRow = within(screen.getByRole('link', { name: secondSite.name }).closest('tr')!);
+  expect(await firstRow.findByText('已收到浏览数据')).toBeVisible();
+  expect(firstRow.getAllByText('9')[0]).toBeVisible();
+  expect(secondRow.getByText('等待查询')).toBeVisible();
+  expect(mocks.summary.mock.calls.map(([ids]) => ids)).toEqual([[site.id], [secondSite.id]]);
+
+  await act(async () => rejectSummary({ status: 503, message: '暂时不可用' }));
+  expect(await secondRow.findByText('读取失败')).toBeVisible();
+  expect(firstRow.getAllByText('9')[0]).toBeVisible();
+  expect(await screen.findByText(/已读取 1\/2 个网站/)).toBeVisible();
+
+  mocks.summary.mockResolvedValue([{ ...summary[0], id: secondSite.id }]);
+  await userEvent.click(screen.getByRole('button', { name: '重新读取统计' }));
+  expect(await secondRow.findByText('已收到浏览数据')).toBeVisible();
+  expect(mocks.summary.mock.calls.map(([ids]) => ids)).toEqual([
+    [site.id],
+    [secondSite.id],
+    [secondSite.id],
+  ]);
 });
 
 it('shows searchable website identities and actions while both statistics reads are pending', async () => {

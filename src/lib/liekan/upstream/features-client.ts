@@ -32,6 +32,7 @@ import { RequestPool, browserReads as reads } from './request-pool';
 
 // Keep initial task submissions within the server's per-consumer active quota.
 const analysisReads = new RequestPool(2);
+const websiteSummaryReads = new RequestPool(3);
 export async function streamFeatureExport(
   websiteId: string,
   body: ExportRequest,
@@ -313,9 +314,15 @@ export async function featureRequest<T = any>(
       );
     return data;
   };
+  const readPool =
+    headers.Prefer === 'respond-async'
+      ? analysisReads
+      : path === '/liekan/websites/summary'
+        ? websiteSummaryReads
+        : reads;
   try {
     const data = await (method === 'GET'
-      ? (headers.Prefer === 'respond-async' ? analysisReads : reads).read(
+      ? readPool.read(
           JSON.stringify([
             url.href,
             Object.fromEntries(Object.entries(headers).filter(([key]) => key !== 'X-Liekan-View')),
