@@ -97,6 +97,22 @@ flowchart LR
 
 ## 快速部署
 
+新装 ClickHouse 版时，在仓库根目录将 `env.example` 复制为 `.env`，填入四个独立的随机密钥，再运行以下命令。[配置与升级说明](docs/warehouse.md#新安装与应用升级)
+
+```sh
+docker compose up -d
+```
+
+从源码安装的实例在同一目录更新：
+
+```sh
+git pull --ff-only && docker compose up -d
+```
+
+Compose 从源码构建镜像，在容器内执行迁移，并在初始化成功后启动应用和 worker。用 `docker compose ps` 查看状态。已有 PostgreSQL 版的迁移方式见 [ClickHouse 安装、迁移与运行](docs/warehouse.md)。
+
+### PostgreSQL 版
+
 准备已启动的 Docker Engine / Docker Desktop、Docker Compose V2，以及可访问镜像和依赖下载源的网络。源码构建要求 Docker 总内存至少 **6 GiB**，建议 **8 GiB 或以上、2 个 CPU 或以上**，并预留空闲内存。可先运行 `sh scripts/liekan-deploy.sh --check`；运行容量说明见 [部署指南](docs/deployment.md#环境要求)。在取得源码并进入项目根目录后执行：
 
 ```sh

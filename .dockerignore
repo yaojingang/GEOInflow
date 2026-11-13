@@ -1,7 +1,8 @@
 .git
 .next
 coverage
-docker-compose.yml
+compose.yml
+docker-compose.umami.yml
 Dockerfile
 .DS_Store
 **/node_modules

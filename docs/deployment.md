@@ -2,7 +2,7 @@
 
 [English](deployment.en.md) | **简体中文**
 
-完整 ClickHouse 版本使用 `python3 scripts/liekan-warehouse-deploy.py --mode fresh` 新装；已有 PostgreSQL 实例使用 `--mode pg-transition`，然后完成历史迁移和切换。详见 [ClickHouse 安装、迁移与运行](warehouse.md)。应用更新继续使用该入口及原安装模式，不会重新建立已经结束的过渡同步。
+全新安装 ClickHouse 版时，在仓库根目录准备 `.env`，然后运行 `docker compose up -d`。已有 PostgreSQL 实例按[迁移指南](warehouse.md)完成历史数据迁移、核验和切换。
 
 下文保留尚未启用 CH 的部署流程。已登记 CH 安装的实例缺少仓库运行配置时会拒绝启动，不能仅执行旧 Compose 文件更新。
 

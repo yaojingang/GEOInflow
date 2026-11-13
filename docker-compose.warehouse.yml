@@ -17,7 +17,8 @@ x-warehouse-environment: &warehouse-environment
   LIEKAN_EXPORT_DIRECTORY: /app/warehouse-exports
   LIEKAN_CH_QUERY_MEMORY_BYTES: ${LIEKAN_CH_QUERY_MEMORY_BYTES:-1073741824}
 x-warehouse-worker: &warehouse-worker
-  image: liekan:1.2.0
+  image: ${LIEKAN_APP_IMAGE:-liekan:1.2.0}
+  pull_policy: never
   environment:
     <<: *warehouse-environment
     DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
@@ -28,6 +29,7 @@ x-warehouse-worker: &warehouse-worker
   volumes:
     - liekan-warehouse-queue:/app/warehouse-queue-storage:ro
   restart: unless-stopped
+  stop_grace_period: 120s
 services:
   warehouse-ch:
     image: clickhouse/clickhouse-server:26.8.36.3@sha256:d426d2f612e1e189c90f9a3f8dcd85a03c6851273833817a296bb327e63aa7a7
@@ -106,20 +108,27 @@ services:
       warehouse-queue: {condition: service_healthy}
     restart: 'no'
   app:
+    pull_policy: ${LIEKAN_APP_PULL_POLICY:-build}
+    stop_grace_period: 120s
     environment:
       <<: *warehouse-environment
     depends_on:
       warehouse-init: {condition: service_completed_successfully}
+      analytics-cache: {condition: service_healthy}
     volumes:
       - liekan-warehouse-queue:/app/warehouse-queue-storage:ro
       - liekan-warehouse-backups:/app/warehouse-backups
       - liekan-warehouse-exports:/app/warehouse-exports
   log-worker:
+    pull_policy: never
+    stop_grace_period: 120s
     environment:
       <<: *warehouse-environment
     volumes:
       - liekan-warehouse-queue:/app/warehouse-queue-storage:ro
   analytics-worker:
+    pull_policy: never
+    stop_grace_period: 120s
     environment:
       <<: *warehouse-environment
       LIEKAN_CH_READ_CONCURRENCY: ${LIEKAN_CH_READ_CONCURRENCY:-1}

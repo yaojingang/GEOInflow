@@ -4,7 +4,7 @@
 
 ## ClickHouse 版本入口
 
-完整 CH 版本需要 Docker Compose 和 Python 3。新安装运行 `python3 scripts/liekan-warehouse-deploy.py --mode fresh`；已有 PG 实例运行 `python3 scripts/liekan-warehouse-deploy.py --mode pg-transition`，随后按 [CH 安装与迁移说明](warehouse.md) 完成历史迁移、核验和切换。已迁移实例更新时继续使用原安装模式；程序保留持久记录的 CH 权威和已有凭据。
+新装或更新 ClickHouse 版本时，在仓库根目录准备或沿用 `.env`，然后运行 `docker compose up -d`。已有 PG 实例按 [CH 安装与迁移说明](warehouse.md) 完成历史迁移、核验和切换。
 
 仅执行旧 Compose 文件会缺少 CH 与队列配置。已登记 CH 安装的应用和 worker 会拒绝这种启动方式，防止显示过时的 PG 统计结果。下面的旧部署入口只适用于尚未启用 CH 的实例。
 

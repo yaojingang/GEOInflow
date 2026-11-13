@@ -99,6 +99,22 @@ Log processing retains sources, classifications, and verification evidence. Anal
 
 ## Quick deployment
 
+For a fresh ClickHouse installation, copy `env.example` to `.env` in the repository root, set four independent random secrets, and run the following command. See the [configuration and upgrade guide](docs/warehouse.md#新安装与应用升级).
+
+```sh
+docker compose up -d
+```
+
+To update, run the following in the same directory.
+
+```sh
+git pull --ff-only && docker compose up -d
+```
+
+Compose builds the image from source and runs database migrations in a container before starting the application and workers. Use `docker compose ps` to check their status. For an existing PostgreSQL installation, see the [ClickHouse installation and migration guide](docs/warehouse.md).
+
+### PostgreSQL installation
+
 Start Docker Engine / Docker Desktop and Docker Compose V2, and ensure that image and dependency download sources are reachable. Source builds require at least **6 GiB total Docker memory**; **8 GiB or more and at least 2 CPUs** are recommended, with free memory reserved for compilation. Run `sh scripts/liekan-deploy.sh --check` to check the build floor. See [deployment requirements](docs/deployment.en.md#requirements) for runtime capacity. After obtaining the source code, run this command from the project root:
 
 ```sh

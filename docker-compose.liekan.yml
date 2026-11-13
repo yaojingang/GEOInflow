@@ -1,7 +1,7 @@
 name: liekan
 services:
   app:
-    image: liekan:1.2.0
+    image: ${LIEKAN_APP_IMAGE:-liekan:1.2.0}
     build:
       context: .
       dockerfile: Dockerfile.liekan
@@ -47,7 +47,7 @@ services:
       start_period: 30m
     restart: unless-stopped
   log-worker:
-    image: liekan:1.2.0
+    image: ${LIEKAN_APP_IMAGE:-liekan:1.2.0}
     command: ['node', 'dist/liekan-worker.mjs']
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
@@ -81,7 +81,7 @@ services:
       retries: 4
     restart: unless-stopped
   analytics-worker:
-    image: liekan:1.2.0
+    image: ${LIEKAN_APP_IMAGE:-liekan:1.2.0}
     command: ['node', 'dist/liekan-analytics-worker.mjs']
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}

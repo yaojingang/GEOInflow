@@ -10,9 +10,9 @@ GEOInflow 的 ClickHouse 版本将日志、浏览器事件及关联分析证据�
 
 ## 服务与配置
 
-仓库的 `docker-compose.warehouse.yml` 与 `docker-compose.liekan.yml` 组合使用。CH 和队列默认只在 Compose 内网开放；应用仍绑定 `127.0.0.1:3002`。入口代理与可信 IP 设置继续遵循 `docs/local-deployment.md`。
+仓库根目录的 `compose.yml` 组合应用与仓库服务。CH 和队列默认只在 Compose 内网开放，应用绑定 `127.0.0.1:3002`。入口代理与可信 IP 设置继续遵循 `docs/local-deployment.md`。
 
-私有 `.env` 保存原数据库密码、APP_SECRET、双重验证密钥和新增的 `LIEKAN_CLICKHOUSE_PASSWORD`。部署脚本保留现有值；发现数据卷而配置缺失时拒绝生成新凭据。不要将 `.env`、备份或导出数据提交到版本库。
+私有 `.env` 保存数据库密码、应用密钥、双重验证密钥和 ClickHouse 密码。升级或恢复时使用原有 `.env`、Compose 项目名和数据卷。不要将 `.env`、备份或导出数据提交到版本库。
 
 主要配置：
 
@@ -49,17 +49,27 @@ GEOInflow 的 ClickHouse 版本将日志、浏览器事件及关联分析证据�
 
 ## 新安装与应用升级
 
-主机需要 Docker Compose 与 Python 3。若使用服务器自动日志采集，先按 `docs/automatic-logs.md` 用受控签名密钥执行 `pnpm liekan:build-agent`，再构建应用镜像；签名资产不在 Git 中，部署脚本不会自动生成生产签名密钥。本地验证的开发签名资产不能作为生产发布资产。
+主机需要 Docker 和 Docker Compose V2（2.20.3 或更新）。若使用服务器自动日志采集，先按[自动日志接入说明](automatic-logs.md)准备签名资产。
 
-运行：
+首次安装时，在仓库根目录将 `env.example` 复制为 `.env`。为 `POSTGRES_PASSWORD`、`APP_SECRET`、`TWO_FACTOR_ENCRYPTION_KEY` 和 `LIEKAN_CLICKHOUSE_PASSWORD` 各生成一个独立的随机值，每次可运行 `openssl rand -hex 32`。将文件权限设为 `0600`。如果还要在宿主机运行开发工具，将 `DATABASE_URL` 中的密码同步为 `POSTGRES_PASSWORD` 的值。
 
 ```bash
-python3 scripts/liekan-warehouse-deploy.py --mode fresh
+docker compose up -d
 ```
 
-程序依次构建应用、确认依赖、停止旧写入进程、执行增量迁移、绑定安装身份、导入明确标记的示例，再启动应用与 worker。示例按页写入和验证，可重试续传；已有或已删除的示例不会重新覆盖。首次登录为 `admin / liekan`；现有账号保留原凭据。
+Compose 构建应用镜像，等待存储服务健康，由 `warehouse-init` 执行迁移、初始化队列并导入官方示例。应用在初始化成功后启动，worker 等待应用健康。执行 `docker compose ps` 查看状态，执行 `docker compose logs warehouse-init` 查看初始化结果。默认访问 `http://127.0.0.1:3002`，首次登录账号和密码为 `admin / liekan`。
 
-已有 PG 数据使用：
+升级源码版时保留原 `.env`，在同一个目录运行：
+
+```bash
+git pull --ff-only && docker compose up -d
+```
+
+默认由 Compose 重新构建应用镜像并复用构建缓存。镜像变化时，Compose 替换应用和 worker，并让新版进程等待新版初始化成功。升级期间应用可能短暂停止服务。原来通过 PG 迁移安装的实例继续使用 `LIEKAN_INSTALL_MODE=pg-transition`。
+
+使用本机已有的预构建镜像时，在 `.env` 将 `LIEKAN_APP_IMAGE` 设为该镜像的版本标签，并设置 `LIEKAN_APP_PULL_POLICY=never`，然后运行 `docker compose up -d`。
+
+已有 PG 数据需要迁移到 CH 时，使用仓库的补充部署脚本：
 
 ```bash
 python3 scripts/liekan-warehouse-deploy.py --mode pg-transition
@@ -69,9 +79,9 @@ python3 scripts/liekan-warehouse-deploy.py --mode pg-transition
 
 部署失败后保留已有数据和配置。修复错误后重试同一命令；不要启动旧版本写入进程去绕过新保护。
 
-CH 安装后的更新继续使用这个部署入口。`sh scripts/liekan-deploy.sh` 和仅包含 `docker-compose.liekan.yml` 的命令不能代替它。应用、日志 worker 与分析 worker 会读取持久安装标记；发现已安装 CH 但缺少对应运行配置时拒绝启动，防止误读旧 PG 事实。恢复完整 Compose 配置后重试，不能删除安装标记来绕过校验。
+需要自动生成私有配置或在升级前核对现有存储容器时，也可以用 `python3 scripts/liekan-warehouse-deploy.py` 并沿用原安装模式。此脚本需要 Python 3。
 
-部署前会核对既有 CH、队列和缓存容器的 Compose 配置。修改 CPU、内存、命令、凭据或镜像后，旧容器仅执行 `start` 不会采用这些变更；脚本会在构建和启停服务前报告配置不一致并退出。PG 始终保留原容器及其引擎版本，不随应用更新自动重建。
+部署脚本会核对既有 CH、队列和缓存容器的 Compose 配置，在发现不一致时退出，并保留原 PG 容器及其引擎版本。直接使用 Compose 时，已有存储服务会按所声明的镜像和配置进行协调。常规应用升级请保留现有存储镜像和配置。存储引擎升级按以下步骤处理。
 
 需要更新这些存储依赖时，先完成一致备份，核对目标镜像的升级兼容性、原卷名和私有凭据，再停止全部入口与 worker。用与部署相同的 `--env-file`、项目名和 Compose override，只重建报错的非 PG 服务，例如：
 

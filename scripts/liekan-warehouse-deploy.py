@@ -8,10 +8,12 @@ import re
 import secrets
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 FILES = ['-f', 'docker-compose.liekan.yml', '-f', 'docker-compose.warehouse.yml']
 COMPOSE_OPTIONS = []
+WORKERS = ('log-worker', 'analytics-worker', 'warehouse-worker', 'warehouse-transition', 'warehouse-maintenance')
 
 
 def compose(*args, capture=False):
@@ -109,6 +111,40 @@ def dependencies(plan):
             compose('up', '-d', '--no-build', '--no-deps', '--wait', '--wait-timeout', '300', name)
 
 
+def select_source_image():
+    if not (ROOT / '.git').exists():
+        return None
+    revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    if not re.fullmatch(r'[a-f0-9]{40}', revision):
+        raise RuntimeError('Cannot determine the Git revision for the application image.')
+    untracked = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], cwd=ROOT)
+    if untracked or subprocess.run(['git', 'diff', '--quiet', 'HEAD', '--'], cwd=ROOT).returncode:
+        raise RuntimeError('Use a clean Git checkout before building a revision-tagged image.')
+    os.environ['LIEKAN_REVISION'] = revision
+    image = f'geoinflow-local:{revision}'
+    os.environ['LIEKAN_APP_IMAGE'] = image
+    return image
+
+
+def save_source_image(env_file, image):
+    previous = env_file.read_bytes()
+    key = b'LIEKAN_APP_IMAGE='
+    # Replace the tag this script wrote at the end of the dotenv file.
+    contents = re.sub(rb'(?m)^LIEKAN_APP_IMAGE=geoinflow-local:[a-f0-9]{40}\n\Z', b'', previous)
+    if contents and not contents.endswith(b'\n'):
+        contents += b'\n'
+    updated = contents + key + image.encode() + b'\n'
+    if updated == previous:
+        return
+    with tempfile.TemporaryDirectory(dir=env_file.parent) as directory:
+        candidate = Path(directory) / '.env'
+        with candidate.open('xb') as file:
+            file.write(updated)
+            file.flush()
+            os.fsync(file.fileno())
+        candidate.replace(env_file)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode', choices=['fresh', 'pg-transition'], required=True)
@@ -120,26 +156,36 @@ def main():
     if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{2,62}',args.project):raise RuntimeError('Invalid project name.')
     args.env_file=args.env_file.resolve()
     COMPOSE_OPTIONS.extend(['--env-file',str(args.env_file),'--project-name',args.project])
-    for override in args.compose_override:FILES.extend(['-f',str(override.resolve())])
+    standard_compose = (ROOT / 'compose.yml').is_file() and not args.compose_override
+    if standard_compose:
+        FILES.clear()
+    else:
+        for override in args.compose_override:
+            FILES.extend(['-f', str(override.resolve())])
     os.umask(0o077)
     (ROOT / '.local').mkdir(exist_ok=True)
     # Same OS lock as the legacy deployment script. Released on every exit.
     import fcntl
     with (ROOT / '.local/liekan-deploy.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        image = select_source_image() if standard_compose and not args.no_build else None
         private_config(args.mode,args.env_file,args.project)
         config = json.loads(compose('config', '--format', 'json', capture=True))
+        if image and any(config['services'][name]['image'] != image
+                         for name in ('app', *WORKERS, 'warehouse-init')):
+            raise RuntimeError('Compose application services must all use the source image.')
         plan = dependency_plan(config, ['db', 'analytics-cache', 'warehouse-ch', 'warehouse-queue'])
         if not args.no_build:
             compose('build', 'app')
         dependencies(plan)
-        compose('stop', '-t', '120', 'app', 'log-worker', 'analytics-worker', 'warehouse-worker', 'warehouse-transition', 'warehouse-maintenance')
+        compose('stop', '-t', '120', 'app', *WORKERS)
         # A failure leaves old writers stopped. Retrying resumes the same durable
         # installation; never restart an unfenced writer against a partial upgrade.
         compose('run', '--rm', '--no-deps', 'warehouse-init')
         compose('up', '-d', '--no-build', '--no-deps', '--wait', '--wait-timeout', '300', 'app')
-        compose('up', '-d', '--no-build', '--no-deps', '--wait', '--wait-timeout', '300',
-                'log-worker', 'analytics-worker', 'warehouse-worker', 'warehouse-transition', 'warehouse-maintenance')
+        compose('up', '-d', '--no-build', '--no-deps', '--wait', '--wait-timeout', '300', *WORKERS)
+        if image:
+            save_source_image(args.env_file, image)
         print('GEOInflow warehouse services ready: http://127.0.0.1:3002')
         if args.mode == 'pg-transition':
             print('Unfinished PostgreSQL upgrades require migration, verification and explicit cutover. Completed installations keep their stored authority.')

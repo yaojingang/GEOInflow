@@ -280,6 +280,17 @@
       "removalCondition": "Remove when the upstream surface follows the same product and distribution boundaries"
     },
     {
+      "path": "compose.yml",
+      "purpose": "Expose the GEOInflow ClickHouse stack as the default Docker Compose project",
+      "tests": [
+        "docker compose config",
+        "python3 tests/liekan/warehouse-deploy.test.py"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Retain the warehouse service definitions, data volume names and deployment migration order",
+      "removalCondition": "Remove when the maintained warehouse stack has an equivalent default Compose entry"
+    },
+    {
       "path": "docker-compose.liekan-clickhouse.yml",
       "purpose": "Optional historical ClickHouse analytics deployment and administrator entry",
       "tests": [
@@ -312,6 +323,22 @@
       "owner": "Liekan installation maintenance",
       "constraint": "Preserve authentication algorithms, infrastructure credentials and upstream migration files",
       "removalCondition": "Remove when upstream initialization supports the Liekan product default through an extension point"
+    },
+    {
+      "path": "docker-compose.yml",
+      "purpose": "Reserve the default Compose discovery path for the GEOInflow stack",
+      "tests": ["docker compose config --services"],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Retain the upstream Compose file as docker-compose.umami.yml",
+      "removalCondition": "Remove when the upstream stack is no longer distributed alongside GEOInflow"
+    },
+    {
+      "path": "docker-compose.umami.yml",
+      "purpose": "Retain the standalone upstream Umami Compose configuration",
+      "tests": ["docker compose -f docker-compose.umami.yml config --services"],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Preserve upstream service definitions and data volume names",
+      "removalCondition": "Remove when the upstream stack is no longer distributed alongside GEOInflow"
     },
     {
       "path": "docker-compose.warehouse.yml",
