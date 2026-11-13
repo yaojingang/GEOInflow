@@ -347,34 +347,42 @@ function Websites() {
   const reading = useManualRefresh();
   const enteredAt = useRef(Date.now());
   const readAt = reading?.page.now ?? enteredAt.current;
-  const query = useData(
-    ['website-management-stats', c.sites.map(site => site.id)],
-    signal =>
-      getFeatureWebsiteSummary(
-        c.sites.map(site => site.id),
-        c.range,
-        signal,
-        c.api.get,
-      ),
-    c.sitesReady !== false,
-  );
-  // 今日窗口自带 compare=昨日，四个指标列共用一次请求。
+  const siteIds = c.sites.map(site => site.id);
+  const canRead = c.sitesReady !== false;
   const todayWindow = websiteDayWindow(c.range.timezone, readAt);
-  const todayQuery = useData(
-    ['website-management-today', c.sites.map(site => site.id), todayWindow.startAt],
-    signal =>
-      getFeatureWebsiteSummary(
-        c.sites.map(site => site.id),
-        todayWindow,
-        signal,
-        c.api.get,
-      ),
-    c.sitesReady !== false,
+  const showsToday = c.range.startAt === todayWindow.startAt && c.range.endAt === todayWindow.endAt;
+  const selectedQuery = useData(
+    ['website-management-stats', siteIds],
+    signal => getFeatureWebsiteSummary(siteIds, c.range, signal, c.api.get),
+    canRead && !showsToday,
   );
+  const todayQuery = useData(
+    ['website-management-today', siteIds, todayWindow.startAt],
+    signal => getFeatureWebsiteSummary(siteIds, todayWindow, signal, c.api.get),
+    canRead,
+    {
+      queryKey: [
+        'liekan-feature',
+        c.user?.id,
+        c.siteId,
+        c.route.teamId,
+        c.route.context,
+        c.query.scope,
+        c.route.id,
+        todayWindow,
+        'website-management-today',
+        siteIds,
+      ],
+      staleTime: 0,
+    },
+  );
+  const query = showsToday ? todayQuery : selectedQuery;
   const stats = query.data || [];
   const todayStats = todayQuery.data || [];
   const readable = stats.filter(row => !row.error);
-  const populations = [...readable, ...todayStats.filter(row => !row.error)]
+  const populations = (
+    showsToday ? readable : [...readable, ...todayStats.filter(row => !row.error)]
+  )
     .map(row => row.population)
     .filter(population => population?.metricScope === 'qualified-browser');
   const populationNotice = populations.some(population => !identityUsable(population))

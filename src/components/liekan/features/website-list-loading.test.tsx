@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { websiteDayWindow } from '@/lib/liekan/upstream/website-day-metrics';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { DataLoading } from '../DataLoading';
 import { CorePages } from './CorePages';
@@ -39,25 +40,29 @@ beforeEach(() => {
 });
 afterEach(() => client.clear());
 
-function page(loading = false) {
+function page(loading = false, range = { startAt: 0, endAt: 1000, timezone: 'Asia/Shanghai' }) {
   return (
     <QueryClientProvider client={client}>
-      <FeatureProvider value={{
-        user: { id: 'owner', role: 'user' },
-        route: { page: 'websites' },
-        sites: [site],
-        sitesReady: !loading,
-        teams: [],
-        siteId: '',
-        range: { startAt: 0, endAt: 1000, timezone: 'Asia/Shanghai' },
-        query: {},
-        filters: {},
-        api: { get: vi.fn() },
-        href: (page: string) => `/websites/101/${page}`,
-        navigate: vi.fn(),
-        notify: vi.fn(),
-        refresh: vi.fn(),
-      } as any}>
+      <FeatureProvider
+        value={
+          {
+            user: { id: 'owner', role: 'user' },
+            route: { page: 'websites' },
+            sites: [site],
+            sitesReady: !loading,
+            teams: [],
+            siteId: '',
+            range,
+            query: {},
+            filters: {},
+            api: { get: vi.fn() },
+            href: (page: string) => `/websites/101/${page}`,
+            navigate: vi.fn(),
+            notify: vi.fn(),
+            refresh: vi.fn(),
+          } as any
+        }
+      >
         <DataLoading loading={loading}>
           <CorePages page="websites" />
         </DataLoading>
@@ -66,6 +71,17 @@ function page(loading = false) {
   );
 }
 
+it('shares a single natural-day request between the totals and the website rows', async () => {
+  const range = websiteDayWindow('Asia/Shanghai');
+  render(page(false, range));
+  await waitFor(() => expect(mocks.summary).toHaveBeenCalledTimes(1));
+  expect(mocks.summary.mock.calls[0][1]).toEqual(range);
+  await act(async () => resolveSummary(summary));
+  expect(await within(screen.getByRole('table')).findByText('已收到浏览数据')).toBeVisible();
+  expect(document.querySelectorAll('.metric')[1]).toHaveTextContent('9');
+  expect(mocks.summary).toHaveBeenCalledTimes(1);
+});
+
 it('shows searchable website identities and actions while both statistics reads are pending', async () => {
   render(page());
   await waitFor(() => expect(mocks.summary).toHaveBeenCalledTimes(2));
@@ -73,7 +89,8 @@ it('shows searchable website identities and actions while both statistics reads 
   expect(within(table).getByRole('link', { name: site.name })).toBeVisible();
   expect(within(table).getByText(site.domain)).toBeVisible();
   expect(within(table).getByRole('link', { name: '网站设置' })).toHaveAttribute(
-    'href', '/websites/101/website-settings',
+    'href',
+    '/websites/101/website-settings',
   );
   expect(within(table).queryByText('0')).not.toBeInTheDocument();
   await userEvent.type(screen.getByRole('searchbox', { name: '搜索本页记录' }), '不存在');
@@ -94,9 +111,9 @@ it.each([500, 403])('keeps website links available when statistics fail with %s'
   );
   expect(screen.getByRole('link', { name: site.name })).toBeVisible();
   expect(screen.getByRole('link', { name: '网站设置' })).toBeVisible();
-  expect(within(screen.getByRole('table')).getByText(
-    status === 403 ? '无统计权限' : '读取失败',
-  )).toBeVisible();
+  expect(
+    within(screen.getByRole('table')).getByText(status === 403 ? '无统计权限' : '读取失败'),
+  ).toBeVisible();
 });
 
 it('fills daily metrics while the selected-period summary is still pending', async () => {

@@ -201,14 +201,22 @@ export function normalizedHostnameRelation() {
         WHERE website_id={wh_site:UUID} AND epoch={wh_epoch:UInt64} AND family='website_event' AND publication<={wh_publication:UInt64} GROUP BY attempt_id)
     GROUP BY key)`;
 }
+function browserEventEligibility() {
+  const hostname = `coalesce(q.hostname,nullIf(arrayElement({wh_host_values:Array(String)},indexOf({wh_host_hashes:Array(String)},lower(hex(SHA256(coalesce(e.hostname,'')))))),''),nullIf(host.hostname,''))`;
+  return `{wh_resource:String}='website' AND e.event_type IN(1,2,5) AND q.source='browser' AND q.classification<>'automated'
+      AND NOT has(q.reasons,'bot_check_disabled') AND ({wh_policy_mode:String}<>'strict' OR q.classification<>'suspected')
+      AND (empty({wh_allowed_hosts:Array(String)}) OR (has({wh_allowed_hosts:Array(String)},${hostname})
+        AND (isNull(env.origin_hostname) OR has({wh_allowed_hosts:Array(String)},env.origin_hostname))))`;
+}
+
+function browserExclusions(options?: FactReadOptions) {
+  return `AND e.event_id NOT IN (SELECT event_id FROM ${factRelation('liekan_traffic_exclusion_member', options)} WHERE collection_id IN {wh_exclusions:Array(UUID)})`;
+}
+
 export function browserEventRelation(
   population: 'admissible' | 'observed' | 'qualified' = 'qualified',
 ) {
-  const hostname = `coalesce(q.hostname,nullIf(arrayElement({wh_host_values:Array(String)},indexOf({wh_host_hashes:Array(String)},lower(hex(SHA256(coalesce(e.hostname,'')))))),''),nullIf(host.hostname,''))`;
-  const excluded =
-    population === 'admissible'
-      ? ''
-      : `AND e.event_id NOT IN (SELECT event_id FROM ${factRelation('liekan_traffic_exclusion_member')} WHERE collection_id IN {wh_exclusions:Array(UUID)})`;
+  const excluded = population === 'admissible' ? '' : browserExclusions();
   const qualified =
     population === 'qualified'
       ? "AND env.scope='browser' AND env.identity_available AND q.classification='browser'"
@@ -217,10 +225,64 @@ export function browserEventRelation(
     INNER JOIN ${repairedQualityRelation()} q ON q.website_id=e.website_id AND q.event_id=e.event_id
     LEFT JOIN ${factRelation('liekan_event_environment')} env ON env.website_id=e.website_id AND env.event_id=e.event_id
     LEFT JOIN ${normalizedHostnameRelation()} host ON host.key=lower(hex(SHA256(coalesce(e.hostname,''))))
-    WHERE {wh_resource:String}='website' AND e.event_type IN(1,2,5) AND q.source='browser' AND q.classification<>'automated'
-      AND NOT has(q.reasons,'bot_check_disabled') AND ({wh_policy_mode:String}<>'strict' OR q.classification<>'suspected')
-      AND (empty({wh_allowed_hosts:Array(String)}) OR (has({wh_allowed_hosts:Array(String)},${hostname})
-        AND (isNull(env.origin_hostname) OR has({wh_allowed_hosts:Array(String)},env.origin_hostname)))) ${excluded} ${qualified})`;
+    WHERE ${browserEventEligibility()} ${excluded} ${qualified})`;
+}
+
+/** The summary needs both observed and qualified traffic from the same event rows. */
+export function websiteSummaryEventRelation(metadata: ReportingMetadata) {
+  const qualityColumns = [
+    'event_id',
+    'website_id',
+    'classification',
+    'source',
+    'reasons',
+    'rule_version',
+    'catalog_version',
+    'hostname',
+  ];
+  const repair = metadata.repairRunId && metadata.repairGeneration;
+  const quality = repair
+    ? repairedQualityRelation()
+    : factRelation('liekan_event_quality', { columns: qualityColumns });
+  const host = metadata.allowedHostnames.length
+    ? normalizedHostnameRelation()
+    : "(SELECT '' AS key, '' AS hostname WHERE 0)";
+  return `(SELECT e.created_at AS created_at,e.session_id AS session_id,e.visit_id AS visit_id,e.event_type AS event_type,
+      e.utm_source AS utm_source,e.utm_medium AS utm_medium,e.referrer_domain AS referrer_domain,
+      (env.scope='browser' AND env.identity_available AND q.classification='browser'
+        AND present.session_id IS NOT NULL) AS qualified,
+      env.identity_version AS identity_version,q.rule_version AS rule_version,
+      toString(q.catalog_version) AS catalog_version
+    FROM ${factRelation('website_event', {
+      columns: [
+        'event_id',
+        'website_id',
+        'created_at',
+        'session_id',
+        'visit_id',
+        'event_type',
+        'utm_source',
+        'utm_medium',
+        'referrer_domain',
+        'hostname',
+      ],
+      immutableTimeWindow: { start: 'previousStart', end: 'end' },
+    })} e
+    INNER JOIN ${quality} q ON q.website_id=e.website_id AND q.event_id=e.event_id
+    LEFT JOIN ${factRelation('liekan_event_environment', {
+      columns: [
+        'website_id',
+        'event_id',
+        'scope',
+        'identity_available',
+        'identity_version',
+        'origin_hostname',
+      ],
+    })} env ON env.website_id=e.website_id AND env.event_id=e.event_id
+    LEFT JOIN ${factRelation('session', { columns: ['website_id', 'session_id'] })} present
+      ON present.website_id=e.website_id AND present.session_id=e.session_id
+    LEFT JOIN ${host} host ON host.key=lower(hex(SHA256(coalesce(e.hostname,''))))
+    WHERE ${browserEventEligibility()} ${metadata.exclusions.length ? browserExclusions({ columns: ['event_id', 'collection_id'] }) : ''})`;
 }
 export function websiteEventRelation(population: 'observed' | 'qualified' = 'qualified') {
   return `(SELECT * FROM ${browserEventRelation(population)} UNION ALL SELECT ${columns('website_event', 'e')} FROM ${factRelation('website_event')} e
