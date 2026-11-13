@@ -1,29 +1,28 @@
-import { readClickHouseLogRollup, readClickHouseLogSeries } from './analytics-engine-read';
+import { createHash } from 'node:crypto';
+import { formatInTimeZone, fromZonedTime } from 'date-fns-tz';
+import { calendarDayRange } from '../contracts/calendar';
+import type { CrawlerMetricOptions } from '../contracts/crawler-metrics';
+import type { CrawlerPageFilters } from '../contracts/query';
+import { crawlerIdentitySql } from '../crawlers/metric-scope';
+import { getPublishedCatalog } from '../crawlers/published';
+import { decodeCursor, encodeCursor } from '../cursor';
+import { CRAWLER_POPULATION_VERSION, crawlerAiSql, unknownCrawlerSql } from '../rules/population';
+import { withLogStatisticsRead } from './ai-log-read-priority';
 import {
   readAnalysisLogRollup,
   readAnalysisLogSeries,
   readAnalysisLogToday,
 } from './analysis-rollups';
-import { getPublishedCatalog } from '../crawlers/published';
-import { createHash } from 'node:crypto';
-import { CRAWLER_POPULATION_VERSION } from '../rules/population';
-import type { CrawlerMetricOptions } from '../contracts/crawler-metrics';
-import type { CrawlerPageFilters } from '../contracts/query';
-import { crawlerIdentitySql } from '../crawlers/metric-scope';
-import { crawlerAiSql, unknownCrawlerSql } from '../rules/population';
-import { logInputConnectedSql } from './log-input';
-import { withLogStatisticsRead } from './ai-log-read-priority';
-import { formatInTimeZone, fromZonedTime } from 'date-fns-tz';
-import { calendarDayRange } from '../contracts/calendar';
-import { readReportFragment, reportFragmentsActive } from './report-fragments';
 import { analysisSafeNumber } from './analysis-rollups-model';
-import { decodeCursor, encodeCursor } from '../cursor';
-import { humanPathFromEncoded } from './paths';
-import { LiekanError, query } from './server';
 import { warehouseEnabled } from '../warehouse/runtime';
+import { readClickHouseLogRollup, readClickHouseLogSeries } from './analytics-engine-read';
 import { staticRequestExtensionPattern } from './log-content-boundary';
+import { logInputConnectedSql } from './log-input';
+import { humanPathFromEncoded } from './paths';
+import { readReportFragment, reportFragmentsActive } from './report-fragments';
+import { LiekanError, query } from './server';
 
-export { staticRequestExtensionPattern, isStaticRequestPath } from './log-content-boundary';
+export { isStaticRequestPath, staticRequestExtensionPattern } from './log-content-boundary';
 
 const readPreferredLogRollup = async (input: Parameters<typeof readAnalysisLogRollup>[0]) =>
   (await readClickHouseLogRollup(input)) ?? readAnalysisLogRollup(input);
@@ -48,8 +47,13 @@ async function readPreferredLogSeries(input: Parameters<typeof readAnalysisLogSe
       boundaries.push(at);
     }
   } else {
-    const today = calendarDayRange(Date.now(), timezone).startAt;
-    if (today > +startDate && today < +endDate) boundaries.push(today);
+    let at = +startDate;
+    while (at < +endDate) {
+      const next = calendarDayRange(at, timezone).endAt + 1;
+      if (next >= +endDate) break;
+      boundaries.push(next);
+      at = next;
+    }
   }
   boundaries.push(+endDate);
   const combined = new Map<
@@ -59,8 +63,14 @@ async function readPreferredLogSeries(input: Parameters<typeof readAnalysisLogSe
   for (let index = 1; index < boundaries.length; index++) {
     const start = new Date(boundaries[index - 1]),
       end = new Date(boundaries[index]);
-    const rows = await readReportFragment('log-series', start, end, conditions, () =>
-      readLogSeries({ ...input, startDate: start, endDate: end }, true),
+    const rows = await readReportFragment(
+      'log-series',
+      start,
+      end,
+      conditions,
+      () => readLogSeries({ ...input, startDate: start, endDate: end }, true),
+      false,
+      'log',
     );
     if (!rows) return null;
     for (const row of rows) {
@@ -109,7 +119,8 @@ async function readLogFacts(
     crawlerIdentityScope: 'all',
   },
   fullExport = false,
-  comparisonBoundary?: [Date, string],
+  comparisonBoundary?: [Date | string, string],
+  detailRead?: { cursorScope: string; limit: 101 },
 ) {
   const read = <T = any>(sql: string, ...params: any[]) =>
     withLogStatisticsRead(() => query<T>(sql, ...params));
@@ -163,13 +174,14 @@ async function readLogFacts(
           ? ` AND ${unknown}`
           : '';
   const [cursorState] =
-    metrics.crawlerMetricsVersion === 1
+    metrics.crawlerMetricsVersion === 1 && !detailRead
       ? await read(
           'SELECT epoch,policy_revision::text FROM liekan_log_state WHERE website_id=$1::uuid',
           id,
         )
       : [];
   const acceleratedClassification =
+    !detailRead &&
     metrics.crawlerMetricsVersion === 1 &&
     (!fields || fields.includes('recent')) &&
     !filter &&
@@ -187,46 +199,52 @@ async function readLogFacts(
       : null;
   const [cursorClassification] = acceleratedClassification
     ? [{ versions: acceleratedClassification.classificationSet }]
-    : metrics.crawlerMetricsVersion === 1 && (!fields || fields.includes('recent'))
+    : !detailRead && metrics.crawlerMetricsVersion === 1 && (!fields || fields.includes('recent'))
       ? await q(
           `SELECT coalesce(string_agg(DISTINCT l.reporting_classification_version,','),'legacy') AS versions ${identityBase}${filterSql}`,
         )
       : [];
-  const [repair] = await read(
-    'SELECT active_generation::text,active_revision::text FROM liekan_history_repair_run WHERE website_id=$1::uuid',
-    id,
-  );
-  const cursorScope = createHash('sha256')
-    .update(
-      JSON.stringify({
+  const [repair] = detailRead
+    ? []
+    : await read(
+        'SELECT active_generation::text,active_revision::text FROM liekan_history_repair_run WHERE website_id=$1::uuid',
         id,
-        start,
-        end,
-        timezone,
-        filter,
-        search,
-        metrics: {
-          crawlerIdentityScope: metrics.crawlerIdentityScope,
-          crawlerMetricsVersion: metrics.crawlerMetricsVersion,
-        },
-        classification: CRAWLER_POPULATION_VERSION,
-        catalogVersion: getPublishedCatalog()?.version ?? null,
-        historyRepair: {
-          generation: repair?.active_generation || null,
-          revision: repair?.active_revision || '0',
-        },
-        classificationVersions: cursorClassification?.versions ?? null,
-        epoch: cursorState?.epoch ?? 1,
-        policyRevision: cursorState?.policy_revision ?? '0',
-      }),
-    )
-    .digest('hex');
+      );
+  const cursorScope =
+    detailRead?.cursorScope ||
+    createHash('sha256')
+      .update(
+        JSON.stringify({
+          id,
+          start,
+          end,
+          timezone,
+          filter,
+          search,
+          metrics: {
+            crawlerIdentityScope: metrics.crawlerIdentityScope,
+            crawlerMetricsVersion: metrics.crawlerMetricsVersion,
+          },
+          classification: CRAWLER_POPULATION_VERSION,
+          catalogVersion: getPublishedCatalog()?.version ?? null,
+          historyRepair: {
+            generation: repair?.active_generation || null,
+            revision: repair?.active_revision || '0',
+          },
+          classificationVersions: cursorClassification?.versions ?? null,
+          epoch: cursorState?.epoch ?? 1,
+          policyRevision: cursorState?.policy_revision ?? '0',
+        }),
+      )
+      .digest('hex');
   let boundary: [Date, string];
   if (cursor) {
     try {
       // Export comparison has already checked the page's policy/catalog/epoch baseline.
       // Its original keyset boundary survives a late record introducing a classification version.
-      boundary = comparisonBoundary ?? decodeCursor(cursor, cursorScope);
+      boundary = comparisonBoundary
+        ? [new Date(comparisonBoundary[0]), comparisonBoundary[1]]
+        : decodeCursor(cursor, cursorScope);
     } catch {
       throw new LiekanError('日志游标已失效，请重新读取', 409, 'history-repair-cursor-conflict');
     }
@@ -301,6 +319,9 @@ async function readLogFacts(
           metrics.resource === 'ai/pages' && !metrics.botId ? (metrics.botName ?? null) : null,
         )
       : Promise.resolve([]);
+  const searchCondition = search
+    ? ` AND strpos(lower(concat_ws(' ',path,user_agent,method,status::text,ip_masked,location,bot,bot_type,CASE verification WHEN 'verified_range' THEN '官方 IP 范围匹配' WHEN 'verified_dns' THEN '官方 DNS 双向核验' WHEN 'verified_edge' THEN '可信边缘身份核验' WHEN 'range_mismatch' THEN '官方范围未匹配' ELSE '身份未核验' END)) ,lower($5))>0`
+    : ' AND $5::text IS NOT NULL';
   const [aggregates, catalog, latest, recent, count] = await Promise.all([
     aggregatesRead,
     needs('catalog')
@@ -317,18 +338,14 @@ async function readLogFacts(
       : Promise.resolve([]),
     needs('recent')
       ? read(
-          `SELECT id AS "recordId",created_at AS time,ip_masked AS "ipMasked",location,method,path,status,user_agent AS "userAgent",bot,l.reporting_crawler_id AS "botId",l.reporting_catalog_version AS "catalogVersion",e.identity_evidence AS "identityEvidence",bot_type AS "botType",verification,${crawlerAiSql()} AS "aiEligible",recognition_state AS "recognitionState",verification_version AS "verificationVersion",verification_observed_at AS "verificationObservedAt",verification_reason AS "verificationReason" ${identityBase}${filterSql} AND strpos(lower(concat_ws(' ',path,user_agent,method,status::text,ip_masked,location,bot,bot_type,CASE verification WHEN 'verified_range' THEN '官方 IP 范围匹配' WHEN 'verified_dns' THEN '官方 DNS 双向核验' WHEN 'verified_edge' THEN '可信边缘身份核验' WHEN 'range_mismatch' THEN '官方范围未匹配' ELSE '身份未核验' END)) ,lower($5))>0 ${seekSql} ORDER BY created_at ${direction},id ${direction} LIMIT ${fullExport ? 100001 : 100}${paginationSql}`,
+          `SELECT id AS "recordId",created_at AS time,ip_masked AS "ipMasked",location,method,path,status,user_agent AS "userAgent",bot,l.reporting_crawler_id AS "botId",l.reporting_catalog_version AS "catalogVersion",e.identity_evidence AS "identityEvidence",bot_type AS "botType",verification,${crawlerAiSql()} AS "aiEligible",recognition_state AS "recognitionState",verification_version AS "verificationVersion",verification_observed_at AS "verificationObservedAt",verification_reason AS "verificationReason" ${identityBase}${filterSql}${searchCondition} ${seekSql} ORDER BY created_at ${direction},id ${direction} LIMIT ${fullExport ? 100001 : detailRead?.limit || 100}${paginationSql}`,
           ...args,
           search,
           ...(cursor ? boundary : [(page - 1) * 100]),
         )
       : Promise.resolve([]),
     needs('count')
-      ? read(
-          `SELECT count(*)::int AS count ${base}${filterSql} AND strpos(lower(concat_ws(' ',path,user_agent,method,status::text,ip_masked,location,bot,bot_type,CASE verification WHEN 'verified_range' THEN '官方 IP 范围匹配' WHEN 'verified_dns' THEN '官方 DNS 双向核验' WHEN 'verified_edge' THEN '可信边缘身份核验' WHEN 'range_mismatch' THEN '官方范围未匹配' ELSE '身份未核验' END)) ,lower($5))>0`,
-          ...args,
-          search,
-        )
+      ? read(`SELECT count(*)::int AS count ${base}${filterSql}${searchCondition}`, ...args, search)
       : Promise.resolve([{ count: 0 }]),
   ]);
   const {

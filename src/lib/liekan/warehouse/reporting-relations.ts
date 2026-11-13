@@ -7,6 +7,7 @@ export type ReportingMetadata = {
   controlRevision: string;
   catalogRevision?: string;
   bookmarkRevision?: string;
+  logRevision?: string;
   population: Record<string, unknown>;
   reports: { id: string; name: string; type: string; parameters: Record<string, any> }[];
   policyMode: string;

@@ -11,7 +11,6 @@ import { fromPrisma } from 'pg-boss';
 import {
   HISTORY_REPAIR_CAMPAIGN,
   HISTORY_REPAIR_ENGINE,
-  HISTORY_REPAIR_QUEUE,
   type HistoryRepairCounts,
   type HistoryRepairRun,
   type HistoryRepairStatus,
@@ -28,6 +27,7 @@ import {
   type RepairRulepack,
   type PreviewPolicy,
 } from '../history-repair/model';
+import { sendRepairStep } from '../history-repair/queue';
 
 /** The SQL aliases i and r denote an input chunk and its run. */
 export const unreferencedRepairInputSql = `NOT EXISTS(SELECT 1 FROM liekan_history_repair_result p WHERE p.run_id=r.id AND p.generation IN(r.active_generation,r.previous_generation) AND p.proof->>'uploadId'=i.upload_id::text)
@@ -303,23 +303,7 @@ export async function enqueueRepair(
   delay = 0,
   recordPointer = true,
 ) {
-  const boss = await getQueue();
-  // Continuations get fresh queue identifiers and remain at the tail for fairness.
-  const stepId = randomUUID();
-  await boss.send(
-    HISTORY_REPAIR_QUEUE,
-    { runId: row.id, stepId },
-    {
-      id: stepId,
-      db: fromPrisma(tx as never),
-      retryLimit: 3,
-      retryDelay: 5,
-      retryBackoff: true,
-      expireInSeconds: 120,
-      retentionSeconds: 7 * 86400,
-      ...(delay ? { startAfter: delay } : {}),
-    },
-  );
+  const stepId = await sendRepairStep(await getQueue(), fromPrisma(tx), row.id, { delay });
   if (recordPointer)
     await tx.$executeRawUnsafe(
       'UPDATE liekan_history_repair_run SET queued_job_id=$2::uuid WHERE id=$1::uuid',

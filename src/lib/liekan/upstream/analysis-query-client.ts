@@ -1,5 +1,5 @@
 'use client';
-import { analysisAcceptedSchema, type AnalysisJob } from '../contracts/analysis-acceleration';
+import { type AnalysisJob, analysisAcceptedSchema } from '../contracts/analysis-acceleration';
 
 const privateTaskPath =
   /^\/liekan\/websites\/[a-f0-9-]{36}\/(?:analytics-jobs|overview-jobs)\/[a-f0-9-]{36}(\/result)?$/i;
@@ -33,6 +33,7 @@ export const analysisPendingStore = {
   },
 };
 export function analysisAsyncPath(path: string, parameters?: Record<string, unknown>) {
+  if (/^\/liekan\/websites\/[^/]+\/(?:log-count|log-summary)$/.test(path)) return true;
   if ([3, 4].includes(Number(parameters?.eventType))) return false;
   if (/^\/liekan\/websites\/[^/]+\/page-report$/.test(path))
     return !['logs', 'human/keywords'].includes(String(parameters?.resource));

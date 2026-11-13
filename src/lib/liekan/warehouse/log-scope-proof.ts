@@ -3,6 +3,7 @@ import type { Attempt } from './control';
 import { warehouseTime } from './fact-input';
 import type { LandedDecision } from './landing';
 import type { ManifestEntry } from './publication';
+import { datePruning, exactTimeFilter, type FactReadOptions } from './read';
 import { effectiveLogRelation } from './reporting-relations';
 
 export async function projectLogScopeProofs(
@@ -63,10 +64,22 @@ export async function projectLogScopeProofs(
 
 // A frozen repair reads the original import's scope without transferring a
 // site-sized list of import/event IDs to PG or trusting unpublished metadata.
-export function repairLogSourceRelation() {
-  return `(SELECT l.* FROM ${effectiveLogRelation()} l INNER JOIN
+export function repairLogSourceRelation(options?: FactReadOptions) {
+  const logs = effectiveLogRelation(options);
+  const window = options?.immutableTimeWindow;
+  // Every eligible import in the batch must occur among the physical logs in
+  // this window. Including unaccepted imports in the key set is harmless: the
+  // final join still checks the accepted log candidate and original scope.
+  const importKeys = window
+    ? `AND key IN (SELECT toString(import_id) FROM warehouse_liekan_log
+         PREWHERE _website_id={wh_site:UUID} AND _epoch={wh_epoch:UInt64} AND ${datePruning(window)}
+         WHERE ${exactTimeFilter(window)})`
+    : '';
+  return `(SELECT l.* FROM ${logs} l INNER JOIN
     (SELECT key,JSONExtractString(p.value,'candidateId') AS candidate,any(JSONExtractString(p.value,'value')) AS body
-     FROM warehouse_control_projection p WHERE website_id={wh_site:UUID} AND epoch={wh_epoch:UInt64} AND kind='log-import-scope-v1' AND revision=0 GROUP BY key,candidate) proof
+     FROM warehouse_control_projection p
+     PREWHERE website_id={wh_site:UUID} AND epoch={wh_epoch:UInt64} AND kind='log-import-scope-v1' AND revision=0 ${importKeys}
+     GROUP BY key,candidate) proof
     ON proof.key=toString(l.import_id) AND proof.candidate=toString(l._candidate_id)
     WHERE JSONExtractBool(proof.body,'present') AND isNull(JSONExtract(proof.body,'repairScopeId','Nullable(String)')))`;
 }

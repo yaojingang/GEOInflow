@@ -1,6 +1,6 @@
 import { warehouseTime } from '../warehouse/fact-input';
 import { repairLogSourceRelation } from '../warehouse/log-scope-proof';
-import { boundaryParameters, factRelation } from '../warehouse/read';
+import { acceptedCandidates, boundaryParameters, factRelation } from '../warehouse/read';
 import { warehouseReader } from '../warehouse/reader-runtime';
 import { qualityAuditRelation, reportingParameters } from '../warehouse/reporting-relations';
 import type { RunRow } from './history-repair-db';
@@ -111,27 +111,112 @@ export async function warehouseRepairEvidence(row: RunRow, ids: string[]) {
   );
   return rows.map(r => ({ record: JSON.parse(r.record) as SavedEvidence }));
 }
-export async function warehouseRepairLogs(row: RunRow): Promise<LogRow[]> {
-  const rows = await warehouseRepairQuery<any>(
+async function nextRepairLogDay(row: RunRow, previous: string | null) {
+  // Seek only days present in the frozen publication. The batch still applies
+  // row versions, deletion and original-import scope.
+  const [result] = await warehouseRepairQuery<{ day: string }>(
     row,
-    `SELECT l.id AS id,${iso('l.created_at')} AS time,formatDateTime(l.created_at,'%Y-%m-%d',{repairTimezone:String}) AS day,
+    `SELECT toDate32(_record_time) AS day FROM warehouse_liekan_log
+    WHERE _website_id={wh_site:UUID} AND _epoch={wh_epoch:UInt64}
+      ${previous ? 'AND toDate32(_record_time)>{previousDay:Date32}' : ''}
+      AND (_attempt_id,_candidate_id) IN (${acceptedCandidates('liekan_log')})
+    ORDER BY _website_id,_epoch,toDate32(_record_time) LIMIT 1 SETTINGS optimize_read_in_order=1`,
+    previous ? { previousDay: previous } : {},
+    true,
+  );
+  return result?.day;
+}
+
+export function repairLogBatchSQL() {
+  const logs = repairLogSourceRelation({
+    immutableTimeWindow: { start: 'repairDayStart', end: 'repairDayEnd', endExclusive: true },
+    orderedLogVersions: true,
+    narrowLogWindow: true,
+    columns: [
+      'website_id',
+      'id',
+      '_record_key',
+      '_candidate_id',
+      'import_id',
+      'created_at',
+      'source_id',
+      'user_agent',
+      'path',
+      'bot',
+      'vendor',
+      'bot_type',
+      'ai_eligible',
+      'recognition_state',
+      'recognition_candidates',
+      'verification',
+      'verification_version',
+      'verification_observed_at',
+      'verification_reason',
+    ],
+  });
+  const evidence = factRelation('liekan_crawler_evidence', {
+    columns: ['website_id', 'log_id', 'catalog_version', 'crawler_id', 'identity_evidence'],
+    evidenceLogBatch: true,
+  });
+  return `WITH repair_log_batch AS MATERIALIZED (
+      SELECT * FROM ${logs}
+      WHERE isNull({repairAfterTime:Nullable(DateTime64(6,'UTC'))})
+        OR (created_at,id)>({repairAfterTime:Nullable(DateTime64(6,'UTC'))},{repairLogAfterId:String})
+      ORDER BY created_at,id LIMIT {repairLimit:UInt32}
+    )
+    SELECT l.id AS id,${iso('l.created_at')} AS time,formatDateTime(l.created_at,'%Y-%m-%d',{repairTimezone:String}) AS day,
     l.user_agent AS user_agent,l.path AS path,e.catalog_version AS catalog_version,l.bot AS bot,l.vendor AS vendor,l.bot_type AS bot_type,
     l.ai_eligible AS ai_eligible,e.crawler_id AS crawler_id,l.recognition_state AS recognition_state,l.recognition_candidates AS recognition_candidates,
     l.verification AS verification,l.verification_version AS verification_version,${iso('l.verification_observed_at')} AS verification_observed_at,
     l.verification_reason AS verification_reason,e.identity_evidence AS identity_evidence
-    FROM ${repairLogSourceRelation()} l LEFT JOIN ${factRelation('liekan_crawler_evidence')} e ON e.website_id=l.website_id AND e.log_id=l.id
-    WHERE isNull({repairAfterTime:Nullable(DateTime64(6,'UTC'))}) OR (l.created_at,l.id)>({repairAfterTime:Nullable(DateTime64(6,'UTC'))},{repairLogAfterId:String})
-    ORDER BY l.created_at,l.id LIMIT {repairLimit:UInt32}`,
-    { repairLogAfterId: row.cursor.id ?? '' },
-    true,
-  );
-  return rows.map(r => ({
-    ...r,
-    ai_eligible: r.ai_eligible === null ? null : !!r.ai_eligible,
-    recognition_candidates:
-      r.recognition_candidates === null ? null : JSON.parse(r.recognition_candidates),
-    identity_evidence: r.identity_evidence === null ? null : JSON.parse(r.identity_evidence),
-  }));
+    FROM repair_log_batch l LEFT JOIN ${evidence} e ON e.website_id=l.website_id AND e.log_id=l.id
+    ORDER BY l.created_at,l.id SETTINGS enable_materialized_cte=1`;
+}
+
+type RepairLogWireRow = Omit<
+  LogRow,
+  'ai_eligible' | 'recognition_candidates' | 'identity_evidence'
+> & {
+  ai_eligible: boolean | number | null;
+  recognition_candidates: string | null;
+  identity_evidence: string | null;
+};
+
+export async function warehouseRepairLogs(row: RunRow): Promise<LogRow[]> {
+  return withinWarehouseReport(async () => {
+    const sql = repairLogBatchSQL();
+    const batch: RepairLogWireRow[] = [];
+    let afterTime = row.cursor.time ? warehouseTime(row.cursor.time) : null;
+    let day = afterTime ? afterTime.slice(0, 10) : await nextRepairLogDay(row, null);
+    while (day && batch.length < row.batch_size) {
+      const start = new Date(`${day}T00:00:00Z`);
+      const end = new Date(start);
+      end.setUTCDate(end.getUTCDate() + 1);
+      const logs = await warehouseRepairQuery<RepairLogWireRow>(
+        row,
+        sql,
+        {
+          repairDayStart: warehouseTime(start),
+          repairDayEnd: warehouseTime(end),
+          repairAfterTime: afterTime,
+          repairLogAfterId: afterTime ? (row.cursor.id ?? '') : '',
+          repairLimit: row.batch_size - batch.length,
+        },
+        true,
+      );
+      batch.push(...logs);
+      if (batch.length === row.batch_size) break;
+      day = await nextRepairLogDay(row, day);
+      afterTime = null;
+    }
+    return batch.map(r => ({
+      ...r,
+      ai_eligible: r.ai_eligible === null ? null : !!r.ai_eligible,
+      recognition_candidates:
+        r.recognition_candidates === null ? null : JSON.parse(r.recognition_candidates),
+      identity_evidence: r.identity_evidence === null ? null : JSON.parse(r.identity_evidence),
+    }));
+  });
 }
 export async function warehouseRepairSourceCounts(row: RunRow) {
   const [counts] = await warehouseRepairQuery<{ events: string; logs: string; missing: string }>(

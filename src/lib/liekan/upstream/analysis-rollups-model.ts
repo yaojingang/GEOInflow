@@ -46,6 +46,13 @@ export interface AnalysisBuildDto {
   updatedAt: string;
 }
 export interface AnalysisStatusDto {
+  warmup?: {
+    unregistered?: number;
+    expected: number;
+    ready: number;
+    preparing: number;
+    oldestPendingAt: string | null;
+  };
   websiteId: string;
   supported: boolean;
   mode: 'live' | 'disabled';
@@ -99,6 +106,7 @@ export interface AnalysisVisitPopulationInput {
   halfOpen?: boolean;
 }
 export interface AnalysisLogResult {
+  counts?: import('./log-statistics').LogStatistics;
   /** Internal cursor population identity; requested explicitly by the log reader. */
   classificationSet?: string;
   summary: {

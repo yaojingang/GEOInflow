@@ -9,6 +9,7 @@ import {
   processAnalysisQuery,
   processAnalysisQueryDelivery,
   pumpAnalysisQueries,
+  readPublishedLogCount,
 } from './analysis-queries';
 import { analysisTransaction } from './analysis-rollups-db';
 import * as rollupDatabase from './analysis-rollups-db';
@@ -68,6 +69,50 @@ describe.skipIf(!enabled)('durable private query lifecycle in PostgreSQL', () =>
     await sql(
       'UPDATE liekan_analysis_background_lease SET token=NULL,lease_until=NULL,incremental_waiting_at=NULL,history_waiting_at=NULL,interactive_turns=0 WHERE id',
     );
+  });
+  it('reuses a retained exact count only after current authority and input proof validation', async () => {
+    const imported = randomUUID();
+    await sql(
+      'INSERT INTO liekan_import(id,website_id,digest,accepted,rejected) VALUES($1::uuid,$2::uuid,$1,1,0)',
+      imported,
+      site,
+    );
+    await sql(
+      `INSERT INTO liekan_log(id,website_id,import_id,created_at,path,method,status,bytes,ip_masked,ip_hash,user_agent,location,bot,vendor,bot_type,verification,ai_eligible,recognition_state)
+      VALUES($1,$2::uuid,$3::uuid,'2026-01-01T01:00Z','/retained-count','GET',200,0,'','','GPTBot/fixture','','GPTBot','OpenAI','训练','unverified',true,'recognized')`,
+      randomUUID(),
+      site,
+      imported,
+    );
+    const { logReadBoundary, parseLogRead } = await import('./log-read-boundary');
+    const p = parseLogRead({ ...parameters, crawlerMetricsVersion: 1 });
+    p.readBoundary = await withPublishedRegistry(() =>
+      analysisTransaction(tx => logReadBoundary(tx, site, p)),
+    );
+    const task = await withPublishedRegistry(() =>
+      requestAnalysisQuery(site, actor, 'feature:log-count', p),
+    );
+    if (!('analysisJob' in task)) throw new Error('expected a cold exact count');
+    await processAnalysisQuery(task.analysisJob.id);
+    await sql(
+      "UPDATE liekan_analysis_query SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1::uuid",
+      task.analysisJob.id,
+    );
+    expect(await withPublishedRegistry(() => readPublishedLogCount(site, actor, p))).toEqual({
+      readBoundary: p.readBoundary,
+      total: 1,
+    });
+    expect(await readPublishedLogCount(site, actor, { ...p, refresh: '1' })).toBeUndefined();
+    await expect(
+      withPublishedRegistry(() => readPublishedLogCount(site, other, p)),
+    ).rejects.toMatchObject({ status: 404 });
+    await sql(
+      "UPDATE liekan_log SET status=500 WHERE website_id=$1::uuid AND path='/retained-count'",
+      site,
+    );
+    await expect(
+      withPublishedRegistry(() => readPublishedLogCount(site, actor, p)),
+    ).rejects.toMatchObject({ status: 409 });
   });
   afterAll(async () => {
     await sql('DELETE FROM liekan_analysis_query WHERE actor_id=ANY($1::uuid[])', [
@@ -160,12 +205,25 @@ describe.skipIf(!enabled)('durable private query lifecycle in PostgreSQL', () =>
         failure = error;
       }
       expect(failure).toBeDefined();
-      expect(failure?.meta?.driverAdapterError?.cause?.originalCode ?? failure?.meta?.code ?? failure?.code).toBe('55P03');
+      expect(
+        failure?.meta?.driverAdapterError?.cause?.originalCode ??
+          failure?.meta?.code ??
+          failure?.code,
+      ).toBe('55P03');
       await blocker.query('ROLLBACK');
-      expect(await withPublishedRegistry(() => readAnalysisQuery(site, actor, task.analysisJob.id))).toMatchObject({
+      expect(
+        await withPublishedRegistry(() => readAnalysisQuery(site, actor, task.analysisJob.id)),
+      ).toMatchObject({
         analysisJob: { id: task.analysisJob.id, status: 'queued' },
       });
-      expect((await q('SELECT attempts FROM liekan_analysis_query WHERE id=$1::uuid', task.analysisJob.id))[0].attempts).toBe(0);
+      expect(
+        (
+          await q(
+            'SELECT attempts FROM liekan_analysis_query WHERE id=$1::uuid',
+            task.analysisJob.id,
+          )
+        )[0].attempts,
+      ).toBe(0);
     } finally {
       await blocker.query('ROLLBACK');
       await blocker.end();

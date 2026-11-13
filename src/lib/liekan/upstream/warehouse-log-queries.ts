@@ -13,6 +13,7 @@ import {
 import { LiekanError } from './errors';
 import { dashboardClock } from './dashboard-clock';
 import { logInputConnectedSql } from './log-input';
+import { decodeWarehouseLogCursor } from './warehouse-log-cursor';
 import { staticRequestExtensionPattern } from './logs';
 import { type LogTrendRow, readWarehouseLogTrend } from './warehouse-log-trend';
 import {
@@ -283,23 +284,6 @@ function encodeLogCursor(row: any, scope: string) {
       )
     : '';
 }
-function decodeLogCursor(cursor: string, scope: string): [string, string] {
-  try {
-    const value = JSON.parse(Buffer.from(cursor, 'base64url').toString());
-    if (
-      !Array.isArray(value) ||
-      value.length !== 3 ||
-      value[2] !== scope ||
-      !/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{6}$/.test(value[0]) ||
-      !/^[a-f0-9]{64}$/.test(value[1])
-    )
-      throw new Error();
-    return [value[0], value[1]];
-  } catch {
-    throw new LiekanError('日志游标已失效，请重新读取', 409, 'history-repair-cursor-conflict');
-  }
-}
-
 export const warehouseLogDetailColumns = (
   ai: string,
 ) => `id AS recordId,toString(created_at) AS cursorTime,toString(created_at) AS time,ip_masked AS ipMasked,location,method,path,status,user_agent AS userAgent,bot,reporting_crawler_id AS botId,toString(reporting_catalog_version) AS catalogVersion,
@@ -507,6 +491,7 @@ export async function warehouseLogFacts(...args: Parameters<typeof import('./log
     metrics = { crawlerIdentityScope: 'all' },
     fullExport = false,
     comparisonBoundary,
+    detailRead,
   ] = args;
   return withinWarehouseReport(async () => {
     const meta = await warehouseReportMetadata(id),
@@ -528,7 +513,7 @@ export async function warehouseLogFacts(...args: Parameters<typeof import('./log
       if (needs(key))
         aggregates[key] = warehouseNumbers(await warehouseReportQuery<any>(id, sql, params));
     const [classification] =
-      metrics.crawlerMetricsVersion === 1 && needs('recent')
+      !detailRead && metrics.crawlerMetricsVersion === 1 && needs('recent')
         ? await warehouseReportQuery<any>(
             id,
             `SELECT arrayStringConcat(arraySort(groupUniqArray(coalesce(reporting_classification_version,'legacy'))),',') AS versions ${base}${filterSql}`,
@@ -536,29 +521,36 @@ export async function warehouseLogFacts(...args: Parameters<typeof import('./log
           )
         : [];
     const { boundary, population: _population, ...control } = meta;
-    const scope = createHash('sha256')
-      .update(
-        JSON.stringify({
-          id,
-          start,
-          end,
-          timezone,
-          filter,
-          search,
-          metrics,
-          control,
-          epoch: boundary.epoch,
-          deletion: boundary.deletionRevision,
-          classification: classification?.versions,
-          population: CRAWLER_POPULATION_VERSION,
-          engine: 'warehouse-v1',
-        }),
-      )
-      .digest('hex');
+    const scope =
+      detailRead?.cursorScope ??
+      createHash('sha256')
+        .update(
+          JSON.stringify({
+            id,
+            start,
+            end,
+            timezone,
+            filter,
+            search,
+            metrics,
+            control,
+            epoch: boundary.epoch,
+            deletion: boundary.deletionRevision,
+            classification: classification?.versions,
+            population: CRAWLER_POPULATION_VERSION,
+            engine: 'warehouse-v1',
+          }),
+        )
+        .digest('hex');
     const boundaryKey = cursor
       ? comparisonBoundary
-        ? [warehouseTime(comparisonBoundary[0]), comparisonBoundary[1]]
-        : decodeLogCursor(cursor, scope)
+        ? [
+            typeof comparisonBoundary[0] === 'string'
+              ? comparisonBoundary[0]
+              : warehouseTime(comparisonBoundary[0]),
+            comparisonBoundary[1],
+          ]
+        : decodeWarehouseLogCursor(cursor, scope)
       : null;
     Object.assign(params, {
       search,
@@ -571,7 +563,7 @@ export async function warehouseLogFacts(...args: Parameters<typeof import('./log
           id,
           `SELECT ${warehouseLogDetailColumns(ai)}
       ${detailBase}${cursor ? ` AND (created_at,id) ${seek === 'before' ? '>' : '<'} ({cursorAt:DateTime64(6,'UTC')},{cursorId:String})` : ''}
-      ORDER BY created_at ${order},id ${order} LIMIT ${fullExport ? 100001 : 100}${cursor ? '' : ' OFFSET {skip:UInt64}'}`,
+      ORDER BY created_at ${order},id ${order} LIMIT ${fullExport ? 100001 : (detailRead?.limit ?? 100)}${cursor ? '' : ' OFFSET {skip:UInt64}'}`,
           params,
         )
       : [];
@@ -607,8 +599,13 @@ export async function warehouseLogFacts(...args: Parameters<typeof import('./log
     for (const row of aggregates.bots ?? []) row.lastVisit = warehouseLogDate(row.lastVisit);
     for (const row of aggregates.pages ?? []) row.lastCrawled = warehouseLogDate(row.lastCrawled);
     if (cursor && seek === 'before') detail.reverse();
-    const nextCursor = encodeLogCursor(detail.at(-1), scope),
-      previousCursor = page > 1 ? encodeLogCursor(detail[0], scope) : '';
+    const visible = detailRead
+      ? cursor && seek === 'before'
+        ? detail.slice(-(detailRead.limit - 1))
+        : detail.slice(0, detailRead.limit - 1)
+      : detail;
+    const nextCursor = encodeLogCursor(visible.at(-1), scope),
+      previousCursor = page > 1 ? encodeLogCursor(visible[0], scope) : '';
     const recent = detail.map(warehouseLogDetailRow);
     return {
       summary: aggregates.summary?.[0] ?? { requests: 0, ai: 0, pages: 0, abnormal: 0 },

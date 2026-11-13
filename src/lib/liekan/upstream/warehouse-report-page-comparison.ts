@@ -52,7 +52,7 @@ export async function warehouseReportPageComparison(
   p: ReportQuery,
   evidence: EvidenceInputs,
   display: Display,
-  boundary?: [Date, string],
+  boundary?: [Date | string, string],
   completeTable?: WarehouseEvidenceRows,
 ) {
   return withinWarehouseReport(async () => {

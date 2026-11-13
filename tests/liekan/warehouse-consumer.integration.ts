@@ -12,6 +12,7 @@ import { Kafka, logLevel } from 'kafkajs';
 import pg from 'pg';
 import { PgBoss } from 'pg-boss';
 import type { LogRecord } from '../../src/lib/liekan/ingest';
+import { closeQueue, getQueue } from '../../src/lib/liekan/log-ingestion/queue';
 import { observeCollection } from '../../src/lib/liekan/upstream/collection-observation';
 import { WarehouseCollectionPackage } from '../../src/lib/liekan/upstream/warehouse-collection-package';
 import { browserPlanner } from '../../src/lib/liekan/warehouse/browser-planner';
@@ -152,13 +153,30 @@ try {
     .filter(f => /^\d{3}_.*\.sql$/.test(f) && Number(f.slice(0, 3)) >= 57)
     .sort()) {
     const sql = await readFile(`db/liekan/migrations/${file}`, 'utf8');
+    const concurrentIndex = file === '094_log_import_time_index.sql';
+    if (concurrentIndex) await db.read(sql);
     await db.transaction(async tx => {
-      await tx.query(sql);
+      if (!concurrentIndex) await tx.query(sql);
       await tx.query('INSERT INTO liekan_migration(name,checksum) VALUES($1,$2)', [
         file,
         createHash('sha256').update(sql).digest('hex'),
       ]);
     });
+  }
+  const installer = new PgBoss({
+    connectionString: url.toString(),
+    schema: 'liekan_jobs',
+    migrate: true,
+    schedule: false,
+    supervise: false,
+    max: 2,
+  });
+  installer.on('error', () => {});
+  await installer.start();
+  try {
+    await installer.createQueue('liekan-history-repair');
+  } finally {
+    await installer.stop();
   }
   await chAdmin.command({ query: `CREATE DATABASE "${run}"` });
   await initializeWarehouse(ch);
@@ -637,12 +655,12 @@ try {
         verification: 'unverified',
       }) as LogRecord,
   );
-  const registerUpload = async (batchId: string, size: number) =>
+  const registerUpload = async (batchId: string, size: number, repairScopeId?: string) =>
     db.transaction(async tx => {
       const digest = createHash('sha256').update(batchId).digest('hex');
       await tx.query(
-        `INSERT INTO liekan_import(id,website_id,digest,accepted,rejected,kind,inserted) VALUES($1::uuid,$2::uuid,$3,0,0,'manual',0)`,
-        [batchId, siteB, digest],
+        `INSERT INTO liekan_import(id,website_id,digest,accepted,rejected,kind,inserted,repair_scope_id) VALUES($1::uuid,$2::uuid,$3,0,0,'manual',0,$4::uuid)`,
+        [batchId, siteB, digest, repairScopeId ?? null],
       );
       await tx.query(
         `INSERT INTO liekan_warehouse_upload(batch_id,website_id,source_epoch,kind,digest,expected,queued) VALUES($1::uuid,$2::uuid,1,'manual',$3,$4,true)`,
@@ -1499,6 +1517,19 @@ try {
         ),
       /正在发布/,
     );
+    const { dispatchWarehouseRepairContinuations, reconcileHistoryRepairs } = await import(
+      '../../src/lib/liekan/upstream/history-repair-worker'
+    );
+    const repairQueue = await getQueue();
+    await db.transaction(async tx => {
+      await tx.query(`CREATE FUNCTION test_repair_queue_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.name='liekan-history-repair' THEN RAISE EXCEPTION 'test-repair-queue-unavailable'; END IF;
+          RETURN NEW;
+        END; $$`);
+      await tx.query(`CREATE TRIGGER test_repair_queue_failure BEFORE INSERT ON liekan_jobs.job
+        FOR EACH ROW EXECUTE FUNCTION test_repair_queue_failure()`);
+    });
     await start(
       collectionPlanner(
         browserPlanner(db),
@@ -1509,11 +1540,98 @@ try {
       true,
     );
     await waitWarehouseTask(db, task, 30000);
+    const continuationJobs = () =>
+      db.read<{ id: string; state: string; step: string }>(
+        `SELECT id,state::text,data->>'stepId' AS step FROM liekan_jobs.job
+         WHERE name='liekan-history-repair' AND data->>'runId'=$1 ORDER BY created_on`,
+        [runId],
+      );
     const updated = (
-      await db.read<any>('SELECT phase,counts FROM liekan_history_repair_run WHERE id=$1', [runId])
+      await db.read<any>(
+        'SELECT phase,counts,queued_job_id FROM liekan_history_repair_run WHERE id=$1',
+        [runId],
+      )
     )[0];
     assert.equal(updated.phase, 'undated-events');
     assert.equal(updated.counts.processed, '1');
+    assert.equal(updated.queued_job_id, task);
+    const pendingContinuations = () =>
+      db.read<{ step_id: string }>(
+        'SELECT step_id FROM liekan_warehouse_repair_continuation WHERE run_id=$1',
+        [runId],
+      );
+    await assert.rejects(
+      () => dispatchWarehouseRepairContinuations(repairQueue),
+      /history-repair-continuation-dispatch-failed/,
+    );
+    assert.deepEqual(await pendingContinuations(), [{ step_id: task }]);
+    assert.deepEqual(await continuationJobs(), []);
+    const liveIds: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const liveBatch = randomUUID(),
+        id = createHash('sha256').update(liveBatch).digest('hex');
+      liveIds.push(id);
+      await registerUpload(liveBatch, 1, repair.repair_scope_id);
+      await queue.enqueue(
+        logEnvelope(
+          await control.site(siteB),
+          installation,
+          { ...records[0], id, time: new Date().toISOString() },
+          { batchId: liveBatch, sourceId: null, sourceEpoch: 1, kind: 'manual', receivedAt: at },
+        ),
+      );
+      await until(async () => {
+        const [upload] = await db.read<{ status: string; inserted: number }>(
+          'SELECT status,inserted FROM liekan_warehouse_upload WHERE batch_id=$1',
+          [liveBatch],
+        );
+        return upload.status === 'processed' && upload.inserted === 1;
+      }, 'ordinary same-site log publishes while repair queue rejects inserts');
+    }
+    const live = await control.site(siteB);
+    const [visible] = await ch
+      .query({
+        query: `SELECT count() AS n FROM ${factRelation('liekan_log')} WHERE id IN {ids:Array(String)}`,
+        query_params: {
+          ...boundaryParameters({
+            websiteId: siteB,
+            epoch: live.epoch,
+            publication: live.publication,
+            deletionRevision: live.deletion_revision,
+          }),
+          ids: liveIds,
+        },
+        format: 'JSONEachRow',
+      })
+      .then(r => r.json<{ n: string }>());
+    assert.equal(visible.n, String(liveIds.length));
+    await assert.rejects(
+      () => dispatchWarehouseRepairContinuations(repairQueue),
+      /history-repair-continuation-dispatch-failed/,
+    );
+    assert.deepEqual(await pendingContinuations(), [{ step_id: task }]);
+    await db.transaction(tx =>
+      tx.query(
+        "UPDATE liekan_history_repair_run SET updated_at=now()-interval '2 minutes' WHERE id=$1",
+        [runId],
+      ),
+    );
+    await reconcileHistoryRepairs();
+    assert.deepEqual(await pendingContinuations(), [{ step_id: task }]);
+    assert.deepEqual(await continuationJobs(), []);
+    await db.transaction(tx =>
+      tx.query('DROP TRIGGER test_repair_queue_failure ON liekan_jobs.job'),
+    );
+    await Promise.all([
+      dispatchWarehouseRepairContinuations(repairQueue),
+      dispatchWarehouseRepairContinuations(repairQueue),
+    ]);
+    await dispatchWarehouseRepairContinuations(repairQueue);
+    assert.deepEqual(await pendingContinuations(), []);
+    const jobsAfterPublication = await continuationJobs();
+    assert.deepEqual(jobsAfterPublication, [
+      { id: updated.queued_job_id, state: 'created', step: updated.queued_job_id },
+    ]);
     assert.equal(
       (
         await db.read<{ n: string }>('SELECT count(*)::text AS n FROM liekan_history_repair_result')
@@ -1550,6 +1668,7 @@ try {
       .then(r => r.json<{ value: string }>());
     await queue.enqueue(JSON.parse(outbox[0].value));
     await delay(1000);
+    assert.deepEqual(await continuationJobs(), jobsAfterPublication);
     assert.equal(
       (
         await db.read<{ n: string }>(
@@ -1561,6 +1680,10 @@ try {
     );
     cases.push({
       name: 'repair batch publishes CH result/visitor facts and PG cursor/day counts atomically; nested metadata survives jsonb order, edits fence pending work and replay does not recount',
+      status: 'pass',
+    });
+    cases.push({
+      name: 'repair queue insert failure leaves durable continuation; same-site intake publishes and racing dispatchers enqueue exactly once on recovery',
       status: 'pass',
     });
     const { warehouseReportMetadata } = await import(
@@ -1830,19 +1953,6 @@ try {
     const { processHistoryRepairJob } = await import(
       '../../src/lib/liekan/upstream/history-repair-worker'
     );
-    const { getQueue } = await import('../../src/lib/liekan/log-ingestion/queue');
-    const installer = new PgBoss({
-      connectionString: url.toString(),
-      schema: 'liekan_jobs',
-      migrate: true,
-      schedule: false,
-      supervise: false,
-      max: 2,
-    });
-    installer.on('error', () => {});
-    await installer.start();
-    await installer.createQueue('liekan-history-repair');
-    await installer.stop();
     await db.transaction(async tx => {
       await tx.query(
         "INSERT INTO liekan_queue_installation(id,package_version,checksum) VALUES('liekan_jobs','12.36.0',$1) ON CONFLICT(id) DO UPDATE SET package_version=EXCLUDED.package_version",
@@ -1892,21 +2002,24 @@ try {
         return jobs.length;
       };
       let ready: any;
-      for (let i = 0; i < 30; i++) {
+      await until(async () => {
+        await dispatchWarehouseRepairContinuations(boss);
         await workOne();
         const [r] = await db.read<any>('SELECT * FROM liekan_history_repair_run WHERE id=$1', [
           runId,
         ]);
         if (r.status === 'ready') {
           ready = r;
-          break;
+          return true;
         }
         assert.ok(
           ['scanning', 'preparing'].includes(r.status),
           `repair job ended with ${r.status}/${r.error_code}`,
         );
-      }
+        return false;
+      }, 'repair preview via publication continuations');
       assert.ok(ready?.preview.complete, 'real queue steps complete a preview');
+      assert.equal(ready.queued_job_id, null);
       assert.equal(ready.counts.afterPV, '36');
       assert.equal(ready.active_generation, null);
       const detail = await getHistoryRepair(siteB, { view: 'status' }, { userId: actorId });
@@ -1951,7 +2064,7 @@ try {
         status: 'pass',
       });
     } finally {
-      await boss.stop();
+      await closeQueue();
     }
   } finally {
     await taskRuntime.close();
@@ -1962,6 +2075,7 @@ try {
   console.error(error instanceof Error ? error.message : 'Warehouse consumer failed');
   process.exitCode = 1;
 } finally {
+  await closeQueue();
   if (process.env.LIEKAN_CLICKHOUSE_DATABASE === run)
     await (await import('../../src/lib/liekan/warehouse/reader-runtime')).warehouseReader().close();
   await worker?.close();

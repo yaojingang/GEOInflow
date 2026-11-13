@@ -55,6 +55,7 @@ import { repairDetailPresence, repairListPresence } from './warehouse-history-re
 import { repairUploadList, warehouseCurrentInputSql } from './warehouse-history-repair-inputs';
 import { dayDto } from './history-repair-worker';
 export {
+  dispatchWarehouseRepairContinuations,
   processHistoryRepairJob,
   reconcileHistoryRepairs,
   historyRepairCapability,

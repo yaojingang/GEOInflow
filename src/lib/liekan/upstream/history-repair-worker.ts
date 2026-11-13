@@ -12,6 +12,8 @@ import {
 } from './history-repair-plan';
 import { emptyLogImpact } from '../history-repair/log-impact';
 import { randomUUID } from 'node:crypto';
+import { fromPrisma, type PgBoss } from 'pg-boss';
+import { sendRepairStep } from '../history-repair/queue';
 import { lockWritableWebsite, LiekanError } from './server';
 import { withPublishedRegistry } from './crawler-registry-context';
 import { bumpAnalyticsRevision } from './analytics-revision';
@@ -618,11 +620,56 @@ export async function processHistoryRepairJob(
   }
   if (invalidated) invalidateWebsiteAnalytics(acquired.website_id);
 }
+export async function dispatchWarehouseRepairContinuations(boss: PgBoss) {
+  if (!warehouseEnabled()) return;
+  const pending = await repairTransaction(tx =>
+    tx.$queryRawUnsafe<{ run_id: string; step_id: string }[]>(
+      `SELECT run_id,step_id FROM liekan_warehouse_repair_continuation
+       ORDER BY created_at,run_id,step_id LIMIT 10`,
+    ),
+  );
+  let failed = false;
+  for (const intent of pending) {
+    try {
+      await repairTransaction(async tx => {
+        await assertTransitionMaintenance(tx, 'repair');
+        // Lock the run before touching the intent, as in publication. The
+        // intent can disappear between selection and this transaction.
+        const [run] = await tx.$queryRawUnsafe<Pick<RunRow, 'status' | 'queued_job_id'>[]>(
+          `SELECT r.status,r.queued_job_id FROM liekan_history_repair_run r
+           WHERE r.id=$1::uuid AND EXISTS (
+             SELECT 1 FROM liekan_warehouse_repair_continuation c
+             WHERE c.run_id=r.id AND c.step_id=$2::uuid
+           ) FOR NO KEY UPDATE SKIP LOCKED`,
+          intent.run_id,
+          intent.step_id,
+        );
+        if (!run) return;
+        const claimed = await tx.$executeRawUnsafe(
+          'DELETE FROM liekan_warehouse_repair_continuation WHERE run_id=$1::uuid AND step_id=$2::uuid',
+          intent.run_id,
+          intent.step_id,
+        );
+        if (!claimed) return;
+        // A pause, cancellation, or new generation can supersede the intent.
+        if (run.queued_job_id === intent.step_id && ['scanning', 'preparing'].includes(run.status))
+          await sendRepairStep(boss, fromPrisma(tx), intent.run_id, { stepId: intent.step_id });
+      });
+    } catch {
+      failed = true;
+    }
+  }
+  if (failed) throw new Error('history-repair-continuation-dispatch-failed');
+}
+
 export async function reconcileHistoryRepairs() {
   if (process.env.CLICKHOUSE_URL) return;
   const warehouse = warehouseEnabled();
   const pendingFence = warehouse
     ? `AND NOT EXISTS(SELECT 1 FROM liekan_warehouse_task t WHERE t.website_id=r.website_id AND t.scope_key=r.id::text AND t.kind IN('history-repair-batch','history-repair-input') AND t.status IN('pending','confirmed'))`
+    : '';
+  const continuationFence = warehouse
+    ? `AND NOT EXISTS(SELECT 1 FROM liekan_warehouse_repair_continuation c WHERE c.run_id=r.id AND c.step_id=r.queued_job_id)`
     : '';
   const unreferencedInput = unreferencedRepairInputSql;
   await repairTransaction(async tx => {
@@ -670,7 +717,7 @@ export async function reconcileHistoryRepairs() {
     );
     const rows = await tx.$queryRawUnsafe<RunRow[]>(
       `SELECT * FROM liekan_history_repair_run r WHERE status IN('scanning','preparing','queued','running','validating') AND attempts<4 AND next_attempt_at<=clock_timestamp() AND updated_at<clock_timestamp()-interval '60 seconds' AND (lease_until IS NULL OR lease_until<clock_timestamp())
-      ${warehouseEnabled() ? "AND NOT EXISTS(SELECT 1 FROM liekan_warehouse_task t WHERE t.website_id=r.website_id AND t.kind IN('history-repair-batch','history-repair-input') AND t.scope_key=r.id::text AND t.status IN('pending','confirmed'))" : ''}
+      ${pendingFence} ${continuationFence}
       ORDER BY updated_at,id LIMIT 20 FOR NO KEY UPDATE SKIP LOCKED`,
     );
     for (const row of rows) {

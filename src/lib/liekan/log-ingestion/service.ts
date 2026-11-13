@@ -181,13 +181,37 @@ export async function createSource(
   return { source, token };
 }
 export async function listSources(websiteId: string) {
+  // The warehouse upload tracks published progress, while the ingest batch
+  // also covers legacy uploads and is retained according to the log policy.
   return query(
-    `SELECT id,kind,domain,state,credential_version AS "credentialVersion",last_heartbeat_at AS "lastHeartbeatAt",last_received_at AS "lastReceivedAt",last_processed_at AS "lastProcessedAt",last_test_at AS "lastTestAt",error_code AS "errorCode",health,
+    `SELECT s.id,s.kind,s.domain,s.state,s.credential_version AS "credentialVersion",s.last_heartbeat_at AS "lastHeartbeatAt",s.last_received_at AS "lastReceivedAt",s.last_processed_at AS "lastProcessedAt",s.last_test_at AS "lastTestAt",s.error_code AS "errorCode",s.health,
     (SELECT count(*)::int FROM liekan_ingest_batch b WHERE b.source_id=s.id AND b.state='pending') AS backlog,
     (SELECT count(*)::int FROM liekan_ingest_batch b WHERE b.source_id=s.id AND b.state='failed') AS failed,
     EXISTS(SELECT 1 FROM liekan_log_interval i WHERE i.source_id=s.id AND i.ends_at IS NULL) AS primary,
-    (s.provider_config IS NOT NULL AND (s.state='disconnected' OR s.credential_hash IS NULL)) AS "cleanupPending"
-    FROM liekan_log_source s WHERE website_id=$1::uuid AND (state!='disconnected' OR provider_config IS NOT NULL) ORDER BY created_at DESC`,
+    (s.provider_config IS NOT NULL AND (s.state='disconnected' OR s.credential_hash IS NULL)) AS "cleanupPending",
+    CASE WHEN latest.id IS NOT NULL THEN jsonb_build_object(
+      'receivedAt',latest.received_at,
+      'state',CASE
+        WHEN latest.state IN ('failed','cancelled') THEN latest.state
+        WHEN latest.state='processed' AND upload.inserted>0 THEN 'published'
+        WHEN latest.state='processed' THEN 'processed'
+        WHEN upload.processed>0 THEN 'processing'
+        WHEN NOT upload.queued THEN 'registered'
+        ELSE 'queued'
+      END,
+      'expected',latest.valid,
+      'processed',coalesce(upload.processed,CASE WHEN latest.state='processed' THEN latest.valid ELSE 0 END),
+      'inserted',latest.inserted,'conflicts',coalesce(upload.conflicts,0)
+    ) END AS "latestBatch"
+    FROM liekan_log_source s
+    LEFT JOIN liekan_log_state log_state ON log_state.website_id=s.website_id
+    LEFT JOIN LATERAL (
+      SELECT b.id,b.received_at,b.state,b.valid,b.inserted FROM liekan_ingest_batch b
+      WHERE b.website_id=s.website_id AND b.source_id=s.id AND b.epoch=coalesce(log_state.epoch,1)
+      ORDER BY b.received_at DESC,b.id DESC LIMIT 1
+    ) latest ON true
+    LEFT JOIN liekan_warehouse_upload upload ON upload.batch_id=latest.id AND upload.website_id=s.website_id
+    WHERE s.website_id=$1::uuid AND (s.state!='disconnected' OR s.provider_config IS NOT NULL) ORDER BY s.created_at DESC`,
     websiteId,
   );
 }

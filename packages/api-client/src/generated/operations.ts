@@ -1216,6 +1216,69 @@ export const operations = {
     queryParams: ['startAt', 'endAt', 'timezone', 'page'],
     hasBody: false,
   },
+  getLiekanLogCount: {
+    operationId: 'getLiekanLogCount',
+    method: 'get',
+    path: '/api/liekan/websites/{websiteId}/log-count',
+    pathParams: ['websiteId'],
+    queryParams: [
+      'startAt',
+      'endAt',
+      'timezone',
+      'page',
+      'cursor',
+      'seek',
+      'filter',
+      'search',
+      'crawlerIdentityScope',
+      'crawlerMetricsVersion',
+      'refresh',
+      'readBoundary',
+    ],
+    hasBody: false,
+  },
+  getLiekanLogEntries: {
+    operationId: 'getLiekanLogEntries',
+    method: 'get',
+    path: '/api/liekan/websites/{websiteId}/log-entries',
+    pathParams: ['websiteId'],
+    queryParams: [
+      'startAt',
+      'endAt',
+      'timezone',
+      'page',
+      'cursor',
+      'seek',
+      'filter',
+      'search',
+      'crawlerIdentityScope',
+      'crawlerMetricsVersion',
+      'refresh',
+      'readBoundary',
+    ],
+    hasBody: false,
+  },
+  getLiekanLogSummary: {
+    operationId: 'getLiekanLogSummary',
+    method: 'get',
+    path: '/api/liekan/websites/{websiteId}/log-summary',
+    pathParams: ['websiteId'],
+    queryParams: [
+      'startAt',
+      'endAt',
+      'timezone',
+      'page',
+      'cursor',
+      'seek',
+      'filter',
+      'search',
+      'crawlerIdentityScope',
+      'crawlerMetricsVersion',
+      'refresh',
+      'readBoundary',
+    ],
+    hasBody: false,
+  },
   getLiekanPageReport: {
     operationId: 'getLiekanPageReport',
     method: 'get',
@@ -1344,6 +1407,14 @@ export const operations = {
     path: '/api/liekan/websites/summary',
     pathParams: [],
     queryParams: ['ids', 'startAt', 'endAt', 'timezone'],
+    hasBody: false,
+  },
+  getLiekanWebsitesWebsiteIdOverviewJobsJobIdResult: {
+    operationId: 'getLiekanWebsitesWebsiteIdOverviewJobsJobIdResult',
+    method: 'get',
+    path: '/api/liekan/websites/{websiteId}/overview-jobs/{jobId}/{result}',
+    pathParams: ['websiteId', 'jobId', 'result'],
+    queryParams: [],
     hasBody: false,
   },
   getLink: {
@@ -4893,6 +4964,39 @@ export abstract class GeneratedUmamiClient {
   }
 
   /**
+   * Read private log count independently
+   * `GET /api/liekan/websites/{websiteId}/log-count`
+   */
+  getLiekanLogCount(
+    input: OperationInput<'getLiekanLogCount'>,
+    options?: RequestOptions,
+  ): Promise<OperationOutput<'getLiekanLogCount'>> {
+    return this.execute('getLiekanLogCount', input, options);
+  }
+
+  /**
+   * Read private log entries independently
+   * `GET /api/liekan/websites/{websiteId}/log-entries`
+   */
+  getLiekanLogEntries(
+    input: OperationInput<'getLiekanLogEntries'>,
+    options?: RequestOptions,
+  ): Promise<OperationOutput<'getLiekanLogEntries'>> {
+    return this.execute('getLiekanLogEntries', input, options);
+  }
+
+  /**
+   * Read private log summary independently
+   * `GET /api/liekan/websites/{websiteId}/log-summary`
+   */
+  getLiekanLogSummary(
+    input: OperationInput<'getLiekanLogSummary'>,
+    options?: RequestOptions,
+  ): Promise<OperationOutput<'getLiekanLogSummary'>> {
+    return this.execute('getLiekanLogSummary', input, options);
+  }
+
+  /**
    * get selected Liekan page statistics
    * `GET /api/liekan/websites/{websiteId}/page-report`
    */
@@ -4978,6 +5082,18 @@ export abstract class GeneratedUmamiClient {
     options?: RequestOptions,
   ): Promise<OperationOutput<'getLiekanWebsiteSummary'>> {
     return this.execute('getLiekanWebsiteSummary', input, options);
+  }
+
+  /**
+   * Get liekan websites website id overview jobs job id result
+   * Generated from the App Router handler and its request-validation source. Add a colocated contract.ts to supply exact response models and curated documentation.
+   * `GET /api/liekan/websites/{websiteId}/overview-jobs/{jobId}/{result}`
+   */
+  getLiekanWebsitesWebsiteIdOverviewJobsJobIdResult(
+    input: OperationInput<'getLiekanWebsitesWebsiteIdOverviewJobsJobIdResult'>,
+    options?: RequestOptions,
+  ): Promise<OperationOutput<'getLiekanWebsitesWebsiteIdOverviewJobsJobIdResult'>> {
+    return this.execute('getLiekanWebsitesWebsiteIdOverviewJobsJobIdResult', input, options);
   }
 
   /**

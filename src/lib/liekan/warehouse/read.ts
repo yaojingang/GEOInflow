@@ -29,7 +29,7 @@ export function boundaryParameters(boundary: ReadBoundary) {
 type FactTimeWindow = { start: string; end: string; endExclusive?: boolean; hours?: string };
 const validParameterName = (name: string) => /^[a-z][a-zA-Z0-9_]*$/.test(name);
 
-function acceptedCandidates(name: string, prefilter = '') {
+export function acceptedCandidates(name: string, prefilter = '') {
   return `SELECT attempt_id, argMax(candidate_id, publication)
     FROM warehouse_publication
     WHERE website_id = {wh_site:UUID} AND epoch = {wh_epoch:UInt64}
@@ -38,12 +38,13 @@ function acceptedCandidates(name: string, prefilter = '') {
     GROUP BY attempt_id`;
 }
 
-function exactTimeFilter(window: FactTimeWindow) {
+export function exactTimeFilter(window: FactTimeWindow) {
   return `_record_time >= {${window.start}:DateTime64(6,'UTC')} AND _record_time ${window.endExclusive ? '<' : '<='} {${window.end}:DateTime64(6,'UTC')}`;
 }
 
-function datePruning(window: FactTimeWindow) {
-  return `toDate32(_record_time) BETWEEN toDate32({${window.start}:DateTime64(6,'UTC')}) AND toDate32({${window.end}:DateTime64(6,'UTC')})`;
+export function datePruning(window: FactTimeWindow) {
+  const end = `{${window.end}:DateTime64(6,'UTC')}`;
+  return `toDate32(_record_time) BETWEEN toDate32({${window.start}:DateTime64(6,'UTC')}) AND toDate32(${window.endExclusive ? `subtractMicroseconds(${end},1)` : end})`;
 }
 
 // Callers apply business filters OUTSIDE this relation. Filtering a mutable field
@@ -66,6 +67,9 @@ export type FactReadOptions = {
   // Restrict evidence by the immutable log ID, using log time on the logs.
   // Evidence timestamps and versions can be independent of the log window.
   evidenceLogWindow?: FactTimeWindow;
+  // A materialized repair batch exposes the exact evidence keys. Physical
+  // evidence timestamps can differ from the parent log timestamp.
+  evidenceLogBatch?: true;
   // GEO needs small, nullable evidence fields, not the complete proof documents
   // in each latest-version aggregate and join. No evidence-time filter is added.
   geoEvidence?: true;
@@ -83,6 +87,8 @@ export function factRelation(name: string, options: FactReadOptions = {}): strin
     throw new Error('Invalid warehouse narrow log window');
   if (options.activeLogRepair && name !== 'liekan_history_repair_result')
     throw new Error('Invalid warehouse active log repair read');
+  if (options.evidenceLogBatch && name !== 'liekan_crawler_evidence')
+    throw new Error('Invalid warehouse evidence batch read');
   if (
     options.evidenceLogWindow &&
     (name !== 'liekan_crawler_evidence' ||
@@ -299,6 +305,7 @@ export function factRelation(name: string, options: FactReadOptions = {}): strin
       }
         ${extras.length ? `, ${extras.join(', ')}` : ''}
       FROM ${counters.length ? `(SELECT DISTINCT * FROM ${identifier(`warehouse_${name}`)} WHERE _website_id={wh_site:UUID} AND _epoch={wh_epoch:UInt64})` : identifier(`warehouse_${name}`)} AS fact
+      ${options.evidenceLogBatch ? 'PREWHERE _record_key IN (SELECT _record_key FROM repair_log_batch)' : ''}
       WHERE _website_id = {wh_site:UUID} AND _epoch = {wh_epoch:UInt64}
         ${options.activeLogRepair ? `AND "run_id"={wh_repair_run:UUID} AND "generation"={wh_repair_generation:UUID} AND "kind"='log'` : ''}
         ${boundedFilter}

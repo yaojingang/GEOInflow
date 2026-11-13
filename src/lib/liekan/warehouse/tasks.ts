@@ -390,7 +390,7 @@ export async function applyWarehouseTask(
   if (!cancelled && t.result.kind === 'history-repair-input')
     await applyRepairInput(tx, site, t.result);
   if (!cancelled && t.result.kind === 'history-repair-batch')
-    await applyRepairBatch(tx, site, t.result);
+    await applyRepairBatch(tx, site, taskId, t.result);
   if (!cancelled && t.result.kind === 'browser-risk') {
     const r = t.result;
     await tx.query(

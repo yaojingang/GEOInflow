@@ -23,6 +23,7 @@ import {
   warehouseEvidenceRows,
   withWarehouseEvidenceResources,
 } from '../upstream/warehouse-evidence-table';
+import { decodeWarehouseLogCursor } from '../upstream/warehouse-log-cursor';
 import { warehouseReportPageComparison } from '../upstream/warehouse-report-page-comparison';
 import { withinWarehouseReport } from '../upstream/warehouse-report-snapshot';
 import { warehouseEnabled } from '../warehouse/authority-routing';
@@ -104,14 +105,16 @@ async function exportEvidenceSnapshot(
         throw new LiekanError('统计条件已变化，请重新读取后导出', 409);
       const value = await reader(tx, id, conditions, evidence);
       if (viewQuery?.success) {
-        let boundary: [Date, string] | undefined;
+        let boundary: [Date | string, string] | undefined;
         if (viewQuery.data.cursor) {
           try {
             const encoded = JSON.parse(
               Buffer.from(viewQuery.data.cursor, 'base64url').toString('utf8'),
             );
             if (!/^[a-f0-9]{64}$/.test(encoded[2])) throw new Error();
-            boundary = decodeCursor(viewQuery.data.cursor, encoded[2]);
+            boundary = warehouseEnabled()
+              ? decodeWarehouseLogCursor(viewQuery.data.cursor, encoded[2])
+              : decodeCursor(viewQuery.data.cursor, encoded[2]);
           } catch {
             throw new LiekanError('日志游标无效', 400);
           }
@@ -137,7 +140,7 @@ async function exportEvidenceSnapshot(
                 viewQuery.data,
                 true,
                 false,
-                boundary,
+                boundary && [new Date(boundary[0]), boundary[1]],
               ),
               viewQuery.data,
             ),

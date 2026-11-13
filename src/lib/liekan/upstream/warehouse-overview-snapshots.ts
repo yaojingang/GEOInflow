@@ -248,6 +248,17 @@ function snapshotExpiry(row: Snapshot) {
 
 function presented(row: Snapshot, access: Access, updating: boolean) {
   const { overviewRanking: _overviewRanking, ...result } = row.result;
+  const version = createHash('sha256')
+    .update(
+      JSON.stringify([
+        row.id,
+        row.control_version,
+        row.publication,
+        row.generated_at,
+        result.meta.snapshot?.dataThrough,
+      ]),
+    )
+    .digest('hex');
   return {
     ...result,
     website: access.website,
@@ -257,6 +268,7 @@ function presented(row: Snapshot, access: Access, updating: boolean) {
       expiresAt: updating || row.error_code ? Date.now() : snapshotExpiry(row),
       snapshot: {
         ...result.meta.snapshot,
+        version,
         intervalMs,
         state: updating ? ('updating' as const) : ('ready' as const),
         ...(row.error_code ? { updateError: true } : {}),

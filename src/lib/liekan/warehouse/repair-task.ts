@@ -98,13 +98,19 @@ export function validateRepairBatch(
       throw new Error('warehouse-repair-task-scope-mismatch');
   }
 }
-export async function applyRepairBatch(tx: ControlSQL, site: string, r: RepairBatchResult) {
+export async function applyRepairBatch(
+  tx: ControlSQL,
+  site: string,
+  taskId: string,
+  r: RepairBatchResult,
+) {
+  const nextStep = r.next.status === 'scanning' || r.next.status === 'preparing' ? taskId : null;
   // All run-edit operations fence pending/confirmed tasks. Never publish partial
   // CH evidence if the corresponding PG work cursor cannot advance atomically.
   const changed = await tx.query(
     `UPDATE liekan_history_repair_run SET status=$10,phase=$11,cursor=$12::jsonb,counts=$13::jsonb,
     log_impact=$14::jsonb,preview=$15::jsonb,error_code=$16,completed_at=$17,membership_digest=$18,attempts=0,
-    lease_token=NULL,lease_until=NULL,updated_at=clock_timestamp()
+    lease_token=NULL,lease_until=NULL,queued_job_id=$20,updated_at=clock_timestamp()
     WHERE id=$1 AND website_id=$2 AND generation=$3 AND actor_id=$4 AND revision=$5 AND input_revision=$6
       AND scope_revision=$7 AND NOT scope_changed AND status=$8 AND phase=$9 AND cursor=$19::jsonb`,
     [
@@ -127,6 +133,7 @@ export async function applyRepairBatch(tx: ControlSQL, site: string, r: RepairBa
       r.next.completedAt,
       r.next.membershipDigest,
       JSON.stringify(r.beforeCursor),
+      nextStep,
     ],
   );
   if (changed.rowCount !== 1) throw new WarehouseConflict('warehouse-repair-control-changed');
@@ -155,5 +162,12 @@ export async function applyRepairBatch(tx: ControlSQL, site: string, r: RepairBa
       `UPDATE liekan_history_repair_day SET coverage=CASE WHEN evidence_rows+log_evidence_rows=0 THEN 'missing'
     WHEN evidence_rows+log_evidence_rows=event_rows+log_rows THEN 'complete' ELSE 'partial' END WHERE run_id=$1 AND generation=$2 AND day=ANY($3::date[])`,
       [r.runId, r.generation, r.coverageDays],
+    );
+  // Persist the continuation with the cursor. The log worker dispatches it
+  // after commit so a PgBoss failure cannot retain a site publication reservation.
+  if (nextStep)
+    await tx.query(
+      'INSERT INTO liekan_warehouse_repair_continuation(run_id,step_id) VALUES($1,$2)',
+      [r.runId, nextStep],
     );
 }

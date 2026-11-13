@@ -18,6 +18,7 @@ import {
   warehousePlotLogs,
 } from './warehouse-log-queries';
 import { warehouseGeoWeightAggregate } from './warehouse-geo-weight';
+import { decodeWarehouseLogCursor } from './warehouse-log-cursor';
 import { factRelation } from '../warehouse/read';
 
 const start = new Date('2026-11-01T00:00:00Z');
@@ -236,4 +237,37 @@ it('evaluates GEO classification once before expanding its overlapping windows',
   expect(sql).toContain('uniqExactIfMerge(units_state)');
   expect(sql).toContain('enable_materialized_cte=1');
   expect(mocks.query.mock.calls[1][2].geoDates).toEqual(['2026-11-02', '2026-11-01']);
+});
+
+it('preserves microseconds and uses only visible rows for split log page cursors', async () => {
+  const scope = 'a'.repeat(64);
+  const rows = Array.from({ length: 101 }, (_, i) => ({
+    cursorTime: `2026-11-01 00:00:00.${String(i).padStart(6, '0')}`,
+    time: '2026-11-01 00:00:00.000000',
+    recordId: i.toString(16).padStart(64, '0'),
+  }));
+  mocks.query.mockResolvedValueOnce(rows);
+  const value = await warehouseLogFacts(
+    'site',
+    start,
+    end,
+    'UTC',
+    1,
+    '',
+    '',
+    '',
+    'after',
+    ['recent'],
+    { crawlerIdentityScope: 'all', crawlerMetricsVersion: 1 },
+    false,
+    undefined,
+    { cursorScope: scope, limit: 101 },
+  );
+  expect(mocks.query).toHaveBeenCalledTimes(1);
+  expect(mocks.query.mock.calls[0][1]).toContain('LIMIT 101');
+  expect(value.recent).toHaveLength(101);
+  expect(decodeWarehouseLogCursor(value.nextCursor, scope)).toEqual([
+    rows[99].cursorTime,
+    rows[99].recordId,
+  ]);
 });

@@ -69,6 +69,13 @@ export interface AnalysisBuildDto {
   updatedAt: string;
 }
 export interface AnalysisStatusDto {
+  warmup?: {
+    unregistered?: number;
+    expected: number;
+    ready: number;
+    preparing: number;
+    oldestPendingAt: string | null;
+  };
   websiteId: string;
   supported: boolean;
   mode: 'live' | 'disabled';
@@ -115,6 +122,15 @@ export const analysisBuildSchema = z.object({
   updatedAt: z.string(),
 });
 export const analysisStatusSchema = z.object({
+  warmup: z
+    .object({
+      unregistered: z.number().int().nonnegative().optional(),
+      expected: z.number().int().nonnegative(),
+      ready: z.number().int().nonnegative(),
+      preparing: z.number().int().nonnegative(),
+      oldestPendingAt: z.string().nullable(),
+    })
+    .optional(),
   expansion: z.object({ path: z.boolean(), visit: z.boolean() }),
   websiteId: z.uuid(),
   supported: z.boolean(),

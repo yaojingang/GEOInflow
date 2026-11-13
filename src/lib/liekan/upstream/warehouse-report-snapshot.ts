@@ -50,7 +50,7 @@ export async function warehouseReportMetadata(site: string) {
 export function warehouseControlFingerprint(m: ReportingMetadata) {
   // New fact publication may advance while the report retains its initial
   // pointer. A delete, policy change or a repair publication invalidates it.
-  const { boundary, population: _population, ...rest } = m;
+  const { boundary, population: _population, logRevision: _logRevision, ...rest } = m;
   return createHash('sha256')
     .update(JSON.stringify({ ...rest, boundary: { ...boundary, publication: '0' } }))
     .digest('hex');

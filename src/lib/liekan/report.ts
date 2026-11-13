@@ -11,18 +11,31 @@ import { identityComplete, identityUsable } from './contracts/browser-population
 import { getPublishedCatalog } from './crawlers/published';
 import { crawlerAiRequests } from './rules/population';
 import { formatInTimeZone } from 'date-fns-tz';
+import { calendarDayRange } from './contracts/calendar';
+import {
+  countryName,
+  geographyCoverage,
+  geographyDisplay,
+  geographyLabel,
+  geographyTableDisplay,
+  isCountryCode,
+  knownChinaProvince,
+  mergeGeography,
+  regionName,
+} from './contracts/geography';
 import { pageReportParts, visitorOverviewCards } from './contracts/page-report';
-import { parseReportQuery, pagableTables, tablePageSize } from './contracts/query';
+import { pagableTables, parseReportQuery, tablePageSize } from './contracts/query';
 import {
   type DataState,
   type LiekanReport,
   liekanReportSchema,
   type Row,
 } from './contracts/report';
-import { summarizeSearchEngines, searchChannels } from './contracts/search-engines';
+import { searchChannels, summarizeSearchEngines } from './contracts/search-engines';
 import { sharedReportParts } from './contracts/shared-report';
-import { calendarDayRange } from './contracts/calendar';
+import { logSummaryView } from './log-report-parts';
 import { getSettings } from './store';
+import { timeReportQuery } from './upstream/analysis-diagnostics';
 import {
   classifyEntrySource,
   getHumanConversions,
@@ -30,17 +43,6 @@ import {
   getHumanFacts,
   type HumanFact,
 } from './upstream/analytics';
-import {
-  countryName,
-  regionName,
-  mergeGeography,
-  geographyTableDisplay,
-  geographyDisplay,
-  geographyLabel,
-  geographyCoverage,
-  knownChinaProvince,
-  isCountryCode,
-} from './contracts/geography';
 import {
   getContentImpact,
   getLogFacts,
@@ -51,7 +53,6 @@ import {
 import { humanPathFromEncoded } from './upstream/paths';
 import { LiekanError } from './upstream/server';
 import type { PreparedReport } from './report-prepared';
-import { timeReportQuery } from './upstream/analysis-diagnostics';
 import { readReportFragment } from './upstream/report-fragments';
 
 const pct = (a: number, b: number): number | null => (b ? Math.round((a / b) * 10000) / 100 : null);
@@ -623,19 +624,13 @@ export async function buildReport(
     preference: preference(b.name, b.botId),
     botId: b.botId,
   }));
-  r.tables.pipeList = [
-    {
-      name: '日志导入',
-      detail: l.latest ? '导入完成，主动刷新读取' : '支持 combined / JSON 单批导入',
-      state: l.latest ? '已接入' : '待接入',
-    },
-    { name: '身份验证', detail: '官方 IP 范围核验；历史或过期依据保留未核验', state: '已接入' },
-    {
-      name: '内容目录',
-      detail: `${catalogCount} 条目录记录`,
-      state: catalogCount ? '已接入' : '待接入',
-    },
-  ];
+  r.tables.pipeList = logSummaryView({
+    latest: l.latest,
+    catalogCount,
+    logState,
+    ruleCount: settings.rules.length,
+    today: todayLogs,
+  }).pipeList;
   r.tables.envGrid = ['device', 'browser', 'os'].flatMap(category =>
     aggregate(h.environment, category, 'sessions').map(row => ({
       category,
@@ -1083,15 +1078,14 @@ export async function buildReport(
   );
   card('转化页 TOP1', [...h.goals].sort((a, b) => b.count - a.count)[0]?.path ?? null, goalState);
   card('白皮书下载', h.goals.find(g => /白皮书|download/i.test(g.name))?.count ?? null, goalState);
-  card('日志处理能力', null, 'unsupported', '', '单批 10 MiB / 10000 行；吞吐量待压测');
-  card('今日已解析', l.latest ? todayLogs.accepted : null, logState, '', '今日导入的有效日志行数');
-  card('蜘蛛识别规则', settings.rules.length, 'available');
-  card(
-    '异常请求（今日）',
-    l.latest ? todayLogs.abnormal : null,
-    logState,
-    '',
-    '已接入日志中状态码 ≥400 的请求',
+  r.cards.push(
+    ...logSummaryView({
+      latest: l.latest,
+      catalogCount,
+      logState,
+      ruleCount: settings.rules.length,
+      today: todayLogs,
+    }).cards,
   );
   if (!parts || parts.insights) {
     const insightDate = (time: number) => formatInTimeZone(time, p.timezone, 'yyyy-MM-dd');

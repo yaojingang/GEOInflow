@@ -1,12 +1,4 @@
 'use client';
-import { browserPopulationSchema } from '../contracts/browser-population';
-import {
-  analysisAsyncPath,
-  followAnalysisJob,
-  waitForAnalysisAdmission,
-  waitForAnalysisVisibility,
-  waitForScheduledOverview,
-} from './analysis-query-client';
 import type { QueryClient } from '@tanstack/react-query';
 import { getApiUrl } from '@/lib/api-url';
 import { getClientAuthToken, removeClientAuthToken, setClientAuthToken } from '@/lib/client';
@@ -14,10 +6,18 @@ import { DATE_RANGE_CONFIG, LOCALE_CONFIG, THEME_CONFIG, TIMEZONE_CONFIG } from 
 import { consumeReturnUrl } from '@/lib/return-url';
 import { getItem, setItem } from '@/lib/storage';
 import { setLocale, setTimezone, setUser, useApp } from '@/store/app';
+import { browserPopulationSchema } from '../contracts/browser-population';
 import type { ExportFrame, ExportRequest } from '../contracts/exports';
 import { isReportOwnedBy } from '../contracts/query';
 import type { WebsiteSummary } from '../contracts/website-summary';
 import { defaultLiekanLocale, isLiekanLocale, readLocaleCookie } from '../i18n/locale';
+import {
+  analysisAsyncPath,
+  followAnalysisJob,
+  waitForAnalysisAdmission,
+  waitForAnalysisVisibility,
+  waitForScheduledOverview,
+} from './analysis-query-client';
 import { aggregateRequestResources, isAggregateRequest } from './cache-policy';
 import { clientCatalogVersion } from './catalog-client';
 import {
@@ -29,6 +29,7 @@ import {
   rememberResponseFreshness,
 } from './client-freshness';
 import { RequestPool, browserReads as reads } from './request-pool';
+
 // Keep initial task submissions within the server's per-consumer active quota.
 const analysisReads = new RequestPool(2);
 export async function streamFeatureExport(
@@ -53,7 +54,7 @@ export async function streamFeatureExport(
     },
   );
   if (!response.ok) {
-    let data = await response.json().catch(() => null);
+    const data = await response.json().catch(() => null);
     throw new FeatureApiError(
       data?.error?.message || `导出失败 (${response.status})`,
       response.status,
@@ -171,7 +172,7 @@ export async function featureRequest<T = any>(
   if (
     !shareToken &&
     headers.Prefer === 'respond-async' &&
-    /^\/liekan\/websites\/[^/]+\/page-report$/.test(path)
+    /^\/liekan\/websites\/[^/]+\/(?:page-report|log-count|log-summary)$/.test(path)
   )
     headers['X-Liekan-View'] = crypto.randomUUID();
   if (shareToken) {

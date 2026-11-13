@@ -1,7 +1,7 @@
-import { browserPopulationSchema, type BrowserPopulation } from './browser-population';
-import { crawlerIdentityScopeSchema, type CrawlerIdentityScope } from './crawler-metrics';
 import { z } from 'zod';
-import type { GeographyDisplay, GeographyCoverage } from './geography';
+import { type BrowserPopulation, browserPopulationSchema } from './browser-population';
+import { type CrawlerIdentityScope, crawlerIdentityScopeSchema } from './crawler-metrics';
+import type { GeographyCoverage, GeographyDisplay } from './geography';
 export const geographyCoverageSchema = z.object({
   displayRuleVersion: z.string(),
   totalVisits: z.number().int().nonnegative(),
@@ -52,6 +52,7 @@ export interface LiekanReport {
   meta: {
     snapshot?: {
       dataThrough: number;
+      version?: string;
       state: 'ready' | 'updating';
       intervalMs: number;
       updateError?: boolean;
@@ -99,6 +100,9 @@ export interface LiekanReport {
     };
     aiCrawlerEnabled?: boolean;
     logsConfigured?: boolean;
+    logReadBoundary?: string;
+    logHasMore?: boolean;
+    logParts?: { count: 'pending' | 'ready' | 'failed'; summary: 'pending' | 'ready' | 'failed' };
     totalLogs?: number;
     page?: number;
     pageSize?: number;
@@ -188,6 +192,7 @@ export const liekanReportSchema = z.object({
     snapshot: z
       .object({
         dataThrough: z.number(),
+        version: z.string().optional(),
         state: z.enum(['ready', 'updating']),
         intervalMs: z.number(),
         updateError: z.boolean().optional(),
@@ -248,6 +253,17 @@ export const liekanReportSchema = z.object({
       .optional(),
     aiCrawlerEnabled: z.boolean().optional(),
     logsConfigured: z.boolean().optional(),
+    logReadBoundary: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    logHasMore: z.boolean().optional(),
+    logParts: z
+      .object({
+        count: z.enum(['pending', 'ready', 'failed']),
+        summary: z.enum(['pending', 'ready', 'failed']),
+      })
+      .optional(),
     totalLogs: z.number().int().nonnegative().optional(),
     page: z.number().int().positive().optional(),
     pageSize: z.number().int().positive().optional(),

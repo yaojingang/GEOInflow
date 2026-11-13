@@ -1,7 +1,7 @@
-import { emptyCounts, hash, workingStatuses } from '../history-repair/model';
+import { emptyCounts, hash } from '../history-repair/model';
 import { WarehouseConflict } from '../warehouse/control-db';
 import { type WarehouseRuntime, warehouseRuntime } from '../warehouse/runtime';
-import { prepareWarehouseTask, waitWarehouseTask } from '../warehouse/tasks';
+import { prepareWarehouseTask } from '../warehouse/tasks';
 import {
   assertSnapshot,
   enqueueRepair,
@@ -129,26 +129,16 @@ export async function processWarehouseHistoryRepairUnit(
       409,
       'history-repair-scope-changed',
     );
-  const task = await prepareWarehouseTask(
-    runtime,
-    site,
-    planned.result,
-    planned.facts,
-    async tx => {
-      await requireLease(warehouseControlAdapter(tx), acquired);
-      if (!(await authorizeWarehouseTask(tx, row.website_id, planned.result)))
-        throw new WarehouseConflict('warehouse-repair-authority-changed');
-    },
-  );
-  try {
-    await waitWarehouseTask(runtime.db, task);
-  } catch (error) {
-    if (error instanceof WarehouseConflict && error.code === 'warehouse-task-publication-pending')
-      return;
-    throw error;
-  }
-  await repairTransaction(async tx => {
-    const next = await runForSite(tx, row.website_id);
-    if (next && workingStatuses.includes(next.status)) await enqueueRepair(tx, next);
+  await prepareWarehouseTask(runtime, site, planned.result, planned.facts, async tx => {
+    await requireLease(warehouseControlAdapter(tx), acquired);
+    if (!(await authorizeWarehouseTask(tx, row.website_id, planned.result)))
+      throw new WarehouseConflict('warehouse-repair-authority-changed');
+    // The registered warehouse task now owns the cursor. A redelivered
+    // PgBoss job must leave that task to the publisher or outbox recovery.
+    const detached = await tx.query(
+      'UPDATE liekan_history_repair_run SET queued_job_id=NULL WHERE id=$1 AND lease_token=$2',
+      [row.id, acquired.lease_token],
+    );
+    if (detached.rowCount !== 1) throw new WarehouseConflict('warehouse-repair-control-changed');
   });
 }

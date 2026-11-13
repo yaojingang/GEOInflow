@@ -277,7 +277,9 @@ it.skipIf(!database)(
       ] as const) {
         const params = reportRequest(date, now);
         const firstPage = await requestWarehouseOverview(access, params);
-        expect(await firstPage.json()).not.toHaveProperty('overviewRanking');
+        const firstBody = await firstPage.json();
+        expect(firstBody).not.toHaveProperty('overviewRanking');
+        expect(firstBody.meta.snapshot.version).toMatch(/^[a-f0-9]{64}$/);
         for (const page of [2, 3]) {
           const response = await requestWarehouseOverview(access, {
             ...params,
@@ -289,6 +291,7 @@ it.skipIf(!database)(
             expect(response.headers.get(header)).toBe(firstPage.headers.get(header));
           const body = await response.json();
           expect(body).not.toHaveProperty('overviewRanking');
+          expect(body.meta.snapshot.version).toBe(firstBody.meta.snapshot.version);
           expect(body.tables[table]).toEqual(
             Array.from({ length: Math.min(20, total - (page - 1) * 20) }, (_, i) => ({
               path: `/rank-${(page - 1) * 20 + 1 + i}`,

@@ -8,6 +8,7 @@ import {
   HISTORY_REPAIR_QUEUE,
 } from '../lib/liekan/contracts/history-repair';
 import {
+  dispatchWarehouseRepairContinuations,
   processHistoryRepairJob,
   reconcileHistoryRepairs,
 } from '../lib/liekan/upstream/history-repair';
@@ -206,6 +207,21 @@ async function main() {
         await withinWarehouseAuthority(() => processHistoryRepairJob(job.data));
     },
   );
+  let dispatchingRepair = false;
+  const dispatchRepair = async () => {
+    if (dispatchingRepair || stopped) return;
+    dispatchingRepair = true;
+    try {
+      await withinWarehouseAuthority(() => dispatchWarehouseRepairContinuations(boss));
+    } finally {
+      dispatchingRepair = false;
+    }
+  };
+  const repairDispatchTimer = setInterval(() => {
+    void background(dispatchRepair()).catch(() =>
+      console.error('History repair continuation dispatch unavailable'),
+    );
+  }, 2000);
   let repairing = false;
   const repairMaintenance = async () => {
     if (repairing || stopped) return;
@@ -440,6 +456,7 @@ async function main() {
   const shutdown = async () => {
     if (stopped) return;
     stopped = true;
+    clearInterval(repairDispatchTimer);
     clearInterval(repairTimer);
     clearInterval(permissionTimer);
     clearInterval(recoveryTimer);

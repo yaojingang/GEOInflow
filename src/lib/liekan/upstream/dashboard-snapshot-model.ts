@@ -112,8 +112,11 @@ export function dashboardWindow(
   const end = Number(parameters.endAt ?? +new Date(parameters.endDate));
   const start = Number(parameters.startAt ?? +new Date(parameters.startDate));
   const dedicatedToday =
-    target === 'feature:page-report' && Boolean(pageReportParts[parameters.resource]?.today);
-  const halfOpen = target === 'feature:page-report' && parameters.crawlerMetricsVersion === 1;
+    target === 'feature:log-summary' ||
+    (target === 'feature:page-report' && Boolean(pageReportParts[parameters.resource]?.today));
+  const halfOpen =
+    ['feature:page-report', 'feature:log-summary'].includes(target) &&
+    parameters.crawlerMetricsVersion === 1;
   const interval = live ? dashboardInterval(target) : 300000;
   const closed = dashboardCutoff(now, interval);
   const fixedRetention = target === 'native:retention' && end < closed;

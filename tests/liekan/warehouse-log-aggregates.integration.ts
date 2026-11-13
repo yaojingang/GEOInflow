@@ -26,6 +26,9 @@ process.env.DATABASE_TYPE = 'postgresql';
 const { warehouseLogQuerySpec } = await import(
   '../../src/lib/liekan/upstream/warehouse-log-queries'
 );
+const { repairLogBatchSQL } = await import(
+  '../../src/lib/liekan/upstream/warehouse-history-repair-read'
+);
 const run = `warehouse_log_aggregates_${randomUUID().replaceAll('-', '')}`;
 const admin = createWarehouseClient({ url, ...auth });
 const ch = createWarehouseClient({
@@ -63,6 +66,7 @@ async function put(
   fields: Record<string, unknown>,
   published = true,
   deleted = false,
+  publication = '1',
 ) {
   const row = factInput(family, fields),
     attempt = randomUUID(),
@@ -97,7 +101,7 @@ async function put(
         {
           website_id: site,
           epoch: '0',
-          publication: '1',
+          publication,
           attempt_id: attempt,
           family,
           candidate_id: candidate,
@@ -107,6 +111,7 @@ async function put(
         },
       ],
     });
+  return candidate;
 }
 const baseLog = {
   website_id: site,
@@ -191,7 +196,7 @@ try {
   await admin.command({ query: `CREATE DATABASE ${run}` });
   created = true;
   for (const ddl of warehouseDDL().filter(sql =>
-    /^CREATE TABLE IF NOT EXISTS "?warehouse_(liekan_log|liekan_crawler_evidence|liekan_history_repair_result|publication|deletion)"?\s*\(/.test(
+    /^CREATE TABLE IF NOT EXISTS "?warehouse_(liekan_log|liekan_crawler_evidence|liekan_history_repair_result|publication|deletion|control_projection)"?\s*\(/.test(
       sql,
     ),
   ))
@@ -355,6 +360,103 @@ try {
     /Invalid warehouse GEO evidence/,
   );
   checks.push({ name: 'GEO JSON field and accepted-version parity', status: 'pass' });
+
+  async function repairLog(id: string, createdAt: string, scope: string | null, sourceId?: string) {
+    const importId = randomUUID();
+    const candidateId = await put('liekan_log', {
+      ...baseLog,
+      id,
+      import_id: importId,
+      created_at: createdAt,
+      source_id: sourceId,
+    });
+    await ch.insert({
+      table: 'warehouse_control_projection',
+      format: 'JSONEachRow',
+      values: [
+        {
+          website_id: site,
+          epoch: '0',
+          kind: 'log-import-scope-v1',
+          revision: '0',
+          key: importId,
+          value: JSON.stringify({
+            candidateId,
+            value: JSON.stringify({ present: true, repairScopeId: scope }),
+          }),
+          created_at: '2026-11-04 00:00:00.000000',
+        },
+      ],
+    });
+  }
+  const endOfDay = '2026-11-01 23:59:59.999999';
+  await repairLog('repair-a', endOfDay, null);
+  await repairLog('repair-b', endOfDay, null);
+  await repairLog('repair-c', '2026-11-02 00:00:00.000000', null);
+  await repairLog('repair-excluded-scope', endOfDay, randomUUID());
+  await repairLog('repair-excluded-source', endOfDay, null, source);
+  await put('liekan_crawler_evidence', {
+    website_id: site,
+    log_id: 'repair-a',
+    crawler_id: 'accepted-late',
+  });
+  await put(
+    'liekan_crawler_evidence',
+    {
+      website_id: site,
+      log_id: 'repair-a',
+      crawler_id: 'unpublished',
+    },
+    false,
+  );
+  await put(
+    'liekan_crawler_evidence',
+    { website_id: site, log_id: 'repair-a', crawler_id: 'after-frozen-publication' },
+    true,
+    false,
+    '2',
+  );
+  await put('liekan_crawler_evidence', {
+    website_id: site,
+    log_id: 'repair-c',
+    crawler_id: 'before-deletion',
+  });
+  await put(
+    'liekan_crawler_evidence',
+    {
+      website_id: site,
+      log_id: 'repair-c',
+      crawler_id: 'tombstone',
+    },
+    true,
+    true,
+  );
+  const readRepairBatch = async (day: number, afterTime: string | null, afterId: string) =>
+    (
+      await ch.query({
+        query: repairLogBatchSQL(),
+        query_params: {
+          ...params,
+          wh_interval_source: [],
+          wh_interval_start: [],
+          wh_interval_end: [],
+          repairDayStart: `2026-11-0${day} 00:00:00.000000`,
+          repairDayEnd: `2026-11-0${day + 1} 00:00:00.000000`,
+          repairAfterTime: afterTime,
+          repairLogAfterId: afterId,
+          repairLimit: 1,
+          repairTimezone: 'UTC',
+        },
+        format: 'JSONEachRow',
+      })
+    )
+      .json<{ id: string; crawler_id: string | null }>()
+      .then(rows => rows.map(r => [r.id, r.crawler_id]));
+  assert.deepEqual(await readRepairBatch(1, null, ''), [['repair-a', 'accepted-late']]);
+  assert.deepEqual(await readRepairBatch(1, endOfDay, 'repair-a'), [['repair-b', null]]);
+  assert.deepEqual(await readRepairBatch(1, endOfDay, 'repair-b'), []);
+  assert.deepEqual(await readRepairBatch(2, null, ''), [['repair-c', null]]);
+  checks.push({ name: 'repair batch cursor, scope and late/deleted evidence', status: 'pass' });
   console.log(JSON.stringify({ checks, database: run }));
 } finally {
   await ch.close();

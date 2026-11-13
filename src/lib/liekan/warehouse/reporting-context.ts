@@ -26,6 +26,7 @@ export async function readReportingMetadataForSites(
     control_revision: string;
     catalog_revision: string;
     bookmark_revision: string;
+    log_revision: string;
     population: Record<string, unknown>;
     reports: ReportingMetadata['reports'];
     mode: string;
@@ -36,7 +37,7 @@ export async function readReportingMetadataForSites(
     repair_generation: string | null;
     exclusions: string[];
   }>(
-    `SELECT s.website_id,s.epoch::text,s.publication::text,s.deletion_revision::text,s.resource_type,s.catalog_revision::text,coalesce(to_jsonb(s)->>'bookmark_revision','0') AS bookmark_revision,
+    `SELECT s.website_id,s.epoch::text,s.publication::text,s.deletion_revision::text,s.resource_type,s.catalog_revision::text,coalesce(to_jsonb(s)->>'bookmark_revision','0') AS bookmark_revision,coalesce(ls.data_revision,0)::text AS log_revision,
     concat_ws(':',coalesce(p.revision,0),coalesce(ls.policy_revision,0),coalesce(r.active_revision,0),coalesce((SELECT revision FROM liekan_traffic_governance g WHERE g.website_id=s.website_id),0)) AS control_revision,
     jsonb_build_object('resourceKind',s.resource_type,'policyRevision',coalesce(p.revision,0)::text,'epoch',coalesce(ls.epoch,1)::text,
       'historyActiveGeneration',r.active_generation,'historyRevision',coalesce(r.active_revision,0)::text,
@@ -69,6 +70,7 @@ export async function readReportingMetadataForSites(
     controlRevision: row.control_revision,
     catalogRevision: row.catalog_revision,
     bookmarkRevision: row.bookmark_revision,
+    logRevision: row.log_revision,
     population: row.population,
     reports: row.reports,
     policyMode: row.mode,

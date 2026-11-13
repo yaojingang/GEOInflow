@@ -1,4 +1,5 @@
 import { useLiekanI18n } from '@/lib/liekan/i18n/client';
+import { DataLoading } from '../DataLoading';
 import {
   FilterChip,
   LatestLog,
@@ -14,32 +15,34 @@ export function Logs({ report, live }: ReportViewProps) {
   const i18n = useLiekanI18n();
   return (
     <main className="max-w-[1200px] mx-auto px-8 py-6 space-y-4">
-      <section className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-        <MetricCard
-          label="日志处理能力"
-          className="card p-4 fade-in d1"
-          valueClass="num text-[24px] font-bold text-brand mt-1.5"
-          report={report}
-        />
-        <MetricCard
-          label="今日已解析"
-          className="card p-4 fade-in d1"
-          valueClass="num text-[24px] font-bold text-brand mt-1.5"
-          report={report}
-        />
-        <MetricCard
-          label="蜘蛛识别规则"
-          className="card p-4 fade-in d1"
-          valueClass="num text-[24px] font-bold text-brand mt-1.5"
-          report={report}
-        />
-        <MetricCard
-          label="异常请求（今日）"
-          className="card p-4 fade-in d1"
-          valueClass="num text-[24px] font-bold text-up mt-1.5"
-          report={report}
-        />
-      </section>
+      <DataLoading loading={!report || report.meta.logParts?.summary === 'pending'}>
+        <section className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <MetricCard
+            label="日志处理能力"
+            className="card p-4 fade-in d1"
+            valueClass="num text-[24px] font-bold text-brand mt-1.5"
+            report={report}
+          />
+          <MetricCard
+            label="今日已解析"
+            className="card p-4 fade-in d1"
+            valueClass="num text-[24px] font-bold text-brand mt-1.5"
+            report={report}
+          />
+          <MetricCard
+            label="蜘蛛识别规则"
+            className="card p-4 fade-in d1"
+            valueClass="num text-[24px] font-bold text-brand mt-1.5"
+            report={report}
+          />
+          <MetricCard
+            label="异常请求（今日）"
+            className="card p-4 fade-in d1"
+            valueClass="num text-[24px] font-bold text-up mt-1.5"
+            report={report}
+          />
+        </section>
+      </DataLoading>
       <section className="card fade-in d2 overflow-hidden">
         <div className="px-6 py-4 border-b border-line flex items-center justify-between gap-3">
           <h2 className="text-[14px] font-bold tracking-tight">{i18n.text('实时访问流')}</h2>
@@ -70,7 +73,17 @@ export function Logs({ report, live }: ReportViewProps) {
       <section className="grid grid-cols-2 gap-4">
         <div className="card fade-in d2 p-5">
           <h2 className="text-[14px] font-bold tracking-tight">{i18n.text('解析管线')}</h2>
-          <ReportList id="pipeList" className="mt-3 space-y-2" report={report} />
+          <DataLoading loading={!report || report.meta.logParts?.summary === 'pending'}>
+            <ReportList
+              id="pipeList"
+              className="mt-3 space-y-2"
+              report={
+                report?.meta.logParts?.summary === 'failed'
+                  ? { ...report, states: { ...report.states, logs: 'unavailable' } }
+                  : report
+              }
+            />
+          </DataLoading>
         </div>
         <div className="card fade-in d3 p-5">
           <h2 className="text-[14px] font-bold tracking-tight">
