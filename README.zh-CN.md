@@ -97,7 +97,7 @@ flowchart LR
 
 ## 快速部署
 
-准备已启动的 Docker Engine / Docker Desktop、Docker Compose V2，以及可访问镜像和依赖下载源的网络。源码构建要求 Docker 总内存至少 **6 GiB**，建议 **8 GiB 或以上、2 个 CPU 或以上**，并预留空闲内存。可先运行 `sh scripts/liekan-deploy.sh --check`；运行容量说明见 [部署指南](docs/deployment.md#环境要求)。在取得源码并进入项目根目录后执行：
+准备已启动的 Docker Engine / Docker Desktop、Docker Buildx、支持 `build --builder` 的 Docker Compose，以及可访问镜像和依赖下载源的网络。源码构建要求 Docker 总内存至少 **6 GiB、当前可用内存至少 6 GiB**，建议 **8 GiB 或以上、2 个 CPU 或以上**。部署构建上限为 **1 核 CPU、5 GiB 内存**，单核机器使用半核。可先运行 `sh scripts/liekan-deploy.sh --check`；详细要求与运行容量说明见 [部署指南](docs/deployment.md#环境要求)。在取得源码并进入项目根目录后执行：
 
 ```sh
 sh scripts/liekan-deploy.sh
