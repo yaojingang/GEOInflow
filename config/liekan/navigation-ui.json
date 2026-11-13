@@ -1808,7 +1808,8 @@
     "entry": "sidebar-footer-grid",
     "label": "关于 GEOInflow",
     "width": 1120,
-    "contributors": "pending",
+    "contributors": "github",
+    "repository": "https://github.com/yaojingang/GEOInflow",
     "publishers": [
       "https://www.liekan.com/?GEOInflow",
       "https://geo.takefoto.cn/?GEOInflow"

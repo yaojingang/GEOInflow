@@ -44,7 +44,15 @@ try {
         await trigger.click();
         const dialog = page.getByRole('dialog');
         await dialog.waitFor();
-        await dialog.getByRole('heading', { name: locale === 'zh-CN' ? 'GitHub 仓库待接入' : 'GitHub repository not connected' }).waitFor();
+        const contributors = dialog.getByRole('region', { name: locale === 'zh-CN' ? '开源贡献者' : 'Open-source contributors' });
+        await contributors.getByRole('listitem').first().waitFor();
+        assert.equal(await contributors.getByRole('link', { name: 'GitHub', exact: true }).getAttribute('href'), baseline.repository);
+        for (const link of await contributors.getByRole('listitem').getByRole('link').all()) {
+          assert.match(await link.getAttribute('href'), /^https:\/\/github\.com\/(?:apps\/)?[a-z\d%\[\]-]+$/i);
+          assert.equal(await link.getAttribute('target'), '_blank');
+          assert.equal(await link.getAttribute('rel'), 'noopener noreferrer');
+          assert.match(await link.locator('img').getAttribute('src'), /^https:\/\/avatars\.githubusercontent\.com\/(?:u|in)\/\d+/);
+        }
         assert.equal(page.url(), before, 'Project information preserves the current page');
         assert.equal(await dialog.getByText('v1.2', { exact: true }).count(), 1);
         assert.equal(await dialog.getByText('姚金刚', { exact: true }).count(), 1);
@@ -102,9 +110,9 @@ try {
     }
   }
   assert.deepEqual(report.errors, []);
-  assert.deepEqual(report.githubRequests, [], 'Pending state makes no GitHub requests');
+  assert.deepEqual(report.githubRequests, [], 'Contributor API requests stay on the application server');
   report.passed = true;
-  console.log(`Project information: ${report.checks.length} viewport, locale and navigation contexts passed; attributed links, focus, close and pending state verified.`);
+  console.log(`Project information: ${report.checks.length} viewport, locale and navigation contexts passed; attributed links, focus, close and GitHub contributors verified.`);
 } finally {
   fs.writeFileSync(`${out}/report.json`, JSON.stringify(report, null, 2) + '\n');
   await browser.close();

@@ -18,8 +18,15 @@ export const liekanProduct = {
     help: '/liekan/help',
     author: 'https://x.com/yaojingang',
     coauthor: 'https://x.com/vista8',
+    github: 'https://github.com/yaojingang/GEOInflow',
   },
 } as const;
+
+export type LiekanContributor = {
+  login: string;
+  avatarUrl: string;
+  profileUrl: string;
+};
 
 export const liekanPublisherLinks = [
   { label: liekanProduct.publishers[0], href: 'https://www.liekan.com/?GEOInflow' },

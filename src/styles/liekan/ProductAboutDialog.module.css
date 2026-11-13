@@ -214,30 +214,71 @@
   font-size: 14px;
   font-weight: 600;
 }
-.root .pending p {
-  max-width: 310px;
-  margin-top: 9px;
-  color: var(--sub);
-  font-size: 12px;
-  line-height: 1.85;
-}
-.waiting {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+.retry {
   margin-top: 18px;
   padding: 5px 8px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: #fff;
   color: var(--sub);
-  font-size: 11px;
+  font-size: 12px;
+  min-height: 40px;
+  cursor: pointer;
 }
-.waiting > span {
-  width: 5px;
-  height: 5px;
+.contributorList {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start;
+  gap: 12px;
+  min-height: 278px;
+  max-height: 360px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 20px;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fafbfc;
+}
+.contributor {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 0;
+  color: var(--ink);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.contributorAvatar {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  overflow: hidden;
   border-radius: 50%;
-  background: #a9b2c1;
+  background: var(--selected);
+  color: #3659a2;
+  font-weight: 600;
+}
+.contributorAvatar img {
+  position: absolute;
+  inset: 0;
+  object-fit: cover;
+}
+.allContributors {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 40px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+.allContributors svg {
+  width: 13px;
+  height: 13px;
 }
 .actions {
   display: flex;
@@ -281,6 +322,11 @@
   }
 }
 @media (max-width: 540px) {
+  .contributorList {
+    grid-template-columns: minmax(0, 1fr);
+    min-height: 278px;
+    padding: 12px 16px;
+  }
   .heading {
     gap: 10px;
   }

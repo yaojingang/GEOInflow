@@ -392,6 +392,17 @@ describe('website navigation transitions', () => {
   it.each(['websites', 'events', 'admin-users'])(
     'opens project information from the footer in %s without navigating away',
     async page => {
+      const contributorFetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        Response.json({
+          contributors: [
+            {
+              login: 'yaojingang',
+              avatarUrl: 'https://avatars.githubusercontent.com/u/266242792?v=4',
+              profileUrl: 'https://github.com/yaojingang',
+            },
+          ],
+        }),
+      );
       render(
         <Navigation
           user={{ id: 'user', username: 'admin', isAdmin: true } as any}
@@ -405,7 +416,10 @@ describe('website navigation transitions', () => {
       expect(screen.queryByRole('dialog')).toBeNull();
       fireEvent.click(trigger);
       const dialog = await screen.findByRole('dialog');
-      expect(within(dialog).getByText('GitHub 仓库待接入')).toBeVisible();
+      expect(
+        await within(dialog).findByRole('link', { name: 'yaojingang的 GitHub 主页' }),
+      ).toBeVisible();
+      expect(contributorFetch).toHaveBeenCalledOnce();
       expect(dialog.querySelector('[data-dialog-size="wide"]')).toBeInTheDocument();
       expect(trigger).toHaveAttribute('aria-expanded', 'true');
       expect(mocks.push).not.toHaveBeenCalled();
