@@ -1287,6 +1287,14 @@ export const operations = {
     ],
     hasBody: false,
   },
+  getLiekanOverviewJob: {
+    operationId: 'getLiekanOverviewJob',
+    method: 'get',
+    path: '/api/liekan/websites/{websiteId}/overview-jobs/{jobId}',
+    pathParams: ['websiteId', 'jobId'],
+    queryParams: [],
+    hasBody: false,
+  },
   getLiekanPageReport: {
     operationId: 'getLiekanPageReport',
     method: 'get',
@@ -1422,7 +1430,7 @@ export const operations = {
     method: 'get',
     path: '/api/liekan/websites/{websiteId}/overview-jobs/{jobId}/{result}',
     pathParams: ['websiteId', 'jobId', 'result'],
-    queryParams: [],
+    queryParams: ['tp_topBody', 'tp_visitorTopBody'],
     hasBody: false,
   },
   getLink: {
@@ -5016,6 +5024,17 @@ export abstract class GeneratedUmamiClient {
   }
 
   /**
+   * Get the status of a warehouse overview job
+   * `GET /api/liekan/websites/{websiteId}/overview-jobs/{jobId}`
+   */
+  getLiekanOverviewJob(
+    input: OperationInput<'getLiekanOverviewJob'>,
+    options?: RequestOptions,
+  ): Promise<OperationOutput<'getLiekanOverviewJob'>> {
+    return this.execute('getLiekanOverviewJob', input, options);
+  }
+
+  /**
    * get selected Liekan page statistics
    * `GET /api/liekan/websites/{websiteId}/page-report`
    */
@@ -5104,8 +5123,7 @@ export abstract class GeneratedUmamiClient {
   }
 
   /**
-   * Get liekan websites website id overview jobs job id result
-   * Generated from the App Router handler and its request-validation source. Add a colocated contract.ts to supply exact response models and curated documentation.
+   * Read the published result of a warehouse overview job
    * `GET /api/liekan/websites/{websiteId}/overview-jobs/{jobId}/{result}`
    */
   getLiekanWebsitesWebsiteIdOverviewJobsJobIdResult(

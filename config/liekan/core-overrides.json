@@ -5428,6 +5428,18 @@
       ]
     },
     {
+      "path": "src/openapi/discover.ts",
+      "purpose": "Discover both forms of optional catch-all routes for the OpenAPI document",
+      "tests": [
+        "pnpm build:openapi",
+        "pnpm openapi:check --explicit",
+        "pnpm check:api:client"
+      ],
+      "owner": "Liekan API maintenance",
+      "constraint": "Keep existing route paths and method discovery while documenting the form without the optional segment",
+      "removalCondition": "Remove when upstream discovery covers both forms of optional catch-all routes"
+    },
+    {
       "path": "src/openapi/operation.ts",
       "owner": "Liekan automatic logs maintenance",
       "constraint": "Preserve existing tracker, SDK and authentication compatibility",
