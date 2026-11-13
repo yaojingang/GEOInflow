@@ -27,7 +27,6 @@ import { hasAnalysisBuildCapacity } from './storage-capacity';
 import {
   analysisForegroundDemandSql,
   coldDashboardPrewarmSql,
-  foregroundAnalysisQueuedSql,
   pauseIdleDashboardRetries,
   dashboardCapacityLockNamespace,
 } from './dashboard-demand';
@@ -297,12 +296,11 @@ function snapshotKey(
 
 function warmParameters(resource: string, timezone: string) {
   return dashboardWarmRanges(timezone).map((range, index) =>
-    analysisQueryParameters('feature:page-report', {
+    analysisQueryParameters(resource === 'logs' ? 'feature:log-summary' : 'feature:page-report', {
       ...range,
       timezone,
-      resource,
-      chartPeriod: ['today', '7d', '30d'][index],
-      ...(resource.startsWith('ai/')
+      ...(resource === 'logs' ? {} : { resource, chartPeriod: ['today', '7d', '30d'][index] }),
+      ...(resource.startsWith('ai/') || resource === 'logs'
         ? { endAt: range.endAt + 1, crawlerIdentityScope: 'all', crawlerMetricsVersion: 1 }
         : {}),
     }),
@@ -310,17 +308,104 @@ function warmParameters(resource: string, timezone: string) {
 }
 
 function isWarmSelection(row: Pick<Snapshot, 'target' | 'parameters'>) {
-  const resource = String(row.parameters.resource);
+  const resource = row.target === 'feature:log-summary' ? 'logs' : String(row.parameters.resource);
   if (
-    row.target !== 'feature:page-report' ||
+    !['feature:page-report', 'feature:log-summary'].includes(row.target) ||
     !Object.hasOwn(pageReportParts, resource) ||
-    ['logs', 'human/keywords'].includes(resource)
+    ['human/keywords'].includes(resource)
   )
     return false;
   const key = analysisDigest(row.parameters);
   return warmParameters(resource, row.parameters.timezone || 'UTC').some(
     parameters => analysisDigest(parameters) === key,
   );
+}
+
+async function defaultCandidates(
+  tx: AnalysisTx,
+  websiteId: string,
+  state: { strong: string; epoch: bigint },
+) {
+  const remembered = await tx.$queryRawUnsafe<{ timezone: string; locale: 'zh-CN' | 'en-US' }[]>(
+    `SELECT parameters->>'timezone' AS timezone,locale FROM liekan_dashboard_snapshot
+     WHERE website_id=$1::uuid AND last_read_at>clock_timestamp()-interval '7 days'
+     GROUP BY 1,2 ORDER BY max(last_read_at) DESC LIMIT 8`,
+    websiteId,
+  );
+  const resources = [
+    'overview',
+    'human/overview',
+    'logs',
+    ...Object.keys(pageReportParts).filter(
+      x => !['overview', 'human/overview', 'logs', 'human/keywords'].includes(x),
+    ),
+  ];
+  const scopes = [
+    ...new Map(
+      [{ timezone: 'Asia/Shanghai', locale: 'zh-CN' as const }, ...remembered]
+        .filter(x => x.timezone)
+        .map(x => [`${x.timezone}:${x.locale}`, x]),
+    ).values(),
+  ].slice(0, Math.max(1, Math.floor(160 / (resources.length * 3))));
+  return [0, 1, 2]
+    .flatMap(rangeIndex =>
+      scopes.flatMap(({ timezone, locale }) =>
+        resources.map(resource => {
+          const target = resource === 'logs' ? 'feature:log-summary' : 'feature:page-report';
+          const parameters = warmParameters(resource, timezone)[rangeIndex];
+          const window = dashboardWindow(target, parameters);
+          return {
+            target,
+            parameters,
+            locale,
+            day: window.day,
+            end: new Date(window.dependencyEnd),
+            key: snapshotKey(websiteId, target, parameters, locale, state, window.day),
+          };
+        }),
+      ),
+    )
+    .map((candidate, priority) => ({ ...candidate, priority }));
+}
+
+/** Count only complete publications with current authority and compatible input evidence. */
+export async function dashboardReadiness(tx: AnalysisTx, websiteId: string, actor: CrawlerActor) {
+  const state = await analysisQueryState(tx, websiteId, actor);
+  if (state.mode !== 'live') return { expected: 0, ready: 0, preparing: 0, oldestPendingAt: null };
+  const candidates = await defaultCandidates(tx, websiteId, state);
+  const rows = await tx.$queryRawUnsafe<
+    (Pick<
+      Snapshot,
+      'website_id' | 'query_key' | 'strong_version' | 'epoch' | 'fingerprint' | 'dependency_end'
+    > & { registered_at: Date; published: boolean })[]
+  >(
+    'SELECT website_id,query_key,strong_version,epoch,fingerprint,dependency_end,registered_at,result IS NOT NULL AS published FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND query_key=ANY($2::text[])',
+    websiteId,
+    candidates.map(x => x.key),
+  );
+  let ready = 0,
+    unregistered = 0,
+    oldest = Infinity;
+  const saved = new Map(rows.map(x => [x.query_key, x]));
+  for (const candidate of candidates) {
+    const row = saved.get(candidate.key);
+    if (
+      row?.published &&
+      row.strong_version === state.strong &&
+      String(row.epoch) === String(state.epoch) &&
+      row.fingerprint === (await fingerprint(tx, row, row.dependency_end))
+    )
+      ready++;
+    else if (row) oldest = Math.min(oldest, +new Date(row.registered_at));
+    else unregistered++;
+  }
+  return {
+    expected: candidates.length,
+    ready,
+    preparing: candidates.length - ready,
+    unregistered,
+    oldestPendingAt: Number.isFinite(oldest) ? new Date(oldest).toISOString() : null,
+  };
 }
 
 function project(row: Snapshot, website: any, stale: boolean) {
@@ -416,8 +501,26 @@ export async function requestDashboardSnapshot(
     last_read_at: foreground ? new Date() : new Date(0),
   } as Snapshot;
   let changed = Boolean(row.job_id || row.error_code);
-  if (!foreground && row.error_code === 'dashboard-paused')
-    throw new LiekanError('后台预热已暂停，打开页面后重试', 503, 'dashboard-paused');
+  if (!foreground && row.error_code === 'dashboard-paused') {
+    // Common selections get one new attempt when their original input or coverage changes.
+    const attempt = row.result == null && isWarmSelection(row)
+      ? await analysisTransaction(tx => attemptFingerprint(tx, row, row.dependency_end))
+      : undefined;
+    if (!attempt || !row.attempt_fingerprint || row.attempt_fingerprint === attempt) {
+      if (attempt && !row.attempt_fingerprint)
+        await analysisTransaction(tx =>
+          tx.$executeRawUnsafe(
+            `UPDATE liekan_dashboard_snapshot SET attempt_fingerprint=$3
+             WHERE website_id=$1::uuid AND query_key=$2 AND error_code='dashboard-paused'
+               AND job_id IS NULL AND attempt_fingerprint IS NULL`,
+            websiteId,
+            key,
+            attempt,
+          ),
+        );
+      throw new LiekanError('后台预热已暂停，打开页面后重试', 503, 'dashboard-paused');
+    }
+  }
   if (row.result != null) {
     // Access and strong versions are checked again immediately before returning a stored projection.
     let current = await analysisTransaction(tx => analysisQueryState(tx, websiteId, actor));
@@ -681,7 +784,7 @@ async function enqueue(
   const pin = await analysisTransaction(tx => fingerprint(tx, row, end));
   const attempt = await analysisTransaction(tx => attemptFingerprint(tx, row, end));
   const cold =
-    row.target === 'feature:page-report' &&
+    ['feature:page-report', 'feature:log-summary'].includes(row.target) &&
     row.result == null &&
     +new Date(row.last_read_at) <= Date.now() - 120000;
   if (cold && maintenance?.coldRegistered)
@@ -704,8 +807,7 @@ async function enqueue(
           throw new LiekanError('统计任务登记繁忙，请稍后重试', 503, 'analysis-admission-busy');
         const [busy] = await tx.$queryRawUnsafe(
           `SELECT 1 FROM liekan_analysis_query q WHERE q.id<>$1::uuid AND
-            ((q.status IN('queued','running') AND ${coldDashboardPrewarmSql})
-              OR (q.status='queued' AND ${analysisForegroundDemandSql})) LIMIT 1`,
+            (q.status IN('queued','running') AND ${coldDashboardPrewarmSql}) LIMIT 1`,
           job.id,
         );
         if (busy) throw new LiekanError('后台预热等待当前任务', 503, 'dashboard-cold-busy');
@@ -778,7 +880,7 @@ async function enqueue(
       // An active producer keeps its originally pinned boundary and publication fence.
       await tx.$executeRawUnsafe(
         `UPDATE liekan_dashboard_snapshot SET job_id=$3::uuid,pending_fingerprint=$4,pending_through=$5,
-       dependency_end=$6,next_refresh_at=$7,error_code=NULL,attempt_fingerprint=$8
+       dependency_end=$6,next_refresh_at=$7,error_code=NULL,attempt_fingerprint=$8,last_read_at=greatest(last_read_at,$9::timestamptz)
        WHERE website_id=$1::uuid AND query_key=$2 AND (job_id IS NULL
         OR NOT EXISTS(SELECT 1 FROM liekan_analysis_query q WHERE q.id=job_id AND q.status IN('queued','running')))`,
         row.website_id,
@@ -789,6 +891,7 @@ async function enqueue(
         end,
         new Date(window.nextRefresh),
         attempt,
+        row.last_read_at,
       );
       if (!window.computable)
         await tx.$executeRawUnsafe(
@@ -922,7 +1025,7 @@ export async function pumpDashboardSnapshots(
      JOIN liekan_analysis_site s USING(website_id) WHERE w.deleted_at IS NULL AND s.mode='live' AND s.epoch=d.epoch
      AND d.next_refresh_at<=clock_timestamp() AND (d.job_id IS NULL OR NOT EXISTS(
       SELECT 1 FROM liekan_analysis_query q WHERE q.id=d.job_id AND q.status IN('queued','running')))
-     ORDER BY (d.last_read_at>clock_timestamp()-interval '2 minutes') DESC,d.next_refresh_at,d.website_id LIMIT 8`,
+     ORDER BY (d.last_read_at>clock_timestamp()-interval '2 minutes') DESC,(d.result IS NOT NULL) DESC,d.next_refresh_at,d.website_id LIMIT 8`,
     ),
   );
   for (const [index, row] of rows.entries()) {
@@ -953,15 +1056,6 @@ export async function pumpDashboardSnapshots(
         const current = await analysisTransaction(tx =>
           analysisQueryState(tx, row.website_id, actor),
         );
-        if (
-          !recent &&
-          (
-            await analysisTransaction(tx =>
-              tx.$queryRawUnsafe<any[]>(`SELECT 1 WHERE ${foregroundAnalysisQueuedSql}`),
-            )
-          ).length
-        )
-          return;
         const window = dashboardWindow(
           row.target,
           row.parameters,
@@ -1050,7 +1144,7 @@ export async function seedDashboardSnapshots(
     (
       await analysisTransaction(tx =>
         tx.$queryRawUnsafe<any[]>(
-          `SELECT 1 WHERE ${foregroundAnalysisQueuedSql} OR EXISTS(
+          `SELECT 1 WHERE EXISTS(
             SELECT 1 FROM liekan_analysis_query q WHERE q.status IN('queued','running') AND ${coldDashboardPrewarmSql})`,
         ),
       )
@@ -1069,55 +1163,20 @@ export async function seedDashboardSnapshots(
   for (const [index, site] of sites.entries()) {
     if (index > 0) await maintenance.dispatchQueries?.();
     if (!site.actor_id) continue;
-    const remembered = await analysisTransaction(tx =>
-      tx.$queryRawUnsafe<{ timezone: string; locale: 'zh-CN' | 'en-US' }[]>(
-        `SELECT parameters->>'timezone' AS timezone,locale FROM liekan_dashboard_snapshot
-       WHERE website_id=$1::uuid AND last_read_at>clock_timestamp()-interval '7 days'
-       GROUP BY 1,2 ORDER BY max(last_read_at) DESC LIMIT 8`,
-        site.website_id,
-      ),
-    );
-    const resources = [
-      'overview',
-      'human/overview',
-      ...Object.keys(pageReportParts).filter(
-        x => !['overview', 'human/overview', 'logs', 'human/keywords'].includes(x),
-      ),
-    ];
-    const scopes = [
-      ...new Map(
-        [{ timezone: 'Asia/Shanghai', locale: 'zh-CN' as const }, ...remembered]
-          .filter(x => x.timezone)
-          .map(x => [`${x.timezone}:${x.locale}`, x]),
-      ).values(),
-    ].slice(0, Math.max(1, Math.floor(160 / (resources.length * 3))));
     const actor = { id: site.actor_id, role: '' };
     const current = await withPublishedRegistry(() =>
       analysisTransaction(tx => analysisQueryState(tx, site.website_id, actor)),
     ).catch(() => null);
     if (!current) continue;
-    const candidates = [0, 1, 2].flatMap(rangeIndex =>
-      scopes.flatMap(({ timezone, locale }) =>
-        resources.map(resource => {
-          const parameters = warmParameters(resource, timezone)[rangeIndex];
-          const key = snapshotKey(
-            site.website_id,
-            'feature:page-report',
-            parameters,
-            locale,
-            current,
-            dashboardWindow('feature:page-report', parameters).day,
-          );
-          return { parameters, locale, key };
-        }),
-      ),
+    const candidates = await analysisTransaction(tx =>
+      defaultCandidates(tx, site.website_id, current),
     );
     const existing = await analysisTransaction(async tx => {
       // Share the capacity lock with foreground registration before reclaiming result space.
       await lockSnapshotCapacity(tx, site.website_id);
       const protectedKeys = candidates.map(candidate => candidate.key);
       await tx.$executeRawUnsafe(
-        `DELETE FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND target='feature:page-report'
+        `DELETE FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND target IN('feature:page-report','feature:log-summary')
          AND last_read_at=to_timestamp(0) AND job_id IS NULL AND NOT(query_key=ANY($2::text[]))`,
         site.website_id,
         protectedKeys,
@@ -1139,17 +1198,52 @@ export async function seedDashboardSnapshots(
         site.website_id,
         protectedKeys,
       );
-      return tx.$queryRawUnsafe<{ query_key: string }[]>(
-        'SELECT query_key FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
+      const previous = await tx.$queryRawUnsafe<{ query_key: string; scheduled: boolean }[]>(
+        'SELECT query_key,(result IS NOT NULL OR job_id IS NOT NULL) AS scheduled FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
+        site.website_id,
+      );
+      const missing = candidates.filter(
+        candidate => !previous.some(row => row.query_key === candidate.key),
+      );
+      if (!missing.length) return previous;
+      const capacity = await analysisCapacity(tx, site.website_id);
+      const reserve = BigInt(Buffer.byteLength(JSON.stringify(missing)) * 2);
+      if (
+        !hasAnalysisBuildCapacity({
+          ...capacity,
+          siteBytes: String(BigInt(capacity.siteBytes) + reserve),
+          globalBytes: String(BigInt(capacity.globalBytes) + reserve),
+        })
+      )
+        return undefined;
+      await tx.$executeRawUnsafe(
+        `INSERT INTO liekan_dashboard_snapshot(website_id,query_key,actor_id,target,parameters,locale,strong_version,epoch,calendar_day,dependency_end,last_read_at,next_refresh_at)
+         SELECT $1::uuid,c.key,$2::uuid,c.target,c.parameters,c.locale,$3,$4::bigint,c.day,c."end"::timestamptz,to_timestamp(0),clock_timestamp()+c.priority*interval '1 millisecond'
+         FROM jsonb_to_recordset($5::jsonb) AS c(key text,target text,parameters jsonb,locale text,day text,"end" text,priority integer)
+         WHERE NOT EXISTS(SELECT 1 FROM liekan_dashboard_snapshot d WHERE d.website_id=$1::uuid AND d.query_key=c.key)
+         LIMIT (SELECT greatest(0,200-count(*)) FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid) ON CONFLICT DO NOTHING`,
+        site.website_id,
+        site.actor_id,
+        current.strong,
+        String(current.epoch),
+        JSON.stringify(missing),
+      );
+      return tx.$queryRawUnsafe<{ query_key: string; scheduled: boolean }[]>(
+        'SELECT query_key,(result IS NOT NULL OR job_id IS NOT NULL) AS scheduled FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
         site.website_id,
       );
     });
-    const keys = new Set(existing.map(row => row.query_key));
-    let space = Math.max(0, 200 - keys.size);
+    if (!existing) {
+      await noteSeedChecked(site.website_id);
+      continue;
+    }
+    const keys = new Set(existing.filter(row => row.scheduled).map(row => row.query_key));
+    const present = new Set(existing.map(row => row.query_key));
+    let space = Math.max(0, 200 - existing.length);
     let visited = 0;
-    for (const { parameters, locale, key } of candidates) {
+    for (const { parameters, locale, key, target } of candidates) {
       if (keys.has(key)) continue;
-      if (space === 0) break;
+      if (space === 0 && !present.has(key)) continue;
       if (visited > 0 && visited % 2 === 0) await maintenance.dispatchQueries?.();
       visited++;
       try {
@@ -1157,7 +1251,7 @@ export async function seedDashboardSnapshots(
           requestDashboardSnapshot(
             site.website_id,
             actor,
-            'feature:page-report',
+            target,
             parameters,
             locale,
             false,
@@ -1170,7 +1264,7 @@ export async function seedDashboardSnapshots(
         }
         if (!keys.has(key)) {
           keys.add(key);
-          space--;
+          if (!present.has(key)) space--;
         }
       } catch (error) {
         if ((error as any)?.code === 'dashboard-cold-busy') return;

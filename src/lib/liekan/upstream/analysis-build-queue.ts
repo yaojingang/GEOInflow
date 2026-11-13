@@ -11,7 +11,8 @@ export async function pumpAnalysisBuilds(boss: Pick<PgBoss, 'send'>) {
     const capacity = await analysisCapacity(tx, null);
     const globalHistoryAllowed = storageHistoryAllowed(capacity);
     await tx.$executeRawUnsafe(`UPDATE liekan_analysis_background_lease SET
-     incremental_waiting_at=${analysisBuildWaitingSql.incremental},
+     incremental_waiting_at=CASE WHEN ${analysisBuildWaitingSql.incremental} IS NULL THEN NULL
+       ELSE coalesce(incremental_waiting_at,${analysisBuildWaitingSql.incremental}) END,
      history_waiting_at=${analysisBuildWaitingSql.history(globalHistoryAllowed)} WHERE id`);
     return tx.$queryRawUnsafe<
       { id: string; actor_id: string | null; automatic_history: boolean }[]

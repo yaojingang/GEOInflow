@@ -1,10 +1,12 @@
 'use client';
-import { keywordStatusVersion, type KeywordConditions } from '../contracts/keywords';
+import { type KeywordConditions, keywordStatusVersion } from '../contracts/keywords';
+import { logReadQuery } from '../contracts/log-read';
 import {
-  pageReportSchema,
   type LiekanPageReport,
+  pageReportSchema,
   type ReportResource,
 } from '../contracts/page-report';
+import type { CrawlerPageFilters } from '../contracts/query';
 import {
   copyClientFreshness,
   freshnessStaleTime,
@@ -14,7 +16,6 @@ import {
   withClientFreshness,
 } from './client-freshness';
 import { featureApi } from './features-client';
-import type { CrawlerPageFilters } from '../contracts/query';
 
 export function pageReportQuery(
   userId: string,
@@ -32,6 +33,7 @@ export function pageReportQuery(
       search?: string;
       page?: number;
       cursor?: string;
+      readBoundary?: string;
       keywordSnapshot?: string;
       seek?: string;
       tablePages?: Record<string, number>;
@@ -41,7 +43,15 @@ export function pageReportQuery(
   fresh?: () => boolean,
   priority: 'foreground' | 'prefetch' = 'foreground',
 ) {
-  const p = { chartPeriod: 'today', filter: '', search: '', page: 1, cursor: '', seek: '', ...input };
+  const p = {
+    chartPeriod: 'today',
+    filter: '',
+    search: '',
+    page: 1,
+    cursor: '',
+    seek: '',
+    ...input,
+  };
   // tablePages 以扁平 tp_<table> 参数上送（reportQuery 归口解析）；
   // queryKey 记录排序后的页码集合，保证等价分页状态命中同一缓存。
   const tpParams = Object.fromEntries(
@@ -98,6 +108,7 @@ export function pageReportQuery(
         keywordStatusVersion,
       ]),
     );
+  if (p.resource === 'logs' && p.readBoundary) queryKey.push(p.readBoundary);
   return {
     queryKey,
     queryFn: ({
@@ -113,14 +124,16 @@ export function pageReportQuery(
         signal,
         () =>
           featureApi.get<LiekanPageReport>(
-            `/liekan/websites/${websiteId}/page-report`,
-            {
-              ...p,
-              tablePages: undefined,
-              ...tpParams,
-              ...(p.resource === 'human/keywords' ? { keywordStatusVersion } : {}),
-              ...(fresh?.() ? { refresh: '1' } : {}),
-            },
+            `/liekan/websites/${websiteId}/${p.resource === 'logs' ? 'log-entries' : 'page-report'}`,
+            p.resource === 'logs'
+              ? logReadQuery.parse({ ...p, seek: p.seek || 'after' })
+              : {
+                  ...p,
+                  tablePages: undefined,
+                  ...tpParams,
+                  ...(p.resource === 'human/keywords' ? { keywordStatusVersion } : {}),
+                  ...(fresh?.() ? { refresh: '1' } : {}),
+                },
             signal,
             {
               priority,

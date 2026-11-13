@@ -216,10 +216,15 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
     await log('2009-11-01T03:00:30Z');
     await log('2009-11-01T03:01:30Z');
     const rows = await api.readAnalysisLogSeries({
-      ...input(), startDate: new Date('2009-11-01T03:00Z'), endDate: new Date('2009-11-01T04:00Z'),
-      timezone: 'America/Goose_Bay', grain: 'day',
+      ...input(),
+      startDate: new Date('2009-11-01T03:00Z'),
+      endDate: new Date('2009-11-01T04:00Z'),
+      timezone: 'America/Goose_Bay',
+      grain: 'day',
     });
-    expect(rows).toEqual([{ day: '2009-11-01', bot: 'GPTBot', type: '训练', count: 2, aiRequests: 2 }]);
+    expect(rows).toEqual([
+      { day: '2009-11-01', bot: 'GPTBot', type: '训练', count: 2, aiRequests: 2 },
+    ]);
   });
   it('keeps crawler context exact across raw gaps, covered visits and late identity corrections', async () => {
     await event('2026-01-01T00:01:00Z');
@@ -227,7 +232,10 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
     await event('2026-01-01T01:20:00Z', { visit: randomUUID() });
     const changed = await event('2026-01-01T01:30:00Z');
     const missing = await event('2026-01-01T01:31:00Z');
-    await execute('UPDATE liekan_event_environment SET identity_available=false WHERE event_id=$1::uuid', missing);
+    await execute(
+      'UPDATE liekan_event_environment SET identity_available=false WHERE event_id=$1::uuid',
+      missing,
+    );
     await event('2026-01-01T01:40:00Z', { type: 5 });
     const { getHumanFacts } = await import('./analytics');
     const { reportSnapshot } = await import('./server');
@@ -238,8 +246,14 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
     ];
     const verify = async () => {
       for (const [starts, ends] of ranges) {
-        const expected = await reportSnapshot(() => getHumanFacts(site, starts, ends, 'Asia/Shanghai', ['daily']));
-        const actual = await reportSnapshot(() => getHumanFacts(site, starts, ends, 'Asia/Shanghai', ['daily'], undefined, { crawlerContext: true }));
+        const expected = await reportSnapshot(() =>
+          getHumanFacts(site, starts, ends, 'Asia/Shanghai', ['daily']),
+        );
+        const actual = await reportSnapshot(() =>
+          getHumanFacts(site, starts, ends, 'Asia/Shanghai', ['daily'], undefined, {
+            crawlerContext: true,
+          }),
+        );
         expect(actual.totals).toEqual(expected.totals);
         expect(actual.population).toEqual(expected.population);
         expect(actual.daily.map(row => row.day)).toEqual(expected.daily.map(row => row.day));
@@ -250,7 +264,10 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
     await verify();
     await finish(await build(from, new Date(+from + 7200000)));
     await verify();
-    await execute('UPDATE liekan_event_environment SET identity_available=false WHERE event_id=$1::uuid', changed);
+    await execute(
+      'UPDATE liekan_event_environment SET identity_available=false WHERE event_id=$1::uuid',
+      changed,
+    );
     await verify();
   });
   it.each([
@@ -261,14 +278,25 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
   ])('keeps crawler local date labels across covered UTC hours in %s', async (timezone, at) => {
     await event(at);
     const hour = new Date(Math.floor(+new Date(at) / 3600000) * 3600000);
-    const starts = new Date(+hour - 86400000), ends = new Date(+hour + 86400000);
+    const starts = new Date(+hour - 86400000),
+      ends = new Date(+hour + 86400000);
     const { getHumanFacts } = await import('./analytics');
     const { reportSnapshot } = await import('./server');
-    const expected = await reportSnapshot(() => getHumanFacts(site, starts, ends, timezone, ['daily']));
-    await finish(await api.createAnalysisBuild(site, actor, {
-      startDate: hour, endDate: new Date(+hour + 3600000), timezone, locale: 'zh-CN', requestId: randomUUID(),
-    }));
-    const actual = await reportSnapshot(() => getHumanFacts(site, starts, ends, timezone, ['daily'], undefined, { crawlerContext: true }));
+    const expected = await reportSnapshot(() =>
+      getHumanFacts(site, starts, ends, timezone, ['daily']),
+    );
+    await finish(
+      await api.createAnalysisBuild(site, actor, {
+        startDate: hour,
+        endDate: new Date(+hour + 3600000),
+        timezone,
+        locale: 'zh-CN',
+        requestId: randomUUID(),
+      }),
+    );
+    const actual = await reportSnapshot(() =>
+      getHumanFacts(site, starts, ends, timezone, ['daily'], undefined, { crawlerContext: true }),
+    );
     expect(actual.totals).toEqual(expected.totals);
     expect(actual.daily.map(row => row.day)).toEqual(expected.daily.map(row => row.day));
   });
@@ -278,18 +306,30 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
     await event('2026-01-01T01:03:00Z', { type: 2 });
     const { getHumanFacts } = await import('./analytics');
     const { reportSnapshot } = await import('./server');
-    const expected = await reportSnapshot(() => getHumanFacts(site, from, until, 'Asia/Shanghai', ['pages']));
+    const expected = await reportSnapshot(() =>
+      getHumanFacts(site, from, until, 'Asia/Shanghai', ['pages']),
+    );
     const factual: string[] = [];
     const actual = await reportSnapshot(() => {
       const snapshot = getQuerySnapshot();
-      return withinQuerySnapshot({
-        $executeRawUnsafe: (sql, ...values) => snapshot.$executeRawUnsafe(sql, ...values),
-        $queryRawUnsafe: async (sql, ...values) => {
-          const rows = await snapshot.$queryRawUnsafe(sql, ...values) as any[];
-          if (rows[0] && ['facts', 'pageviews', 'qualifiedVisitors'].some(key => Object.hasOwn(rows[0], key))) factual.push(sql);
-          return rows;
+      return withinQuerySnapshot(
+        {
+          $executeRawUnsafe: (sql, ...values) => snapshot.$executeRawUnsafe(sql, ...values),
+          $queryRawUnsafe: async (sql, ...values) => {
+            const rows = (await snapshot.$queryRawUnsafe(sql, ...values)) as any[];
+            if (
+              rows[0] &&
+              ['facts', 'pageviews', 'qualifiedVisitors'].some(key => Object.hasOwn(rows[0], key))
+            )
+              factual.push(sql);
+            return rows;
+          },
         },
-      }, () => getHumanFacts(site, from, until, 'Asia/Shanghai', ['pages'], undefined, { crawlerContext: true }));
+        () =>
+          getHumanFacts(site, from, until, 'Asia/Shanghai', ['pages'], undefined, {
+            crawlerContext: true,
+          }),
+      );
     });
     expect(actual.pages).toEqual(expected.pages);
     expect(actual.totals).toEqual(expected.totals);
@@ -300,25 +340,50 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
     await event('2026-01-01T00:01:00Z');
     await event('2026-01-02T00:02:00Z', { visit: randomUUID() });
     const unknown = await event('2026-01-02T00:03:00Z');
-    await execute('UPDATE liekan_event_environment SET identity_available=false WHERE event_id=$1::uuid', unknown);
+    await execute(
+      'UPDATE liekan_event_environment SET identity_available=false WHERE event_id=$1::uuid',
+      unknown,
+    );
     const { getHumanFacts } = await import('./analytics');
     const { reportSnapshot } = await import('./server');
-    const expected = await reportSnapshot(() => getHumanFacts(site, from, until, 'Asia/Shanghai', ['daily']));
+    const expected = await reportSnapshot(() =>
+      getHumanFacts(site, from, until, 'Asia/Shanghai', ['daily']),
+    );
     const factual: string[] = [];
     const actual = await reportSnapshot(() => {
       const snapshot = getQuerySnapshot();
-      return withinQuerySnapshot({
-        $executeRawUnsafe: (sql, ...values) => snapshot.$executeRawUnsafe(sql, ...values),
-        $queryRawUnsafe: async (sql, ...values) => {
-          const rows = await snapshot.$queryRawUnsafe(sql, ...values) as any[];
-          if (rows[0] && ['facts', 'pageviews', 'qualifiedVisitors'].some(key => Object.hasOwn(rows[0], key))) factual.push(sql);
-          return rows;
+      return withinQuerySnapshot(
+        {
+          $executeRawUnsafe: (sql, ...values) => snapshot.$executeRawUnsafe(sql, ...values),
+          $queryRawUnsafe: async (sql, ...values) => {
+            const rows = (await snapshot.$queryRawUnsafe(sql, ...values)) as any[];
+            if (
+              rows[0] &&
+              ['facts', 'pageviews', 'qualifiedVisitors'].some(key => Object.hasOwn(rows[0], key))
+            )
+              factual.push(sql);
+            return rows;
+          },
         },
-      }, () => Reflect.apply(getHumanFacts, undefined, [site, from, until, 'Asia/Shanghai', ['daily'], undefined, { crawlerContext: true }]));
+        () =>
+          Reflect.apply(getHumanFacts, undefined, [
+            site,
+            from,
+            until,
+            'Asia/Shanghai',
+            ['daily'],
+            undefined,
+            { crawlerContext: true },
+          ]),
+      );
     });
     expect(actual.totals).toEqual(expected.totals);
     expect(actual.daily.map(row => row.day)).toEqual(expected.daily.map(row => row.day));
-    expect(actual.population.identity).toMatchObject({ eligiblePV: 3, qualifiedPV: 2, status: 'partial' });
+    expect(actual.population.identity).toMatchObject({
+      eligiblePV: 3,
+      qualifiedPV: 2,
+      status: 'partial',
+    });
     expect(factual.length).toBeGreaterThan(0);
     expect(factual).toHaveLength(1);
   });
@@ -676,6 +741,68 @@ describe.skipIf(!enabled)('exact rollups in an owned isolated PostgreSQL schema'
       (await api.readAnalysisLogRollup(input({ crawlerIdentityScope: 'verified_range' }))).summary
         .requests,
     ).toBe(2);
+  });
+  it('keeps compact numeric counts exact across raw gaps, coverage, late input and endpoint semantics', async () => {
+    await log('2026-01-01T00:03:00Z');
+    await log('2026-01-01T00:08:00Z', { verification: 'verified_dns', status: 500 });
+    await log('2026-01-02T00:03:00Z', {
+      ai: null,
+      state: 'unknown',
+      bot: '其他',
+      verification: 'unverified',
+    });
+    await log('2026-01-01T01:00:00Z', { selfCheck: true, status: 503 });
+    await log('2026-01-03T00:00:00Z');
+    const read = (extra: Partial<AnalysisLogInput> = {}) =>
+      api.readAnalysisLogRollup(input({ ...extra, fields: ['counts'] }));
+    const expected = {
+      requests: 3,
+      ai: 3,
+      abnormal: 1,
+      legacyRequests: 1,
+      unclassifiedRequests: 1,
+      classifications: ['legacy'],
+    };
+    expect((await read()).counts).toEqual(expected);
+    expect((await read({ crawlerMetricsVersion: undefined })).counts).toMatchObject({
+      requests: 5,
+      abnormal: 2,
+    });
+    await finish(await shortLogBuild(from, new Date('2026-01-01T00:10:00Z')));
+    const partial = await read();
+    expect(partial.counts).toEqual(expected);
+    expect(partial.coverage.manifests).toBeGreaterThan(0);
+    expect(partial.coverage.rawFallback).toBe(true);
+    expect((await read({ crawlerIdentityScope: 'verified_identity' })).counts).toMatchObject({
+      requests: 2,
+      abnormal: 1,
+    });
+    expect((await read({ crawlerIdentityScope: 'verified_range' })).counts).toMatchObject({
+      requests: 1,
+      abnormal: 0,
+    });
+    await log('2026-01-01T00:04:00Z', {
+      ai: false,
+      status: 404,
+      state: 'unknown',
+      bot: '其他',
+      verification: 'unverified',
+    });
+    expect((await read()).counts).toEqual({
+      ...expected,
+      requests: 4,
+      abnormal: 2,
+      unclassifiedRequests: 2,
+    });
+    expect(
+      (
+        await read({
+          startDate: new Date('2026-01-01T00:03:00.001Z'),
+          endDate: new Date('2026-01-01T00:08:00Z'),
+        })
+      ).counts,
+    ).toMatchObject({ requests: 1, ai: 0, abnormal: 1, unclassifiedRequests: 1 });
+    expect(await read({ filters: { botProductForm: 'workbench' } })).toBeNull();
   });
   it('keeps today static errors, case/path/query boundaries and import time exact through partial v4 coverage', async () => {
     const end = new Date('2026-01-01T00:15:00.123Z');

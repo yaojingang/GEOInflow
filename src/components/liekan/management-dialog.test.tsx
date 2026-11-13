@@ -422,3 +422,50 @@ it('keeps rule policy absent from unrelated robots writes', async () => {
     }),
   );
 });
+
+it.each(['pending', 'failed'] as const)(
+  'keeps independent log paging available when count is %s',
+  count => {
+    const onPage = vi.fn();
+    render(
+      <ManagementDrawer
+        action="日志查询"
+        websiteId="site-a"
+        canManage={true}
+        onClose={() => {}}
+        onSaved={() => {}}
+        onSearch={() => {}}
+      onRange={() => {}}
+        onPage={onPage}
+        isFetching={false}
+        report={{
+          contractVersion: 2,
+          website: { id: 'site-a', name: 'Fixture', domain: 'example.test' },
+          range: { startAt: 1, endAt: 1000, timezone: 'UTC' },
+          states: { human: 'empty', logs: 'available', catalog: 'empty', goals: 'empty' },
+          cards: [],
+          charts: {},
+          tables: { logBody: [{ path: '/available' }] },
+          insights: [],
+          meta: {
+            demo: false,
+            canManage: true,
+            ruleCount: 0,
+            latestImportAt: null,
+            logReadBoundary: 'a'.repeat(64),
+            logHasMore: true,
+            logParts: { count, summary: 'ready' },
+            page: 1,
+            pageSize: 100,
+          },
+        }}
+      />,
+    );
+    expect(screen.queryByText(/共 1 条/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText(count === 'pending' ? '正在读取记录…' : '无法读取此范围的数据'),
+    ).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: '下一页' }));
+    expect(onPage).toHaveBeenCalledWith(2);
+  },
+);

@@ -34,10 +34,15 @@ export const dashboardFirstPageTurnSql = `q.id=(SELECT q.id FROM liekan_analysis
  ORDER BY q.queued_at,q.sequence LIMIT 1)`;
 export const foregroundAnalysisQueuedSql = `EXISTS(SELECT 1 FROM liekan_analysis_query q
   WHERE q.status='queued' AND ${analysisForegroundDemandSql})`;
-export const coldDashboardPrewarmSql = `(q.target='feature:page-report'
+export const coldDashboardPrewarmSql = `(q.target IN('feature:page-report','feature:log-summary')
   AND EXISTS(SELECT 1 FROM liekan_dashboard_snapshot d WHERE d.job_id=q.id)
   AND NOT EXISTS(SELECT 1 FROM liekan_dashboard_snapshot d WHERE d.job_id=q.id
     AND (d.result IS NOT NULL OR d.last_read_at>clock_timestamp()-interval '2 minutes')))`;
+export const defaultDashboardWaitingSql = `(SELECT min(q.queued_at) FROM liekan_analysis_query q
+ WHERE q.status='queued' AND q.next_attempt_at<=clock_timestamp() AND q.retention_until>clock_timestamp()
+ AND NOT ${analysisForegroundDemandSql} AND EXISTS(SELECT 1 FROM liekan_dashboard_snapshot d WHERE d.job_id=q.id))`;
+export const defaultDashboardTurnSql = `EXISTS(SELECT 1 FROM liekan_analysis_background_lease
+ WHERE id AND default_turns>=2 AND ${defaultDashboardWaitingSql}<=clock_timestamp()-interval '30 seconds')`;
 
 /** Keep deterministic input failures when the producer receipt is retired. */
 export async function preserveDashboardFailure(tx: AnalysisTx, jobId?: string) {

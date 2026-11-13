@@ -1,15 +1,16 @@
 import { z } from 'zod';
 import type { requestAnalysisQuery } from './analysis-queries';
-import { noteCacheResult } from './cache-context';
-import { LiekanError } from './errors';
 import { analysisQueryParameters } from './analysis-query-model';
-import { processSingleton } from './process-singleton';
 import {
   analysisViewerId,
-  withAnalysisViewer,
   releaseAnalysisViewer,
   retainPublishedAnalysisViewer,
+  withAnalysisViewer,
 } from './analysis-viewers';
+import { noteCacheResult } from './cache-context';
+import { LiekanError } from './errors';
+import { processSingleton } from './process-singleton';
+import { readLocaleCookie } from '../i18n/locale';
 
 const handoffs = processSingleton(
   'analysis-early-handoffs',
@@ -86,6 +87,46 @@ export function analysisResponse(value: Awaited<ReturnType<typeof requestAnalysi
     },
   );
 }
+
+function requestLocale(request: Request): 'zh-CN' | 'en-US' {
+  return (
+    readLocaleCookie(request.headers.get('cookie') || '') ||
+    (request.headers.get('accept-language')?.startsWith('en') ? 'en-US' : 'zh-CN')
+  );
+}
+
+export async function publishedLogCountResponse(
+  request: Request,
+  websiteId: string,
+  actor: import('./crawler-access').CrawlerActor,
+  query: Record<string, unknown>,
+) {
+  const { readPublishedLogCount } = await import('./analysis-queries');
+  const value = await readPublishedLogCount(websiteId, actor, query, requestLocale(request));
+  if (value)
+    return Response.json(value, {
+      headers: { 'Cache-Control': 'private, no-store', 'X-Liekan-Read-Path': 'published' },
+    });
+}
+
+/** Register an independent private calculation without creating a dashboard snapshot. */
+export async function privateAnalysisResponse(
+  request: Request,
+  websiteId: string,
+  actor: import('./crawler-access').CrawlerActor,
+  target: string,
+  query: Record<string, unknown>,
+) {
+  const { requestAnalysisQuery } = await import('./analysis-queries');
+  const locale = requestLocale(request);
+  const value = await withAnalysisViewer(analysisViewerId(request), () =>
+    requestAnalysisQuery(websiteId, actor, target, query, locale),
+  );
+  if (value.ready === false) await earlyHandoff(value.analysisJob.id);
+  const response = analysisResponse(value);
+  response.headers.set('X-Liekan-Read-Path', value.ready ? 'published' : 'queued');
+  return response;
+}
 export async function asyncAnalysisResponse(request: Request, websiteId: string, target: string) {
   const { authenticateCrawlerMaintenance } = await import('./crawler-maintenance');
   const { authorize } = await import('./server');
@@ -93,10 +134,7 @@ export async function asyncAnalysisResponse(request: Request, websiteId: string,
   const actor = await authenticateCrawlerMaintenance(request);
   const access = await authorize(request, websiteId);
   const query = Object.fromEntries(new URL(request.url).searchParams);
-  const { readLocaleCookie } = await import('../i18n/locale');
-  const locale =
-    readLocaleCookie(request.headers.get('cookie') || '') ||
-    (request.headers.get('accept-language')?.startsWith('en') ? 'en-US' : 'zh-CN');
+  const locale = requestLocale(request);
   const viewerId = analysisViewerId(request);
   const admittedAt = performance.now();
   let value = await withAnalysisViewer(viewerId, () =>

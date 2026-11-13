@@ -203,6 +203,10 @@ export async function getAnalysisStatus(
         rangeEnd: row.rangeEnd.toISOString(),
       })),
       capacity: await analysisCapacity(tx, websiteId),
+      warmup: await (await import('./dashboard-snapshots')).dashboardReadiness(tx, websiteId, {
+        id: identity.userId,
+        role: '',
+      }),
     };
   }, 'RepeatableRead');
 }

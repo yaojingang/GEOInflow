@@ -177,7 +177,7 @@ describe.skipIf(!enabled)('ordinary dashboard demand scheduling in owned Postgre
     [site, otherSite] = sites;
     await sql("UPDATE liekan_analysis_site SET mode='disabled' WHERE website_id<>$1::uuid", site);
     await sql(
-      'UPDATE liekan_analysis_background_lease SET token=NULL,lease_until=NULL,incremental_waiting_at=NULL,history_waiting_at=NULL,interactive_turns=0 WHERE id',
+      'UPDATE liekan_analysis_background_lease SET token=NULL,lease_until=NULL,incremental_waiting_at=NULL,history_waiting_at=NULL,interactive_turns=0,default_turns=0 WHERE id',
     );
     await sql('UPDATE liekan_analysis_dashboard_lease SET token=NULL,lease_until=NULL WHERE id');
     await sql('UPDATE liekan_analysis_read_lease SET token=NULL,lease_until=NULL');
@@ -645,7 +645,7 @@ describe.skipIf(!enabled)('ordinary dashboard demand scheduling in owned Postgre
           site,
         )
       )[0].n,
-    ).toBe(1);
+    ).toBe((Object.keys(pageReportParts).length - 1) * 3);
   });
   it('serializes same-site capacity when existing producers reattach outside global admission', async () => {
     const first = await read(),
@@ -972,7 +972,7 @@ describe.skipIf(!enabled)('ordinary dashboard demand scheduling in owned Postgre
   });
   it('prioritizes every Today resource before seven-day ranges, starting with both overview pages', async () => {
     const resources = Object.keys(pageReportParts).filter(
-      resource => !['logs', 'human/keywords'].includes(resource),
+      resource => !['human/keywords'].includes(resource),
     );
     const seeded: any[] = [];
     for (let pass = 0; pass <= resources.length; pass++) {
@@ -985,9 +985,14 @@ describe.skipIf(!enabled)('ordinary dashboard demand scheduling in owned Postgre
       await finish(cold.id);
     }
     expect(seeded.slice(0, 2).map(value => value.resource)).toEqual(['overview', 'human/overview']);
-    expect(seeded.slice(0, resources.length).every(value => value.chartPeriod === 'today')).toBe(
-      true,
-    );
+    expect(
+      seeded
+        .slice(0, resources.length)
+        .every(
+          value =>
+            value.chartPeriod === 'today' || (value.crawlerMetricsVersion === 1 && !value.resource),
+        ),
+    ).toBe(true);
     expect(seeded[resources.length]).toMatchObject({ chartPeriod: '7d', resource: 'overview' });
   });
   it('projects real page-report website metadata from the authoritative resource row', async () => {
@@ -1584,18 +1589,36 @@ describe.skipIf(!enabled)('ordinary dashboard demand scheduling in owned Postgre
       });
     },
   );
-  it('retains another aged incremental site after one short unit while cold demand waits', async () => {
+  it('retains another incremental site while yielding one unit to cold demand', async () => {
     const ids = await Promise.all([
       pendingBuild('incremental'),
       pendingBuild('incremental', otherSite),
     ]);
-    expect((await read(false)).ready).toBe(false);
+    const cold = await read(false);
+    if (cold.ready) throw new Error('expected cold default');
     await pumpAnalysisBuilds({ send: vi.fn(async () => randomUUID()) });
     const result = await processAnalysisBuild(ids[0], 'incremental');
-    expect(result.completedUnits).toBe(2);
-    expect(
-      await q('SELECT status FROM liekan_analysis_build WHERE id=ANY($1::uuid[])', ids),
-    ).toEqual([{ status: 'completed' }, { status: 'completed' }]);
+    expect(result.completedUnits).toBe(1);
+    const states = await q(
+      'SELECT status FROM liekan_analysis_build WHERE id=ANY($1::uuid[])',
+      ids,
+    );
+    expect(states.filter(row => row.status === 'completed')).toHaveLength(1);
+    await finish(cold.analysisJob.id);
+    expect((await processAnalysisBuild(ids[1], 'incremental')).completedUnits).toBe(1);
+  });
+  it('yields one incremental unit to a default gap even while older incremental work remains', async () => {
+    await seedDashboardSnapshots();
+    await pendingBuild('incremental');
+    await pumpAnalysisBuilds({ send: vi.fn(async () => randomUUID()) });
+    expect((await withAnalysisPermit('incremental', async () => true)).acquired).toBe(true);
+    await pumpAnalysisBuilds({ send: vi.fn(async () => randomUUID()) });
+    expect((await withAnalysisPermit('default', async () => true)).acquired).toBe(true);
+    expect((await withAnalysisPermit('incremental', async () => true)).acquired).toBe(false);
+    await sql(
+      "UPDATE liekan_analysis_background_lease SET incremental_waiting_at=clock_timestamp()-interval '31 seconds' WHERE id",
+    );
+    expect((await withAnalysisPermit('incremental', async () => true)).acquired).toBe(true);
   });
   it('retains pending history after a short unit and yields again after five interactive turns', async () => {
     const ids = await Promise.all([pendingBuild('history'), pendingBuild('history', otherSite)]);

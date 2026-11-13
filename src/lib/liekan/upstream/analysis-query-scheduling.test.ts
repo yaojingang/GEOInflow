@@ -84,7 +84,7 @@ afterEach(() => vi.restoreAllMocks());
 it.each([
   ['feature:page-report', 0, true, 'dashboard', 60000],
   ['feature:page-report', 1, true, 'dashboard', 60000],
-  ['feature:page-report', 0, false, 'interactive', 10000],
+  ['feature:page-report', 0, false, 'default', 10000],
   ['native:stats', 0, true, 'dashboard', 10000],
   ['native:stats', 1, true, 'interactive', 60000],
   ['native:pageviews', 0, true, 'dashboard', 10000],
