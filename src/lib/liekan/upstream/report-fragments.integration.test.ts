@@ -7,7 +7,12 @@ import { withDashboardClock } from './dashboard-clock';
 import { reportSnapshot } from './server';
 import * as snapshots from './query-snapshot';
 import { withPublishedRegistry } from './crawler-registry-context';
-import { readReportFragment, withReportFragments } from './report-fragments';
+import {
+  readReportFragment,
+  withReportFragments,
+  primeReportFragments,
+  ReportFragmentMiss,
+} from './report-fragments';
 
 const enabled = process.env.LIEKAN_ANALYSIS_ROLLUPS_TEST === '1';
 const actor = randomUUID();
@@ -23,7 +28,11 @@ const run = <T>(
   work: () => Promise<T>,
   scope: unknown = { private: true },
   allowed = true,
-  options: { deadline?: number; reauthorize?: (deadline?: number) => Promise<boolean> } = {},
+  options: {
+    deadline?: number;
+    reauthorize?: (deadline?: number) => Promise<boolean>;
+    readOnly?: boolean;
+  } = {},
 ) => {
   const deadline = options.deadline ?? Date.now() + 5000;
   return withPublishedRegistry(() =>
@@ -32,7 +41,9 @@ const run = <T>(
       scope,
       () =>
         withDashboardClock(Date.now(), () =>
-          withReportFragments(site, () => reportSnapshot(work, deadline)),
+          withReportFragments(site, () => reportSnapshot(work, deadline), {
+            readOnly: options.readOnly,
+          }),
         ),
       {
         kind: 'interactive',
@@ -107,6 +118,68 @@ describe.skipIf(!enabled)('persistent private report modules', () => {
     await read();
     expect(load).toHaveBeenCalledTimes(4);
     expect(await count()).toBe(1);
+  });
+  it('keeps a log day reusable across unrelated traffic and dates and rebuilds only its changed day', async () => {
+    const first = vi.fn(async () => 11),
+      second = vi.fn(async () => 17);
+    const next = new Date(+end + 86400000);
+    const read = () =>
+      run(async () => [
+        await readReportFragment('log-series', start, end, {}, first, false, 'log'),
+        await readReportFragment('log-series', end, next, {}, second, false, 'log'),
+      ]);
+    expect(await read()).toEqual([11, 17]);
+    await sql(
+      `INSERT INTO liekan_analysis_dirty(website_id,epoch,family,bucket,shard) SELECT website_id,epoch,'visit',$2,0 FROM liekan_analysis_site WHERE website_id=$1::uuid`,
+      site,
+      start,
+    );
+    await read();
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+    await sql(
+      `INSERT INTO liekan_analysis_dirty(website_id,epoch,family,bucket,shard) SELECT website_id,epoch,'log',$2,0 FROM liekan_analysis_site WHERE website_id=$1::uuid`,
+      site,
+      start,
+    );
+    await read();
+    expect(first).toHaveBeenCalledTimes(2);
+    expect(second).toHaveBeenCalledTimes(1);
+  });
+  it('batches exact numeric probes and declines missing or oversized groups without source scans', async () => {
+    const ranges = [
+      { start, end },
+      { start: end, end: new Date(+end + 86400000) },
+    ];
+    const load = vi.fn(async () => ({ requests: 7, classifications: ['v1'] }));
+    const parts = () =>
+      Promise.all(
+        ranges.map(r => readReportFragment('numeric', r.start, r.end, {}, load, false, 'log')),
+      );
+    const prepared = () =>
+      run(
+        async () => {
+          await primeReportFragments('numeric', ranges, {}, 'log');
+          return parts();
+        },
+        { private: true },
+        true,
+        { readOnly: true },
+      );
+    await expect(prepared()).rejects.toBeInstanceOf(ReportFragmentMiss);
+    expect(load).not.toHaveBeenCalled();
+    await run(parts);
+    expect(await prepared()).toEqual([
+      { requests: 7, classifications: ['v1'] },
+      { requests: 7, classifications: ['v1'] },
+    ]);
+    expect(load).toHaveBeenCalledTimes(2);
+    await sql(
+      'UPDATE liekan_report_fragment SET result_bytes=2097152 WHERE website_id=$1::uuid',
+      site,
+    );
+    await expect(prepared()).rejects.toBeInstanceOf(ReportFragmentMiss);
+    expect(load).toHaveBeenCalledTimes(2);
   });
   it('invalidates inclusive endpoint data while keeping half-open endpoint data reusable', async () => {
     const inclusive = vi.fn(async () => 1);

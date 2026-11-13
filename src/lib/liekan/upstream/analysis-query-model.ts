@@ -6,7 +6,12 @@ import { LiekanError } from './errors';
 export const ANALYSIS_QUERY_QUEUE = 'liekan-analysis-query';
 export const ANALYSIS_BUILD_QUEUE = 'liekan-analysis-build';
 export const ANALYSIS_RESULT_FORMAT = 'liekan-analysis-result-v3';
-export const liveAnalysisTargets = ['feature:page-report', 'native:stats', 'native:pageviews'];
+export const liveAnalysisTargets = [
+  'feature:page-report',
+  'feature:log-summary',
+  'native:stats',
+  'native:pageviews',
+];
 /** Classify each unclaimed attempt from current authorized reader demand. */
 export function analysisAttemptPolicy(row: {
   target: string;
@@ -17,9 +22,11 @@ export function analysisAttemptPolicy(row: {
   const viewedPage = row.target === 'feature:page-report' && row.foreground !== false;
   return {
     lane:
-      viewedPage || (firstLive && row.foreground !== false)
-        ? ('dashboard' as const)
-        : ('interactive' as const),
+      row.foreground === false
+        ? ('default' as const)
+        : viewedPage || firstLive
+          ? ('dashboard' as const)
+          : ('interactive' as const),
     budgetMs: (firstLive && !viewedPage) || row.target === 'native:heatmaps' ? 10000 : 60000,
   };
 }

@@ -10,6 +10,7 @@ import {
   publishDashboardSnapshot,
   seedDashboardSnapshots,
   pumpDashboardDemand,
+  dashboardReadiness,
 } from './dashboard-snapshots';
 import {
   processAnalysisQuery,
@@ -26,10 +27,12 @@ import { withAnalysisPermit } from './analysis-background';
 import { ANALYSIS_QUERY_QUEUE } from './analysis-query-model';
 import { pageReportParts } from '../contracts/page-report';
 import { AnalyticsUnavailable } from './analytics-budget';
+import { dashboardWarmRanges } from './dashboard-snapshot-model';
 
 const warmResources = [
   'overview',
   'human/overview',
+  'logs',
   ...Object.keys(pageReportParts).filter(
     resource => !['overview', 'human/overview', 'logs', 'human/keywords'].includes(resource),
   ),
@@ -181,7 +184,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
       site,
     );
     await sql(
-      'UPDATE liekan_analysis_background_lease SET token=NULL,lease_until=NULL,incremental_waiting_at=NULL,history_waiting_at=NULL,interactive_turns=0 WHERE id',
+      'UPDATE liekan_analysis_background_lease SET token=NULL,lease_until=NULL,incremental_waiting_at=NULL,history_waiting_at=NULL,interactive_turns=0,default_turns=0 WHERE id',
     );
     await event();
   });
@@ -1278,6 +1281,78 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     await sql('UPDATE liekan_analysis_query SET attempts=1 WHERE id=$1::uuid', task.analysisJob.id);
     expect((await withAnalysisPermit('history', async () => true)).acquired).toBe(false);
   });
+  it('resumes a paused common seed after coverage changes while unchanged input stays parked', async () => {
+    const parameters = {
+      resource: 'overview',
+      chartPeriod: 'today',
+      ...dashboardWarmRanges('UTC')[0],
+      timezone: 'UTC',
+    };
+    const open = () =>
+      withPublishedRegistry(() =>
+        requestDashboardSnapshot(site, actor, 'feature:page-report', parameters, 'zh-CN', false),
+      );
+    const pending = await open();
+    if (!('analysisJob' in pending)) throw new Error('expected a cold common seed');
+    await sql(
+      "UPDATE liekan_analysis_query SET status='failed',error_code='analysis-idle' WHERE id=$1::uuid",
+      pending.analysisJob.id,
+    );
+    await pumpDashboardSnapshots();
+    await expect(open()).rejects.toMatchObject({ code: 'dashboard-paused' });
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 31000);
+    await expect(open()).rejects.toMatchObject({ code: 'dashboard-paused' });
+    clock.mockRestore();
+    await sql(
+      `INSERT INTO liekan_analysis_manifest(website_id,epoch,family,bucket,bucket_end,generation,fingerprint,versions,row_count)
+      SELECT website_id,epoch,'visit','2026-01-01','2026-01-01T01:00Z',$2::uuid,'synthetic-coverage','{}',0
+      FROM liekan_analysis_site WHERE website_id=$1::uuid`,
+      site,
+      randomUUID(),
+    );
+    const resumed = await open();
+    expect(resumed.ready).toBe(false);
+    expect(
+      (
+        await q('SELECT error_code FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid', site)
+      )[0].error_code,
+    ).toBeNull();
+  });
+  it('serves a default gap while automatic history waits without any real reader', async () => {
+    await sql("UPDATE liekan_analysis_site SET mode='disabled' WHERE website_id<>$1::uuid", site);
+    await seedDashboardSnapshots();
+    const [task] = await q(
+      "SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid AND status='queued'",
+      site,
+    );
+    await sql(
+      "UPDATE liekan_analysis_background_lease SET history_waiting_at=clock_timestamp()-interval '1 minute',interactive_turns=0,default_turns=0 WHERE id",
+    );
+    await finish(task.id);
+    expect((await withAnalysisPermit('history', async () => true)).acquired).toBe(true);
+  });
+  it('gives an aged default gap one turn after two real foreground units', async () => {
+    await sql("UPDATE liekan_analysis_site SET mode='disabled' WHERE website_id<>$1::uuid", site);
+    await seedDashboardSnapshots();
+    const [task] = await q(
+      "SELECT id FROM liekan_analysis_query WHERE website_id=$1::uuid AND status='queued'",
+      site,
+    );
+    await sql(
+      "UPDATE liekan_analysis_query SET queued_at=clock_timestamp()-interval '31 seconds' WHERE id=$1::uuid",
+      task.id,
+    );
+    const foreground = await read();
+    expect(foreground.ready).toBe(false);
+    expect((await withAnalysisPermit('default', async () => true)).acquired).toBe(false);
+    await withAnalysisPermit('dashboard', async () => true);
+    await withAnalysisPermit('dashboard', async () => true);
+    await finish(task.id);
+    expect(
+      (await q('SELECT default_turns FROM liekan_analysis_background_lease WHERE id'))[0]
+        .default_turns,
+    ).toBe(0);
+  });
   it('uses remaining seed space without evicting and rebuilding a current seed', async () => {
     await sql("UPDATE liekan_analysis_site SET mode='disabled' WHERE website_id<>$1::uuid", site);
     await sql(
@@ -1323,6 +1398,36 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
       "DELETE FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND query_key LIKE 'synthetic-front-%'",
       site,
     );
+  });
+  it('keeps default placeholder registration within the site and global capacity boundary', async () => {
+    await sql("UPDATE liekan_analysis_site SET mode='disabled' WHERE website_id<>$1::uuid", site);
+    const spy = vi.spyOn(rollupDatabase, 'analysisCapacity').mockResolvedValue({
+      siteBytes: '1073741824',
+      globalBytes: '8589934592',
+      siteLimit: 1073741824,
+      globalLimit: 8589934592,
+    });
+    try {
+      await seedDashboardSnapshots();
+      expect(
+        (
+          await q(
+            'SELECT count(*)::int AS n FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
+            site,
+          )
+        )[0].n,
+      ).toBe(0);
+      expect(
+        (
+          await q(
+            'SELECT count(*)::int AS n FROM liekan_analysis_query WHERE website_id=$1::uuid',
+            site,
+          )
+        )[0].n,
+      ).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
   });
   it('prewarms Today and seven-day results at full capacity and reuses them across an hour', async () => {
     await sql("UPDATE liekan_analysis_site SET mode='disabled' WHERE website_id<>$1::uuid", site);
@@ -1551,13 +1656,13 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     );
     await finish(seed.id);
     const [published] = await q(
-      'SELECT query_key,generated_at FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid',
+      'SELECT query_key,generated_at FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid AND result IS NOT NULL',
       site,
     );
     await sql(
       `INSERT INTO liekan_dashboard_snapshot(website_id,query_key,actor_id,target,parameters,locale,strong_version,epoch,calendar_day,dependency_end,last_read_at)
        SELECT website_id,'synthetic-foreground-lru-'||n,$2::uuid,'native:stats','{}','zh-CN','synthetic',epoch,'','2026-01-01',clock_timestamp()-interval '1 day'
-       FROM liekan_analysis_site CROSS JOIN generate_series(1,199) n WHERE website_id=$1::uuid`,
+       FROM liekan_analysis_site CROSS JOIN generate_series(1,(SELECT 200-count(*)::int FROM liekan_dashboard_snapshot WHERE website_id=$1::uuid)) n WHERE website_id=$1::uuid`,
       site,
       actor.id,
     );
@@ -1654,6 +1759,7 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
       'UPDATE liekan_analysis_site SET dashboard_seed_checked_at=NULL WHERE website_id=$1::uuid',
       site,
     );
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now());
     const { dashboardWarmRanges } = await import('./dashboard-snapshot-model');
     const ranges = dashboardWarmRanges('Asia/Shanghai');
     for (const [index, range] of ranges.entries()) {
@@ -1664,11 +1770,13 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
           site,
         );
         expect(cold?.parameters).toMatchObject({
-          resource,
-          chartPeriod: ['today', '7d', '30d'][index],
+          ...(resource === 'logs' ? {} : { resource, chartPeriod: ['today', '7d', '30d'][index] }),
           startAt: range.startAt,
-          endAt: range.endAt + (resource.startsWith('ai/') ? 1 : 0),
-          ...(resource.startsWith('ai/')
+          endAt:
+            resource === 'logs'
+              ? Math.floor(Date.now() / 300000) * 300000
+              : range.endAt + (resource.startsWith('ai/') ? 1 : 0),
+          ...(resource.startsWith('ai/') || resource === 'logs'
             ? { crawlerIdentityScope: 'all', crawlerMetricsVersion: 1 }
             : {}),
         });
@@ -1683,6 +1791,17 @@ describe.skipIf(!enabled)('persistent dashboard publications in PostgreSQL', () 
     expect(publications.every(row => +new Date(row.last_read_at) === 0 && row.result != null)).toBe(
       true,
     );
+    expect(
+      await withPublishedRegistry(() =>
+        analysisTransaction(tx => dashboardReadiness(tx, site, actor)),
+      ),
+    ).toMatchObject({
+      expected: warmResources.length * 3,
+      ready: warmResources.length * 3,
+      preparing: 0,
+      unregistered: 0,
+      oldestPendingAt: null,
+    });
     const selected = ranges[0];
     expect(
       await withPublishedRegistry(() =>

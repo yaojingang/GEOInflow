@@ -46,8 +46,13 @@ async function readPreferredLogSeries(input: Parameters<typeof readAnalysisLogSe
       boundaries.push(at);
     }
   } else {
-    const today = calendarDayRange(Date.now(), timezone).startAt;
-    if (today > +startDate && today < +endDate) boundaries.push(today);
+    let at = +startDate;
+    while (at < +endDate) {
+      const next = calendarDayRange(at, timezone).endAt + 1;
+      if (next >= +endDate) break;
+      boundaries.push(next);
+      at = next;
+    }
   }
   boundaries.push(+endDate);
   const combined = new Map<
@@ -57,8 +62,14 @@ async function readPreferredLogSeries(input: Parameters<typeof readAnalysisLogSe
   for (let index = 1; index < boundaries.length; index++) {
     const start = new Date(boundaries[index - 1]),
       end = new Date(boundaries[index]);
-    const rows = await readReportFragment('log-series', start, end, conditions, () =>
-      readLogSeries({ ...input, startDate: start, endDate: end }, true),
+    const rows = await readReportFragment(
+      'log-series',
+      start,
+      end,
+      conditions,
+      () => readLogSeries({ ...input, startDate: start, endDate: end }, true),
+      false,
+      'log',
     );
     if (!rows) return null;
     for (const row of rows) {

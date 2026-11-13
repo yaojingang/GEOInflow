@@ -29,12 +29,7 @@ export async function logReadBoundary(tx: any, websiteId: string, p: LogReadQuer
     end = new Date(p.endAt + (p.crawlerMetricsVersion === 1 ? 0 : 1));
   const [state] = await tx.$queryRawUnsafe(
     `SELECT s.epoch::text,s.mode,l.epoch::text AS log_epoch,
-      liekan_analysis_fingerprint(s.website_id,s.epoch,'log',
-        date_bin(interval '5 minutes',$2::timestamptz,timestamptz '2000-01-01Z'),
-        date_bin(interval '5 minutes',$3::timestamptz,timestamptz '2000-01-01Z')) AS coarse,
-      (SELECT coalesce(string_agg(d.bucket::text||':'||d.shard::text||':'||d.revision::text,',' ORDER BY d.bucket,d.shard),'')
-       FROM liekan_dashboard_dirty d WHERE d.website_id=s.website_id AND d.epoch=s.epoch AND d.family='log'
-       AND (d.bucket='-infinity' OR (d.bucket>=greatest(date_bin(interval '30 seconds',$2::timestamptz,timestamptz '2000-01-01Z'),date_bin(interval '5 minutes',$3::timestamptz,timestamptz '2000-01-01Z')) AND d.bucket<$3::timestamptz))) AS fine
+      liekan_report_range_fingerprint(s.website_id,s.epoch,'log',$2::timestamptz,$3::timestamptz) AS coarse,'' AS fine
      FROM liekan_analysis_site s LEFT JOIN liekan_log_state l USING(website_id) WHERE s.website_id=$1::uuid`,
     websiteId,
     start,
@@ -42,7 +37,7 @@ export async function logReadBoundary(tx: any, websiteId: string, p: LogReadQuer
   );
   if (!state) throw new LiekanError('统计加速迁移未完成', 503);
   const identity = [
-    'log-read-v1',
+    'log-read-v2',
     websiteId,
     p.startAt,
     p.endAt,

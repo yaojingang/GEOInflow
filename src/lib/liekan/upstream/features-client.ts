@@ -162,7 +162,7 @@ export async function featureRequest<T = any>(
   if (
     !shareToken &&
     headers.Prefer === 'respond-async' &&
-    /^\/liekan\/websites\/[^/]+\/(?:page-report|log-count)$/.test(path)
+    /^\/liekan\/websites\/[^/]+\/(?:page-report|log-count|log-summary)$/.test(path)
   )
     headers['X-Liekan-View'] = crypto.randomUUID();
   if (shareToken) {

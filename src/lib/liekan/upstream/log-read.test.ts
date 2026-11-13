@@ -5,7 +5,9 @@ const mocks = vi.hoisted(() => ({
   today: vi.fn(),
   settings: vi.fn(),
   query: vi.fn(),
+  statistics: vi.fn(),
 }));
+vi.mock('./log-statistics', () => ({ readLogStatistics: mocks.statistics }));
 vi.mock('./logs', () => ({ getLogFacts: mocks.facts, getLogToday: mocks.today }));
 vi.mock('../store', () => ({ getSettings: mocks.settings }));
 vi.mock('./server', () => ({ reportSnapshot: (work: any) => work(), query: mocks.query }));
@@ -42,6 +44,14 @@ const rows = Array.from({ length: 101 }, (_, i) => ({
 }));
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.statistics.mockResolvedValue({
+    requests: 9876,
+    ai: 50,
+    abnormal: 40,
+    legacyRequests: 4,
+    unclassifiedRequests: 5,
+    classifications: ['fixture'],
+  });
   mocks.facts.mockResolvedValue({
     connected: true,
     latest: new Date(1),
@@ -105,13 +115,7 @@ it('keeps summary counters unfiltered and records the original displayed cursor 
     filter: 'abnormal',
     search: '/entry',
   });
-  expect(mocks.facts.mock.calls[0].slice(5, 10)).toEqual([
-    '',
-    '',
-    '',
-    'after',
-    ['summary', 'latest'],
-  ]);
+  expect(mocks.facts.mock.calls[0].slice(5, 10)).toEqual(['', '', '', 'after', ['latest']]);
   expect(value.cards.find(c => c.label === '今日已解析').value).toBe(11);
   expect(value.cards.find(c => c.label === '异常请求（今日）').value).toBe(3);
   expect(value.tables.pipeList[2].detail).toBe('7 条目录记录');

@@ -21,6 +21,8 @@ export async function executeAnalysisQuery(
   );
   if (target === 'feature:log-count')
     return (await import('./log-read')).readLogCount(websiteId, parameters);
+  if (target === 'feature:log-summary')
+    return (await import('./log-read')).readLogSummary(websiteId, parameters);
   if (target === 'feature:page-report') {
     const result = await readPageReport(website, parameters);
     noteCacheResult(result);

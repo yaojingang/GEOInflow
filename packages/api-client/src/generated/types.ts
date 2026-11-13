@@ -17841,6 +17841,13 @@ export interface operations {
             mode: 'live' | 'disabled';
             revision: number;
             supported: boolean;
+            warmup?: {
+              expected: number;
+              oldestPendingAt: string | null;
+              preparing: number;
+              ready: number;
+              unregistered?: number;
+            };
             /**
              * Format: uuid
              * @description ID of the website.
@@ -32162,6 +32169,41 @@ export interface operations {
                 [key: string]: string | number | boolean | null;
               }[];
             };
+          };
+        };
+      };
+      /** @description Exact summary accepted as a private durable task */
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': {
+            analysisJob: {
+              completedAt: string | null;
+              errorCode: string | null;
+              /** @description Date and time the credential expires. */
+              expiresAt: number | null;
+              generatedAt: number | null;
+              /**
+               * Format: uuid
+               * @description Unique identifier of the resource.
+               */
+              id: string;
+              queuedAt: string;
+              resultUrl: string;
+              retryAfterMs: number;
+              /** @description Date and time the recording started. */
+              startedAt: string | null;
+              /** @enum {string} */
+              status: 'queued' | 'running' | 'ready' | 'failed' | 'invalidated' | 'expired';
+              /**
+               * Format: uuid
+               * @description ID of the website.
+               */
+              websiteId: string;
+            };
+            previousResult?: unknown;
           };
         };
       };

@@ -4,7 +4,7 @@ import { EVENT_COLUMNS, SESSION_COLUMNS } from '@/lib/constants';
 import { filterParams, withDateRange } from '@/lib/schema';
 import { analysisQuery, journeyQuery } from '../contracts/analysis';
 import { CALENDAR_POLICY_VERSION } from '../contracts/calendar';
-import { logCountQuery } from '../contracts/log-read';
+import { logCountQuery, logReadQuery } from '../contracts/log-read';
 import { parseReportQuery } from '../contracts/query';
 import { sharedReportQuery } from '../contracts/shared-report';
 import { ANALYTICS_READ_VERSION } from './analytics-revision';
@@ -34,6 +34,7 @@ export const analyticsRefreshJobSchema = z
       'native:revenue/metrics',
       'native:utm/metrics',
       'feature:log-count',
+      'feature:log-summary',
       'feature:page-report',
       'feature:shared-report',
       'feature:analytics',
@@ -107,6 +108,7 @@ export function parseAnalyticsHotParameters(target: string, input: Record<string
   if (target === 'native:funnels/stats' && Array.isArray(parameters.steps))
     parameters.steps = JSON.stringify(parameters.steps);
   if (target === 'feature:log-count') return logCountQuery.parse(parameters);
+  if (target === 'feature:log-summary') return logReadQuery.parse(parameters);
   if (target === 'feature:page-report') {
     const parsed = parseReportQuery(parameters);
     if (!parsed.success) throw parsed.error;

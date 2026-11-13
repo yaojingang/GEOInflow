@@ -50,9 +50,11 @@ import {
   pauseIdleDashboardRetries,
   preserveDashboardFailure,
   yieldIdleDashboard,
+  defaultDashboardTurnSql,
 } from './dashboard-demand';
 import { LiekanError } from './errors';
 import { websiteCacheTag } from './query-cache';
+import { logCountSchema } from '../contracts/log-read';
 
 type Row = {
   id: string;
@@ -80,6 +82,7 @@ type Row = {
   lease_token: string | null;
   attempts: number;
   foreground?: boolean;
+  default_turn?: boolean;
   fast_attempted_at?: Date | null;
 };
 export type AnalysisRegistration = (tx: any, row: Row) => Promise<void>;
@@ -121,6 +124,54 @@ export async function analysisQueryState(tx: any, websiteId: string, actor: Craw
   };
 }
 const state = analysisQueryState;
+function queryKey(
+  websiteId: string,
+  target: string,
+  parameters: Record<string, unknown>,
+  locale: string,
+  snapshot: { strong: string; epoch: bigint },
+) {
+  return analysisDigest([
+    ANALYSIS_RESULT_FORMAT,
+    websiteId,
+    target,
+    parameters,
+    locale,
+    snapshot.strong,
+    String(snapshot.epoch),
+  ]);
+}
+
+/** A scalar count remains exact while its current input proof and authority match. */
+export async function readPublishedLogCount(
+  websiteId: string,
+  actor: CrawlerActor,
+  input: Record<string, unknown>,
+  locale: 'zh-CN' | 'en-US' = 'zh-CN',
+) {
+  if (input.refresh === '1') return;
+  const parameters = analysisQueryParameters('feature:log-count', input);
+  return analysisTransaction(async tx => {
+    const current = await state(tx, websiteId, actor);
+    const [saved] = await tx.$queryRawUnsafe<{ result: unknown }[]>(
+      `SELECT result FROM liekan_analysis_query WHERE website_id=$1::uuid AND query_key=$2
+       AND status='ready' AND strong_version=$3 AND epoch=$4::bigint AND retention_until>clock_timestamp()
+       ORDER BY sequence DESC LIMIT 1`,
+      websiteId,
+      queryKey(websiteId, 'feature:log-count', parameters, locale, current),
+      current.strong,
+      String(current.epoch),
+    );
+    if (!saved) return;
+    const value = logCountSchema.safeParse(decodeAnalysisEnvelope(saved.result, websiteId).value);
+    if (!value.success || value.data.readBoundary !== parameters.readBoundary) return;
+    const { logReadBoundary, parseLogRead } = await import('./log-read-boundary');
+    await logReadBoundary(tx, websiteId, parseLogRead(parameters));
+    if ((await readAnalyticsVersions(tx, [websiteCacheTag(websiteId)])).strong !== current.strong)
+      throw new LiekanError('统计条件已变化，请重新读取', 409);
+    return value.data;
+  });
+}
 function projected(row: Row, website: any) {
   const result = decodeAnalysisEnvelope(row.result, row.website_id);
   const value = structuredClone(result.value) as any;
@@ -159,15 +210,7 @@ async function requestAnalysisQueryOnce(
     throw new LiekanError('统计条件超出上限', 413);
   return analysisTransaction(async tx => {
     const snapshot = await state(tx, websiteId, actor);
-    const key = analysisDigest([
-      ANALYSIS_RESULT_FORMAT,
-      websiteId,
-      target,
-      parameters,
-      locale,
-      snapshot.strong,
-      String(snapshot.epoch),
-    ]);
+    const key = queryKey(websiteId, target, parameters, locale, snapshot);
     const rows = await tx.$queryRawUnsafe<Row[]>(
       'SELECT * FROM liekan_analysis_query WHERE website_id=$1::uuid AND query_key=$2 AND retention_until>clock_timestamp() ORDER BY sequence DESC LIMIT 20',
       websiteId,
@@ -422,7 +465,7 @@ export async function readAnalysisQuery(
       actor.id,
     );
     if (!row) throw new LiekanError('统计任务不存在或已过期，请重新读取', 410, 'analysis-expired');
-    if (row.target === 'feature:log-count') {
+    if (['feature:log-count', 'feature:log-summary'].includes(row.target)) {
       const { logReadBoundary, parseLogRead } = await import('./log-read-boundary');
       await logReadBoundary(tx, websiteId, parseLogRead(row.parameters));
     }
@@ -478,7 +521,7 @@ export async function pumpAnalysisQueries(boss: Pick<PgBoss, 'send' | 'update'>)
       `DELETE FROM liekan_analysis_query WHERE id IN(SELECT id FROM(SELECT id,row_number() OVER(PARTITION BY website_id ORDER BY sequence DESC) AS rank FROM liekan_analysis_query WHERE status='ready') r WHERE rank>20)`,
     );
     return tx.$queryRawUnsafe<Row[]>(
-      `SELECT q.*,${analysisForegroundDemandSql} AS foreground
+      `SELECT q.*,${analysisForegroundDemandSql} AS foreground,${defaultDashboardTurnSql} AS default_turn
        FROM liekan_analysis_query q WHERE status='queued' AND next_attempt_at<=clock_timestamp()
        AND q.retention_until>clock_timestamp()
        AND (NOT ${dashboardAnalysisWorkSql} OR ${dashboardRunnableHeadSql})
@@ -488,7 +531,7 @@ export async function pumpAnalysisQueries(boss: Pick<PgBoss, 'send' | 'update'>)
   for (const row of rows) await handoff(row, boss);
 }
 async function handoff(row: Row, boss: Pick<PgBoss, 'send' | 'update'>) {
-  const priority = row.foreground === false ? 0 : 10;
+  const priority = row.foreground === false ? (row.default_turn ? 20 : 0) : 10;
   // First live deliveries can gain a reader after pickup; pre-arm their bounded contention retries.
   // Delivery retries do not claim the business row or spend a computation attempt.
   const delivery = {
@@ -672,7 +715,7 @@ export async function processAnalysisQuery(id: string, options: { firstPage?: bo
               String(snapshot.epoch) !== String(row.epoch)
             )
               throw new LiekanError('统计条件已变化', 410);
-            if (row.target === 'feature:log-count') {
+            if (['feature:log-count', 'feature:log-summary'].includes(row.target)) {
               const { logReadBoundary, parseLogRead } = await import('./log-read-boundary');
               await logReadBoundary(tx, row.website_id, parseLogRead(row.parameters));
             }
@@ -681,8 +724,9 @@ export async function processAnalysisQuery(id: string, options: { firstPage?: bo
             );
             // Page-report may include today's dedicated counters even for a historical selection.
             const ttl =
-              row.target === 'feature:page-report' &&
-              pageReportParts[String(row.parameters.resource)]?.today
+              (row.target === 'feature:page-report' &&
+                pageReportParts[String(row.parameters.resource)]?.today) ||
+              row.target === 'feature:log-summary'
                 ? 30000
                 : statisticsCacheTtl(endAt, String(row.parameters.timezone || 'UTC'));
             const generatedAt = result.freshness.length

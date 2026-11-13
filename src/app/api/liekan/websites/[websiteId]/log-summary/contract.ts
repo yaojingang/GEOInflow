@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { logCountQuery, logSummarySchema } from '@/lib/liekan/contracts/log-read';
+import { analysisAcceptedSchema } from '@/lib/liekan/contracts/analysis-acceleration';
 import {
   apiErrorSchema,
   badRequestResponse,
@@ -20,6 +21,10 @@ export const operations = [
       tags: ['Liekan'],
       requestParams: { path: z.object({ websiteId: z.uuid() }), query: logCountQuery },
       responses: {
+        '202': {
+          description: 'Exact summary accepted as a private durable task',
+          content: { 'application/json': { schema: analysisAcceptedSchema } },
+        },
         '200': {
           description: 'Authorized log summary at the requested input boundary',
           content: { 'application/json': { schema: logSummarySchema } },

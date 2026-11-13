@@ -8,6 +8,9 @@ import { logEntryRows, logSummaryView } from '../log-report-parts';
 import { getSettings } from '../store';
 import { logReadBoundary, parseLogRead } from './log-read-boundary';
 import { getLogFacts, getLogToday } from './logs';
+import { readLogStatistics } from './log-statistics';
+import { withReportFragments } from './report-fragments';
+import { currentCacheContext } from './cache-context';
 import { getQuerySnapshot } from './query-snapshot';
 import { reportEvidencePolicy } from './report-evidence-view';
 import { query, reportSnapshot } from './server';
@@ -87,103 +90,153 @@ export async function readLogEntries(website: Website, input: unknown, canManage
 
 export async function readLogCount(websiteId: string, input: unknown) {
   const p = parseLogRead(input);
-  return reportSnapshot(async () => {
-    const boundary = await logReadBoundary(getQuerySnapshot(), websiteId, p);
-    const facts = await getLogFacts(
-      websiteId,
-      new Date(p.startAt),
-      new Date(p.endAt),
-      p.timezone,
-      1,
-      p.filter,
-      p.search,
-      '',
-      'after',
-      ['count'],
-      p,
-      false,
-      undefined,
-      { cursorScope: boundary, limit: 101 },
-    );
-    return logCountSchema.parse({ readBoundary: boundary, total: facts.totalLogs });
-  });
+  return withReportFragments(
+    websiteId,
+    () =>
+      reportSnapshot(async () => {
+        const boundary = await logReadBoundary(getQuerySnapshot(), websiteId, p);
+        if (p.crawlerMetricsVersion === 1 && !p.search) {
+          const counts = await readLogStatistics(websiteId, p);
+          const total =
+            p.filter === 'ai'
+              ? counts.ai
+              : p.filter === 'abnormal'
+                ? counts.abnormal
+                : p.filter === 'other'
+                  ? counts.unclassifiedRequests
+                  : counts.requests;
+          return logCountSchema.parse({ readBoundary: boundary, total });
+        }
+        const facts = await getLogFacts(
+          websiteId,
+          new Date(p.startAt),
+          new Date(p.endAt),
+          p.timezone,
+          1,
+          p.filter,
+          p.search,
+          '',
+          'after',
+          ['count'],
+          p,
+          false,
+          undefined,
+          { cursorScope: boundary, limit: 101 },
+        );
+        return logCountSchema.parse({ readBoundary: boundary, total: facts.totalLogs });
+      }, currentCacheContext()?.deadline),
+    { logStatistics: true },
+  );
 }
 
 export async function readLogSummary(websiteId: string, input: unknown): Promise<LogSummary> {
   const p = parseLogRead(input);
-  return reportSnapshot(async () => {
-    const boundary = await logReadBoundary(getQuerySnapshot(), websiteId, p);
-    const now = Date.now(),
-      today = calendarDayRange(now, p.timezone).startAt;
-    const [facts, settings, counters, [catalog]] = await Promise.all([
-      getLogFacts(
-        websiteId,
-        new Date(p.startAt),
-        new Date(p.endAt),
-        p.timezone,
-        1,
-        '',
-        '',
-        '',
-        'after',
-        ['summary', 'latest'],
-        p,
-        false,
-        undefined,
-        { cursorScope: boundary, limit: 101 },
-      ),
-      getSettings(websiteId),
-      getLogToday(websiteId, new Date(today), new Date(Math.max(today, now))),
-      query<{ count: number }>(
-        'SELECT count(*)::int AS count FROM liekan_catalog WHERE website_id=$1::uuid',
-        websiteId,
-      ),
-    ]);
-    const state: DataState = facts.connected
-      ? facts.summary.requests
-        ? 'available'
-        : 'empty'
-      : 'not_connected';
-    const view = logSummaryView({
-      latest: facts.latest,
-      catalogCount: catalog.count,
-      logState: state,
-      ruleCount: settings.rules.length,
-      today: counters,
-    });
-    const conditions = parseReportQuery({ ...p, resource: 'logs' });
-    return logSummarySchema.parse({
-      readBoundary: boundary,
-      ...(p.crawlerMetricsVersion === 1 && conditions.success
-        ? {
-            evidence: {
-              query: Object.fromEntries(
-                Object.entries(conditions.data).filter(([key]) => key !== 'refresh'),
+  return withReportFragments(
+    websiteId,
+    () =>
+      reportSnapshot(async () => {
+        const boundary = await logReadBoundary(getQuerySnapshot(), websiteId, p);
+        const now = Date.now(),
+          today = calendarDayRange(now, p.timezone).startAt;
+        const [facts, settings, counters, [catalog]] = await Promise.all([
+          p.crawlerMetricsVersion === 1
+            ? (async () => {
+                const counts = await readLogStatistics(websiteId, { ...p, filter: '', search: '' });
+                const latest = await getLogFacts(
+                  websiteId,
+                  new Date(p.startAt),
+                  new Date(p.endAt),
+                  p.timezone,
+                  1,
+                  '',
+                  '',
+                  '',
+                  'after',
+                  ['latest'],
+                  p,
+                  false,
+                  undefined,
+                  { cursorScope: boundary, limit: 101 },
+                );
+                return {
+                  ...latest,
+                  summary: {
+                    ...counts,
+                    pages: 0,
+                    classificationVersions: counts.classifications.length,
+                  },
+                };
+              })()
+            : getLogFacts(
+                websiteId,
+                new Date(p.startAt),
+                new Date(p.endAt),
+                p.timezone,
+                1,
+                '',
+                '',
+                '',
+                'after',
+                ['summary', 'latest'],
+                p,
+                false,
+                undefined,
+                { cursorScope: boundary, limit: 101 },
               ),
-              policySnapshot: await reportEvidencePolicy(websiteId),
+          getSettings(websiteId),
+          getLogToday(websiteId, new Date(today), new Date(Math.max(today, now))),
+          query<{ count: number }>(
+            'SELECT count(*)::int AS count FROM liekan_catalog WHERE website_id=$1::uuid',
+            websiteId,
+          ),
+        ]);
+        const state: DataState = facts.connected
+          ? facts.summary.requests
+            ? 'available'
+            : 'empty'
+          : 'not_connected';
+        const view = logSummaryView({
+          latest: facts.latest,
+          catalogCount: catalog.count,
+          logState: state,
+          ruleCount: settings.rules.length,
+          today: counters,
+        });
+        const conditions = parseReportQuery({ ...p, resource: 'logs' });
+        return logSummarySchema.parse({
+          readBoundary: boundary,
+          ...(p.crawlerMetricsVersion === 1 && conditions.success
+            ? {
+                evidence: {
+                  query: Object.fromEntries(
+                    Object.entries(conditions.data).filter(([key]) => key !== 'refresh'),
+                  ),
+                  policySnapshot: await reportEvidencePolicy(websiteId),
+                },
+              }
+            : {}),
+          cards: view.cards,
+          tables: { pipeList: view.pipeList },
+          states: { logs: state, catalog: catalog.count ? 'available' : 'not_connected' },
+          meta: {
+            latestImportAt: facts.latest ? new Date(facts.latest).toISOString() : null,
+            ruleCount: settings.rules.length,
+            crawlerClassification: {
+              mode:
+                (facts.summary.classificationVersions ?? 0) > 1 ||
+                ((facts.summary.legacyRequests ?? 0) > 0 &&
+                  facts.summary.legacyRequests < facts.summary.requests)
+                  ? 'mixed'
+                  : (facts.summary.legacyRequests ?? 0) > 0
+                    ? 'legacy'
+                    : 'current',
+              versions: facts.summary.classificationVersions ?? 0,
+              legacyRequests: facts.summary.legacyRequests ?? 0,
+              unclassifiedRequests: facts.summary.unclassifiedRequests ?? 0,
             },
-          }
-        : {}),
-      cards: view.cards,
-      tables: { pipeList: view.pipeList },
-      states: { logs: state, catalog: catalog.count ? 'available' : 'not_connected' },
-      meta: {
-        latestImportAt: facts.latest ? new Date(facts.latest).toISOString() : null,
-        ruleCount: settings.rules.length,
-        crawlerClassification: {
-          mode:
-            (facts.summary.classificationVersions ?? 0) > 1 ||
-            ((facts.summary.legacyRequests ?? 0) > 0 &&
-              facts.summary.legacyRequests < facts.summary.requests)
-              ? 'mixed'
-              : (facts.summary.legacyRequests ?? 0) > 0
-                ? 'legacy'
-                : 'current',
-          versions: facts.summary.classificationVersions ?? 0,
-          legacyRequests: facts.summary.legacyRequests ?? 0,
-          unclassifiedRequests: facts.summary.unclassifiedRequests ?? 0,
-        },
-      },
-    }) as LogSummary;
-  });
+          },
+        }) as LogSummary;
+      }, currentCacheContext()?.deadline),
+    { logStatistics: true },
+  );
 }

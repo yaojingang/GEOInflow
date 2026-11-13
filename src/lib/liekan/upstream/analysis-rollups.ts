@@ -249,11 +249,66 @@ export async function readAnalysisLogToday(input: AnalysisVisitInput): Promise<{
 }
 
 /** Exact disjoint covered/raw population. Unsupported input returns null to the existing SQL path. */
+async function readLogCounts(
+  tx: AnalysisTx,
+  input: AnalysisLogInput,
+  versions: Record<string, unknown>,
+): Promise<AnalysisLogResult> {
+  const modern = input.crawlerMetricsVersion === 1;
+  const [result] = await tx.$queryRawUnsafe<any[]>(
+    `WITH ${coverageSql}, ${gapRangesSql('raw_gaps', 'covered', !modern)},
+     raw_bounds AS MATERIALIZED(SELECT lower(span) AS starts,upper(span) AS ends
+       FROM (SELECT unnest(range_agg(tstzrange(starts,ends,'[)'))) AS span FROM raw_gaps) merged),
+     facts AS(SELECT f.requests,${flattened} FROM liekan_analysis_log f
+       JOIN covered c ON c.generation=f.generation AND c.website_id=f.website_id
+       WHERE ${derivedBucketBounds} AND f.grain=${lowGrainSql}),
+     counts AS(
+       SELECT coalesce(classification_version,'legacy') AS classification,
+        sum(requests) AS requests,coalesce(sum(requests) FILTER(WHERE ${ai}),0) AS ai,
+        coalesce(sum(requests) FILTER(WHERE status>=400),0) AS abnormal,
+        coalesce(sum(requests) FILTER(WHERE ai_eligible IS NULL),0) AS legacy,
+        coalesce(sum(requests) FILTER(WHERE ${unknown}),0) AS unknown
+       FROM facts WHERE ${modern ? 'NOT self_check AND' : ''} ${identity} GROUP BY 1
+       UNION ALL
+       SELECT coalesce(l.reporting_classification_version,'legacy'),count(*),
+        count(*) FILTER(WHERE ${ai}),count(*) FILTER(WHERE status>=400),
+        count(*) FILTER(WHERE ai_eligible IS NULL),count(*) FILTER(WHERE ${unknown})
+       FROM raw_bounds b CROSS JOIN LATERAL(
+        SELECT l.reporting_classification_version,l.ai_eligible,l.bot_type,l.bot,l.recognition_state,
+         l.status,l.verification,l.user_agent FROM liekan_reporting_log l
+        WHERE l.website_id=$1::uuid AND l.created_at>=b.starts AND l.created_at<b.ends OFFSET 0
+       ) l WHERE ${modern ? "user_agent NOT LIKE 'Liekan-Crawler-Check/%' AND" : ''} ${identity} GROUP BY 1
+     ) SELECT jsonb_build_object('requests',coalesce(sum(requests),0)::text,
+      'ai',coalesce(sum(ai),0)::text,'abnormal',coalesce(sum(abnormal),0)::text,
+      'legacyRequests',coalesce(sum(legacy),0)::text,'unclassifiedRequests',coalesce(sum(unknown),0)::text,
+      'classifications',coalesce(jsonb_agg(DISTINCT classification),'[]'::jsonb)) AS counts,
+      jsonb_build_object('manifests',(SELECT count(*)::text FROM covered),
+       'rawFallback',EXISTS(SELECT 1 FROM raw_gaps)) AS coverage FROM counts CROSS JOIN (SELECT $7::boolean) parameter_types`,
+    input.websiteId,
+    input.startDate,
+    input.endDate,
+    input.timezone || 'UTC',
+    'log',
+    JSON.stringify(versions),
+    modern,
+    input.crawlerIdentityScope || 'all',
+  );
+  for (const key of ['requests', 'ai', 'abnormal', 'legacyRequests', 'unclassifiedRequests'])
+    result.counts[key] = analysisSafeNumber(result.counts[key]);
+  result.coverage.manifests = analysisSafeNumber(result.coverage.manifests);
+  return result;
+}
+
 export async function readAnalysisLogRollup(
   input: AnalysisLogInput,
 ): Promise<AnalysisLogResult | null> {
   if (process.env.CLICKHOUSE_URL || !validWindow(input)) return null;
   const filters = input.filters || {};
+  if (
+    input.fields?.includes('counts') &&
+    (input.fields.length !== 1 || Object.values(filters).some(value => !inactive(value)))
+  )
+    return null;
   if (Object.entries(filters).some(([key, value]) => !logFilterKeys.has(key) && !inactive(value)))
     return null;
   if (Object.values(filters).some(value => !inactive(value) && typeof value !== 'string'))
@@ -272,6 +327,8 @@ export async function readAnalysisLogRollup(
     return await readTransaction(async tx => {
       const versions = await pinnedReadVersions(tx, input.websiteId);
       if (!versions || !(await hasCoveredManifest(tx, input, 'log', versions))) return null;
+      if (input.fields?.length === 1 && input.fields[0] === 'counts')
+        return readLogCounts(tx, input, versions);
       const aggregates: Record<string, string> = {
         classificationSet: `(SELECT coalesce(string_agg(DISTINCT classification_version,','),'legacy') FROM low)`,
         summary: `(SELECT jsonb_build_object('requests',coalesce(sum(requests),0)::text,'ai',coalesce(sum(requests) FILTER(WHERE ${ai}),0)::text,

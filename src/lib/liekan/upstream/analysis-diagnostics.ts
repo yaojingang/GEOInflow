@@ -20,6 +20,8 @@ const wallMs = (value: number) => Math.round(Math.max(0, value) * 10) / 10;
 export const analysisTargetCategory = (target: string) =>
   ({
     'feature:page-report': 'page-report',
+    'feature:log-count': 'log-count',
+    'feature:log-summary': 'log-summary',
     'feature:analytics': 'analytics',
     'feature:journeys': 'journeys',
   })[target] || (target.startsWith('native:') ? 'native' : 'unknown');
