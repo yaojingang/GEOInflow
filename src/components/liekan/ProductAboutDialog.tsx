@@ -1,7 +1,9 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import Link from '@/components/liekan/Link';
 import {
+  type LiekanContributor,
   liekanProduct,
   liekanProjectInitiators,
   liekanPublisherLinks,
@@ -28,6 +30,29 @@ function ExternalIcon() {
 
 export function ProductAboutDialog({ onClose }: { onClose: () => void }) {
   const i18n = useLiekanI18n();
+  const [contributors, setContributors] = useState<LiekanContributor[] | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setFailed(false);
+    async function loadContributors() {
+      try {
+        const response = await fetch(`${process.env.basePath || ''}/api/liekan/contributors`, {
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error('Contributors unavailable');
+        const data = await response.json();
+        if (!controller.signal.aborted) setContributors(data.contributors);
+      } catch {
+        if (!controller.signal.aborted) setFailed(true);
+      }
+    }
+    void loadContributors();
+    return () => controller.abort();
+  }, [attempt]);
+
   return (
     <LiekanDialog
       size="wide"
@@ -117,23 +142,73 @@ export function ProductAboutDialog({ onClose }: { onClose: () => void }) {
         <section className={styles.contributors} aria-label={i18n.text('开源贡献者')}>
           <div className={styles.contributorHead}>
             <h3>{i18n.text('开源贡献者')}</h3>
-            <span className={styles.source}>
+            <a
+              className={styles.source}
+              href={liekanProduct.links.github}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
               <GitHubIcon />
               GitHub
-            </span>
+            </a>
           </div>
           <p className={styles.thanks}>{i18n.text('感谢每一位参与 GEOInflow 建设的朋友。')}</p>
-          <div className={styles.pending}>
-            <GitHubIcon className={styles.pendingIcon} />
-            <h4>{i18n.text('GitHub 仓库待接入')}</h4>
-            <p>
-              {i18n.text('公开仓库接入后，将在这里自动展示贡献者头像、GitHub 用户名和个人主页。')}
-            </p>
-            <span className={styles.waiting}>
-              <span aria-hidden="true" />
-              {i18n.text('等待公开仓库接入')}
-            </span>
-          </div>
+          {contributors?.length ? (
+            <ul className={styles.contributorList}>
+              {contributors.map(({ login, avatarUrl, profileUrl }) => (
+                <li key={login}>
+                  <a
+                    className={styles.contributor}
+                    href={profileUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    aria-label={i18n.text('{v0}的 GitHub 主页', [login])}
+                  >
+                    <span className={styles.contributorAvatar} aria-hidden="true">
+                      {login[0].toUpperCase()}
+                      <img
+                        src={avatarUrl}
+                        alt=""
+                        width="40"
+                        height="40"
+                        loading="lazy"
+                        referrerPolicy="no-referrer"
+                        onError={event => {
+                          event.currentTarget.style.visibility = 'hidden';
+                        }}
+                      />
+                    </span>
+                    <span>{login}</span>
+                  </a>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className={styles.pending} role="status" aria-live="polite">
+              <GitHubIcon className={styles.pendingIcon} />
+              <h4>
+                {failed
+                  ? i18n.text('暂时无法加载贡献者')
+                  : contributors
+                    ? i18n.text('暂无公开贡献者')
+                    : i18n.text('正在加载贡献者…')}
+              </h4>
+              {failed && (
+                <button className={styles.retry} onClick={() => setAttempt(value => value + 1)}>
+                  {i18n.text('重试')}
+                </button>
+              )}
+            </div>
+          )}
+          <a
+            className={styles.allContributors}
+            href={`${liekanProduct.links.github}/graphs/contributors`}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {i18n.text('查看全部贡献者')}
+            <ExternalIcon />
+          </a>
         </section>
       </div>
       <DialogActions>
