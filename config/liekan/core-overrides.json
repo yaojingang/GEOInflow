@@ -201,12 +201,13 @@
     },
     {
       "path": "Dockerfile.liekan",
-      "purpose": "Isolate local Liekan runtime, database and immutable image revision; carry the website site number migration revision; carry crawler analysis/control migration revision; advertise the complete immutable migration register in default builds; share the measured build budget with deployment and reduce build concurrency while retaining full type checking",
+      "purpose": "Isolate local Liekan runtime, database and immutable image revision; carry the website site number migration revision; carry crawler analysis/control migration revision; advertise the complete immutable migration register in default builds; share the measured build budget with deployment and reduce build concurrency while retaining full type checking; advertise the incremental hourly-count proof migration",
       "tests": [
         "pnpm liekan:verify",
         "Liekan Docker and visual acceptance",
         "pnpm test:deployment",
-        "node --test tests/liekan/deployment.test.mjs"
+        "node --test tests/liekan/deployment.test.mjs",
+        "pnpm test:analytics-engine"
       ],
       "owner": "Liekan release maintenance",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Isolate local Liekan runtime, database and immutable image revision; carry the website site number migration revision",

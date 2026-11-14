@@ -1,7 +1,9 @@
 // @vitest-environment node
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { SHARE_CONTEXT_HEADER } from '@/lib/constants';
+import { sqlStatements } from '../../../../scripts/liekan-sql-statements.mjs';
 
 const auth = vi.hoisted(() => ({ user: null as any }));
 vi.mock('@/lib/auth', () => ({
@@ -153,6 +155,598 @@ describe.skipIf(!enabled)('optional ClickHouse analytics on owned databases', ()
       legacyRequests: 2,
       unclassifiedRequests: 1,
     });
+  });
+  it('serves exact compact counts for each identity scope and backfills existing raw generations', async () => {
+    const counts = await import('./analytics-engine-counts');
+    const { readAnalysisLogRollup } = await import('./analysis-rollups');
+    for (const scope of ['all', 'verified_range', 'verified_identity'] as const) {
+      const actual = await counts.readClickHouseLogCounts(input({ crawlerIdentityScope: scope }));
+      const expected = await readAnalysisLogRollup(
+        input({ crawlerIdentityScope: scope, fields: ['counts'], allowRawOnly: true }),
+      );
+      expect(actual).not.toBeNull();
+      expect(actual).toEqual(expected?.counts);
+    }
+    const [before] = await q(
+      'SELECT generation FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket LIMIT 1',
+      site,
+    );
+    await exec(
+      'UPDATE liekan_analytics_engine_unit SET counts_verified_at=NULL,counts_version=NULL WHERE website_id=$1::uuid',
+      site,
+    );
+    expect(await counts.readClickHouseLogCounts(input())).toBeNull();
+    await finish();
+    const [after] = await q(
+      'SELECT generation FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket LIMIT 1',
+      site,
+    );
+    expect(after.generation).toBe(before.generation);
+    expect((await counts.readClickHouseLogCounts(input()))?.requests).toBe(4);
+    expect(
+      (await api.engineStatus(admin)).sites.find(s => s.websiteId === site)?.logCountsCoverage
+        ?.completed,
+    ).toBe('2');
+  });
+  it('preserves raw coverage across a lost compact backfill response', async () => {
+    const counts = await import('./analytics-engine-counts');
+    const [unit] = await q(
+      'SELECT generation FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket LIMIT 1',
+      site,
+    );
+    await ch.engineClient().command({
+      query: `ALTER TABLE ${counts.LOG_COUNTS_TABLE} DELETE WHERE generation={generation:UUID}`,
+      query_params: { generation: unit.generation },
+      clickhouse_settings: { mutations_sync: '1' },
+    });
+    await exec(
+      'UPDATE liekan_analytics_engine_unit SET counts_verified_at=NULL WHERE generation=$1::uuid',
+      unit.generation,
+    );
+    const client = ch.engineClient(),
+      insert = client.insert.bind(client);
+    const spy = vi.spyOn(client, 'insert').mockImplementationOnce(async options => {
+      await insert(options);
+      throw new Error('synthetic response loss');
+    });
+    try {
+      await expect(worker.runEngineBatch()).rejects.toThrow('synthetic response loss');
+    } finally {
+      spy.mockRestore();
+    }
+    const [after] = await q(
+      'SELECT generation,verified_at FROM liekan_analytics_engine_unit WHERE generation=$1::uuid',
+      unit.generation,
+    );
+    expect(after.verified_at).not.toBeNull();
+    expect((await reader.readClickHouseLogRollup(input()))?.summary.requests).toBe(4);
+    await exec(
+      'UPDATE liekan_analytics_engine_unit SET retry_at=NULL WHERE generation=$1::uuid',
+      unit.generation,
+    );
+    await finish();
+    expect((await counts.readClickHouseLogCounts(input()))?.requests).toBe(4);
+    const [kept] = await q(
+      'SELECT generation FROM liekan_analytics_engine_unit WHERE generation=$1::uuid',
+      unit.generation,
+    );
+    expect(kept.generation).toBe(unit.generation);
+  });
+  it.each(['lost', 'duplicated'])(
+    'rejects raw rows %s during the count aggregation snapshot',
+    async damage => {
+      const counts = await import('./analytics-engine-counts');
+      const [unit] = await q(
+        'SELECT generation FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket LIMIT 1',
+        site,
+      );
+      const client = ch.engineClient(),
+        query = client.query.bind(client);
+      await client.command({
+        query: `ALTER TABLE ${counts.LOG_COUNTS_TABLE} DELETE WHERE generation={generation:UUID}`,
+        query_params: { generation: unit.generation },
+        clickhouse_settings: { mutations_sync: '1' },
+      });
+      await exec(
+        'UPDATE liekan_analytics_engine_unit SET counts_verified_at=NULL WHERE generation=$1::uuid',
+        unit.generation,
+      );
+      let injected = false;
+      const spy = vi.spyOn(client, 'query').mockImplementation(async options => {
+        if (
+          !injected &&
+          options.query.includes('groupUniqArray') &&
+          options.query_params?.generation === unit.generation
+        ) {
+          injected = true;
+          await client.command({
+            query:
+              damage === 'lost'
+                ? `ALTER TABLE ${ch.ENGINE_TABLE} DELETE WHERE generation={generation:UUID}`
+                : `INSERT INTO ${ch.ENGINE_TABLE} SELECT * FROM ${ch.ENGINE_TABLE} WHERE generation={generation:UUID}`,
+            query_params: { generation: unit.generation },
+            clickhouse_settings: { mutations_sync: '1' },
+          });
+        }
+        return query(options);
+      });
+      try {
+        await expect(worker.runEngineBatch()).rejects.toThrow('engine-count-mismatch');
+        expect(injected).toBe(true);
+        expect(await counts.readClickHouseLogCounts(input())).toBeNull();
+      } finally {
+        spy.mockRestore();
+        await exec(
+          "UPDATE liekan_analytics_engine_unit SET verified_at=NULL,counts_verified_at=NULL,attempts=0,retry_at=NULL,error_code='engine-counts-rebuild' WHERE generation=$1::uuid",
+          unit.generation,
+        );
+        await finish();
+      }
+      expect((await counts.readClickHouseLogCounts(input()))?.requests).toBe(4);
+    },
+  );
+  it.each(['source', 'versions'])(
+    'allows changed %s to rebuild after exhausting count-only retries',
+    async change => {
+      const [unit] = await q(
+        'SELECT generation,bucket FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket LIMIT 1',
+        site,
+      );
+      await exec(
+        'UPDATE liekan_analytics_engine_unit SET counts_verified_at=NULL WHERE generation=$1::uuid',
+        unit.generation,
+      );
+      const client = ch.engineClient(),
+        query = client.query.bind(client);
+      const spy = vi.spyOn(client, 'query').mockImplementation(options => {
+        if (options.query.includes('groupUniqArray'))
+          return Promise.reject(new Error('synthetic count-only outage'));
+        return query(options);
+      });
+      try {
+        for (let attempt = 0; attempt < 4; attempt++) {
+          await exec(
+            'UPDATE liekan_analytics_engine_unit SET retry_at=NULL WHERE generation=$1::uuid',
+            unit.generation,
+          );
+          await expect(worker.runEngineBatch()).rejects.toThrow('synthetic count-only outage');
+        }
+      } finally {
+        spy.mockRestore();
+      }
+      try {
+        const [failed] = await q(
+          'SELECT attempts,verified_at,counts_attempt_version FROM liekan_analytics_engine_unit WHERE generation=$1::uuid',
+          unit.generation,
+        );
+        expect(failed.attempts).toBe(4);
+        expect(failed.counts_attempt_version).toBe('liekan-log-counts-v2');
+        expect(failed.verified_at).not.toBeNull();
+        await exec(
+          "UPDATE liekan_analytics_engine_dirty SET pending=true WHERE website_id=$1::uuid AND bucket>=$2 AND bucket<$2::timestamptz+interval '1 hour'",
+          site,
+          unit.bucket,
+        );
+        await worker.discoverEngineWork(true);
+        expect(await worker.runEngineBatch()).toBe(false);
+        if (change === 'source')
+          await exec(
+            "UPDATE liekan_log SET bytes=bytes+1 WHERE website_id=$1::uuid AND created_at>=$2 AND created_at<$2::timestamptz+interval '1 hour'",
+            site,
+            unit.bucket,
+          );
+        else
+          await exec(
+            'UPDATE liekan_analytics_engine_site SET revision=revision+1 WHERE website_id=$1::uuid',
+            site,
+          );
+        await finish();
+        const [rebuilt] = await q(
+          'SELECT generation,attempts FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid AND bucket=$2',
+          site,
+          unit.bucket,
+        );
+        expect(rebuilt.generation).not.toBe(unit.generation);
+        expect(rebuilt.attempts).toBe(0);
+        expect((await reader.readClickHouseLogRollup(input()))?.summary.requests).toBe(4);
+      } finally {
+        await exec(
+          'UPDATE liekan_analytics_engine_unit SET attempts=0,retry_at=NULL WHERE website_id=$1::uuid',
+          site,
+        );
+        await finish();
+      }
+    },
+  );
+  it.each(['source', 'versions'])(
+    'does not charge a late obsolete failure to changed %s',
+    async change => {
+      const [unit] = await q(
+        'SELECT generation,bucket FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket LIMIT 1',
+        site,
+      );
+      await exec(
+        'UPDATE liekan_analytics_engine_unit SET counts_verified_at=NULL WHERE generation=$1::uuid',
+        unit.generation,
+      );
+      const client = ch.engineClient(),
+        query = client.query.bind(client);
+      let injected = false;
+      const spy = vi.spyOn(client, 'query').mockImplementation(async options => {
+        if (!injected && options.query.includes('groupUniqArray')) {
+          injected = true;
+          if (change === 'source')
+            await exec(
+              "UPDATE liekan_log SET bytes=bytes+1 WHERE website_id=$1::uuid AND created_at>=$2 AND created_at<$2::timestamptz+interval '1 hour'",
+              site,
+              unit.bucket,
+            );
+          else
+            await exec(
+              'UPDATE liekan_analytics_engine_site SET revision=revision+1 WHERE website_id=$1::uuid',
+              site,
+            );
+          await worker.discoverEngineWork(true);
+          throw new Error('synthetic obsolete failure');
+        }
+        return query(options);
+      });
+      try {
+        await expect(worker.runEngineBatch()).rejects.toThrow('synthetic obsolete failure');
+        expect(injected).toBe(true);
+        spy.mockRestore();
+        await exec(
+          'UPDATE liekan_analytics_engine_unit SET retry_at=NULL WHERE website_id=$1::uuid',
+          site,
+        );
+        expect(await worker.runEngineBatch()).toBe(true);
+        const [next] = await q(
+          'SELECT candidate,copied,attempts,error_code FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid AND bucket=$2',
+          site,
+          unit.bucket,
+        );
+        expect(next.candidate).not.toBeNull();
+        expect(Number(next.copied)).toBeGreaterThan(0);
+        expect(next.attempts).toBe(0);
+        expect(next.error_code).toBeNull();
+      } finally {
+        spy.mockRestore();
+        await exec(
+          'UPDATE liekan_analytics_engine_unit SET attempts=0,retry_at=NULL WHERE website_id=$1::uuid',
+          site,
+        );
+        await finish();
+      }
+    },
+  );
+  it('keeps the retry limit for a failed candidate when remaining markers have the same fingerprint', async () => {
+    const [unit] = await q(
+      'SELECT bucket FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket LIMIT 1',
+      site,
+    );
+    await exec(
+      "UPDATE liekan_log SET bytes=bytes+1 WHERE website_id=$1::uuid AND created_at>=$2 AND created_at<$2::timestamptz+interval '1 hour'",
+      site,
+      unit.bucket,
+    );
+    const client = ch.engineClient(),
+      query = client.query.bind(client);
+    const spy = vi
+      .spyOn(client, 'query')
+      .mockImplementation(options =>
+        options.query.includes('groupUniqArray')
+          ? Promise.reject(new Error('synthetic candidate outage'))
+          : query(options),
+      );
+    try {
+      await worker.discoverEngineWork(true);
+      for (let attempt = 0; attempt < 4; attempt++) {
+        await exec(
+          'UPDATE liekan_analytics_engine_unit SET retry_at=NULL WHERE website_id=$1::uuid AND bucket=$2',
+          site,
+          unit.bucket,
+        );
+        expect(await worker.runEngineBatch()).toBe(true);
+        await expect(worker.runEngineBatch()).rejects.toThrow('synthetic candidate outage');
+      }
+      const [failed] = await q(
+        'SELECT attempts,candidate_fingerprint,fingerprint FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid AND bucket=$2',
+        site,
+        unit.bucket,
+      );
+      expect(failed.attempts).toBe(4);
+      expect(failed.candidate_fingerprint).not.toBe(failed.fingerprint);
+      await exec(
+        "UPDATE liekan_analytics_engine_dirty SET pending=true WHERE website_id=$1::uuid AND bucket>=$2 AND bucket<$2::timestamptz+interval '1 hour'",
+        site,
+        unit.bucket,
+      );
+      await worker.discoverEngineWork(true);
+      expect(
+        (
+          await q(
+            'SELECT attempts FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid AND bucket=$2',
+            site,
+            unit.bucket,
+          )
+        )[0].attempts,
+      ).toBe(4);
+      expect(await worker.runEngineBatch()).toBe(false);
+    } finally {
+      spy.mockRestore();
+      await exec(
+        'UPDATE liekan_analytics_engine_unit SET attempts=0,retry_at=NULL WHERE website_id=$1::uuid',
+        site,
+      );
+      await finish();
+    }
+  });
+  it.each([false, true])('keeps zero counts valid when self-check-only=%s', async selfOnly => {
+    const counts = await import('./analytics-engine-counts');
+    const [state] = await q('SELECT installation_id FROM liekan_analytics_engine WHERE id=1');
+    const generation = randomUUID();
+    const params = {
+      installation: state.installation_id,
+      site,
+      generation,
+      bucket: start.toISOString(),
+      epoch: '1',
+    };
+    try {
+      if (selfOnly)
+        await ch.engineClient().command({
+          query: `INSERT INTO ${ch.ENGINE_TABLE} SELECT * REPLACE ({generation:UUID} AS generation,parseDateTime64BestEffort({bucket:String},3) AS bucket) FROM ${ch.ENGINE_TABLE} WHERE installation_id={installation:UUID} AND website_id={site:UUID} AND self_check=1 LIMIT 1`,
+          query_params: params,
+        });
+      expect(
+        (
+          await ch.engineQuery(
+            `SELECT count() AS n FROM ${ch.ENGINE_TABLE} WHERE generation={generation:UUID}`,
+            params,
+          )
+        )[0].n,
+      ).toBe(selfOnly ? 1 : 0);
+      expect(await counts.prepareCounts(params, selfOnly ? '1' : '0')).toBe(
+        counts.countsDigest(counts.countScopes.map(counts.emptyCountRow)),
+      );
+    } finally {
+      for (const table of [ch.ENGINE_TABLE, counts.LOG_COUNTS_TABLE])
+        await ch.engineClient().command({
+          query: `ALTER TABLE ${table} DELETE WHERE generation={generation:UUID}`,
+          query_params: params,
+          clickhouse_settings: { mutations_sync: '1' },
+        });
+    }
+  });
+  it('revokes legacy count proofs and cached identities without rebuilding valid raw facts', async () => {
+    const counts = await import('./analytics-engine-counts');
+    const { readAnalyticsVersions } = await import('./analytics-revision');
+    const before = await q(
+      'SELECT generation,verified_at,versions,fingerprint FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket',
+      site,
+    );
+    const strong = await db.analysisTransaction(tx =>
+      readAnalyticsVersions(tx, [`website:${site}`]),
+    );
+    await exec(
+      "UPDATE liekan_analytics_engine_unit SET attempts=4,retry_at=clock_timestamp()+interval '1 day',error_code='engine-sync-failed',lease_token=$2::uuid,lease_until=clock_timestamp()+interval '1 day' WHERE website_id=$1::uuid",
+      site,
+      randomUUID(),
+    );
+    const migration = await readFile(
+      'db/liekan/migrations/076_analytics_count_snapshot_proof.sql',
+      'utf8',
+    );
+    await db.analysisTransaction(async tx => {
+      for (const statement of sqlStatements(migration)) await tx.$executeRawUnsafe(statement);
+    });
+    expect(
+      await q(
+        'SELECT generation,verified_at,versions,fingerprint FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket',
+        site,
+      ),
+    ).toEqual(before);
+    const after = await q(
+      'SELECT counts_verified_at,counts_generation,attempts,retry_at,error_code,lease_token FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid',
+      site,
+    );
+    expect(after).toHaveLength(2);
+    expect(
+      after.every(
+        row =>
+          row.counts_verified_at === null &&
+          row.counts_generation === null &&
+          row.attempts === 0 &&
+          row.retry_at === null &&
+          row.error_code === null &&
+          row.lease_token === null,
+      ),
+    ).toBe(true);
+    expect(
+      (await db.analysisTransaction(tx => readAnalyticsVersions(tx, [`website:${site}`]))).strong,
+    ).not.toBe(strong.strong);
+    expect((await reader.readClickHouseLogRollup(input()))?.summary.requests).toBe(4);
+    expect(await counts.readClickHouseLogCounts(input())).toBeNull();
+    await finish();
+    expect((await counts.readClickHouseLogCounts(input()))?.requests).toBe(4);
+    expect(
+      (
+        await q(
+          'SELECT generation FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket',
+          site,
+        )
+      ).map(row => row.generation),
+    ).toEqual(before.map(row => row.generation));
+  });
+  it('detects compact table loss independently and rebuilds a new generation', async () => {
+    const counts = await import('./analytics-engine-counts');
+    await ch.engineClient().command({
+      query: `ALTER TABLE ${counts.LOG_COUNTS_TABLE} DELETE WHERE website_id={site:UUID} AND identity='all'`,
+      query_params: { site },
+      clickhouse_settings: { mutations_sync: '1' },
+    });
+    expect(await counts.readClickHouseLogCounts(input())).toBeNull();
+    await finish();
+    expect((await counts.readClickHouseLogCounts(input()))?.requests).toBe(4);
+    const [unit] = await q(
+      'SELECT generation FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket LIMIT 1',
+      site,
+    );
+    await ch.engineClient().command({
+      query: `ALTER TABLE ${counts.LOG_COUNTS_TABLE} UPDATE requests=requests+1 WHERE generation={generation:UUID} AND identity='all'`,
+      query_params: { generation: unit.generation },
+      clickhouse_settings: { mutations_sync: '1' },
+    });
+    expect(await counts.readClickHouseLogCounts(input())).toBeNull();
+    await finish();
+    expect((await counts.readClickHouseLogCounts(input()))?.requests).toBe(4);
+  });
+  it('rebuilds a dropped compact table without relying on the garbage collector', async () => {
+    const counts = await import('./analytics-engine-counts');
+    await ch.engineClient().command({ query: `DROP TABLE ${counts.LOG_COUNTS_TABLE}` });
+    expect(await counts.readClickHouseLogCounts(input())).toBeNull();
+    expect((await reader.readClickHouseLogRollup(input()))?.summary.requests).toBe(4);
+    await finish();
+    expect((await counts.readClickHouseLogCounts(input()))?.requests).toBe(4);
+  });
+  it('rejects count proofs republished by the unsafe v1 producer after rollback', async () => {
+    const counts = await import('./analytics-engine-counts');
+    const before = await q(
+      'SELECT generation FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket',
+      site,
+    );
+    await exec(
+      "UPDATE liekan_analytics_engine_unit SET counts_version='liekan-log-counts-v1' WHERE website_id=$1::uuid",
+      site,
+    );
+    try {
+      expect(await counts.readClickHouseLogCounts(input())).toBeNull();
+      expect(
+        (await api.engineStatus(admin)).sites.find(s => s.websiteId === site)?.logCountsCoverage
+          ?.completed,
+      ).toBe('0');
+      expect((await reader.readClickHouseLogRollup(input()))?.summary.requests).toBe(4);
+    } finally {
+      await exec(
+        'UPDATE liekan_analytics_engine_unit SET counts_verified_at=NULL WHERE website_id=$1::uuid',
+        site,
+      );
+      await finish();
+    }
+    expect((await counts.readClickHouseLogCounts(input()))?.requests).toBe(4);
+    expect(
+      (
+        await q(
+          'SELECT generation FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket',
+          site,
+        )
+      ).map(row => row.generation),
+    ).toEqual(before.map(row => row.generation));
+  });
+  it.each(['published', 'failed', 'retained'])(
+    'renews the count retry budget after a rolled-back producer %s',
+    async outcome => {
+      const counts = await import('./analytics-engine-counts');
+      const before = await q(
+        'SELECT generation FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket',
+        site,
+      );
+      if (outcome === 'published')
+        await exec(
+          "UPDATE liekan_analytics_engine_unit SET counts_version='liekan-log-counts-v1',counts_verified_at=clock_timestamp() WHERE website_id=$1::uuid",
+          site,
+        );
+      else if (outcome === 'failed')
+        await exec(
+          'UPDATE liekan_analytics_engine_unit SET counts_verified_at=NULL WHERE website_id=$1::uuid',
+          site,
+        );
+      // Reproduce the old producer's lease and failure writes without its newer family stamp.
+      for (let attempt = 0; attempt < 4; attempt++) {
+        await exec(
+          "UPDATE liekan_analytics_engine_unit SET lease_token=$2::uuid,lease_until=clock_timestamp()+interval '90 seconds' WHERE website_id=$1::uuid",
+          site,
+          randomUUID(),
+        );
+        await exec(
+          "UPDATE liekan_analytics_engine_unit SET lease_token=NULL,lease_until=clock_timestamp(),attempts=attempts+1,retry_at=clock_timestamp()+interval '1 day',error_code='engine-sync-failed' WHERE website_id=$1::uuid",
+          site,
+        );
+      }
+      try {
+        await finish();
+        expect((await counts.readClickHouseLogCounts(input()))?.requests).toBe(4);
+        expect(
+          (
+            await q(
+              'SELECT counts_attempt_version,attempts FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid',
+              site,
+            )
+          ).every(
+            row => row.counts_attempt_version === counts.LOG_COUNTS_VERSION && row.attempts === 0,
+          ),
+        ).toBe(true);
+        expect(
+          (
+            await q(
+              'SELECT generation FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket',
+              site,
+            )
+          ).map(row => row.generation),
+        ).toEqual(before.map(row => row.generation));
+      } finally {
+        await exec(
+          'UPDATE liekan_analytics_engine_unit SET attempts=0,retry_at=NULL WHERE website_id=$1::uuid',
+          site,
+        );
+        await finish();
+      }
+    },
+  );
+  it('recognizes a raw generation republished by an older worker before a count read', async () => {
+    const counts = await import('./analytics-engine-counts');
+    const [unit] = await q(
+      'SELECT generation FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid ORDER BY bucket LIMIT 1',
+      site,
+    );
+    const generation = randomUUID();
+    await ch.engineClient().command({
+      query: `INSERT INTO ${ch.ENGINE_TABLE} SELECT * REPLACE ({next:UUID} AS generation) FROM (SELECT * FROM ${ch.ENGINE_TABLE} WHERE website_id={site:UUID} AND generation={previous:UUID}) source`,
+      query_params: { next: generation, previous: unit.generation, site },
+    });
+    expect(
+      (
+        await ch.engineQuery(
+          'SELECT count() AS n FROM liekan_log_projection_v1 WHERE generation={generation:UUID}',
+          { generation },
+        )
+      )[0].n,
+    ).toBe(2);
+    await exec(
+      'INSERT INTO liekan_analytics_engine_generation(id,website_id) VALUES($1::uuid,$2::uuid)',
+      generation,
+      site,
+    );
+    await exec(
+      'UPDATE liekan_analytics_engine_generation SET retired_at=clock_timestamp() WHERE id=$1::uuid',
+      unit.generation,
+    );
+    // The old publisher updates raw generation and leaves every newer proof column untouched.
+    await exec(
+      'UPDATE liekan_analytics_engine_unit SET generation=$2::uuid WHERE generation=$1::uuid',
+      unit.generation,
+      generation,
+    );
+    const status = await api.engineStatus(admin);
+    expect(status.sites.find(s => s.websiteId === site)?.logCountsCoverage?.completed).toBe('1');
+    expect(await counts.readClickHouseLogCounts(input())).toBeNull();
+    await finish();
+    expect((await counts.readClickHouseLogCounts(input()))?.requests).toBe(4);
+    const [after] = await q(
+      'SELECT generation,counts_generation FROM liekan_analytics_engine_unit WHERE generation=$1::uuid',
+      generation,
+    );
+    expect(after.counts_generation).toBe(generation);
   });
   it('can disable after a malformed deployment setting and preserves upstream ClickHouse mode', async () => {
     const original = process.env.LIEKAN_ANALYTICS_CLICKHOUSE_URL;
@@ -584,6 +1178,12 @@ describe.skipIf(!enabled)('optional ClickHouse analytics on owned databases', ()
     await act('enable');
   });
   it('denies stale permissions and purges the analysis copy after a website reset', async () => {
+    const counts = await import('./analytics-engine-counts');
+    const [oldCount] = await ch.engineQuery(
+      `SELECT * FROM ${counts.LOG_COUNTS_TABLE} WHERE website_id={site:UUID} LIMIT 1`,
+      { site },
+    );
+    expect(oldCount).toBeTruthy();
     const [old] = await ch.engineQuery(
       `SELECT * FROM ${ch.ENGINE_TABLE} WHERE website_id={site:UUID} LIMIT 1`,
       { site },
@@ -592,6 +1192,32 @@ describe.skipIf(!enabled)('optional ClickHouse analytics on owned databases', ()
     await expect(api.getAnalyticsEngine(request())).rejects.toMatchObject({ status: 403 });
     await exec('UPDATE website SET reset_at=clock_timestamp() WHERE website_id=$1::uuid', site);
     expect(await reader.readClickHouseLogRollup(input())).toBeNull();
+    // A legacy publisher cannot acknowledge a family it has not deleted.
+    await expect(
+      db.analysisTransaction(async tx => {
+        await tx.$executeRawUnsafe(
+          'DELETE FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid',
+          site,
+        );
+        await tx.$executeRawUnsafe(
+          'DELETE FROM liekan_analytics_engine_generation WHERE website_id=$1::uuid',
+          site,
+        );
+        await tx.$executeRawUnsafe(
+          `UPDATE liekan_analytics_engine_site SET pending_targets=array_remove(pending_targets,$2),purge_pending=cardinality(array_remove(pending_targets,$2))>0 WHERE website_id=$1::uuid`,
+          site,
+          ch.engineConnection().key,
+        );
+      }),
+    ).rejects.toThrow('engine-count-cleanup-required');
+    expect(
+      (
+        await q(
+          'SELECT count(*)::integer AS n FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid',
+          site,
+        )
+      )[0].n,
+    ).toBeGreaterThan(0);
     await worker.discoverEngineWork(true);
     const client = ch.engineClient(),
       original = client.command.bind(client);
@@ -624,6 +1250,20 @@ describe.skipIf(!enabled)('optional ClickHouse analytics on owned databases', ()
         )
       )[0].n,
     ).toBe(0);
+    expect(
+      (
+        await ch.engineQuery(
+          `SELECT count() AS n FROM ${counts.LOG_COUNTS_TABLE} WHERE website_id={site:UUID}`,
+          { site },
+        )
+      )[0].n,
+    ).toBe(0);
+    await client.insert({
+      table: counts.LOG_COUNTS_TABLE,
+      format: 'JSONEachRow',
+      values: [oldCount],
+      clickhouse_settings: { date_time_input_format: 'best_effort' },
+    });
     await client.insert({
       table: ch.ENGINE_TABLE,
       format: 'JSONEachRow',
@@ -631,7 +1271,7 @@ describe.skipIf(!enabled)('optional ClickHouse analytics on owned databases', ()
       clickhouse_settings: { date_time_input_format: 'best_effort' },
     });
     await exec(
-      'UPDATE liekan_analytics_engine_site SET purge_checked_at=NULL WHERE website_id=$1::uuid',
+      "UPDATE liekan_analytics_engine_site SET purge_checked_at=clock_timestamp(),counts_swept_at=clock_timestamp()-interval '31 seconds' WHERE website_id=$1::uuid",
       site,
     );
     await worker.runEngineBatch();
@@ -643,6 +1283,46 @@ describe.skipIf(!enabled)('optional ClickHouse analytics on owned databases', ()
         )
       )[0].n,
     ).toBe(0);
+    expect(
+      (
+        await ch.engineQuery(
+          `SELECT count() AS n FROM ${counts.LOG_COUNTS_TABLE} WHERE website_id={site:UUID}`,
+          { site },
+        )
+      )[0].n,
+    ).toBe(0);
+  });
+  it('keeps retired sweep destinations out of a later mandatory purge', async () => {
+    const tombstone = randomUUID(),
+      a = 'a'.repeat(64),
+      b = 'b'.repeat(64);
+    await exec(
+      'INSERT INTO liekan_analytics_engine_site(website_id,epoch,purge_through,sweep_targets) VALUES($1::uuid,2,2,ARRAY[$2])',
+      tombstone,
+      a,
+    );
+    try {
+      await exec(
+        'UPDATE liekan_analytics_engine_site SET targets=ARRAY[$2],sweep_targets=ARRAY[$3,$2] WHERE website_id=$1::uuid',
+        tombstone,
+        b,
+        a,
+      );
+      await exec(
+        'UPDATE liekan_analytics_engine_site SET epoch=3,purge_through=3,pending_targets=ARRAY[$2],purge_pending=true WHERE website_id=$1::uuid',
+        tombstone,
+        b,
+      );
+      const [state] = await q(
+        'SELECT pending_targets,counts_pending_targets,sweep_targets FROM liekan_analytics_engine_site WHERE website_id=$1::uuid',
+        tombstone,
+      );
+      expect(state.pending_targets).toEqual([b]);
+      expect(state.counts_pending_targets).toEqual([b]);
+      expect(state.sweep_targets).toEqual([a, b]);
+    } finally {
+      await exec('DELETE FROM liekan_analytics_engine_site WHERE website_id=$1::uuid', tombstone);
+    }
   });
   it('can restore one cleanup destination when other sites still require a different destination', async () => {
     const a = ch.engineConnection().key,

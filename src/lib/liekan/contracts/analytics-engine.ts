@@ -34,6 +34,15 @@ export const analyticsEngineStatusSchema = z.object({
       rangeEnd: z.string().nullable(),
       lastPublishedAt: z.string().nullable(),
       purgePending: z.boolean(),
+      logCountsCoverage: z
+        .object({
+          version: z.string(),
+          completed: z.string(),
+          pending: z.string(),
+          failed: z.string(),
+          dataThrough: z.string().nullable(),
+        })
+        .optional(),
     }),
   ),
 });
@@ -61,5 +70,12 @@ export interface AnalyticsEngineStatus {
     rangeEnd: string | null;
     lastPublishedAt: string | null;
     purgePending: boolean;
+    logCountsCoverage?: {
+      version: string;
+      completed: string;
+      pending: string;
+      failed: string;
+      dataThrough: string | null;
+    };
   }[];
 }

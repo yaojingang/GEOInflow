@@ -8695,6 +8695,13 @@ export interface operations {
               completed: string;
               failed: string;
               lastPublishedAt: string | null;
+              logCountsCoverage?: {
+                completed: string;
+                dataThrough: string | null;
+                failed: string;
+                pending: string;
+                version: string;
+              };
               /** @description Display name of the resource. */
               name: string;
               pending: string;
@@ -8837,6 +8844,13 @@ export interface operations {
               completed: string;
               failed: string;
               lastPublishedAt: string | null;
+              logCountsCoverage?: {
+                completed: string;
+                dataThrough: string | null;
+                failed: string;
+                pending: string;
+                version: string;
+              };
               /** @description Display name of the resource. */
               name: string;
               pending: string;

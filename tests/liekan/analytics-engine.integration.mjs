@@ -4,14 +4,22 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
 const args = process.argv.slice(2).filter(a => a !== '--');
-const benchmark = args.includes('--benchmark');
+const countsBenchmark = args.includes('--counts-benchmark');
+const benchmark = args.includes('--benchmark') || countsBenchmark;
 const rowIndex = args.indexOf('--rows');
 const rows = rowIndex >= 0 ? Number(args[rowIndex + 1]) : 1000000;
 if (
-  args.some((a, i) => !['--benchmark', '--rows'].includes(a) && i !== rowIndex + 1) ||
-  ![1000000, 10000000].includes(rows)
+  args.some(
+    (a, i) =>
+      !['--benchmark', '--counts-benchmark', '--rows'].includes(a) &&
+      !(rowIndex >= 0 && i === rowIndex + 1),
+  ) ||
+  ![1000000, 10000000, 100000000].includes(rows) ||
+  (countsBenchmark && args.includes('--benchmark'))
 )
-  throw new Error('Usage: test:analytics-engine [--benchmark --rows 1000000|10000000]');
+  throw new Error(
+    'Usage: test:analytics-engine [--benchmark|--counts-benchmark] [--rows 1000000|10000000|100000000]',
+  );
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const id = randomUUID(),
   label = 'io.liekan.analytics-engine-test';
@@ -28,7 +36,8 @@ const env = {
   APP_SECRET: randomBytes(32).toString('hex'),
   LIEKAN_ANALYTICS_ENGINE_TEST: '1',
 };
-if (benchmark) env.LIEKAN_ANALYTICS_ENGINE_BENCHMARK_ROWS = String(rows);
+if (countsBenchmark) env.LIEKAN_ANALYTICS_COUNTS_BENCHMARK_ROWS = String(rows);
+else if (benchmark) env.LIEKAN_ANALYTICS_ENGINE_BENCHMARK_ROWS = String(rows);
 let interrupted = false,
   active;
 for (const signal of ['SIGINT', 'SIGTERM'])
@@ -87,7 +96,11 @@ try {
     `${folder}/pg.env`,
     '-p',
     '127.0.0.1::5432',
-    'postgres:16-alpine',
+    '--cpus',
+    '2',
+    '--memory',
+    '2g',
+    process.env.LIEKAN_ENGINE_PG15 === '1' ? 'postgres:15-alpine' : 'postgres:16-alpine',
   ]);
   await run(
     'docker',
@@ -144,17 +157,21 @@ try {
     if (i >= 60) throw new Error('Owned test databases did not become ready');
     await new Promise(resolve => setTimeout(resolve, 500));
   }
-  console.log('Owned PostgreSQL16 and ClickHouse26.8 test databases ready');
+  console.log(
+    `Owned PostgreSQL${process.env.LIEKAN_ENGINE_PG15 === '1' ? '15' : '16'} and ClickHouse26.8 test databases ready`,
+  );
   await run(process.execPath, ['node_modules/prisma/build/index.js', 'migrate', 'deploy']);
   await run(process.execPath, ['scripts/liekan-migrate.mjs']);
   await run(process.execPath, ['scripts/liekan-migrate.mjs']);
-  const file = benchmark
-    ? 'src/lib/liekan/upstream/analytics-engine.benchmark.test.ts'
-    : 'src/lib/liekan/upstream/analytics-engine.integration.test.ts';
+  const file = countsBenchmark
+    ? 'src/lib/liekan/upstream/analytics-engine-counts.benchmark.test.ts'
+    : benchmark
+      ? 'src/lib/liekan/upstream/analytics-engine.benchmark.test.ts'
+      : 'src/lib/liekan/upstream/analytics-engine.integration.test.ts';
   const result = await run(
     process.execPath,
     ['node_modules/vitest/vitest.mjs', 'run', file, '--maxWorkers=1'],
-    { timeout: benchmark ? 7200000 : 180000 },
+    { timeout: countsBenchmark ? 28800000 : benchmark ? 7200000 : 180000 },
   );
   console.log(result.output);
   if (!benchmark && env.LIEKAN_ENGINE_VISUAL === '1') {

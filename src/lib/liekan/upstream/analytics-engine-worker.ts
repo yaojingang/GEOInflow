@@ -16,6 +16,12 @@ import {
   projectionDigest,
 } from './analytics-engine-clickhouse';
 import { LiekanError } from './errors';
+import {
+  LOG_COUNTS_TABLE,
+  LOG_COUNTS_VERSION,
+  initializeCountsTable,
+  prepareCounts,
+} from './analytics-engine-counts';
 
 const owner = randomUUID();
 const columns = projectionColumns.join(',');
@@ -81,7 +87,7 @@ export async function discoverEngineWork(force = false) {
         engineValueKey(site.seen_versions) !== engineValueKey(versions)
       ) {
         await tx.$executeRawUnsafe(
-          'UPDATE liekan_analytics_engine_unit SET verified_at=NULL WHERE website_id=$1::uuid',
+          'UPDATE liekan_analytics_engine_unit SET verified_at=NULL,attempts=0,retry_at=NULL,error_code=NULL WHERE website_id=$1::uuid',
           site.website_id,
         );
         await tx.$executeRawUnsafe(
@@ -142,7 +148,11 @@ export async function discoverEngineWork(force = false) {
       );
       await tx.$executeRawUnsafe(
         `INSERT INTO liekan_analytics_engine_unit(website_id,bucket) VALUES($1::uuid,$2)
-    ON CONFLICT(website_id,bucket) DO UPDATE SET verified_at=CASE WHEN liekan_analytics_engine_unit.fingerprint=liekan_engine_fingerprint($1::uuid,$2) THEN liekan_analytics_engine_unit.verified_at ELSE NULL END`,
+    ON CONFLICT(website_id,bucket) DO UPDATE SET
+     verified_at=CASE WHEN liekan_analytics_engine_unit.fingerprint=liekan_engine_fingerprint($1::uuid,$2) THEN liekan_analytics_engine_unit.verified_at ELSE NULL END,
+     attempts=CASE WHEN coalesce(liekan_analytics_engine_unit.candidate_fingerprint,liekan_analytics_engine_unit.fingerprint) IS DISTINCT FROM liekan_engine_fingerprint($1::uuid,$2) THEN 0 ELSE liekan_analytics_engine_unit.attempts END,
+     retry_at=CASE WHEN coalesce(liekan_analytics_engine_unit.candidate_fingerprint,liekan_analytics_engine_unit.fingerprint) IS DISTINCT FROM liekan_engine_fingerprint($1::uuid,$2) THEN NULL ELSE liekan_analytics_engine_unit.retry_at END,
+     error_code=CASE WHEN coalesce(liekan_analytics_engine_unit.candidate_fingerprint,liekan_analytics_engine_unit.fingerprint) IS DISTINCT FROM liekan_engine_fingerprint($1::uuid,$2) THEN NULL ELSE liekan_analytics_engine_unit.error_code END`,
         hour.site,
         hour.bucket,
       );
@@ -165,8 +175,8 @@ async function claim() {
       'UPDATE liekan_analytics_engine SET maintenance_turn=(maintenance_turn+1)%8 WHERE id=1',
     );
     const [purge] = await tx.$queryRawUnsafe<any[]>(
-      `SELECT * FROM liekan_analytics_engine_site WHERE ((purge_pending AND $1=ANY(pending_targets)) OR ($2::boolean AND purge_through>0 AND $1=ANY(sweep_targets) AND (purge_checked_at IS NULL OR purge_checked_at<clock_timestamp()-interval '30 seconds')))
-   AND (purge_until IS NULL OR purge_until<clock_timestamp()) ORDER BY purge_pending DESC,purge_checked_at NULLS FIRST,website_id LIMIT 1 FOR UPDATE SKIP LOCKED`,
+      `SELECT * FROM liekan_analytics_engine_site WHERE ((purge_pending AND $1=ANY(pending_targets)) OR ($2::boolean AND purge_through>0 AND $1=ANY(sweep_targets) AND (purge_checked_at IS NULL OR purge_checked_at<clock_timestamp()-interval '30 seconds' OR counts_swept_at IS NULL OR counts_swept_at<clock_timestamp()-interval '30 seconds')))
+   AND (purge_until IS NULL OR purge_until<clock_timestamp()) ORDER BY purge_pending DESC,counts_swept_at NULLS FIRST,website_id LIMIT 1 FOR UPDATE SKIP LOCKED`,
       state.connection_hash,
       !state.syncing || Number(state.maintenance_turn) === 0,
     );
@@ -187,8 +197,8 @@ async function claim() {
    JOIN liekan_analytics_engine_site s USING(website_id) JOIN website w USING(website_id)
    WHERE w.deleted_at IS NULL AND NOT s.purge_pending AND u.bucket<$1
    AND (u.lease_token=$2::uuid OR u.lease_until IS NULL OR u.lease_until<clock_timestamp())
-   AND (u.retry_at IS NULL OR u.retry_at<=clock_timestamp()) AND u.attempts<4
-   AND (u.candidate IS NOT NULL OR u.generation IS NULL OR u.verified_at IS NULL)
+   AND (u.counts_attempt_version IS DISTINCT FROM '${LOG_COUNTS_VERSION}' OR ((u.retry_at IS NULL OR u.retry_at<=clock_timestamp()) AND u.attempts<4))
+   AND (u.candidate IS NOT NULL OR u.generation IS NULL OR u.verified_at IS NULL OR u.counts_verified_at IS NULL OR u.counts_version IS DISTINCT FROM '${LOG_COUNTS_VERSION}' OR u.counts_generation IS DISTINCT FROM u.generation OR u.counts_attempt_version IS DISTINCT FROM '${LOG_COUNTS_VERSION}')
    ORDER BY s.served_at NULLS FIRST,(u.candidate IS NOT NULL) DESC,u.bucket,u.website_id LIMIT 1 FOR UPDATE OF u SKIP LOCKED`,
       closed,
       owner,
@@ -200,13 +210,27 @@ async function claim() {
       unit.website_id,
       unit.bucket,
     );
+    const countsOnly =
+      !unit.candidate &&
+      unit.generation &&
+      unit.verified_at &&
+      !['engine-counts-lost', 'engine-counts-rebuild'].includes(unit.error_code) &&
+      String(unit.active_epoch) === String(state.epoch) &&
+      unit.fingerprint === source.fingerprint &&
+      engineValueKey(unit.versions) === engineValueKey(versions);
     if (
-      !unit.candidate ||
-      unit.lease_token !== owner ||
-      String(unit.candidate_control_revision) !== String(state.revision) ||
-      unit.candidate_fingerprint !== source.fingerprint ||
-      engineValueKey(unit.candidate_versions) !== engineValueKey(versions)
+      !countsOnly &&
+      (!unit.candidate ||
+        unit.lease_token !== owner ||
+        String(unit.candidate_control_revision) !== String(state.revision) ||
+        unit.candidate_fingerprint !== source.fingerprint ||
+        engineValueKey(unit.candidate_versions) !== engineValueKey(versions))
     ) {
+      const inputChanged =
+        (unit.candidate ? unit.candidate_fingerprint : unit.fingerprint) !== source.fingerprint ||
+        engineValueKey(unit.candidate ? unit.candidate_versions : unit.versions) !==
+          engineValueKey(versions) ||
+        String(unit.candidate ? unit.candidate_epoch : unit.active_epoch) !== String(state.epoch);
       if (unit.candidate)
         await tx.$executeRawUnsafe(
           'UPDATE liekan_analytics_engine_generation SET retired_at=clock_timestamp() WHERE id=$1::uuid',
@@ -226,7 +250,10 @@ async function claim() {
       await tx.$executeRawUnsafe(
         `UPDATE liekan_analytics_engine_unit SET candidate=$3::uuid,candidate_versions=$4::jsonb,
     candidate_fingerprint=$5,candidate_epoch=$6::bigint,candidate_control_revision=$7::bigint,
-    cursor_time=NULL,cursor_id=NULL,copied=0,chunk=0,candidate_checksum='' WHERE website_id=$1::uuid AND bucket=$2`,
+    cursor_time=NULL,cursor_id=NULL,copied=0,chunk=0,candidate_checksum='',
+    attempts=CASE WHEN $8::boolean THEN 0 ELSE attempts END,
+    retry_at=CASE WHEN $8::boolean THEN NULL ELSE retry_at END,
+    error_code=CASE WHEN $8::boolean THEN NULL ELSE error_code END WHERE website_id=$1::uuid AND bucket=$2`,
         unit.website_id,
         unit.bucket,
         unit.candidate,
@@ -234,6 +261,7 @@ async function claim() {
         source.fingerprint,
         String(state.epoch),
         String(state.revision),
+        inputChanged,
       );
     }
     await tx.$executeRawUnsafe(
@@ -242,15 +270,37 @@ async function claim() {
       unit.bucket,
       owner,
     );
+    // Stamp after acquiring the lease: the database also recognizes leases from older workers.
+    await tx.$executeRawUnsafe(
+      `UPDATE liekan_analytics_engine_unit SET counts_attempt_version=$3,
+    attempts=CASE WHEN $4::boolean THEN 0 ELSE attempts END,
+    retry_at=CASE WHEN $4::boolean THEN NULL ELSE retry_at END,
+    error_code=CASE WHEN $4::boolean THEN NULL ELSE error_code END WHERE website_id=$1::uuid AND bucket=$2`,
+      unit.website_id,
+      unit.bucket,
+      LOG_COUNTS_VERSION,
+      unit.counts_attempt_version !== LOG_COUNTS_VERSION,
+    );
     await tx.$executeRawUnsafe(
       'UPDATE liekan_analytics_engine_site SET served_at=clock_timestamp(),targets=CASE WHEN $2=ANY(targets) THEN targets ELSE array_append(targets,$2) END WHERE website_id=$1::uuid',
       unit.website_id,
       state.connection_hash,
     );
-    return { kind: 'unit' as const, state, unit, versions, fingerprint: source.fingerprint };
+    return {
+      kind: 'unit' as const,
+      state,
+      unit,
+      countsOnly: !!countsOnly,
+      versions,
+      fingerprint: source.fingerprint,
+    };
   });
 }
-async function recordFailure(work: NonNullable<Awaited<ReturnType<typeof claim>>>) {
+async function recordFailure(work: NonNullable<Awaited<ReturnType<typeof claim>>>, error: unknown) {
+  const integrityFailure =
+    error instanceof Error &&
+    /^engine-(counts-(shape|number|mismatch)|count-mismatch)$/.test(error.message);
+  const rawLost = error instanceof Error && error.message === 'engine-count-mismatch';
   await analysisTransaction(async tx => {
     if (work.kind === 'purge') {
       await tx.$executeRawUnsafe(
@@ -260,13 +310,19 @@ async function recordFailure(work: NonNullable<Awaited<ReturnType<typeof claim>>
       );
     } else {
       await tx.$executeRawUnsafe(
-        `UPDATE liekan_analytics_engine_unit SET attempts=attempts+1,error_code='engine-sync-failed',
+        `UPDATE liekan_analytics_engine_unit SET attempts=attempts+1,error_code=$6,
+    candidate_control_revision=CASE WHEN $7::boolean THEN NULL ELSE candidate_control_revision END,
+    verified_at=CASE WHEN $8::boolean THEN NULL ELSE verified_at END,
     retry_at=clock_timestamp()+CASE WHEN attempts=0 THEN interval '5 seconds' WHEN attempts=1 THEN interval '30 seconds' ELSE interval '120 seconds' END,
-    lease_until=clock_timestamp(),lease_token=NULL WHERE website_id=$1::uuid AND bucket=$2 AND candidate=$3::uuid AND lease_token=$4::uuid`,
+    lease_until=clock_timestamp(),lease_token=NULL WHERE website_id=$1::uuid AND bucket=$2 AND (candidate=$3::uuid OR ($5::boolean AND generation=$3::uuid)) AND lease_token=$4::uuid`,
         work.unit.website_id,
         work.unit.bucket,
-        work.unit.candidate,
+        work.countsOnly ? work.unit.generation : work.unit.candidate,
         owner,
+        work.countsOnly,
+        integrityFailure ? 'engine-counts-rebuild' : 'engine-sync-failed',
+        integrityFailure,
+        rawLost && work.countsOnly,
       );
     }
     await tx.$executeRawUnsafe(
@@ -281,16 +337,18 @@ export async function runEngineBatch(): Promise<boolean> {
   if (!work) return false;
   try {
     if (work.kind === 'purge') {
-      await engineClient().command({
-        query: `ALTER TABLE ${ENGINE_TABLE} DELETE WHERE installation_id={installation:UUID}
+      await initializeCountsTable();
+      for (const table of [ENGINE_TABLE, LOG_COUNTS_TABLE])
+        await engineClient().command({
+          query: `ALTER TABLE ${table} DELETE WHERE installation_id={installation:UUID}
     AND website_id={site:UUID} AND source_epoch<{epoch:UInt64}`,
-        query_params: {
-          installation: work.state.installation_id,
-          site: work.site.website_id,
-          epoch: String(work.site.purge_through),
-        },
-        clickhouse_settings: { mutations_sync: '1' },
-      });
+          query_params: {
+            installation: work.state.installation_id,
+            site: work.site.website_id,
+            epoch: String(work.site.purge_through),
+          },
+          clickhouse_settings: { mutations_sync: '1' },
+        });
       await analysisTransaction(async tx => {
         const state = await stateForWork(tx);
         if (!state || state.connection_hash !== work.state.connection_hash) return;
@@ -306,7 +364,7 @@ export async function runEngineBatch(): Promise<boolean> {
           return;
         if (!site.purge_pending) {
           await tx.$executeRawUnsafe(
-            'UPDATE liekan_analytics_engine_site SET purge_checked_at=clock_timestamp(),purge_token=NULL,purge_until=NULL WHERE website_id=$1::uuid',
+            'UPDATE liekan_analytics_engine_site SET purge_checked_at=clock_timestamp(),counts_swept_at=clock_timestamp(),purge_token=NULL,purge_until=NULL WHERE website_id=$1::uuid',
             site.website_id,
           );
           return;
@@ -324,7 +382,7 @@ export async function runEngineBatch(): Promise<boolean> {
           site.website_id,
         );
         await tx.$executeRawUnsafe(
-          `UPDATE liekan_analytics_engine_site SET pending_targets=array_remove(pending_targets,$2),targets=array_remove(targets,$2),purge_pending=cardinality(array_remove(pending_targets,$2))>0,purge_checked_at=clock_timestamp(),purge_token=NULL,purge_until=NULL,
+          `UPDATE liekan_analytics_engine_site SET counts_pending_targets=array_remove(counts_pending_targets,$2),counts_swept_at=clock_timestamp(),pending_targets=array_remove(pending_targets,$2),targets=array_remove(targets,$2),purge_pending=cardinality(array_remove(pending_targets,$2))>0,purge_checked_at=clock_timestamp(),purge_token=NULL,purge_until=NULL,
      history_cursor=(SELECT ${utcHour('min(created_at)')} FROM liekan_log WHERE website_id=$1::uuid),
      history_start=(SELECT ${utcHour('min(created_at)')} FROM liekan_log WHERE website_id=$1::uuid),
      history_end=(SELECT ${utcHour('max(created_at)')}+interval '1 hour' FROM liekan_log WHERE website_id=$1::uuid)
@@ -335,19 +393,21 @@ export async function runEngineBatch(): Promise<boolean> {
       });
       return true;
     }
-    const { unit, state, versions, fingerprint } = work;
-    const rows = await analysisTransaction(async tx =>
-      (
-        await tx.$queryRawUnsafe<any[]>(
-          `${projectionSql}
+    const { unit, state, versions, fingerprint, countsOnly } = work;
+    const rows = countsOnly
+      ? []
+      : await analysisTransaction(async tx =>
+          (
+            await tx.$queryRawUnsafe<any[]>(
+              `${projectionSql}
    ${unit.cursor_time ? 'AND (l.created_at,l.id)>($3::timestamptz,$4::text)' : ''}
    ORDER BY l.created_at,l.id LIMIT 2000`,
-          unit.website_id,
-          unit.bucket,
-          ...(unit.cursor_time ? [unit.cursor_time, unit.cursor_id] : []),
-        )
-      ).map(normalizeProjection),
-    );
+              unit.website_id,
+              unit.bucket,
+              ...(unit.cursor_time ? [unit.cursor_time, unit.cursor_id] : []),
+            )
+          ).map(normalizeProjection),
+        );
     if (rows.length) {
       const readChunk = async () =>
         (
@@ -388,19 +448,20 @@ export async function runEngineBatch(): Promise<boolean> {
       if (!copied.length) copied = await readChunk();
       if (copied.length !== rows.length || projectionDigest(copied) !== projectionDigest(rows))
         throw new Error('engine-copy-mismatch');
-    } else {
-      const [count] = await engineQuery(
-        `SELECT count() AS count FROM ${ENGINE_TABLE} WHERE installation_id={installation:UUID}
-    AND website_id={site:UUID} AND bucket=parseDateTime64BestEffort({bucket:String},3) AND generation={generation:UUID}`,
-        {
-          installation: state.installation_id,
-          site: unit.website_id,
-          generation: unit.candidate,
-          bucket: new Date(unit.bucket).toISOString(),
-        },
-      );
-      if (String(count.count) !== String(unit.copied)) throw new Error('engine-count-mismatch');
     }
+    if (!rows.length) await initializeCountsTable();
+    const countsChecksum = rows.length
+      ? null
+      : await prepareCounts(
+          {
+            installation: state.installation_id,
+            site: unit.website_id,
+            generation: countsOnly ? unit.generation : unit.candidate,
+            bucket: new Date(unit.bucket).toISOString(),
+            epoch: String(versions.siteEpoch),
+          },
+          countsOnly ? unit.row_count : unit.copied,
+        );
     // No external I/O runs while publication holds source or authority locks.
     await analysisTransaction(async tx => {
       const permit = currentAnalysisPermit();
@@ -433,7 +494,10 @@ export async function runEngineBatch(): Promise<boolean> {
         unit.bucket,
       );
       if (
-        currentUnit?.candidate !== unit.candidate ||
+        !currentUnit ||
+        (countsOnly
+          ? currentUnit.generation !== unit.generation || currentUnit.candidate !== null
+          : currentUnit.candidate !== unit.candidate) ||
         currentUnit.lease_token !== owner ||
         String(currentUnit.chunk) !== String(unit.chunk)
       )
@@ -465,6 +529,14 @@ export async function runEngineBatch(): Promise<boolean> {
           rows.length,
           digest,
         );
+      } else if (countsOnly) {
+        await tx.$executeRawUnsafe(
+          `UPDATE liekan_analytics_engine_unit SET counts_generation=generation,counts_version=$3,counts_checksum=$4,counts_verified_at=clock_timestamp(),lease_token=NULL,lease_until=NULL,attempts=0,error_code=NULL,retry_at=NULL WHERE website_id=$1::uuid AND bucket=$2`,
+          unit.website_id,
+          unit.bucket,
+          LOG_COUNTS_VERSION,
+          countsChecksum,
+        );
       } else {
         if (unit.generation)
           await tx.$executeRawUnsafe(
@@ -475,15 +547,17 @@ export async function runEngineBatch(): Promise<boolean> {
           `UPDATE liekan_analytics_engine_unit SET generation=candidate,active_epoch=candidate_epoch,
      versions=candidate_versions,fingerprint=candidate_fingerprint,row_count=copied,checksum=candidate_checksum,
      published_at=clock_timestamp(),verified_at=clock_timestamp(),candidate=NULL,lease_token=NULL,lease_until=NULL,
-     attempts=0,error_code=NULL,retry_at=NULL WHERE website_id=$1::uuid AND bucket=$2`,
+     attempts=0,error_code=NULL,retry_at=NULL,counts_generation=candidate,counts_version=$3,counts_checksum=$4,counts_verified_at=clock_timestamp() WHERE website_id=$1::uuid AND bucket=$2`,
           unit.website_id,
           unit.bucket,
+          LOG_COUNTS_VERSION,
+          countsChecksum,
         );
       }
     });
     return true;
   } catch (error) {
-    await recordFailure(work);
+    await recordFailure(work, error);
     throw error;
   }
 }
@@ -516,10 +590,11 @@ async function checkHealth() {
 export async function collectEngineGarbage() {
   const state = await analysisTransaction(tx => stateForWork(tx, ''));
   if (!state) return;
+  await initializeCountsTable();
   // Query parameters use multipart. Mutations have a bounded list and stay below URL limits.
   const candidates = await engineQuery<{ generation: string }>(
-    `SELECT generation FROM ${ENGINE_TABLE}
-  WHERE installation_id={installation:UUID} AND generation>{cursor:UUID}
+    `SELECT generation FROM (SELECT generation,inserted_at FROM ${ENGINE_TABLE} WHERE installation_id={installation:UUID} UNION ALL SELECT generation,inserted_at FROM ${LOG_COUNTS_TABLE} WHERE installation_id={installation:UUID})
+  WHERE generation>{cursor:UUID}
   GROUP BY generation HAVING max(inserted_at)<now()-INTERVAL 7 DAY
   ORDER BY generation LIMIT 1000`,
     {
@@ -540,12 +615,13 @@ export async function collectEngineGarbage() {
     .slice(0, 50)
     .map(g => g.generation);
   if (retired.length)
-    await engineClient().command({
-      query: `ALTER TABLE ${ENGINE_TABLE} DELETE WHERE installation_id={installation:UUID}
+    for (const table of [ENGINE_TABLE, LOG_COUNTS_TABLE])
+      await engineClient().command({
+        query: `ALTER TABLE ${table} DELETE WHERE installation_id={installation:UUID}
   AND generation IN {generations:Array(UUID)}`,
-      query_params: { installation: state.installation_id, generations: retired },
-      clickhouse_settings: { mutations_sync: '1' },
-    });
+        query_params: { installation: state.installation_id, generations: retired },
+        clickhouse_settings: { mutations_sync: '1' },
+      });
   await analysisTransaction(async tx => {
     await tx.$executeRawUnsafe(
       "DELETE FROM liekan_analytics_engine_generation WHERE id=ANY($1::uuid[]) AND retired_at<clock_timestamp()-interval '7 days'",

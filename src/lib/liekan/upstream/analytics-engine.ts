@@ -16,6 +16,7 @@ import {
 import { authenticateCrawlerMaintenance } from './crawler-maintenance';
 import { LiekanError } from './errors';
 import { TRAFFIC_POLICY_VERSION } from './traffic-query';
+import { initializeCountsTable, LOG_COUNTS_VERSION } from './analytics-engine-counts';
 
 export const currentEngineVersionsSql = `(liekan_analysis_versions(s.website_id,'${ENGINE_VERSION}','${TRAFFIC_POLICY_VERSION}','${CRAWLER_POPULATION_VERSION}')
  || jsonb_build_object('siteEpoch',s.epoch::text,'siteRevision',s.revision::text))`;
@@ -67,6 +68,8 @@ export async function engineStatus(actor: string, cursor?: string): Promise<Anal
       (count(u.bucket) FILTER(WHERE NOT coalesce((${validEngineUnitSql.replace(currentEngineVersionsSql, 's.current_versions')}),false) OR u.candidate IS NOT NULL)+greatest(0,extract(epoch FROM least(s.history_end,clock_timestamp())-s.history_cursor)/3600)::bigint)::text AS pending,
       count(u.bucket) FILTER(WHERE u.error_code IS NOT NULL)::text AS failed,
       coalesce(sum(u.row_count),0)::text AS rows,min(u.bucket) AS "rangeStart",max(u.bucket)+interval '1 hour' AS "rangeEnd",
+      count(u.bucket) FILTER(WHERE u.counts_verified_at IS NOT NULL AND u.counts_version='${LOG_COUNTS_VERSION}' AND u.counts_generation=u.generation AND ${validEngineUnitSql.replace(currentEngineVersionsSql, 's.current_versions')})::text AS "countsCompleted",
+      max(u.bucket+interval '1 hour') FILTER(WHERE u.counts_verified_at IS NOT NULL AND u.counts_version='${LOG_COUNTS_VERSION}' AND u.counts_generation=u.generation AND ${validEngineUnitSql.replace(currentEngineVersionsSql, 's.current_versions')}) AS "countsThrough",
       max(u.published_at) AS "lastPublishedAt",s.purge_pending AS "purgePending"
       FROM current_sites s LEFT JOIN liekan_analytics_engine_unit u USING(website_id)
       GROUP BY s.website_id,s.name,s.purge_pending,s.history_end,s.history_cursor,s.current_versions ORDER BY s.website_id`,
@@ -87,8 +90,15 @@ export async function engineStatus(actor: string, cursor?: string): Promise<Anal
       workerAt: iso(state.worker_at),
       error: state.error_code,
       nextCursor: sites.length > 10 ? sites[9].websiteId : null,
-      sites: sites.slice(0, 10).map(s => ({
+      sites: sites.slice(0, 10).map(({ countsCompleted, countsThrough, ...s }) => ({
         ...s,
+        logCountsCoverage: {
+          version: LOG_COUNTS_VERSION,
+          completed: countsCompleted,
+          pending: String(BigInt(s.pending) + BigInt(s.completed) - BigInt(countsCompleted)),
+          failed: s.failed,
+          dataThrough: iso(countsThrough),
+        },
         name: s.name || s.websiteId,
         rangeStart: iso(s.rangeStart),
         rangeEnd: iso(s.rangeEnd),
@@ -178,6 +188,7 @@ export async function changeAnalyticsEngine(request: Request, raw: unknown) {
       if (!state.healthy || state.connection_hash !== config.key)
         throw new LiekanError('请先检查当前连接', 409, 'engine-check-required');
       await initializeEngineTable();
+      await initializeCountsTable();
       // Fence transactions that began before capture was enabled.
       await tx.$executeRawUnsafe('LOCK TABLE liekan_log IN SHARE ROW EXCLUSIVE MODE');
       await tx.$executeRawUnsafe(`INSERT INTO liekan_analytics_engine_site(website_id,history_cursor,history_start,history_end)

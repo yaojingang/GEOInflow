@@ -1,6 +1,11 @@
 // @vitest-environment node
 import { beforeEach, expect, it, vi } from 'vitest';
-const m = vi.hoisted(() => ({ read: vi.fn(), fragments: new Map<string, unknown>() }));
+vi.mock('./analytics-engine-counts', () => ({ readClickHouseLogCounts: m.counts }));
+const m = vi.hoisted(() => ({
+  read: vi.fn(),
+  counts: vi.fn(),
+  fragments: new Map<string, unknown>(),
+}));
 vi.mock('./analysis-rollups', () => ({
   readAnalysisLogRollup: m.read,
   analysisSafeNumber: (v: string) => {
@@ -33,6 +38,7 @@ const at = (s: string) => Date.parse(s);
 beforeEach(() => {
   m.fragments.clear();
   m.read.mockReset();
+  m.counts.mockReset().mockResolvedValue(null);
 });
 it.each([
   ['UTC', '2026-01-01T00:00Z', '2027-01-01T00:00Z'],
@@ -112,4 +118,27 @@ it('does not sum per-day distinct path or visitor counts', async () => {
   } as any);
   expect(result).not.toHaveProperty('pages');
   expect(result).not.toHaveProperty('visitors');
+});
+
+it('uses the compact source before PG while retaining durable fragment reuse', async () => {
+  const value = {
+    requests: 9,
+    ai: 4,
+    abnormal: 1,
+    legacyRequests: 2,
+    unclassifiedRequests: 1,
+    classifications: ['v1'],
+  };
+  m.counts.mockResolvedValue(value);
+  const p: any = {
+    startAt: at('2026-01-01T00:00Z'),
+    endAt: at('2026-02-01T00:00Z'),
+    timezone: 'UTC',
+    crawlerMetricsVersion: 1,
+    crawlerIdentityScope: 'all',
+  };
+  expect(await readLogStatistics('site', p)).toEqual(value);
+  expect(await readLogStatistics('site', p)).toEqual(value);
+  expect(m.counts).toHaveBeenCalledTimes(1);
+  expect(m.read).not.toHaveBeenCalled();
 });

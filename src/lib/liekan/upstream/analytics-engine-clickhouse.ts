@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { type ClickHouseClient, createClient } from '@clickhouse/client';
+import { type ClickHouseClient, type ResultSet, createClient } from '@clickhouse/client';
 
 export const ENGINE_VERSION = 'liekan-log-projection-v1';
 export const ENGINE_TABLE = 'liekan_log_projection_v1';
@@ -80,6 +80,7 @@ export function engineClient() {
 export async function engineQuery<T = Record<string, any>>(
   sql: string,
   params: Record<string, any> = {},
+  deadline?: number,
 ) {
   // Annual coverage has thousands of hourly generations. Bound each form field
   // below ClickHouse's default HTTP field limit while retaining one query.
@@ -95,12 +96,32 @@ export async function engineQuery<T = Record<string, any>>(
     }
     sql = sql.replaceAll('{generations:Array(UUID)}', `arrayConcat(${parts.join(',')})`);
   }
-  const result = await engineClient().query({
-    query: sql,
-    query_params: params,
-    format: 'JSONEachRow',
-  });
-  return result.json<T>();
+  if (deadline !== undefined && Date.now() >= deadline) throw new Error('engine-query-timeout');
+  const controller = new AbortController();
+  let result: ResultSet<'JSONEachRow'>;
+  const timer =
+    deadline === undefined
+      ? undefined
+      : setTimeout(
+          () => {
+            controller.abort();
+            result?.close();
+          },
+          Math.max(1, Math.min(5000, deadline - Date.now())),
+        );
+  try {
+    result = await engineClient().query({
+      query: sql,
+      query_params: params,
+      format: 'JSONEachRow',
+      ...(deadline === undefined ? {} : { abort_signal: controller.signal }),
+    });
+    const rows = await result.json<T>();
+    if (deadline !== undefined && Date.now() >= deadline) throw new Error('engine-query-timeout');
+    return rows;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 export async function initializeEngineTable() {
   await engineClient().command({

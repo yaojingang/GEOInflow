@@ -6,6 +6,7 @@ import { crawlerAiSql, unknownCrawlerSql } from '../rules/population';
 import { readAnalysisLogRollup, analysisSafeNumber } from './analysis-rollups';
 import { readReportFragment, primeReportFragments } from './report-fragments';
 import { query } from './server';
+import { readClickHouseLogCounts } from './analytics-engine-counts';
 
 export type LogStatistics = {
   requests: number;
@@ -58,7 +59,7 @@ async function load(
   start: number,
   end: number,
 ): Promise<LogStatistics> {
-  const accelerated = await readAnalysisLogRollup({
+  const input = {
     websiteId,
     startDate: new Date(start),
     endDate: new Date(end),
@@ -67,7 +68,10 @@ async function load(
     crawlerIdentityScope: p.crawlerIdentityScope,
     fields: ['counts'],
     allowRawOnly: true,
-  });
+  } as const;
+  const counts = await readClickHouseLogCounts(input);
+  if (counts) return counts;
+  const accelerated = await readAnalysisLogRollup(input);
   if (accelerated?.counts) return accelerated.counts;
   const [value] = await query<LogStatistics>(
     `SELECT count(*)::text AS requests,

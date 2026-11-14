@@ -27,9 +27,9 @@ it('fences prior metric semantics while keeping source revisions unchanged', asy
   const tx = { $queryRawUnsafe: vi.fn().mockResolvedValue([]) };
   const current = await readAnalyticsVersions(tx, ['website:00000000-0000-4000-8000-000000000001']);
   const fields = JSON.parse(current.strong);
-  expect(fields).toContain('analytics-read-v4');
+  expect(fields).toContain('analytics-read-v5');
   const legacy = JSON.stringify(
-    fields.map((value: unknown) => (value === 'analytics-read-v4' ? 'analytics-read-v3' : value)),
+    fields.map((value: unknown) => (value === 'analytics-read-v5' ? 'analytics-read-v4' : value)),
   );
   expect(current.strong).not.toBe(legacy);
   for (const format of [DASHBOARD_FORMAT, ANALYSIS_RESULT_FORMAT]) {

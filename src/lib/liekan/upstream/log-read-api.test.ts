@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   summary: vi.fn(),
   async: vi.fn(),
   published: vi.fn(),
+  boundary: vi.fn(),
   probeMiss: true,
 }));
 vi.mock('./report-fragments', () => {
@@ -34,7 +35,7 @@ vi.mock('./log-read', () => ({
 }));
 vi.mock('./log-read-boundary', async () => ({
   ...(await vi.importActual('./log-read-boundary')),
-  logReadBoundary: async () => 'a'.repeat(64),
+  logReadBoundary: mocks.boundary,
 }));
 vi.mock('./query-snapshot', () => ({ getQuerySnapshot: () => ({}) }));
 vi.mock('./analysis-query-api', () => ({
@@ -56,6 +57,7 @@ const request = (part: string, headers = {}) =>
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.probeMiss = true;
+  mocks.boundary.mockResolvedValue('a'.repeat(64));
   mocks.published.mockResolvedValue(undefined);
   mocks.authenticate.mockResolvedValue({ id: 'actor', role: 'admin' });
   mocks.authorize.mockResolvedValue({ website: { id, name: 'Current' }, canManage: false });
@@ -119,6 +121,7 @@ it('delivers a proved complete count before probing its component fragments', as
   );
   expect(response.status).toBe(200);
   expect((await response.json()).total).toBe(7);
+  expect(mocks.boundary).not.toHaveBeenCalled();
   expect(mocks.count).not.toHaveBeenCalled();
   expect(mocks.async).not.toHaveBeenCalled();
 });
@@ -217,4 +220,15 @@ it('checks current permission again before publishing an independently loaded pa
     return { website: { id }, canManage: false };
   });
   expect((await logReadResponse(request('entries'), id, 'entries')).status).toBe(403);
+});
+
+it.each(['refresh', 'miss'])('validates the outer boundary on a %s count path', async kind => {
+  const r = new Request(request('count').url + (kind === 'refresh' ? '&refresh=1' : ''), {
+    headers: { prefer: 'respond-async' },
+  });
+  mocks.boundary.mockRejectedValueOnce(new LiekanError('边界已变化', 409));
+  expect((await logReadResponse(r, id, 'count')).status).toBe(409);
+  expect(mocks.boundary).toHaveBeenCalledTimes(1);
+  expect(mocks.async).not.toHaveBeenCalled();
+  expect(mocks.count).not.toHaveBeenCalled();
 });

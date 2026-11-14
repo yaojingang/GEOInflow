@@ -34,11 +34,11 @@ export async function logReadResponse(
     if (!logCountQuery.safeParse(input).success) throw new LiekanError('日志读取边界无效', 400);
     const target = part === 'summary' ? 'feature:log-summary' : 'feature:log-count';
     if (analysisAsyncRequested(request, target)) {
-      await reportSnapshot(() => logReadBoundary(getQuerySnapshot(), access.website.id, parsed));
       if (part === 'count' && parsed.refresh !== '1') {
         const saved = await publishedLogCountResponse(request, access.website.id, actor, parsed);
         if (saved) return saved;
       }
+      await reportSnapshot(() => logReadBoundary(getQuerySnapshot(), access.website.id, parsed));
       if (parsed.crawlerMetricsVersion === 1 && (part === 'summary' || !parsed.search)) {
         const context = currentCacheContext();
         const deadline = context.deadline;

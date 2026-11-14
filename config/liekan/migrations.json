@@ -76,5 +76,11 @@
   "068_optional_analytics_engine.sql": "50af561c083939236cda8f3a3c23678325d977b48ede8e26dc53571a311b94f1",
   "069_report_fragments.sql": "2fec0a333e012cec6106ca0de8f944edb9bae68cfd4c7db44c775d3cb9f9f2b9",
   "070_analytics_input_summary.sql": "5d16b0660ecb38480a4d443a46840d546585e1d0f356668071dee5df474eb5e0",
-  "071_report_range_dependencies.sql": "f5b1eab19b2f74401f4b166344a3c8aa3926401d9244af0e4d4662061646b1af"
+  "071_report_range_dependencies.sql": "f5b1eab19b2f74401f4b166344a3c8aa3926401d9244af0e4d4662061646b1af",
+  "072_analytics_log_counts.sql": "e47c05db18e7248fa6585a6607cfce839c163767bd20eb56636b63e5020492a6",
+  "073_analytics_count_generation.sql": "73aedde904d9011b7d1a3f9705aa1cc215cc267e1207549d1eaab1b13e965c73",
+  "074_analytics_count_cleanup.sql": "8bf40ec9f0976fa2d9b7655d5de962c8a52bf70a36abe8e1b20e471f5aea75c8",
+  "075_analytics_count_cleanup_destinations.sql": "fd3ed46b7beba379419b66c758b31a0fe496c4c37f8325adfb1bf41b0924d21d",
+  "076_analytics_count_snapshot_proof.sql": "c0df6ca1b4ff9df4b098f116d01915e58cf397246c96d72538b515804ad34d4f",
+  "077_analytics_count_attempt_family.sql": "3259ef6fba3adfe682b44e94a8d4c030c28f0430c242b61765bef640b9a969ae"
 }
