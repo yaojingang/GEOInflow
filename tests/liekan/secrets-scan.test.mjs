@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -53,7 +53,10 @@ test('secret scan exceptions match known metadata while new secrets remain detec
   const metadata = scan('metadata');
   assert.equal(metadata.status, 0, metadata.error?.message || metadata.stderr);
 
-  const unexpectedSecret = randomBytes(32).toString('base64url');
+  // Stable probes keep upstream heuristic allowlists from making this check random.
+  const unexpectedSecret = createHash('sha256')
+    .update('liekan-gitleaks-positive-base64url-v1')
+    .digest('base64url');
   for (const file of [...files, 'unexpected-source.ts']) {
     await writeFile(join(source, file), `const api_key = "${unexpectedSecret}";\n`);
   }
@@ -63,7 +66,9 @@ test('secret scan exceptions match known metadata while new secrets remain detec
   const detected = new Set(findings.map(finding => finding.File));
   for (const file of [...files, 'unexpected-source.ts']) assert.ok(detected.has(file), file);
 
-  const unexpectedHexSecret = randomBytes(32).toString('hex');
+  const unexpectedHexSecret = createHash('sha256')
+    .update('liekan-gitleaks-positive-hex-v1')
+    .digest('hex');
   for (const file of [...files, 'unexpected-source.ts']) {
     await writeFile(join(source, file), `const api_key = "${unexpectedHexSecret}";\n`);
   }
