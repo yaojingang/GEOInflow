@@ -37,11 +37,35 @@ test('default Docker metadata covers the immutable release register and UI basel
     assert.equal(defaults[arg], release[key], arg);
 });
 
+test('Docker compilation isolates the webpack worker and retains type checking and all prerequisite builds', async () => {
+  const pkg = JSON.parse(await readFile('package.json', 'utf8'));
+  assert.equal(pkg.scripts['build:app:docker'], 'next build --webpack');
+  assert.equal(pkg.scripts['build:app'], 'next build --turbo');
+  assert.ok(pkg.scripts['test:deployment'].includes('tests/liekan/build-css-compat.test.mjs'));
+  assert.equal(
+    pkg.scripts['build:docker'],
+    pkg.scripts.build
+      .replace('check:env ', '')
+      .replace('check:db ', '')
+      .replace(/build:app$/, 'build:app:docker'),
+  );
+  const config = await readFile('next.config.ts', 'utf8');
+  assert.match(config, /ignoreBuildErrors: false/);
+  assert.match(config, /webpackBuildWorker: true/);
+  assert.match(config, /webpackMemoryOptimizations: true/);
+  const dockerfile = await readFile('Dockerfile.liekan', 'utf8');
+  assert.match(dockerfile, /\. \.\/config\/liekan\/build-resources.sh/);
+  assert.match(dockerfile, /RAYON_NUM_THREADS=1 NODE_OPTIONS="--max-old-space-size=\$liekan_build_node_heap_mib/);
+});
+
 async function installation(t, options = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'liekan-install-test-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(path.join(root, 'scripts'));
   await mkdir(path.join(root, 'bin'));
+  await mkdir(path.join(root, 'config/liekan'), { recursive: true });
+  await copyFile('config/liekan/buildkit.toml', path.join(root, 'config/liekan/buildkit.toml'));
+  await copyFile('config/liekan/build-resources.sh', path.join(root, 'config/liekan/build-resources.sh'));
   await copyFile('scripts/liekan-deploy.sh', path.join(root, 'scripts/liekan-deploy.sh'));
   await copyFile('tests/liekan/fixtures/deployment-docker.sh', path.join(root, 'bin/docker'));
   await chmod(path.join(root, 'bin/docker'), 0o755);
@@ -201,7 +225,7 @@ for (const memory of ['', 'unknown', '0', '-1', '8589934592extra']) {
     assert.equal(result.status, 1);
     assert.match(result.stderr, /Docker/);
     await assert.rejects(access(path.join(root, '.env')));
-    assert.doesNotMatch(await readFile(calls, 'utf8'), /build app| up | stop /);
+    assert.doesNotMatch(await readFile(calls, 'utf8'), /build app| up | stop log-worker|^start /m);
   });
 }
 
@@ -213,6 +237,175 @@ test('low-memory upgrade preserves existing credentials and keeps existing servi
   assert.equal(run().status, 1);
   assert.deepEqual(await readFile(path.join(root, '.env')), config);
   assert.doesNotMatch(await readFile(calls, 'utf8'), /build app| up | stop /);
+});
+
+for (const available of ['2097152', '3145728', '5242880', '6291455', '', 'unknown', '-1', '9999999999999999']) {
+  test(`unavailable build headroom (${JSON.stringify(available)}) preserves the running installation`, async t => {
+    const { root, calls, run } = await existingInstallation(t, {
+      DEPLOY_TEST_AVAILABLE_KIB: available,
+    });
+    const original = await readFile(path.join(root, '.env'));
+    const result = run();
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /可用内存/);
+    assert.deepEqual(await readFile(path.join(root, '.env')), original);
+    assert.doesNotMatch(await readFile(calls, 'utf8'), /build app| up | stop |buildx create/);
+  });
+}
+
+test('available-memory floor accepts exactly 6 GiB in check mode', async t => {
+  const { root, calls, run } = await installation(t, { DEPLOY_TEST_AVAILABLE_KIB: '6291456' });
+  const result = run(['--check']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /至少 6144 MiB/);
+  await assert.rejects(access(path.join(root, '.env')));
+  await assert.rejects(access(path.join(root, '.local')));
+  assert.match(await readFile(calls, 'utf8'), /^run .*--memory 32m .*--cpus 0.1 .*--network none/m);
+  assert.doesNotMatch(await readFile(calls, 'utf8'), /build app| up | stop |buildx create/);
+});
+
+test('memory is checked again immediately before building', async t => {
+  const { calls, run } = await installation(t, { DEPLOY_TEST_LATER_AVAILABLE_KIB: '3145728' });
+  const result = run();
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /可用内存/);
+  const commands = await readFile(calls, 'utf8');
+  assert.equal(commands.split('\n').filter(line => line.startsWith('run ')).length, 2);
+  assert.doesNotMatch(commands, /build app| up | stop |buildx create/);
+});
+
+for (const options of [
+  { DEPLOY_TEST_BUILDX_STATUS: '1' },
+  { DEPLOY_TEST_BUILD_HELP: 'no supported builder option' },
+  { DEPLOY_TEST_RESOURCE_SUPPORT: 'true false true true' },
+  { DEPLOY_TEST_CPUS: 'unknown' },
+  { DEPLOY_TEST_PROBE_STATUS: '1' },
+  { DEPLOY_TEST_BUILDER_CREATE_STATUS: '1' },
+  { DEPLOY_TEST_BUILDER_LIMITS: '0|0|0|0' },
+]) {
+  test(`build isolation failure (${Object.keys(options)[0]}) never falls back to an unbounded build`, async t => {
+    const { calls, run } = await installation(t, options);
+    assert.notEqual(run().status, 0);
+    assert.doesNotMatch(await readFile(calls, 'utf8'), /build app| up |compose [^\n]* stop /);
+  });
+}
+
+for (const cpus of ['1', '2', '8']) {
+  test(`bounded builder on a ${cpus}-CPU daemon is stopped after building and reused`, async t => {
+    const { calls, run } = await installation(t, { DEPLOY_TEST_CPUS: cpus });
+    const result = run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(run().status, 0);
+    const commands = await readFile(`${calls}.raw`, 'utf8');
+    const creates = commands.split('\n').filter(line => line.startsWith('buildx create '));
+    assert.equal(creates.length, 1);
+    assert.match(creates[0], /--driver docker-container/);
+    assert.match(creates[0], /--driver-opt memory=5120m --driver-opt memory-swap=5120m/);
+    assert.match(creates[0], new RegExp(`cpu-quota=${cpus === '1' ? '50000' : '100000'}`));
+    assert.doesNotMatch(creates[0], /--use/);
+    assert.match(
+      commands,
+      /build --builder geoinflow-build-v1-\d+ --build-arg LIEKAN_REVISION=unknown app/,
+    );
+    assert.equal(commands.split('\n').filter(line => line.startsWith('buildx stop ')).length, 2);
+    const trace = await readFile(calls, 'utf8');
+    assert.ok(trace.indexOf('buildx stop ') < trace.indexOf(safeAppUp));
+  });
+}
+
+test('build failure stops the isolated builder and preserves the original services', async t => {
+  const { calls, run } = await existingInstallation(t, { DEPLOY_TEST_BUILD_STATUS: '137' });
+  const result = run();
+  assert.notEqual(result.status, 0);
+  const commands = await readFile(calls, 'utf8');
+  assert.match(commands, /build app/);
+  assert.match(commands, /buildx stop /);
+  assert.doesNotMatch(commands, / up | stop log-worker|^start /m);
+});
+
+test('inherited legacy build mode cannot bypass the bounded builder', async t => {
+  const { calls, run } = await installation(t, { DOCKER_BUILDKIT: '0' });
+  const result = run();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await readFile(`${calls}.buildkit`, 'utf8'), '1');
+});
+
+test('TERM during a blocked build promptly stops the builder without touching services', async t => {
+  const { calls, start } = await installation(t, {
+    DEPLOY_TEST_BLOCK_BUILD: '1',
+    DEPLOY_TEST_BUILD_DELAY: '4',
+  });
+  const child = start();
+  t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
+  const exited = new Promise(resolve => child.on('exit', code => resolve(code)));
+  let building = false;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    building = await access(`${calls}.building`).then(() => true, () => false);
+    if (building) break;
+    await delay(20);
+  }
+  assert.ok(building, 'the build must start before it is interrupted');
+  const interrupted = Date.now();
+  child.kill('SIGTERM');
+  assert.equal(await exited, 143);
+  assert.ok(Date.now() - interrupted < 2000, 'cleanup must not wait for the blocked build');
+  const commands = await readFile(calls, 'utf8');
+  assert.match(commands, /buildx stop /);
+  assert.doesNotMatch(commands, / up | stop log-worker|^start /m);
+  assert.match(commands, /^rm f{64}$/m);
+});
+
+test('a daemon-wide lease excludes another checkout until the first builder stops', async t => {
+  const first = await installation(t, { DEPLOY_TEST_BLOCK_BUILD: '1' });
+  const lease = path.join(first.root, 'daemon-lease');
+  const second = await installation(t, { DEPLOY_TEST_LEASE_PATH: lease });
+  // Each client has its own installation lock and shares only the Docker lease.
+  const child = spawn('sh', ['scripts/liekan-deploy.sh'], {
+    cwd: first.root,
+    env: {
+      ...process.env,
+      PATH: `${first.root}/bin:${process.env.PATH}`,
+      DEPLOY_TEST_CALLS: first.calls,
+      DEPLOY_TEST_LEASE_PATH: lease,
+      DEPLOY_TEST_BLOCK_BUILD: '1',
+    },
+    stdio: 'ignore',
+  });
+  t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
+  const exited = new Promise(resolve => child.on('exit', code => resolve(code)));
+  let building = false;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    building = await access(`${first.calls}.building`).then(() => true, () => false);
+    if (building) break;
+    await delay(20);
+  }
+  assert.ok(building);
+  const refused = second.run();
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /构建租约/);
+  assert.doesNotMatch(await readFile(second.calls, 'utf8'), /build app|buildx create/);
+  assert.equal(await exited, 0);
+  await assert.rejects(access(lease));
+  assert.equal(second.run().status, 0);
+});
+
+test('a builder that cannot stop retains its lease and never starts application services', async t => {
+  const { calls, run } = await installation(t, { DEPLOY_TEST_BUILDER_STOP_STATUS: '1' });
+  const result = run();
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /构建租约已保留/);
+  const commands = await readFile(calls, 'utf8');
+  assert.match(commands, /build app/);
+  assert.doesNotMatch(commands, /^rm f{64}$| up | stop log-worker/m);
+});
+
+test('private BuildKit registry configuration is passed only when creating the dedicated builder', async t => {
+  const { root, calls, run } = await installation(t);
+  await mkdir(path.join(root, '.local'));
+  await writeFile(path.join(root, '.local/liekan-buildkit.toml'), '[worker.oci]\nmax-parallelism=1\n');
+  const result = run();
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(await readFile(calls, 'utf8'), /--buildkitd-config .local\/liekan-buildkit.toml/);
 });
 
 test('lost configuration also protects project names previously supplied by .env', async t => {
@@ -449,7 +642,10 @@ test('worker drain finishes before application migration during an existing upgr
     commands.indexOf(`${safeAppUp} app`) <
       commands.indexOf(`${safeWorkerUp} log-worker analytics-worker`),
   );
-  assert.equal(commands.filter(command => command.includes(' stop ')).length, 1);
+  assert.equal(
+    commands.filter(command => command.startsWith('compose ') && command.includes(' stop ')).length,
+    1,
+  );
 });
 test('worker stop failure preserves existing configuration and prevents application migration', async t => {
   const { root, calls, run } = await existingInstallation(t, {
@@ -468,7 +664,7 @@ test('build failure leaves workers running before an upgrade begins', async t =>
   assert.equal(run().status, 6);
   const commands = await readFile(calls, 'utf8');
   assert.match(commands, /build app/);
-  assert.doesNotMatch(commands, / stop | up -d /);
+  assert.doesNotMatch(commands, /compose [^\n]* stop | up -d /);
 });
 
 const candidateImage = `sha256:${'a'.repeat(64)}`;
@@ -539,7 +735,7 @@ test('an unresolved candidate image stops before touching the current services',
   const result = run();
   assert.equal(result.status, 1);
   assert.match(result.stderr, /不可变镜像 ID/);
-  assert.doesNotMatch(await readFile(calls, 'utf8'), / stop | up -d |^start /m);
+  assert.doesNotMatch(await readFile(calls, 'utf8'), /compose [^\n]* stop | up -d |^start /m);
 });
 
 for (const revision of ['development', '<no value>']) {
@@ -593,7 +789,12 @@ test('Git source metadata records real HEAD and changes its digest for untracked
   const changed = await readFile(`${calls}.build-override`, 'utf8');
   assert.notEqual(changed, original);
   const raw = await readFile(`${calls}.raw`, 'utf8');
-  assert.match(raw, new RegExp(`build --build-arg LIEKAN_REVISION=${revision} app`));
+  assert.match(
+    raw,
+    new RegExp(
+      `build --builder geoinflow-build-v1-\\d+ --build-arg LIEKAN_REVISION=${revision} app`,
+    ),
+  );
   options.DEPLOY_TEST_GIT_CLEAN = '1';
   assert.equal(run().status, 0);
   assert.match(await readFile(`${calls}.build-override`, 'utf8'), /source.state: "clean"/);
@@ -603,7 +804,7 @@ test('Git source metadata records real HEAD and changes its digest for untracked
   const mismatch = run();
   assert.equal(mismatch.status, 1);
   assert.match(mismatch.stderr, /app 构建来源版本不匹配/);
-  assert.doesNotMatch((await readFile(calls, 'utf8')).slice(previousCalls), / stop | up -d /);
+  assert.doesNotMatch((await readFile(calls, 'utf8')).slice(previousCalls), /compose [^\n]* stop | up -d /);
 });
 
 test('Docker startup seeds the bundled official demo after migrations and before serving', async t => {

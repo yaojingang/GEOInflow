@@ -201,11 +201,12 @@
     },
     {
       "path": "Dockerfile.liekan",
-      "purpose": "Isolate local Liekan runtime, database and immutable image revision; carry the website site number migration revision; carry crawler analysis/control migration revision; advertise the complete immutable migration register in default builds",
+      "purpose": "Isolate local Liekan runtime, database and immutable image revision; carry the website site number migration revision; carry crawler analysis/control migration revision; advertise the complete immutable migration register in default builds; share the measured build budget with deployment and reduce build concurrency while retaining full type checking",
       "tests": [
         "pnpm liekan:verify",
         "Liekan Docker and visual acceptance",
-        "pnpm test:deployment"
+        "pnpm test:deployment",
+        "node --test tests/liekan/deployment.test.mjs"
       ],
       "owner": "Liekan release maintenance",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Isolate local Liekan runtime, database and immutable image revision; carry the website site number migration revision",
@@ -330,7 +331,7 @@
     },
     {
       "path": "next.config.ts",
-      "purpose": "Typed production build, local font/branding and explicit agent rule control; externalize the pg driver for the website handle proxy; preserve private no-store headers for crawler recognition, candidates, administrator source health, crawler context and private traffic evidence; preserve private no-store headers for browser cache authorization manifests; preserve private no-store responses for durable analysis tasks, acceleration management, instance and website storage cleanup, and opted-in native aggregates; preserve private no-store responses for robots drafts, server pairing credentials and deployment evidence",
+      "purpose": "Typed production build, local font/branding and explicit agent rule control; use one static generation worker to reduce build resource peaks; externalize the pg driver for the website handle proxy; preserve private no-store headers for crawler recognition, candidates, administrator source health, crawler context and private traffic evidence; preserve private no-store headers for browser cache authorization manifests; preserve private no-store responses for durable analysis tasks, acceleration management, instance and website storage cleanup, and opted-in native aggregates; preserve private no-store responses for robots drafts, server pairing credentials and deployment evidence",
       "tests": [
         "pnpm liekan:verify",
         "Liekan Docker and visual acceptance",
@@ -345,7 +346,7 @@
     },
     {
       "path": "package.json",
-      "purpose": "Pin reproducible toolchain, offline prototype charts and license-compatible browser detection Pin reproducible toolchain, offline prototype charts and license-compatible browser detection; Pin reproducible toolchain, offline prototype charts and license-compatible browser detection；AI 加密配置、实时测试、授权分析与生命周期事务集成; add the read-only crawler source inspection command",
+      "purpose": "Pin reproducible toolchain, offline prototype charts and license-compatible browser detection Pin reproducible toolchain, offline prototype charts and license-compatible browser detection; Pin reproducible toolchain, offline prototype charts and license-compatible browser detection；AI 加密配置、实时测试、授权分析与生命周期事务集成; add the read-only crawler source inspection command; isolate Docker production compilation in the memory-optimized Webpack worker",
       "tests": [
         "src/lib/country.test.ts",
         "src/lib/detect.test.ts",
@@ -6371,6 +6372,16 @@
       "owner": "Liekan lifecycle compatibility",
       "constraint": "Preserve source facts on failure, current website authority, source cleanup and soft-delete settings",
       "removalCondition": "Remove when upstream provides bounded atomic large-site cleanup with equivalent permission and rollback regressions"
+    },
+    {
+      "path": "src/app/(main)/pixels/[pixelId]/page.tsx",
+      "purpose": "Match Next.js asynchronous route parameter types during the complete Docker production type check",
+      "tests": [
+        "pnpm build:app:docker"
+      ],
+      "owner": "Liekan build compatibility",
+      "constraint": "Preserve pixel loading, deleted-pixel handling and page rendering while correcting the parameter type",
+      "removalCondition": "Remove when the pinned upstream route declares the matching Promise parameter type"
     },
     {
       "path": "src/tracker/privacy.d.ts",

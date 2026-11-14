@@ -26,9 +26,9 @@ Git 工作目录的构建标签记录实际 HEAD，未提交的产品文件同�
 
 Alpine 包下载显式使用构建代理的小写变量，Node.js 构建步骤启用环境代理支持，保留官方 HTTPS 地址及证书校验。城市库下载每个版本最多等待十五分钟，以容纳较慢网络。运行镜像的系统包安装层位于产品版本参数之前，可在不同候选之间复用；代理仅传入下载步骤，不保存为应用环境变量。
 
-源码构建前运行 `sh scripts/liekan-deploy.sh --check`。部署脚本要求 Docker 总内存至少 6 GiB，建议 8 GiB 或以上、2 个 CPU 或以上，并预留空闲内存；该门槛用于构建保护，运行容量按真实负载实测。小内存机器可使用独立构建机生成的同一提交镜像。详见 [环境要求](deployment.md#环境要求)。
+源码构建前运行 `sh scripts/liekan-deploy.sh --check`。部署脚本要求 Docker 总内存至少 6 GiB、当前可用内存至少 6 GiB，建议 8 GiB 或以上、2 个 CPU 或以上。检查使用临时只读容器，首次可能下载 Node 基础镜像。运行容量按真实负载实测。小内存机器可使用独立构建机生成的同一提交镜像。详见 [环境要求](deployment.md#环境要求)。
 
-Next.js 构建使用两个静态生成工作进程。Docker 构建同时限制 Rayon 线程数为 2、Node 堆为 3072 MiB，为完整类型检查保留空间；构建机器还需为系统、原生编译和其他运行服务预留内存。这些 Docker 构建环境变量不传入运行容器。线程设置依据 [Rayon 官方说明](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html)。资源检查需结合 Docker 虚拟机总量，逐个容器的使用率不等于虚拟机整体占用。
+部署脚本使用专属 BuildKit 构建器，将整个构建限制为最多 1 核 CPU、5 GiB 内存并禁止使用 Swap；单核机器使用半核。构建步骤串行执行，Next.js 静态生成进程与 Rayon 线程均为 1，Node 堆上限为 3072 MiB。Docker 使用 Webpack 独立构建进程与内存优化，编译结束释放内存后再执行完整类型检查，本地 `build:app` 继续使用 Turbopack。构建完成或可捕获的失败退出后停止构建器，缓存继续保留。构建环境变量不传入运行容器；CPU 配额会延长构建时间。线程设置依据 [Rayon 官方说明](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html)。
 
 ## 手动开发与本地验收
 

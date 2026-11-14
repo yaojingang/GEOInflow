@@ -8,18 +8,50 @@ This guide uses Docker Compose on a single host. See the [local deployment detai
 
 ## Requirements
 
-- Docker Engine or Docker Desktop installed and running, with Docker Compose V2.
+- Docker Engine or Docker Desktop installed and running, Docker Buildx, and Docker Compose with `build --builder` support. The host must support memory, swap, and CPU quotas.
 - `flock` on Linux or `lockf` on macOS to prevent overlapping deployments.
 - Network access to container images, Node dependencies, and geographic database download sources.
 - Sufficient memory and disk space for Docker, builds, PostgreSQL, and the application.
 
-The image pins Node.js 22.23.4 and pnpm 12.3.4. Source deployment requires at least **6 GiB total Docker memory**; **8 GiB or more and at least 2 CPUs** are recommended, with free memory reserved for compilation. For Docker Desktop, check the VM allocation. For remote Docker, check the daemon host. The script checks daemon-reported memory before creating configuration, building, or stopping existing services.
+The image pins Node.js 22.23.4 and pnpm 12.3.4. Source deployment requires at least **6 GiB total Docker memory** and **6 GiB currently available on the daemon host**; **8 GiB or more and at least 2 CPUs** are recommended. A temporary read-only container with no mounts or network reads the daemon host's `MemAvailable`, including Docker Desktop VMs and remote hosts. The first probe may download the pinned Node base image. Checks run before configuration is created and again immediately before building.
 
 ```sh
 sh scripts/liekan-deploy.sh --check
 ```
 
-This read-only command checks Docker connectivity and the build memory floor. The 6 GiB floor reserves headroom beyond the 3072 MiB Node heap. Other services, native allocations, and compilation peaks still require monitoring; passing this check does not establish sufficient free memory. For a small server, build an image on a separate machine and deploy that same revision to the application and both workers. Measure runtime capacity with your actual log volume, retention, concurrency, and background computation. The memory floor applies to this script's source-build path.
+This command checks connectivity, build plugins, quota support, and memory headroom without creating project configuration or starting applications. An 8 GiB host with only 2–3 GiB available is refused before building. For a small server, build an image on a separate machine and deploy that same revision to the application and both workers. Measure runtime capacity with your actual workload.
+
+The installation and daemon get a dedicated BuildKit builder capped at **1 CPU and 5 GiB memory**, with a half-CPU cap on single-core hosts. Builder swap is disabled. BuildKit runs one step at a time; Next.js static generation and Rayon use one worker each, and the Node heap is capped at 3072 MiB. Docker production builds use a separate Webpack compilation worker with memory optimizations, releasing its memory before full type checking. Local `build:app` retains Turbopack. See [Next.js memory guidance](https://nextjs.org/docs/app/guides/memory-usage). The admission check reserves at least 1 GiB outside the builder; monitor subsequent growth in other services. CPU limits increase build duration.
+
+The builder uses `moby/buildkit:buildx-stable-1` and retains its own cache for subsequent deployments. It stops after building or a catchable failure, leaving the user's selected default builder unchanged. Actual quotas are verified before compilation. These guards apply to this deployment script; direct `docker compose build` uses the selected builder. See [Docker's builder documentation](https://docs.docker.com/build/builders/drivers/docker-container/).
+
+A stopped container named `geoinflow-build-lease` provides an atomic daemon-wide lease across source directories and Docker clients. Available memory is checked again after acquiring it, and the lease is released after the builder stops. A forced termination or failed builder stop can retain it. Read the owner and inspect its container directly on the Docker daemon. Confirm both the stopped builder and the finished deployment before removing the lease. Buildx lists registrations belonging to the current client.
+
+```sh
+owner=$(docker inspect --format '{{index .Config.Labels "io.liekan.build-owner"}}' geoinflow-build-lease)
+docker inspect --format '{{.State.Status}}' "buildx_buildkit_geoinflow-build-v1-${owner}0"
+# After confirming the builder is stopped and the deployment has ended:
+docker rm geoinflow-build-lease
+```
+
+The dedicated BuildKit has independent registry, proxy and certificate settings. Before its first creation, environments using registry mirrors or private CAs can create `.local/liekan-buildkit.toml` with mode 0600. Retain `[worker.oci]` with `max-parallelism = 1` and add mirrors and CAs following [BuildKit configuration](https://docs.docker.com/build/buildkit/configure/). This private file is excluded from Git and build contexts. Existing builders retain their original settings. To reload configuration, confirm the builder is stopped, remove it with `docker buildx rm --keep-state BUILDER`, and recreate it while retaining cache.
+
+For HTTP(S) proxies, precreate the builder from the project root using this template. Replace the proxy addresses with an endpoint reachable from build containers. For mirrors or CAs, use the private TOML path above. Deployment reuses this builder and verifies its quotas while preserving the user's selected default builder. Proxy settings remain in private Docker configuration.
+
+```sh
+. ./config/liekan/build-resources.sh
+builder_key=$(printf '%s\n' "$PWD" "$(docker info --format '{{.ID}}')" | cksum | awk '{ print $1 }')
+quota=100000
+if [ "$(docker info --format '{{.NCPU}}')" = 1 ]; then quota=50000; fi
+docker buildx create --name "geoinflow-build-v1-$builder_key" --driver docker-container \
+  --driver-opt "memory=${liekan_build_memory_mib}m" --driver-opt "memory-swap=${liekan_build_memory_mib}m" \
+  --driver-opt cpu-period=100000 --driver-opt "cpu-quota=$quota" \
+  --driver-opt restart-policy=no \
+  --driver-opt env.HTTP_PROXY=http://proxy.internal:3128 \
+  --driver-opt env.HTTPS_PROXY=http://proxy.internal:3128 \
+  --buildkitd-config config/liekan/buildkit.toml
+sh scripts/liekan-deploy.sh
+```
 
 If the host becomes unresponsive or a build exits with code 137, inspect host/Docker memory, disk space, and system OOM logs. On Linux, use `free -h`, `df -h`, and `journalctl -k --since "30 minutes ago"`. Remove credentials and personal information before sharing logs.
 

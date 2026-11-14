@@ -8,18 +8,50 @@
 
 ## 环境要求
 
-- 已安装并启动的 Docker Engine 或 Docker Desktop，以及 Docker Compose V2。
+- 已安装并启动的 Docker Engine 或 Docker Desktop、Docker Buildx，以及支持 `build --builder` 的 Docker Compose。宿主机需支持内存、Swap 和 CPU 配额限制。
 - Linux 的 `flock`，或 macOS 的 `lockf`，用于防止两个部署同时执行。
 - 可访问容器镜像、Node 依赖和地理数据库下载源的网络。
 - 可供 Docker、构建过程、PostgreSQL 和应用使用的内存与磁盘空间。
 
-镜像固定 Node.js 22.23.4、pnpm 12.3.4。源码构建的部署准入要求 Docker 总内存至少 **6 GiB**，建议 **8 GiB 或以上、2 个 CPU 或以上**，并为构建预留空闲内存。Docker Desktop 应检查虚拟机分配值；远程 Docker 应检查守护进程所在机器。脚本在创建配置、构建及停止现有服务前检查 Docker 报告的总内存。
+镜像固定 Node.js 22.23.4、pnpm 12.3.4。源码构建要求 Docker 总内存至少 **6 GiB**，所在机器的当前可用内存至少 **6 GiB**，建议 **8 GiB 或以上、2 个 CPU 或以上**。脚本通过无挂载、无网络、只读的临时容器读取 Docker 所在机器的 `MemAvailable`，覆盖 Linux、Docker Desktop 虚拟机和远程 Docker；首次探测可能下载固定 Node 基础镜像。创建项目配置前检查一次，开始构建前再次检查。
 
 ```sh
 sh scripts/liekan-deploy.sh --check
 ```
 
-该命令只检查 Docker 连通性和构建内存门槛。6 GiB 是基于 3072 MiB Node 堆及额外开销设置的保护阈值，运行中其他服务的占用、原生内存和编译峰值仍需观察。检查通过不代表当前空闲内存足够。小内存服务器可在独立构建机生成与源码提交对应的镜像，再将同一镜像部署给应用及两个 worker；运行目标的内存按日志量、保留期、并发和后台计算实测。内存门槛仅约束本脚本的源码构建路径。
+该命令检查 Docker 连通性、构建插件、资源配额支持与内存余量，不创建项目配置或启动应用。8 GiB 机器仅剩 2～3 GiB 可用时会提前停止。小内存服务器可在独立构建机生成与源码提交对应的镜像，再将同一镜像部署给应用及两个 worker；运行目标的容量按实际负载测量。
+
+部署使用安装目录与 Docker 实例专属的 BuildKit 构建器，整体上限为 **1 核 CPU、5 GiB 内存**；单核机器的 CPU 上限为半核。构建器禁用 Swap，BuildKit 同时执行一个构建步骤，Next.js 静态生成与 Rayon 均使用一个工作线程，Node 堆上限为 3072 MiB。Docker 生产编译使用 Webpack 独立构建进程及内存优化，编译进程结束后释放内存，再执行完整类型检查；本地 `build:app` 保留 Turbopack。配置依据 [Next.js 内存优化指南](https://nextjs.org/docs/app/guides/memory-usage)。剩余至少 1 GiB 可用内存作为系统余量，其他业务后续增长仍需监控。CPU 限制会延长构建时间。
+
+构建器使用 `moby/buildkit:buildx-stable-1` 镜像，保留独立缓存供后续部署复用；构建结束或可捕获的失败退出时停止构建器，保持用户原有默认构建器选择。实际配额核验失败会停止部署。内存检查与资源隔离只覆盖此部署脚本；直接执行 `docker compose build` 使用所选构建器。配额机制见 [Docker 构建器文档](https://docs.docker.com/build/builders/drivers/docker-container/)。
+
+同一 Docker 实例通过名为 `geoinflow-build-lease` 的已停止容器保留原子构建租约，覆盖不同源码目录与 Docker 客户端；取得租约后再次检查可用内存。构建器停止后才释放租约。强制终止部署或构建器无法停止时可能保留租约。先读取所有者，再直接向 Docker 守护进程核对构建器容器；确认它已停止且对应部署已结束，才可删除租约后重试。Buildx 列表仅显示当前客户端登记的构建器。
+
+```sh
+owner=$(docker inspect --format '{{index .Config.Labels "io.liekan.build-owner"}}' geoinflow-build-lease)
+docker inspect --format '{{.State.Status}}' "buildx_buildkit_geoinflow-build-v1-${owner}0"
+# 确认对应构建器已停止、部署已结束后：
+docker rm geoinflow-build-lease
+```
+
+专属 BuildKit 的镜像源、代理和证书配置独立于 Docker 守护进程。依赖私有镜像加速源或 CA 的环境，可在首次创建构建器前准备权限为 0600 的 `.local/liekan-buildkit.toml`，保留 `[worker.oci]` 下的 `max-parallelism = 1`，按 [BuildKit 网络配置](https://docs.docker.com/build/buildkit/configure/) 添加 registry mirrors 与 CA。该私有文件不进入 Git 或构建上下文。已有构建器继续复用创建时的配置；更新前确认构建器停止，使用 `docker buildx rm --keep-state 构建器名` 保留缓存，再创建新配置。
+
+HTTP(S) 代理通过构建器的 driver options 配置。在项目根目录按以下模板预建构建器，将代理地址替换为构建容器可达的地址；需要镜像源或 CA 时，将配置路径替换为上述私有 TOML。部署脚本随后复用此构建器并核验配额，用户原有默认构建器继续保持原状。代理配置仅保存在私有 Docker 设置中。
+
+```sh
+. ./config/liekan/build-resources.sh
+builder_key=$(printf '%s\n' "$PWD" "$(docker info --format '{{.ID}}')" | cksum | awk '{ print $1 }')
+quota=100000
+if [ "$(docker info --format '{{.NCPU}}')" = 1 ]; then quota=50000; fi
+docker buildx create --name "geoinflow-build-v1-$builder_key" --driver docker-container \
+  --driver-opt "memory=${liekan_build_memory_mib}m" --driver-opt "memory-swap=${liekan_build_memory_mib}m" \
+  --driver-opt cpu-period=100000 --driver-opt "cpu-quota=$quota" \
+  --driver-opt restart-policy=no \
+  --driver-opt env.HTTP_PROXY=http://proxy.internal:3128 \
+  --driver-opt env.HTTPS_PROXY=http://proxy.internal:3128 \
+  --buildkitd-config config/liekan/buildkit.toml
+sh scripts/liekan-deploy.sh
+```
 
 安装时若机器失去响应或构建退出 137，先检查 Docker/宿主机内存、磁盘和系统 OOM 日志；Linux 可运行 `free -h`、`df -h`、`journalctl -k --since "30 minutes ago"`。分享日志前移除凭据与个人信息。
 

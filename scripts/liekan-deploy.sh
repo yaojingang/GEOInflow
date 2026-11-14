@@ -1,10 +1,16 @@
 #!/bin/sh
 set -eu
+cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+. ./config/liekan/build-resources.sh
+build_memory_bytes=$((liekan_build_memory_mib * 1024 * 1024))
+build_required_mib=$((liekan_build_memory_mib + liekan_build_reserve_mib))
+build_required_kib=$((build_required_mib * 1024))
+build_total_floor_bytes=$((build_required_kib * 1024))
 with_clickhouse=0
 if [ "${1:-}" = '--with-clickhouse' ]; then with_clickhouse=1; shift; fi
 
 if [ "${1:-}" = '--help' ]; then
-  printf '%s\n' '用法：sh scripts/liekan-deploy.sh [--with-clickhouse] [--check]' '需要 Docker 和 Docker Compose，源码构建要求 Docker 至少配置 6 GiB 内存，建议 8 GiB 或以上并预留空闲内存。' '首次生成私有配置，构建并启动GEOInflow；再次运行保留配置与数据。--check 只检查 Docker 和构建内存门槛。' '可选 ClickHouse 使用独立内部服务和数据卷，后台完成同步对账后启用。'
+  printf '%s\n' '用法：sh scripts/liekan-deploy.sh [--with-clickhouse] [--check]' '需要 Docker、Buildx 和支持 --builder 的 Docker Compose。Docker 总内存至少 6 GiB、可用内存至少 6 GiB。' '构建最多使用 1 核、5 GiB 内存，单核机器最多使用半核；构建缓存保留。' '首次生成私有配置，构建并启动 GEOInflow；再次运行保留配置与数据。--check 使用临时只读容器检查构建资源，不创建项目配置或启动服务。' '可选 ClickHouse 使用独立内部服务和数据卷，后台完成同步对账后启用。'
   exit 0
 fi
 check_only=0
@@ -14,7 +20,6 @@ elif [ "$#" -ne 0 ]; then
   printf '%s\n' '用法：sh scripts/liekan-deploy.sh [--with-clickhouse] [--check]' >&2
   exit 1
 fi
-cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
   printf '%s\n' '请先安装并启动 Docker 和 Docker Compose。' >&2
   exit 1
@@ -24,18 +29,51 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 # MemTotal is reported by the Docker daemon, including a remote daemon or Desktop VM.
-# The 3 GiB V8 heap excludes native allocations, build workers and the operating system.
+# The isolated builder and the host reserve share one budget with Docker compilation.
 docker_memory=$(docker info --format '{{.MemTotal}}' 2>/dev/null || :)
 case "$docker_memory" in
   ''|*[!0-9]*)
     printf '%s\n' '无法确认 Docker 内存，部署已停止。请检查 docker info --format '\''{{.MemTotal}}'\'' 后重试。' >&2
     exit 1 ;;
 esac
-if [ "${#docker_memory}" -gt 15 ] || [ "$docker_memory" -lt 6442450944 ]; then
+if [ "${#docker_memory}" -gt 15 ] || [ "$docker_memory" -lt "$build_total_floor_bytes" ]; then
   printf '%s\n' 'Docker 源码构建至少需要配置 6 GiB 内存，建议 8 GiB 或以上。请增加服务器或 Docker 虚拟机内存，或在独立构建机生成镜像后部署。现有服务与配置保持原状。' >&2
   exit 1
 fi
-printf '%s\n' 'Docker 构建内存门槛检查通过（至少 6 GiB）。请为构建预留空闲内存，已有服务也会消耗资源。'
+if ! docker buildx version >/dev/null 2>&1 || ! docker compose build --help | grep -q -- '--builder'; then
+  printf '%s\n' '资源隔离构建需要 Docker Buildx 和支持 --builder 的 Docker Compose，请更新 Docker 构建插件。' >&2
+  exit 1
+fi
+resource_support=$(docker info --format '{{.MemoryLimit}} {{.SwapLimit}} {{.CPUCfsQuota}} {{.CPUCfsPeriod}}')
+if [ "$resource_support" != 'true true true true' ]; then
+  printf '%s\n' 'Docker 未提供完整的内存、Swap 和 CPU 配额支持，部署已停止。请启用宿主机 cgroup 资源限制或使用独立构建机。' >&2
+  exit 1
+fi
+docker_cpus=$(docker info --format '{{.NCPU}}')
+case "$docker_cpus" in
+  ''|*[!0-9]*|0) printf '%s\n' '无法确认 Docker CPU 数量，部署已停止。' >&2; exit 1 ;;
+esac
+build_cpu_quota=100000
+if [ "$docker_cpus" = 1 ]; then build_cpu_quota=50000; fi
+check_available_memory() {
+  # /proc belongs to the daemon host, including a remote daemon or Desktop VM.
+  # This probe has no mounts, network, credentials or project configuration.
+  available_kib=$(docker run --rm --memory 32m --memory-swap 32m --cpus 0.1 --network none \
+    --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 32 \
+    --entrypoint sh node:22.23.4-alpine -c 'awk '\''$1 == "MemAvailable:" { print $2 }'\'' /proc/meminfo') || {
+    printf '%s\n' '无法探测 Docker 所在机器的可用内存，部署已停止。请检查 Node 基础镜像下载与 Docker 容器运行能力。' >&2
+    return 1
+  }
+  case "$available_kib" in
+    ''|*[!0-9]*) printf '%s\n' '无法确认 Docker 所在机器的可用内存，部署已停止。' >&2; return 1 ;;
+  esac
+  if [ "${#available_kib}" -gt 15 ] || [ "$available_kib" -lt "$build_required_kib" ]; then
+    printf 'Docker 所在机器的可用内存至少需要 %s MiB（构建上限 %s MiB，另留 %s MiB）。请释放资源或使用独立构建机；现有服务保持原状。\n' "$build_required_mib" "$liekan_build_memory_mib" "$liekan_build_reserve_mib" >&2
+    return 1
+  fi
+  printf 'Docker 构建资源检查通过：总内存至少 6 GiB，可用内存 %s MiB（至少 %s MiB）。\n' "$((available_kib / 1024))" "$build_required_mib"
+}
+check_available_memory
 if [ "$check_only" -eq 1 ]; then exit 0; fi
 umask 077
 mkdir -p .local
@@ -59,9 +97,20 @@ fi
 temporary=''
 candidate_override=''
 candidate_tag=''
+build_builder=''
+builder_started=''
+build_process=''
+build_lease=''
 cleanup() {
   cleanup_status=$?
   if [ "$cleanup_status" -ne 0 ] && [ -n "${workers_stopped:-}" ]; then stop_candidate_workers; fi
+  if [ -n "$build_process" ]; then kill "$build_process" >/dev/null 2>&1 || :; fi
+  if [ -n "$builder_started" ]; then
+    if docker buildx stop "$build_builder" >/dev/null 2>&1; then builder_started=''
+    else printf '%s\n' '专用构建器未能停止，构建租约已保留；请确认构建器停止后再重试部署。' >&2; fi
+  fi
+  if [ -n "$build_process" ]; then wait "$build_process" >/dev/null 2>&1 || :; fi
+  if [ -n "$build_lease" ] && [ -z "$builder_started" ]; then docker rm "$build_lease" >/dev/null 2>&1 || :; fi
   if [ -n "$temporary" ]; then rm -f "$temporary"; fi
   if [ -n "$candidate_override" ]; then rm -f "$candidate_override"; fi
   if [ -n "$candidate_tag" ]; then docker image rm "$candidate_tag" >/dev/null 2>&1 || :; fi
@@ -280,7 +329,61 @@ services:
         io.liekan.source.difference: "$source_difference"
 EOF
 candidate_compose() { docker compose -f docker-compose.liekan.yml -f "$candidate_override" "$@"; }
-candidate_compose build --build-arg "LIEKAN_REVISION=$source_revision" app
+# Scope the reusable builder to this installation and daemon; keep the user's selection intact.
+docker_daemon_id=$(docker info --format '{{.ID}}')
+if [ -z "$docker_daemon_id" ]; then printf '%s\n' '无法确认 Docker 实例，部署已停止。' >&2; exit 1; fi
+builder_key=$(printf '%s\n' "$PWD" "$docker_daemon_id" | cksum | awk '{ print $1 }')
+build_builder="geoinflow-build-v1-$builder_key"
+# A daemon-wide container name atomically excludes builds from other checkouts and clients.
+lease_candidate=$(docker create --name geoinflow-build-lease --label "io.liekan.build-owner=$builder_key" \
+  --network none --read-only --entrypoint true node:22.23.4-alpine 2>/dev/null) || {
+  printf '%s\n' '无法取得 Docker 构建租约。请等待其他 GEOInflow 构建结束；若上次部署被强制终止，请先确认专用构建器已停止，再检查 geoinflow-build-lease 容器。' >&2
+  exit 1
+}
+case "$lease_candidate" in
+  ''|*[!a-f0-9]*) printf '%s\n' '无法确认 Docker 构建租约，部署已停止。' >&2; exit 1 ;;
+esac
+if [ "${#lease_candidate}" -ne 64 ]; then printf '%s\n' '无法确认 Docker 构建租约，部署已停止。' >&2; exit 1; fi
+build_lease=$lease_candidate
+check_available_memory
+if ! docker buildx inspect "$build_builder" >/dev/null 2>&1; then
+  buildkit_config=config/liekan/buildkit.toml
+  if [ -f .local/liekan-buildkit.toml ]; then buildkit_config=.local/liekan-buildkit.toml; fi
+  docker buildx create --name "$build_builder" --driver docker-container \
+    --driver-opt "memory=${liekan_build_memory_mib}m" --driver-opt "memory-swap=${liekan_build_memory_mib}m" \
+    --driver-opt cpu-period=100000 --driver-opt "cpu-quota=$build_cpu_quota" \
+    --driver-opt restart-policy=no \
+    --buildkitd-config "$buildkit_config" >/dev/null
+fi
+builder_description=$(docker buildx inspect "$build_builder")
+builder_driver=$(printf '%s\n' "$builder_description" | awk '/^Driver:/ { print $2 }')
+builder_names=$(printf '%s\n' "$builder_description" | awk '/^Name:/ { count++ } END { print count }')
+if [ "$builder_driver" != docker-container ] || [ "$builder_names" != 2 ]; then
+  printf '%s\n' '专用构建器配置不匹配，部署已停止，请检查该构建器。' >&2
+  exit 1
+fi
+builder_started=1
+docker buildx inspect --bootstrap "$build_builder" >/dev/null
+builder_limits=$(docker inspect --format '{{.HostConfig.Memory}}|{{.HostConfig.MemorySwap}}|{{.HostConfig.CpuPeriod}}|{{.HostConfig.CpuQuota}}' "buildx_buildkit_${build_builder}0")
+if [ "$builder_limits" != "$build_memory_bytes|$build_memory_bytes|100000|$build_cpu_quota" ]; then
+  printf '%s\n' '专用构建器的实际 CPU 或内存限制不匹配，部署已停止。' >&2
+  exit 1
+fi
+printf '开始资源隔离构建：最多 1 核（单核机器半核）、%s MiB 内存，禁止构建器使用 Swap。首次构建耗时较长，原服务继续运行。\n' "$liekan_build_memory_mib"
+DOCKER_BUILDKIT=1 docker compose -f docker-compose.liekan.yml -f "$candidate_override" \
+  build --builder "$build_builder" --build-arg "LIEKAN_REVISION=$source_revision" app &
+build_process=$!
+build_status=0
+wait "$build_process" || build_status=$?
+build_process=''
+if [ "$build_status" -ne 0 ]; then
+  printf '%s\n' '镜像构建失败，现有应用与后台服务保持原状。请检查上方日志；资源不足时可在独立构建机生成镜像。' >&2
+  exit "$build_status"
+fi
+docker buildx stop "$build_builder"
+builder_started=''
+docker rm "$build_lease" >/dev/null
+build_lease=''
 candidate_image=$(docker image inspect --format '{{.Id}}' "$candidate_tag")
 case "$candidate_image" in
   sha256:*) image_digest=${candidate_image#sha256:} ;;
