@@ -1,5 +1,6 @@
+import { calendarDayRange } from '../contracts/calendar';
 import { pageReportParts } from '../contracts/page-report';
-import type { ReportQuery } from '../contracts/query';
+import { parseReportQuery, type ReportQuery } from '../contracts/query';
 import { reportLogRange } from '../report-log-tables';
 import type { PreparedReport } from '../report-prepared';
 import { warehouseReader } from '../warehouse/reader-runtime';
@@ -55,6 +56,21 @@ export async function prepareWarehousePageReport(
     overviewSnapshot,
   );
   prepared.range = range;
+  // A scheduled Today overview owns the site-wide daily counter. Other windows
+  // store only their window metrics; the reader composes the published Today card.
+  const today = calendarDayRange(range.now, p.timezone);
+  const canonical = parseReportQuery({
+    resource: 'overview',
+    chartPeriod: 'today',
+    ...today,
+    timezone: p.timezone,
+  });
+  const { refresh: _refresh, ...parameters } = p;
+  prepared.sharedTodayRequests =
+    overviewSnapshot &&
+    p.resource === 'overview' &&
+    (!canonical.success || JSON.stringify(parameters) !== JSON.stringify(canonical.data));
+
   try {
     const catalog = prepared.catalogCoverage ?? { catalogCount, blindCount: catalogCount };
     prepared.catalogCount = catalog.catalogCount;

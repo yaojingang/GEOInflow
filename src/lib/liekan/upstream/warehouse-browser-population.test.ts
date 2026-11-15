@@ -14,6 +14,7 @@ vi.mock('./warehouse-report-snapshot', () => ({
   warehouseReportQuery: m.query,
   warehouseReportMetadata: m.metadata,
   withinWarehouseReport: (work: () => unknown) => work(),
+  memoWarehouseReport: (_key: string, work: () => unknown) => work(),
 }));
 
 import { readBrowserPopulation } from './browser-population';

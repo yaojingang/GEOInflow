@@ -4,7 +4,7 @@ import { rename, rm, writeFile } from 'node:fs/promises';
 import { WarehouseRuntime, warehouseRuntimeConfig } from '../lib/liekan/warehouse/runtime';
 import { TransitionService } from '../lib/liekan/warehouse/transition-service';
 const config = warehouseRuntimeConfig();
-const runtime = await WarehouseRuntime.connect(config);
+const runtime = await WarehouseRuntime.connect({ ...config, workload: 'liekan_background' });
 const service = new TransitionService(runtime.db, runtime.ch, config.queue);
 const healthFile =
   process.env.LIEKAN_TRANSITION_HEALTH_FILE ?? '/tmp/liekan-transition-worker.health.json';

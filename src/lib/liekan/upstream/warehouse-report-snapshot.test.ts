@@ -8,11 +8,12 @@ const mocks = vi.hoisted(() => ({
   close: vi.fn(),
   verify: vi.fn(),
   identity: vi.fn(),
+  pending: vi.fn(),
   admission: undefined as any,
 }));
 vi.mock('../warehouse/reader-runtime', () => ({
   warehouseReader: () => ({
-    db: {},
+    db: { read: mocks.pending },
     ch: { query: mocks.query },
     admission: mocks.admission,
     verifyIdentity: mocks.identity,
@@ -31,6 +32,9 @@ vi.mock('../warehouse/read-reference', () => ({
   },
 }));
 import {
+  frozenCountKey,
+  readFrozenCount,
+  saveFrozenCount,
   withinWarehouseReport,
   warehouseReportQuery,
   warehouseReportMetadata,
@@ -40,11 +44,22 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.admission = new ReadAdmission(1);
   mocks.metadata.mockResolvedValue({ boundary: { publication: '1' }, policy: '1' });
+  mocks.pending.mockResolvedValue([{ pending: false }]);
   mocks.query.mockResolvedValue({ json: async () => [{ count: 1 }] });
 });
 afterEach(() => {
   mocks.admission.close();
   vi.useRealTimers();
+});
+it('applies the background budget only to explicitly marked jobs and inherits it in nested reads', async () => {
+  await withinWarehouseReport(() => warehouseReportQuery('site', 'SELECT 1'));
+  expect(mocks.pending).not.toHaveBeenCalled();
+  expect(mocks.query.mock.calls[0][0].clickhouse_settings.max_threads).toBeUndefined();
+  expect(mocks.query.mock.calls[0][0].clickhouse_settings.workload).toBe('liekan_interactive');
+  await withinWarehouseReport(() => warehouseReportQuery('site', 'SELECT 1'), { background: true });
+  expect(mocks.pending).toHaveBeenCalledTimes(1);
+  expect(mocks.query.mock.calls[1][0].clickhouse_settings.max_threads).toBe(1);
+  expect(mocks.query.mock.calls[1][0].clickhouse_settings.workload).toBe('liekan_background');
 });
 it('propagates the report deadline to CH and retains the permit until cancellation settles', async () => {
   vi.useFakeTimers();
@@ -235,4 +250,73 @@ it('drains pending metadata before closing references when another report branch
   await failure;
   expect(mocks.pin).not.toHaveBeenCalled();
   expect(mocks.close).toHaveBeenCalledTimes(1);
+});
+
+it('keeps a saved-page boundary separate from the enclosing request publication', async () => {
+  mocks.metadata.mockResolvedValue({
+    boundary: { websiteId: 'site', publication: '9' },
+    policy: '1',
+  });
+  await withinWarehouseReport(async () => {
+    await warehouseReportQuery('site', 'SELECT 1');
+    await withinWarehouseReport(() => warehouseReportQuery('site', 'SELECT 2'), {
+      publication: { websiteId: 'site', publication: '5' },
+    });
+    await warehouseReportQuery('site', 'SELECT 3');
+  });
+  expect(mocks.query.mock.calls.map(([q]) => q.query_params.wh_publication)).toEqual([
+    '9',
+    '5',
+    '9',
+  ]);
+  expect(mocks.close).toHaveBeenCalledTimes(2);
+});
+
+it.each([
+  'audienceRevision',
+  'crawlerRevision',
+  'controlRevision',
+  'repairGeneration',
+  'exclusions',
+  'reports',
+])('rejects a changed %s while retaining append-only publication stability', async field => {
+  const initial = {
+    boundary: { websiteId: 'site', epoch: '1', publication: '1', deletionRevision: '0' },
+    [field]: 'old',
+  };
+  mocks.metadata.mockResolvedValueOnce(initial).mockResolvedValueOnce({
+    ...initial,
+    boundary: { ...initial.boundary, publication: '2' },
+    [field]: 'new',
+  });
+  await expect(
+    withinWarehouseReport(() => warehouseReportQuery('site', 'SELECT 1')),
+  ).rejects.toBeInstanceOf(Error);
+  expect(mocks.close).toHaveBeenCalledTimes(1);
+});
+
+it('reuses only exact same-boundary counts and fences publication/control changes', async () => {
+  const base = {
+    boundary: { websiteId: 'count-site', epoch: '0', publication: '1', deletionRevision: '0' },
+    policy: 'v1',
+  };
+  mocks.metadata.mockResolvedValue(base);
+  const key = await withinWarehouseReport(() =>
+    frozenCountKey('count-site', 'count-visits', { start: 1 }),
+  );
+  saveFrozenCount(key, 12);
+  expect(readFrozenCount(key)).toBe(12);
+  for (const metadata of [
+    { ...base, policy: 'v2' },
+    { ...base, boundary: { ...base.boundary, publication: '2' } },
+    { ...base, boundary: { ...base.boundary, deletionRevision: '1' } },
+  ]) {
+    mocks.metadata.mockResolvedValue(metadata);
+    const next = await withinWarehouseReport(() =>
+      frozenCountKey('count-site', 'count-visits', { start: 1 }),
+    );
+    expect(next).not.toBe(key);
+    expect(readFrozenCount(next)).toBeUndefined();
+  }
+  expect(() => saveFrozenCount(key, Infinity)).toThrow();
 });

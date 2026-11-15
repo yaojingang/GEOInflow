@@ -5195,5 +5195,10 @@
   "m_7a4e52e14456": "Contributors are temporarily unavailable",
   "m_8b7a812a5708": "No public contributors yet",
   "m_a4328ba66777": "View all contributors",
-  "m_0785e90d146f": "{v0} on GitHub"
+  "m_0785e90d146f": "{v0} on GitHub",
+  "m_8141a9db82dd": "Queue status unconfirmed",
+  "m_835cc88516a0": "Data is being prepared. Please check again later.",
+  "m_7c4b06e07cb4": "Check again",
+  "m_5e1997e163e8": "The selected range is not ready. Showing the last report ({v0}).",
+  "m_583b493d3124": "Last report: {v0}"
 }

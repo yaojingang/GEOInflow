@@ -1,3 +1,5 @@
+import { formatInTimeZone } from 'date-fns-tz';
+import { capturingReportRankings, recordReportRanking } from './report-ranking-artifact';
 import { identityComplete, identityUsable } from '../contracts/browser-population';
 import { pageReportParts } from '../contracts/page-report';
 import { applyHumanFactsPopulation } from '../contracts/population-results';
@@ -72,7 +74,7 @@ async function streamBrowser(
   const params = await warehouseBrowserParameters(site, start, end, timezone);
   await warehouseReportStream(
     site,
-    warehouseVisitsSQL() + sql,
+    warehouseVisitsSQL(false, false, { start: +start, end: +end }) + sql,
     params,
     async batch => {
       for (const row of batch) await emit(numeric(row));
@@ -102,7 +104,13 @@ export async function buildWarehouseBrowserPages(
     entry: any,
     durationTotal = 0,
     durationSamples = 0;
-  await produce(async row => {
+  const allPages = capturingReportRankings() ? await spool.write<any>(produce) : undefined;
+  const pageProduce: EvidenceProducer<any> = allPages
+    ? async emit => {
+        for await (const row of allPages.iterate()) await emit(row);
+      }
+    : produce;
+  await pageProduce(async row => {
     for (const { table, start, end } of ranges) {
       if (total >= start && total < end) rows[table].push(row);
     }
@@ -123,7 +131,106 @@ export async function buildWarehouseBrowserPages(
     total,
     entryPath: entry?.path ?? null,
     duration: durationSamples ? durationTotal / durationSamples : null,
-    ai: await browserPageCrawlerRows(spool, wanted, logProduce),
+    ai: allPages ? new Map<string, any>() : await browserPageCrawlerRows(spool, wanted, logProduce),
+    ranking: allPages ? await joinBrowserRanking(spool, allPages, logProduce, rows) : undefined,
+  };
+}
+
+/** External merge join keeps full path rankings off the worker heap. Encoded
+ * aliases use the same request sum and bot tie-break as the interactive path. */
+async function joinBrowserRanking(
+  spool: WarehouseEvidenceSpool,
+  pages: import('./warehouse-evidence-spool').SpoolRows<any>,
+  logs: EvidenceProducer<any>,
+  selected: Record<string, any[]>,
+) {
+  const sortedLogs = await spool.sort<any>(logs, (a, b) => lexical(a.path, b.path));
+  const decoded = await spool.sort<any>(
+    async emit => {
+      let group: any;
+      for await (const row of sortedLogs.iterate()) {
+        if (group?.path !== row.path) {
+          if (group)
+            await emit({
+              ...group,
+              path: humanPathFromEncoded(group.path),
+              encodedPath: group.path,
+            });
+          group = undefined;
+        }
+        group = addReportAiPage(group, row);
+      }
+      if (group)
+        await emit({ ...group, path: humanPathFromEncoded(group.path), encodedPath: group.path });
+    },
+    (a, b) => lexical(a.path, b.path),
+  );
+  await sortedLogs.remove();
+  const ai = await spool.write<any>(async emit => {
+    let group: any;
+    for await (const row of decoded.iterate()) {
+      const winner = { ...row, path: row.encodedPath };
+      if (group?.path !== row.path) {
+        if (group) await emit(group);
+        group = { ...row, winner };
+      } else {
+        group.requests += row.requests;
+        if (compareReportAiPages(winner, group.winner) < 0) {
+          group.bot = row.bot;
+          group.botId = row.botId;
+          group.winner = winner;
+        }
+      }
+    }
+    if (group) await emit(group);
+  });
+  await decoded.remove();
+  let ordinal = 0;
+  const byPath = await spool.sort<any>(
+    async emit => {
+      for await (const row of pages.iterate()) await emit({ ...row, _ordinal: ordinal++ });
+    },
+    (a, b) => lexical(a.path, b.path),
+  );
+  await pages.remove();
+  const iterator = ai.iterate();
+  let next = await iterator.next();
+  try {
+    return await spool.sort<any>(
+      async emit => {
+        for await (const row of byPath.iterate()) {
+          while (!next.done && lexical(next.value.path, row.path) < 0) next = await iterator.next();
+          const match = !next.done && next.value.path === row.path ? next.value : undefined;
+          for (const rows of Object.values(selected))
+            for (const item of rows) if (item.path === row.path) item._ai = match;
+          await emit({ ...row, _ai: match });
+        }
+      },
+      (a, b) => a._ordinal - b._ordinal,
+    );
+  } finally {
+    await iterator.return(undefined);
+    await byPath.remove();
+    await ai.remove();
+  }
+}
+function browserRankingRow(
+  table: string,
+  row: any,
+  ai: any,
+  hasLogs: boolean,
+  population: LiekanReport['meta']['population'],
+): Row {
+  if (table === 'topBody' || table === 'visitorTopBody')
+    return overviewRankingRow(table, row, ai, hasLogs, population);
+  return {
+    path: row.path,
+    pv: row.pv,
+    uv: row.uv,
+    entries: row.entries,
+    duration: row.duration,
+    bounceRate: row.entries ? pct(row.bounces, row.entries) : null,
+    ...(table === 'pgBody' ? { aiRequests: hasLogs ? (ai?.requests ?? 0) : null } : {}),
   };
 }
 
@@ -212,7 +319,7 @@ export async function readWarehouseOverviewRankingPage(
   const rows = (
     await warehouseReportQuery(
       site,
-      `${warehouseVisitsSQL()}
+      `${warehouseVisitsSQL(false, false, { start: +start, end: +end })}
        SELECT e.url_path AS path,count() AS pv,uniqExact(e.session_id) AS uv
        FROM window_events e WHERE e.event_type NOT IN(2,5) GROUP BY path
        ORDER BY pv DESC,path LIMIT ${tablePageSize} OFFSET {overviewOffset:UInt64}`,
@@ -311,8 +418,13 @@ export async function buildWarehouseBrowserSources(
   let total = 0;
   const offset = ((p.tablePages.srcBody ?? 1) - 1) * 20;
   for await (const row of metrics.iterate()) {
-    if (p.resource === 'human/sources' && total >= offset && total < offset + 20)
+    if (
+      p.resource === 'human/sources' &&
+      (capturingReportRankings() || (total >= offset && total < offset + 20))
+    ) {
       selected.push(row);
+      if (selected.length > 100000) throw new Error('warehouse-source-ranking-too-large');
+    }
     total++;
     const channel = channels.get(row.channel) ?? { name: row.channel, count: 0 };
     channel.count += row.sessions;
@@ -429,25 +541,7 @@ export async function prepareWarehouseBrowserPageReport(
     ),
     p,
   );
-  if (p.resource === 'human/sources') {
-    const spec = await warehouseLogQuerySpec(
-      start,
-      end,
-      p.timezone,
-      p,
-      p.filter,
-      p.search,
-      false,
-      site,
-    );
-    // This page only uses log days to complete the human daily chart axis.
-    // Preserve the original population while keeping one row per calendar day.
-    logs.daily = await warehouseReportQuery(
-      site,
-      `SELECT DISTINCT day FROM (${spec.statements.daily}) ORDER BY day`,
-      spec.params,
-    );
-  }
+
   const spool = await WarehouseEvidenceSpool.create(warehouseReportSignal());
   try {
     const overviewPages =
@@ -590,6 +684,22 @@ export async function prepareWarehouseBrowserPageReport(
       logs,
       catalogCoverage,
       dispose: () => spool.dispose(),
+      async publishRankings(report) {
+        if (!pageData?.ranking) return;
+        for (const table of Object.keys(pageData.rows)) {
+          if (!report.tables[table]) continue;
+          await pageData.ranking.stream(rows =>
+            recordReportRanking(
+              report,
+              table,
+              rows.map(row =>
+                browserRankingRow(table, row, row._ai, !!logs.latest, human.totals.population),
+              ),
+            ),
+          );
+          if (!pageData.total) await recordReportRanking(report, table, []);
+        }
+      },
       decorate(report: LiekanReport) {
         const setCard = (key: string, value: number | string | null) => {
           const card = report.cards.find(card => card.key === key);
@@ -629,7 +739,7 @@ export async function prepareWarehouseBrowserPageReport(
             report.charts.s2.labels = sources.aiSources.map(row => row.source);
             report.charts.s2.series[0].values = sources.aiSources.map(row => row.sessions);
           }
-          if (report.tables.srcBody)
+          if (report.tables.srcBody && !capturingReportRankings())
             report.meta.tablePages = {
               ...report.meta.tablePages,
               srcBody: { page: p.tablePages.srcBody ?? 1, pageSize: 20, total: sources.total },
@@ -644,22 +754,15 @@ export async function prepareWarehouseBrowserPageReport(
           );
           for (const [table, rows] of Object.entries(pageData.rows)) {
             if (!report.tables[table]) continue;
-            report.tables[table] = rows.map(row => {
-              const ai = pageData.ai.get(row.path);
-              if (table === 'topBody' || table === 'visitorTopBody')
-                return overviewRankingRow(table, row, ai, !!logs.latest, human.totals.population);
-              return {
-                path: row.path,
-                pv: row.pv,
-                uv: row.uv,
-                entries: row.entries,
-                duration: row.duration,
-                bounceRate: row.entries ? pct(row.bounces, row.entries) : null,
-                ...(table === 'pgBody'
-                  ? { aiRequests: logs.latest ? (ai?.requests ?? 0) : null }
-                  : {}),
-              };
-            });
+            report.tables[table] = rows.map(row =>
+              browserRankingRow(
+                table,
+                row,
+                row._ai ?? pageData.ai.get(row.path),
+                !!logs.latest,
+                human.totals.population,
+              ),
+            );
             report.meta.tablePages = {
               ...report.meta.tablePages,
               [table]: {

@@ -6,21 +6,17 @@ import { z } from 'zod';
 
 export async function GET(
   request: Request,
-  { params }: { params: Promise<{ websiteId: string; jobId: string; result?: string[] }> },
+  { params }: { params: Promise<{ websiteId: string; jobId: string }> },
 ) {
   return requestApi(request, async () => {
-    const { websiteId, jobId, result } = await params;
+    const { websiteId, jobId } = await params;
     const access = await authorize(request, websiteId);
-    if (
-      !warehouseEnabled() ||
-      !z.uuid().safeParse(jobId).success ||
-      (result && (result.length !== 1 || result[0] !== 'result'))
-    )
+    if (!warehouseEnabled() || !z.uuid().safeParse(jobId).success)
       throw new LiekanError('统计任务不存在', 404);
     return readWarehouseOverviewJob(
       access,
       jobId,
-      result?.[0] === 'result',
+      true,
       new URL(request.url).searchParams,
       request.signal,
     );

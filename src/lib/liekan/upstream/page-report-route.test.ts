@@ -1,7 +1,7 @@
 vi.mock('@/lib/liekan/upstream/crawler-registry-context', () => ({
   withPublishedRegistry: (work: () => unknown) => work(),
 }));
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({ authorize: vi.fn(), read: vi.fn() }));
 vi.mock('./server', async () => ({
   authorize: mocks.authorize,
@@ -10,7 +10,7 @@ vi.mock('./server', async () => ({
 vi.mock('./page-report', () => ({ readPageReport: mocks.read }));
 import { GET } from '@/app/api/liekan/websites/[websiteId]/page-report/route';
 import { LiekanError } from './errors';
-import { bindCacheRequest } from './cache-context';
+import { bindCacheRequest, installAuthorizationRunner } from './cache-context';
 import { timeReportQuery } from './analysis-diagnostics';
 const id = '11111111-1111-4111-8111-111111111111';
 const request = () =>
@@ -19,6 +19,9 @@ const request = () =>
   );
 const params = { params: Promise.resolve({ websiteId: id }) };
 beforeEach(() => {
+  // The route fixture supplies authorization, including the final recheck.
+  // Do not open the real control database through the installed runtime wrapper.
+  installAuthorizationRunner(work => work());
   vi.resetAllMocks();
   mocks.authorize.mockResolvedValue({
     website: { id, name: 'Current name', domain: 'example.test' },
@@ -31,6 +34,7 @@ beforeEach(() => {
     status: 'hit',
   });
 });
+afterEach(() => installAuthorizationRunner(undefined));
 it('rechecks access before a warm read and applies current metadata and management permissions', async () => {
   const response = await GET(request(), params);
   expect(response.status).toBe(200);

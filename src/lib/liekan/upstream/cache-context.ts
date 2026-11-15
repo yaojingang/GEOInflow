@@ -1,3 +1,8 @@
+import {
+  withReadDiagnostics,
+  noteReadRetry,
+  traceReadAuthorization,
+} from './report-read-diagnostics';
 import type { BrowserPopulation } from '../contracts/browser-population';
 import { withPublishedRegistry } from './crawler-registry-context';
 import { getPublishedCatalog } from '../crawlers/published';
@@ -7,8 +12,9 @@ import { randomUUID } from 'node:crypto';
 import type { CachedResult } from './query-cache';
 import { AnalyticsRestart, AnalyticsUnavailable } from './analytics-budget';
 import { processSingleton } from './process-singleton';
-import { withinWarehouseAuthority } from '../warehouse/authority-routing';
+import { withinWarehouseAuthority, warehouseEnabled } from '../warehouse/authority-routing';
 import { warehouseTransient } from '../warehouse/control-db';
+import { isWarehouseReportRequest } from './warehouse-report-scope';
 
 interface CacheContext {
   populations?: Map<string, BrowserPopulation>;
@@ -44,9 +50,9 @@ export function installAuthorizationRunner(runner: CacheState['authorizationRunn
   state.authorizationRunner = runner;
 }
 export function runCacheAuthorization<T>(work: () => Promise<T>) {
-  return cacheHeadersEnabled() && state.authorizationRunner
-    ? state.authorizationRunner(work)
-    : work();
+  return traceReadAuthorization(() =>
+    cacheHeadersEnabled() && state.authorizationRunner ? state.authorizationRunner(work) : work(),
+  );
 }
 export function installVersionReader(reader: CacheState['versionReader']) {
   state.versionReader = reader;
@@ -65,7 +71,10 @@ export const currentAnalyticsSignal = () =>
 /** Coalesced work belongs to all its live viewers, not the initiating request. */
 export function withAnalyticsComputationSignal<T>(signal: AbortSignal, work: () => Promise<T>) {
   const parent = contexts.getStore();
-  return contexts.run({ ...parent, results: parent?.results ?? [], computationSignal: signal }, work);
+  return contexts.run(
+    { ...parent, results: parent?.results ?? [], computationSignal: signal },
+    work,
+  );
 }
 
 export function bindCacheRequest(
@@ -93,7 +102,8 @@ export function bindCacheRequest(
     : { private: true };
   context.parameters = parameters;
   context.reauthorize = reauthorize;
-  context.allowWarehousePublicationAdvance = options?.allowWarehousePublicationAdvance;
+  if (options?.allowWarehousePublicationAdvance !== undefined)
+    context.allowWarehousePublicationAdvance = options.allowWarehousePublicationAdvance;
 }
 export function noteBrowserPopulation(resourceId: string, population: BrowserPopulation) {
   const context = contexts.getStore();
@@ -193,13 +203,17 @@ export function analyticsWorkerContext<T>(
 export async function withQueryCacheHeaders(
   work: () => Promise<Response>,
   request?: Request,
+  catalogPinned = false,
+  diagnostics = false,
 ): Promise<Response> {
-  if (request && !process.env.CLICKHOUSE_URL) {
+  if (request && isWarehouseReportRequest(request) && !diagnostics)
+    return withReadDiagnostics(() => withQueryCacheHeaders(work, request, catalogPinned, true));
+  if (request && !process.env.CLICKHOUSE_URL && !catalogPinned) {
     const version = request.headers.get('x-liekan-catalog-version');
     if (version && !z.uuid().safeParse(version).success)
       return Response.json({ error: { message: '目录版本无效', status: 400 } }, { status: 400 });
     return withPublishedRegistry(async () => {
-      const response = await withQueryCacheHeaders(work);
+      const response = await withQueryCacheHeaders(work, request, true, true);
       response.headers.set('X-Liekan-Catalog-Version', getPublishedCatalog()?.version || '');
       return response;
     }, version || undefined);
@@ -216,13 +230,26 @@ export async function withQueryCacheHeaders(
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        response = await withinWarehouseAuthority(() => contexts.run(context, work));
+        response = await withinWarehouseAuthority(() =>
+          contexts.run(context, async () => {
+            if (warehouseEnabled() && isWarehouseReportRequest(request)) {
+              context.allowWarehousePublicationAdvance = true;
+              const { withinWarehouseReport } = await import('./warehouse-report-snapshot');
+              return withinWarehouseReport(work, {
+                signal: request.signal,
+                deadline: context.deadline,
+              });
+            }
+            return work();
+          }),
+        );
         break;
       } catch (error) {
         if (!(error instanceof AnalyticsRestart) || attempt > 0)
           throw error instanceof AnalyticsRestart
             ? new AnalyticsUnavailable('统计配置已变更，请稍后重试')
             : error;
+        noteReadRetry();
         context.versions.clear();
         context.results = [];
         context.populations?.clear();
@@ -271,7 +298,9 @@ export async function withQueryCacheHeaders(
         identity: {
           ...identity,
           versions: identity.versions.slice(0, 4),
-          ...(identity.qualifiedVersions ? { qualifiedVersions: identity.qualifiedVersions.slice(0, 4) } : {}),
+          ...(identity.qualifiedVersions
+            ? { qualifiedVersions: identity.qualifiedVersions.slice(0, 4) }
+            : {}),
         },
         ruleVersions: ruleVersions.slice(0, 4),
         catalogVersions: catalogVersions.slice(0, 4),

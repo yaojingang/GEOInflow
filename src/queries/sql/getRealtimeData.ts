@@ -6,6 +6,10 @@ import type { QueryFilters, RealtimeActivity, RealtimeData, RealtimeEvent } from
 import { getRealtimeActivity } from '@/queries/sql/getRealtimeActivity';
 import { getPageviewStats } from '@/queries/sql/pageviews/getPageviewStats';
 import { getSessionStats } from '@/queries/sql/sessions/getSessionStats';
+import {
+  warehouseRealtimeEnabled,
+  warehouseRealtimeStats,
+} from '@/lib/liekan/upstream/warehouse-realtime';
 
 function increment(data: object, key?: string | null) {
   if (key) {
@@ -29,11 +33,15 @@ async function computeRealtimeData(
   websiteId: string,
   filters: QueryFilters,
 ): Promise<RealtimeData> {
-  const [activity, pageviews, sessions, totals] = await Promise.all([
+  const [activity, { pageviews, sessions, totals }] = await Promise.all([
     getRealtimeActivity(websiteId, filters),
-    getPageviewStats(websiteId, filters),
-    getSessionStats(websiteId, filters),
-    getWebsiteStats(websiteId, filters),
+    warehouseRealtimeEnabled()
+      ? warehouseRealtimeStats(websiteId, filters)
+      : Promise.all([
+          getPageviewStats(websiteId, filters),
+          getSessionStats(websiteId, filters),
+          getWebsiteStats(websiteId, filters),
+        ]).then(([pageviews, sessions, totals]) => ({ pageviews, sessions, totals })),
   ]);
 
   const uniques = new Set();

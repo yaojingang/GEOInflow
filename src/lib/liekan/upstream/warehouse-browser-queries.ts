@@ -1,9 +1,20 @@
 import { getClickHouseCountrySQL, getClickHouseRegionSQL } from '@/lib/country';
 import { identityUsable, unavailableFields } from '../contracts/browser-population';
+import {
+  type AnalysisWindow,
+  analysisWindowRelation,
+  currentAnalysisRead,
+} from '../warehouse/analysis-context';
+import { factTable } from '../warehouse/catalog';
+import { analysisBrowserFields, analysisVisitEntryFields } from '../warehouse/schema';
 import { warehouseTime } from '../warehouse/fact-input';
-import { geographicEventRelation } from '../warehouse/reporting-relations';
+import { factRelation } from '../warehouse/read';
+import { analyticsEventRelation, geographicEventRelation } from '../warehouse/reporting-relations';
+import { analysisVisitTotals } from './warehouse-analysis-visits';
 import { warehouseBrowserPopulation } from './warehouse-browser-population';
 import {
+  memoWarehouseReport,
+  cachedWarehouseReport,
   warehouseReportMetadata,
   warehouseReportQuery,
   withinWarehouseReport,
@@ -32,11 +43,28 @@ export async function warehouseBrowserParameters(
     goalValues: definitions.map(d => d.parameters.value),
   };
 }
-export function warehouseVisitsSQL(halfOpen = false) {
-  return `WITH all_events AS ${geographicEventRelation()},
+export function warehouseVisitsSQL(halfOpen = false, geography = false, window?: AnalysisWindow) {
+  const prepared = analysisWindowRelation(
+    'browser',
+    [
+      ...factTable('website_event').columns.map(c => c.name),
+      ...analysisBrowserFields
+        .filter(c => !c[0].startsWith('_') || c[0].startsWith('_entry_'))
+        .map(c => c[0]),
+    ],
+    window && { ...window, endExclusive: halfOpen },
+    true,
+  );
+  const attribution = prepared
+    ? `attributed AS (SELECT *,tuple(${analysisVisitEntryFields.map(c => `_entry_${c}`).join(',')}) AS entry FROM ${prepared})`
+    : `report_visit_keys AS (
+      SELECT DISTINCT session_id,visit_id FROM ${factRelation('website_event', { columns: ['website_id', 'event_id', 'session_id', 'visit_id', 'created_at'], immutableTimeWindow: { start: 'start', end: 'end', endExclusive: halfOpen } })}
+      WHERE created_at>={start:DateTime64(6,'UTC')} AND created_at${halfOpen ? '<' : '<='}{end:DateTime64(6,'UTC')}
+    ), all_events AS ${geography ? geographicEventRelation(true) : analyticsEventRelation(true)},
     attributed AS (SELECT *,argMinIf(tuple(referrer_domain,utm_source,utm_medium,utm_campaign,referrer_path,referrer_query,utm_term),tuple(created_at,event_id),event_type NOT IN(2,5))
       OVER(PARTITION BY session_id,visit_id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS entry
-      FROM all_events WHERE created_at<={end:DateTime64(6,'UTC')}),
+      FROM all_events WHERE created_at<={end:DateTime64(6,'UTC')})`;
+  return `WITH ${attribution},
     events AS (SELECT *,arrayMap(g->g.1,arrayFilter(g ->
       ((g.2='path' AND event_type=1) OR (g.2!='path' AND event_type=2)) AND
       if(startsWith(g.3,'*') OR endsWith(g.3,'*'),if(g.2='path',url_path,event_name) LIKE replaceRegexpOne(replaceRegexpOne(g.3,'^[*]','%'),'[*]$','%'),if(g.2='path',url_path,event_name)=g.3),
@@ -98,6 +126,52 @@ function numbers(rows: any[]) {
     ),
   );
 }
+
+const visitGroupDimensions = {
+  sources: {
+    referrer: 'v.referrer',
+    utmSource: 'v.utmSource',
+    utmMedium: 'v.utmMedium',
+    utmCampaign: 'v.utmCampaign',
+  },
+  geo: {
+    country: getClickHouseCountrySQL('v.country'),
+    region: getClickHouseRegionSQL('v.country', 'v.region'),
+    city: 'v.city',
+  },
+  environment: { device: 'v.device', browser: 'v.browser', os: 'v.os' },
+  heatmap: {
+    weekday: 'modulo(toDayOfWeek(toTimeZone(v.started,{timezone:String})),7)',
+    hour: 'toHour(toTimeZone(v.started,{timezone:String}))',
+  },
+};
+type VisitGroup = keyof typeof visitGroupDimensions;
+const visitGroupMetrics: Record<VisitGroup, string[]> = {
+  sources: ['sessions', 'pv', 'duration', 'bounces', 'conversions'],
+  geo: ['durationTotal', 'durationSamples', 'sessions', 'pv', 'duration', 'bounces', 'conversions'],
+  environment: ['sessions'],
+  heatmap: ['count'],
+};
+
+/** GROUPING SETS consumes the visit relation once without materializing a wide
+ * event table. Grouping flags distinguish real null dimensions from other sets. */
+function groupedVisitsSQL(groups: VisitGroup[]) {
+  const dimensions = Object.assign(
+    {},
+    ...groups.map(group => visitGroupDimensions[group]),
+  ) as Record<string, string>;
+  const dimensionsOf = (group: VisitGroup) => Object.keys(visitGroupDimensions[group]).join(',');
+  const order = groups.includes('heatmap')
+    ? 'if(grouping(weekday,hour)=0,toInt64(weekday),-toInt64(sessions)),if(grouping(weekday,hour)=0,hour,0),'
+    : 'sessions DESC,';
+  return ` SELECT ${groups.map((group, i) => `grouping(${dimensionsOf(group)}) AS _group${i}`).join(',')},
+    ${Object.entries(dimensions)
+      .map(([alias, sql]) => `${sql} AS ${alias}`)
+      .join(',')},${metrics},
+    sum(v.duration) AS durationTotal,count(v.duration) AS durationSamples,count() AS count
+    FROM visits v GROUP BY GROUPING SETS (${groups.map(group => `(${dimensionsOf(group)})`).join(',')})
+    ORDER BY ${order}${Object.keys(dimensions).join(',')}`;
+}
 export async function warehouseBrowserFacts(
   id: string,
   start: Date,
@@ -139,34 +213,124 @@ export async function warehouseBrowserFacts(
         " SELECT formatDateTime(created_at,'%Y-%m-%d',{timezone:String}) AS day,uniqExact(event_id) AS count FROM matches GROUP BY day ORDER BY day",
     };
     const result: Record<string, any[]> = {};
+    const factKey = (field: string) =>
+      JSON.stringify([
+        'browser-fact',
+        currentAnalysisRead()?.control ?? 'raw',
+        id,
+        +start,
+        +end,
+        timezone,
+        { hour: !!options.hour, halfOpen: !!options.halfOpen },
+        field,
+      ]);
+    const existing = new Map<string, any[]>();
+    for (const field of fields) {
+      const cached = await cachedWarehouseReport<any[]>(factKey(field), field !== 'pages');
+      if (cached) existing.set(field, cached.value);
+    }
+    const groups = (Object.keys(visitGroupDimensions) as VisitGroup[]).filter(
+      field => fields.includes(field) && !existing.has(field),
+    );
+    const grouped =
+      groups.length > 1
+        ? await memoWarehouseReport(
+            JSON.stringify([
+              'browser-visit-groups',
+              currentAnalysisRead()?.control ?? 'raw',
+              id,
+              +start,
+              +end,
+              timezone,
+              options,
+              groups,
+            ]),
+            async () => {
+              const rows = numbers(
+                await warehouseReportQuery<any>(
+                  id,
+                  warehouseVisitsSQL(options.halfOpen, groups.includes('geo'), {
+                    start: +start,
+                    end: +end,
+                  }) + groupedVisitsSQL(groups),
+                  params,
+                ),
+              );
+              return Object.fromEntries(
+                groups.map((group, i) => [
+                  group,
+                  rows
+                    .filter(row => String(row[`_group${i}`]) === '0')
+                    .map(row =>
+                      Object.fromEntries(
+                        [
+                          ...Object.keys(visitGroupDimensions[group]),
+                          ...visitGroupMetrics[group],
+                        ].map(key => [key, row[key]]),
+                      ),
+                    ),
+                ]),
+              );
+            },
+            { round: true },
+          )
+        : {};
     for (const field of fields) {
       const sql = statements[field];
       if (!sql) continue;
-      result[field] = numbers(
-        await warehouseReportQuery<any>(id, warehouseVisitsSQL(options.halfOpen) + sql, params),
+      result[field] = await memoWarehouseReport(
+        factKey(field),
+        async () =>
+          existing.get(field) ??
+          grouped[field] ??
+          numbers(
+            await warehouseReportQuery<any>(
+              id,
+              warehouseVisitsSQL(options.halfOpen, field === 'geo', { start: +start, end: +end }) +
+                sql,
+              params,
+            ),
+          ),
+        { round: field !== 'pages' },
       );
     }
     return result;
   });
 }
 export async function warehouseBrowserTotals(id: string, start: Date, end: Date, timezone = 'UTC') {
-  return withinWarehouseReport(async () => {
-    const params = await warehouseBrowserParameters(id, start, end, timezone),
-      population = await warehouseBrowserPopulation(id, start, end, timezone);
-    const [row] = numbers(
-      await warehouseReportQuery<any>(
+  return withinWarehouseReport(() =>
+    memoWarehouseReport(
+      JSON.stringify([
+        'browser-totals',
+        currentAnalysisRead()?.control ?? 'raw',
         id,
-        `${warehouseVisitsSQL()} SELECT sum(pv) AS pageviews,uniqExact(session_id) AS visitors,count() AS visits,countIf(pv=1 AND custom=0) AS bounces,coalesce(sum(duration),0) AS totaltime FROM visits`,
-        params,
-      ),
-    );
-    return {
-      ...(identityUsable(population)
-        ? row
-        : unavailableFields(row, ['visitors', 'visits', 'bounces', 'totaltime'])),
-      population,
-    };
-  });
+        +start,
+        +end,
+        timezone,
+      ]),
+      async () => {
+        const params = await warehouseBrowserParameters(id, start, end, timezone),
+          population = await warehouseBrowserPopulation(id, start, end, timezone);
+        const fragments = await analysisVisitTotals(id, start, end);
+        const [row] = numbers(
+          fragments
+            ? [fragments]
+            : await warehouseReportQuery<any>(
+                id,
+                `${warehouseVisitsSQL(false, false, { start: +start, end: +end })} SELECT sum(pv) AS pageviews,uniqExact(session_id) AS visitors,count() AS visits,countIf(pv=1 AND custom=0) AS bounces,coalesce(sum(duration),0) AS totaltime FROM visits`,
+                params,
+              ),
+        );
+        return {
+          ...(identityUsable(population)
+            ? row
+            : unavailableFields(row, ['visitors', 'visits', 'bounces', 'totaltime'])),
+          population,
+        };
+      },
+      { round: true },
+    ),
+  );
 }
 export async function warehouseBrowserConversions(
   id: string,
@@ -179,7 +343,7 @@ export async function warehouseBrowserConversions(
     return numbers(
       await warehouseReportQuery<any>(
         id,
-        `${warehouseVisitsSQL()} SELECT uniqExact(event_id) AS count FROM matches`,
+        `${warehouseVisitsSQL(false, false, { start: +start, end: +end })} SELECT uniqExact(event_id) AS count FROM matches`,
         params,
       ),
     )[0].count;

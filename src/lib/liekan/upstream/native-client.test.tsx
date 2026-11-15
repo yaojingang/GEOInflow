@@ -290,6 +290,33 @@ it('rechecks expired mounted cache using monotonic time after the wall clock mov
   expect(fetch).toHaveBeenCalledTimes(2);
 });
 
+it('rereads the shared Today card when mounting a cached long-range overview without polling', async () => {
+  let requests = 20;
+  const fetch = vi.fn(async () =>
+    response({
+      resource: 'overview',
+      cards: [{ label: '今日总请求', value: requests }],
+      meta: { todayRequests: { state: 'ready', intervalMs: 600000 } },
+    }),
+  );
+  vi.stubGlobal('fetch', fetch);
+  const options = pageReportQuery('principal', 'site', {
+    resource: 'overview',
+    startAt: 100,
+    endAt: 200,
+    timezone: 'UTC',
+    chartPeriod: '30d',
+  });
+  await client.prefetchQuery(options);
+  requests = 55;
+  const q = renderHook(() => useApi().useQuery(options), { wrapper });
+  await advance(1);
+  expect(fetch).toHaveBeenCalledTimes(2);
+  expect((q.result.current.data as any).cards[0].value).toBe(55);
+  await advance(600000);
+  expect(fetch).toHaveBeenCalledTimes(2);
+});
+
 it('reuses a fresh product report and preserves explicit reads', async () => {
   const report = { websiteId: 'site', resource: 'content', total: 7 };
   const fetch = vi.fn(async (_url: URL | string) => response(report));

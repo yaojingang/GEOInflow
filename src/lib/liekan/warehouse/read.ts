@@ -26,7 +26,14 @@ export function boundaryParameters(boundary: ReadBoundary) {
   };
 }
 
-type FactTimeWindow = { start: string; end: string; endExclusive?: boolean; hours?: string };
+type FactTimeWindow = {
+  start: string;
+  end: string;
+  endExclusive?: boolean;
+  hours?: string;
+  // Only immutable log event time may exclude already published model hours.
+  excludedHours?: string;
+};
 const validParameterName = (name: string) => /^[a-z][a-zA-Z0-9_]*$/.test(name);
 
 export function acceptedCandidates(name: string, prefilter = '') {
@@ -45,6 +52,19 @@ export function exactTimeFilter(window: FactTimeWindow) {
 export function datePruning(window: FactTimeWindow) {
   const end = `{${window.end}:DateTime64(6,'UTC')}`;
   return `toDate32(_record_time) BETWEEN toDate32({${window.start}:DateTime64(6,'UTC')}) AND toDate32(${window.endExclusive ? `subtractMicroseconds(${end},1)` : end})`;
+}
+
+function logHourFilter(window: FactTimeWindow) {
+  return [
+    window.hours
+      ? `AND toUnixTimestamp(toStartOfHour(_record_time)) IN {${window.hours}:Array(UInt32)}`
+      : '',
+    window.excludedHours
+      ? `AND toUnixTimestamp(toStartOfHour(_record_time)) NOT IN {${window.excludedHours}:Array(Int64)}`
+      : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
 }
 
 // Callers apply business filters OUTSIDE this relation. Filtering a mutable field
@@ -67,6 +87,7 @@ export type FactReadOptions = {
   // Restrict evidence by the immutable log ID, using log time on the logs.
   // Evidence timestamps and versions can be independent of the log window.
   evidenceLogWindow?: FactTimeWindow;
+  repairLogWindow?: FactTimeWindow;
   // A materialized repair batch exposes the exact evidence keys. Physical
   // evidence timestamps can differ from the parent log timestamp.
   evidenceLogBatch?: true;
@@ -89,26 +110,36 @@ export function factRelation(name: string, options: FactReadOptions = {}): strin
     throw new Error('Invalid warehouse active log repair read');
   if (options.evidenceLogBatch && name !== 'liekan_crawler_evidence')
     throw new Error('Invalid warehouse evidence batch read');
-  if (
-    options.evidenceLogWindow &&
-    (name !== 'liekan_crawler_evidence' ||
-      options.evidenceLogWindow.hours ||
-      ![options.evidenceLogWindow.start, options.evidenceLogWindow.end].every(validParameterName))
-  )
-    throw new Error('Invalid warehouse evidence log window');
+  for (const [window, family] of [
+    [options.evidenceLogWindow, 'liekan_crawler_evidence'],
+    [options.repairLogWindow, 'liekan_history_repair_result'],
+  ] as const) {
+    if (
+      window &&
+      (name !== family ||
+        ![window.start, window.end, window.hours, window.excludedHours]
+          .filter(Boolean)
+          .every(validParameterName))
+    )
+      throw new Error('Invalid warehouse evidence log window');
+  }
   if (options.sessionIdsParameter && !validParameterName(options.sessionIdsParameter))
     throw new Error('Invalid warehouse session parameter');
   if (options.recordKeysParameter && !validParameterName(options.recordKeysParameter))
     throw new Error('Invalid warehouse record-key parameter');
   if (
     options.immutableTimeWindow &&
-    (!['website_event', 'liekan_log', 'liekan_event_quality', 'liekan_browser_risk'].includes(
-      name,
-    ) ||
+    ((options.immutableTimeWindow.excludedHours && name !== 'liekan_log') ||
+      !['website_event', 'liekan_log', 'liekan_event_quality', 'liekan_browser_risk'].includes(
+        name,
+      ) ||
       [
         options.immutableTimeWindow.start,
         options.immutableTimeWindow.end,
         ...(options.immutableTimeWindow.hours ? [options.immutableTimeWindow.hours] : []),
+        ...(options.immutableTimeWindow.excludedHours
+          ? [options.immutableTimeWindow.excludedHours]
+          : []),
       ].some(p => !validParameterName(p)))
   )
     throw new Error('Invalid warehouse immutable-time filter');
@@ -268,7 +299,7 @@ export function factRelation(name: string, options: FactReadOptions = {}): strin
     .map(column => `${overrides[column] ?? latest(column)} AS ${identifier(column)}`)
     .join(', ');
   const narrowWindow = options.narrowLogWindow ? options.immutableTimeWindow : undefined;
-  const evidenceWindow = options.evidenceLogWindow;
+  const evidenceWindow = options.evidenceLogWindow ?? options.repairLogWindow;
   const boundedFilter = [
     options.recordKeysParameter
       ? `AND _record_key IN {${options.recordKeysParameter}:Array(String)}`
@@ -280,6 +311,9 @@ export function factRelation(name: string, options: FactReadOptions = {}): strin
     options.immutableTimeWindow?.hours
       ? `AND toDate32(_record_time) IN arrayMap(h -> toDate32(toDateTime(h,'UTC')),{${options.immutableTimeWindow.hours}:Array(UInt32)})
         AND toUnixTimestamp(toStartOfHour(_record_time)) IN {${options.immutableTimeWindow.hours}:Array(UInt32)}`
+      : '',
+    options.immutableTimeWindow?.excludedHours
+      ? `AND toUnixTimestamp(toStartOfHour(_record_time)) NOT IN {${options.immutableTimeWindow.excludedHours}:Array(Int64)}`
       : '',
     narrowWindow ? `AND ${datePruning(narrowWindow)}` : '',
   ]
@@ -312,10 +346,10 @@ export function factRelation(name: string, options: FactReadOptions = {}): strin
         AND (_attempt_id, _candidate_id) IN (${acceptedCandidates(name, attemptPrefilter)})
         ${
           evidenceWindow
-            ? `AND "log_id" IN (
+            ? `AND "${options.repairLogWindow ? 'record_id' : 'log_id'}" IN (
                 SELECT id FROM warehouse_liekan_log
                 PREWHERE _website_id={wh_site:UUID} AND _epoch={wh_epoch:UInt64} AND ${datePruning(evidenceWindow)}
-                WHERE ${exactTimeFilter(evidenceWindow)}
+                WHERE ${exactTimeFilter(evidenceWindow)} ${logHourFilter(evidenceWindow)}
                   AND (_attempt_id,_candidate_id) IN (${acceptedCandidates('liekan_log')})
               )`
             : ''

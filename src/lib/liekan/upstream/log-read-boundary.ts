@@ -49,12 +49,7 @@ async function postgresLogVersion(tx: any, websiteId: string, p: LogReadQuery) {
 export async function logReadBoundary(tx: any, websiteId: string, p: LogReadQuery) {
   let version: unknown[];
   if (warehouseEnabled()) {
-    const { warehouseReportMetadata, warehouseControlFingerprint } = await import(
-      './warehouse-report-snapshot'
-    );
-    const metadata = await warehouseReportMetadata(websiteId);
-    // Browser-event publications do not change the independently loaded log parts.
-    version = ['warehouse', metadata.logRevision, warehouseControlFingerprint(metadata)];
+    return (await import('./warehouse-log-boundary')).pinnedLogBoundary(websiteId, p);
   } else {
     version = await postgresLogVersion(tx, websiteId, p);
   }

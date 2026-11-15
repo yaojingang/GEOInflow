@@ -10,6 +10,12 @@ const mocks = vi.hoisted(() => ({
 }));
 vi.mock('../warehouse/authority-routing', () => ({ warehouseEnabled: mocks.warehouse }));
 vi.mock('./crawler-registry-context', () => ({ withPublishedRegistry: (work: any) => work() }));
+vi.mock('./warehouse-log-boundary', () => ({
+  withWarehouseLogBoundary: (_site: any, _p: any, work: any) => work(),
+}));
+vi.mock('./warehouse-analysis-model', () => ({
+  withAvailableAnalysisModel: (_site: any, work: any) => work(),
+}));
 vi.mock('./log-statistics', () => ({ readLogStatistics: mocks.statistics }));
 vi.mock('./logs', () => ({ getLogFacts: mocks.facts, getLogToday: mocks.today }));
 vi.mock('../store', () => ({ getSettings: mocks.settings }));

@@ -45,6 +45,10 @@ export const journeyResponse = z.object({
   limited: z.boolean(),
 });
 const pagedSessions = z.object({
+  readBoundary: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
   population: browserPopulationSchema.optional(),
   rows: z.array(featureSession),
   count: z.number().nullable(),

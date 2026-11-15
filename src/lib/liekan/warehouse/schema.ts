@@ -127,6 +127,11 @@ export const warehouseAnalyticsTables = [
   warehouseLogTrendTable,
   warehouseOverviewLogDays,
   warehouseOverviewLogCoverage,
+  'warehouse_report_rank_v1',
+  'warehouse_analysis_browser_v1',
+  'warehouse_analysis_log_v1',
+  'warehouse_analysis_visit_hour_v1',
+  'warehouse_analysis_coverage_v1',
 ];
 export const warehouseOverviewLogDDL = [
   `CREATE TABLE IF NOT EXISTS ${warehouseOverviewLogDays} (
@@ -147,3 +152,82 @@ TTL recorded_at + INTERVAL 45 DAY`,
 ORDER BY (website_id,epoch,control,publication,recorded_at,checkpoint)
 TTL recorded_at + INTERVAL 45 DAY`,
 ];
+
+export const analysisVisitEntryFields = [
+  'referrer_domain',
+  'utm_source',
+  'utm_medium',
+  'utm_campaign',
+  'referrer_path',
+  'referrer_query',
+  'utm_term',
+] as const;
+export const analysisBrowserFields: ReadonlyArray<readonly [string, string]> = [
+  ...[
+    'country',
+    'region',
+    'city',
+    'browser',
+    'os',
+    'device',
+    'screen',
+    'language',
+    'distinct_id',
+  ].map(c => [`liekan_${c}`, 'Nullable(String)'] as const),
+  ['liekan_identity_available', 'Nullable(Bool)'],
+  ['liekan_session_created_at', "Nullable(DateTime64(6,'UTC'))"],
+  ...analysisVisitEntryFields.map(c => [`_entry_${c}`, 'Nullable(String)'] as const),
+  ['_qualified', 'Bool'],
+  ['_qualified_event', 'Bool'],
+  ['_identity_version', 'Nullable(String)'],
+  ['_rule_version', 'Nullable(String)'],
+  ['_catalog_version', 'Nullable(String)'],
+] as const;
+export const analysisLogFields: ReadonlyArray<readonly [string, string]> = [
+  ['reporting_crawler_id', 'Nullable(String)'],
+  ['reporting_catalog_version', 'Nullable(UUID)'],
+  ['reporting_classification_version', 'Nullable(String)'],
+  ['reporting_identity_evidence', 'Nullable(String)'],
+  ['reporting_generation', 'Nullable(UUID)'],
+] as const;
+export const warehouseAnalysisTables = [
+  'warehouse_analysis_browser_v1',
+  'warehouse_analysis_log_v1',
+  'warehouse_analysis_visit_hour_v1',
+  'warehouse_analysis_coverage_v1',
+];
+const analysisMetadata = `epoch UInt64,_control FixedString(64),_hour Int64,_build UUID,_publication UInt64,_recorded_at DateTime64(6,'UTC') DEFAULT now64(6)`;
+export const warehouseAnalysisDDL = [
+  ...(['browser', 'log'] as const).map(
+    kind => `CREATE TABLE IF NOT EXISTS warehouse_analysis_${kind}_v1 (
+    ${factTable(kind === 'browser' ? 'website_event' : 'liekan_log')
+      .columns.map(c => `${identifier(c.name)} ${clickhouseType(c)}`)
+      .join(',')},
+    ${(kind === 'browser' ? analysisBrowserFields : analysisLogFields).map(([name, type]) => `${identifier(name)} ${type}`).join(',')},
+    ${analysisMetadata}
+  ) ENGINE=MergeTree PARTITION BY toYYYYMM(toDateTime(_hour))
+    ORDER BY (website_id,epoch,_control,_hour,_build,${kind === 'browser' ? 'session_id,visit_id,event_id' : 'id'})`,
+  ),
+  ...analysisVisitEntryFields.map(
+    c =>
+      `ALTER TABLE warehouse_analysis_browser_v1 ADD COLUMN IF NOT EXISTS _entry_${c} Nullable(String)`,
+  ),
+  `CREATE TABLE IF NOT EXISTS warehouse_analysis_visit_hour_v1 (
+    website_id UUID,session_id UUID,visit_id UUID,${analysisMetadata},
+    pv UInt64,custom UInt64,first_pv Nullable(DateTime64(6,'UTC')),last_pv Nullable(DateTime64(6,'UTC')),
+    visitors AggregateFunction(uniqExact,UUID)
+  ) ENGINE=MergeTree PARTITION BY toYYYYMM(toDateTime(_hour))
+    ORDER BY (website_id,epoch,_control,_hour,_build,session_id,visit_id)`,
+  `CREATE TABLE IF NOT EXISTS warehouse_analysis_coverage_v1 (
+    website_id UUID,epoch UInt64,control FixedString(64),publication UInt64,checkpoint UUID,
+    browser String,log String,recorded_at DateTime64(6,'UTC') DEFAULT now64(6)
+  ) ENGINE=MergeTree PARTITION BY toYYYYMM(recorded_at)
+    ORDER BY (website_id,epoch,control,publication,recorded_at,checkpoint)`,
+  `ALTER TABLE warehouse_analysis_coverage_v1 ADD COLUMN IF NOT EXISTS browser_publication UInt64 DEFAULT publication`,
+  `ALTER TABLE warehouse_analysis_coverage_v1 ADD COLUMN IF NOT EXISTS log_publication UInt64 DEFAULT publication`,
+];
+export const warehouseReportRankDDL = `CREATE TABLE IF NOT EXISTS warehouse_report_rank_v1 (
+  website_id UUID,epoch UInt64,snapshot UUID,build UUID,table_name LowCardinality(String),
+  ordinal UInt64,row String,geography Nullable(String),recorded_at DateTime64(6,'UTC') DEFAULT now64(6)
+) ENGINE=MergeTree PARTITION BY toYYYYMM(recorded_at)
+ORDER BY (website_id,epoch,snapshot,build,table_name,ordinal)`;

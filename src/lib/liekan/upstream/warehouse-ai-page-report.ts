@@ -1,3 +1,4 @@
+import { recordReportRanking, capturingReportRankings } from './report-ranking-artifact';
 import type { PreparedReport } from '../report-prepared';
 import type { ReportQuery } from '../contracts/query';
 import { tablePageSize } from '../contracts/query';
@@ -97,6 +98,19 @@ export async function prepareWarehouseAiPageReport(
       catalogCount: summary.catalogCount,
       logs,
       dispose: () => evidence.source.dispose(),
+      async publishRankings(report) {
+        if (!capturingReportRankings()) return;
+        await evidence.source.stream(rows => recordReportRanking(report, 'apBody', rows));
+        if (logs.latest)
+          await summary.blind.stream(rows =>
+            recordReportRanking(
+              report,
+              'blindList',
+              rows.map(row => ({ path: row.path, reason: '已收录目录，所选范围无 AI 抓取' })),
+            ),
+          );
+        else await recordReportRanking(report, 'blindList', []);
+      },
       decorate(report) {
         report.states.catalog = summary.catalogCount ? 'available' : 'not_connected';
         const values = {

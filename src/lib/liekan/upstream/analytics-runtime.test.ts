@@ -20,6 +20,9 @@ const warehouse = vi.hoisted(() => ({
 }));
 vi.mock('./warehouse-report-snapshot', () => ({ withinWarehouseReport: warehouse.report }));
 
+vi.mock('./crawler-registry-context', () => ({
+  withPublishedRegistry: (work: () => unknown) => work(),
+}));
 vi.mock('./analytics-hot', () => ({
   rememberAnalyticsHot: vi.fn(async () => {}),
   reserveWorkerComputation: vi.fn(async () => true),
@@ -435,6 +438,42 @@ it('finishes a website summary during continuous publication and invalidates it 
   expect(await afterDeletion.json()).toEqual({ publication: 2, deletion: 1 });
   expect(load).toHaveBeenCalledTimes(3);
 });
+it.each([
+  '/api/liekan/websites/SITE/page-report',
+  '/api/liekan/websites/SITE/log-entries',
+  '/api/liekan/websites/SITE/log-count',
+  '/api/liekan/websites/SITE/log-summary',
+  '/api/websites/SITE/sessions',
+  '/api/websites/SITE/retention',
+  '/api/websites/SITE/active',
+])(
+  'pins reporting HTTP scope before preparation and preserves it across auth rebinds: %s',
+  async path => {
+    vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+    const cache = new QueryCache();
+    installAnalyticsRuntime(cache, primary, disabled());
+    const request = new Request(`http://localhost${path.replace('SITE', id)}`);
+    const load = vi.fn(async () => {
+      const result = { publication, deletion };
+      strong++;
+      publication++;
+      return result;
+    });
+    const run = () =>
+      withQueryCacheHeaders(async () => {
+        bindCacheRequest(request, { user: { id, role: 'admin' } });
+        await prepareAnalyticsVersions(tags);
+        bindCacheRequest(request, { user: { id, role: 'admin' } }, {}, async () => true);
+        return Response.json((await cache.read('pinned-report', 30000, tags, load)).value);
+      }, request);
+    expect((await run()).status).toBe(200);
+    expect(load).toHaveBeenCalledOnce();
+    expect(await (await run()).json()).toEqual({ publication: 0, deletion: 0 });
+    deletion++;
+    expect(await (await run()).json()).toEqual({ publication: 1, deletion: 1 });
+    expect(load).toHaveBeenCalledTimes(2);
+  },
+);
 it('isolates public scopes and rechecks authorization before cached data is returned', async () => {
   const cache = new QueryCache();
   installAnalyticsRuntime(cache, primary, disabled());
@@ -862,7 +901,8 @@ it('does not cancel a shared CH computation when only its first viewer disconnec
       bindCacheRequest(new Request('http://localhost', { signal: abort.signal }), { user: { id } });
       return Response.json((await cache.read('shared-ch-disconnect', 30000, tags, load)).value);
     });
-  const firstAbort = new AbortController(), secondAbort = new AbortController();
+  const firstAbort = new AbortController(),
+    secondAbort = new AbortController();
   const first = request(firstAbort).catch(error => error);
   await vi.waitFor(() => expect(load).toHaveBeenCalledOnce());
   const second = request(secondAbort).catch(error => error);
@@ -887,7 +927,9 @@ it('cancels CH work after its last viewer leaves and permits a subsequent retry'
   let settle!: () => void;
   const load = vi.fn(async () => {
     signal = (warehouse.report.mock.lastCall[1] as { signal: AbortSignal }).signal;
-    return new Promise<number>((_, reject) => { settle = () => reject(signal.reason); });
+    return new Promise<number>((_, reject) => {
+      settle = () => reject(signal.reason);
+    });
   });
   const abort = new AbortController();
   const first = withQueryCacheHeaders(async () => {

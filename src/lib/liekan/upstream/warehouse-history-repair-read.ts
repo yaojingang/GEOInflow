@@ -64,6 +64,7 @@ export async function warehouseRepairQuery<T>(
             ...params,
           },
           format: 'JSONEachRow',
+          clickhouse_settings: { workload: 'liekan_background', max_threads: 1 },
         })
         .then(r => r.json<T>()),
     );

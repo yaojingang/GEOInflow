@@ -126,6 +126,12 @@ export async function featureAnalytics(websiteId: string, input: unknown) {
     noteCacheResult(result);
     return result.value;
   }
+  if (warehouseEnabled() && p.kind === 'sessions')
+    return (await import('./warehouse-session-boundary')).withSessionReadBoundary(
+      websiteId,
+      p,
+      () => featurePopulation(websiteId, p, () => computeFeatureAnalytics(websiteId, p, filters)),
+    );
   return featurePopulation(websiteId, p, () => computeFeatureAnalytics(websiteId, p, filters));
 }
 async function computeFeatureAnalytics(websiteId: string, p: any, filters: any) {

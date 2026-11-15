@@ -1,3 +1,4 @@
+import { recordReportRanking } from './upstream/report-ranking-artifact';
 import {
   reportLogRange,
   reportLogRow,
@@ -71,13 +72,18 @@ function stringifySafe(value: unknown): any {
 // page-report 路径始终下发（缺省第 1 页）：客户端据 meta.tablePages 判定服务端模式并经
 // onTablePage 翻页，不下发则客户端只会本地分页，服务端切片永远无法生效；
 // legacy /report 与 share 路径保持显式请求才切，避免破坏既有全量消费方。
-function capTablePages(report: LiekanReport, tablePages: Record<string, number>, always: boolean) {
+async function capTablePages(
+  report: LiekanReport,
+  tablePages: Record<string, number>,
+  always: boolean,
+) {
   for (const table of pagableTables) {
     if (report.meta.tablePages?.[table]) continue;
     const requested = tablePages[table];
     if (!always && !requested) continue;
     const rows = report.tables[table];
     if (!rows) continue;
+    await recordReportRanking(report, table, rows, report.meta.geography?.tables?.[table]);
     const page =
       table === 'cityBody'
         ? Math.min(requested ?? 1, Math.max(1, Math.ceil(rows.length / tablePageSize)))
@@ -115,7 +121,8 @@ export async function buildReport(
     pageOnly === 'share'
       ? resources.includes('human/overview')
       : !pageOnly || resources.includes(p.resource);
-  const { clock, now, start, end, readEndAt, days, halfOpen } = prepared?.range ?? reportLogRange(p);
+  const { clock, now, start, end, readEndAt, days, halfOpen } =
+    prepared?.range ?? reportLogRange(p);
   const todayStart = new Date(calendarDayRange(clock?.dayAt ?? now, p.timezone).startAt);
   const plotStart = new Date(
     p.chartPeriod === 'today'
@@ -217,7 +224,7 @@ export async function buildReport(
         ),
       ),
     timeReportQuery('settings', () => getSettings(website.id)),
-    needed('overview', 'logs') && (!clock || now > +todayStart)
+    !prepared?.sharedTodayRequests && needed('overview', 'logs') && (!clock || now > +todayStart)
       ? timeReportQuery('today-logs', () =>
           getLogToday(website.id, todayStart, new Date(Math.max(+todayStart, now))),
         )
@@ -639,6 +646,15 @@ export async function buildReport(
     })),
   );
   r.tables.journeyList = h.journeys;
+  // Source charts use the requested calendar, independent of server log presence.
+  const sourceDays: string[] = [];
+  if (p.resource === 'human/sources')
+    for (
+      let day = calendarDayRange(+start, p.timezone);
+      day.startAt <= +end;
+      day = calendarDayRange(day.endAt + 1, p.timezone)
+    )
+      sourceDays.push(formatInTimeZone(day.startAt, p.timezone, 'yyyy-MM-dd'));
   const dateLabels = Array.from(
     new Set([...h.daily.map(d => d.day), ...l.daily.map(d => d.day)]),
   ).sort();
@@ -715,10 +731,10 @@ export async function buildReport(
   );
   chart(
     's1',
-    dateLabels,
+    p.resource === 'human/sources' ? sourceDays : dateLabels,
     ['直接访问', '传统搜索', '其他引荐', 'AI 搜索引荐'].map(name => ({
       name,
-      values: dateLabels.map(day =>
+      values: (p.resource === 'human/sources' ? sourceDays : dateLabels).map(day =>
         h.dailySources
           .filter(s => s.day === day && channel(s) === name)
           .reduce((sum, s) => sum + s.count, 0),
@@ -925,13 +941,14 @@ export async function buildReport(
   );
   card('访客（UV）', t.visitors, humanState, '', '按当前流量策略去重，可能含未识别自动化');
   card('AI 蜘蛛请求', l.latest ? l.summary.ai : null, logState);
-  card(
-    '今日总请求',
-    l.latest ? todayLogs.requests : null,
-    logState,
-    '',
-    '今日已接入日志的内容请求，排除静态资源扩展名',
-  );
+  if (!prepared?.sharedTodayRequests)
+    card(
+      '今日总请求',
+      l.latest ? todayLogs.requests : null,
+      logState,
+      '',
+      '今日已接入日志的内容请求，排除静态资源扩展名',
+    );
   card(
     '今日转化',
     h.goals.length ? todayConversions : null,
@@ -1199,6 +1216,8 @@ export async function buildReport(
   if (Object.values(geography).some(entries => Object.keys(entries).length))
     r.meta.geography = geography;
   prepared?.decorate?.(r);
-  if (!fullTableExport) capTablePages(r, p.tablePages, pageOnly === true);
-  return applyReportPopulation(r, t.population);
+  const result = applyReportPopulation(r, t.population);
+  await prepared?.publishRankings?.(result);
+  if (!fullTableExport) await capTablePages(result, p.tablePages, pageOnly === true);
+  return result;
 }

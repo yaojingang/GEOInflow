@@ -1,4 +1,6 @@
 'use client';
+import { reportDataThrough } from '@/lib/liekan/upstream/client-freshness';
+import { isReportPreparing, publishedReport } from '@/lib/liekan/contracts/report-status';
 import { calendarDayRange, shiftCalendarRange } from '@/lib/liekan/contracts/calendar';
 import { identityUsable } from '@/lib/liekan/contracts/browser-population';
 import { identityUnavailableReason } from '@/lib/liekan/contracts/population-results';
@@ -7,7 +9,7 @@ import { useLiekanI18n } from '@/lib/liekan/i18n/client';
 
 import { useManualRefresh } from '@/lib/liekan/contracts/manual-refresh';
 import Link from '@/components/liekan/Link';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { formatInTimeZone, fromZonedTime } from 'date-fns-tz';
 import {
   conditionsToQuery,
@@ -85,13 +87,20 @@ function useWebsiteData(
   const c = useFeature();
   return useData(
     key,
-    signal => c.api.get(`${owned ? '/liekan' : ''}/websites/${c.siteId}/${suffix}`, params, signal),
+    signal =>
+      c.api.get(
+        `${owned ? '/liekan' : ''}/websites/${c.siteId}/${suffix}`,
+        params,
+        signal,
+        suffix === 'retention' ? { waitForResult: false } : undefined,
+      ),
     !!c.siteId && enabled,
-    ['sessions', 'session', 'session-properties', 'events', 'realtime'].includes(params.kind) ||
+    suffix === 'retention' ||
+      ['sessions', 'session', 'session-properties', 'events', 'realtime'].includes(params.kind) ||
       suffix.startsWith('journeys/details')
       ? {
           queryKey: ['liekan-feature', c.user.id, c.siteId, ...key, params],
-          staleTime: 0,
+          staleTime: suffix === 'retention' ? Infinity : 0,
           direct: true,
         }
       : undefined,
@@ -178,7 +187,47 @@ export function SessionTable({
     () => setPage(1),
     [c.siteId, JSON.stringify(c.filters), c.range.startAt, c.range.endAt, JSON.stringify(params)],
   );
-  const query = useWebsiteData(['sessions-rich', scope], 'analytics', scope, true, true);
+  const reading = useManualRefresh();
+  const boundaryKey = JSON.stringify([
+    c.siteId,
+    c.filters,
+    c.range,
+    params,
+    reading?.page.token,
+    reading?.page.round,
+  ]);
+  const [boundaryRound, setBoundaryRound] = useState(0);
+  const boundary = useRef({ key: boundaryKey, token: undefined as string | undefined });
+  if (boundary.current.key !== boundaryKey)
+    boundary.current = { key: boundaryKey, token: undefined };
+  const query = useData(
+    ['sessions-rich', scope],
+    async signal => {
+      const owner = boundary.current;
+      try {
+        const data = await c.api.get(
+          `/liekan/websites/${c.siteId}/analytics`,
+          { ...scope, readBoundary: owner.token },
+          signal,
+        );
+        if (boundary.current === owner) owner.token = data.readBoundary;
+        return data;
+      } catch (error) {
+        if ((error as any)?.status === 409 && owner.token && boundary.current === owner) {
+          boundary.current = { key: boundaryKey, token: undefined };
+          setPage(1);
+          setBoundaryRound(round => round + 1);
+        }
+        throw error;
+      }
+    },
+    !!c.siteId,
+    {
+      queryKey: ['liekan-feature', c.user.id, c.siteId, 'sessions-rich', scope, boundaryRound],
+      staleTime: 0,
+      direct: true,
+    },
+  );
   const data = query.data;
   return (
     <Panel
@@ -1551,17 +1600,19 @@ function Retention() {
   const startAt = +fromZonedTime(`${month}-01T00:00:00`, c.range.timezone);
   const next = new Date(`${month}-01T00:00:00Z`);
   next.setUTCMonth(next.getUTCMonth() + 1);
-  const endAt = Math.min(
-    readAt,
-    +fromZonedTime(`${next.toISOString().slice(0, 10)}T00:00:00`, c.range.timezone) - 1,
-  );
+  const endAt = +fromZonedTime(`${next.toISOString().slice(0, 10)}T00:00:00`, c.range.timezone) - 1;
   const { segment: ignoredSegment, cohort: ignoredCohort, ...rest } = c.filters;
   const [type, id] = audience.split(':');
   const scope = { ...c.range, startAt, endAt, ...rest, ...(id ? { [type]: id } : {}) };
-  const query = useWebsiteData(['retention', month, audience], 'retention', scope);
+  const rawQuery = useWebsiteData(['retention', month, audience], 'retention', scope);
+  const preparing = !rawQuery.error && isReportPreparing(rawQuery.data);
+  const query = { ...rawQuery, data: publishedReport(rawQuery.data) };
   const rows: any[] = query.data || [];
   const cohorts = rows.filter(r => Number(r.day) === 0);
-  const cutoff = completedObservationDate(endAt, c.range.timezone);
+  const cutoff = completedObservationDate(
+    Math.min(endAt, reportDataThrough(rawQuery.data) ?? readAt),
+    c.range.timezone,
+  );
   const days = [1, 2, 3, 4, 5, 6, 7, 14, 21, 28];
   const summary = days
     .filter(d => [1, 7, 28].includes(d))
@@ -1608,171 +1659,187 @@ function Retention() {
         </div>
         <Button onClick={() => setInfo(true)}>{i18n.text('口径说明')}</Button>
       </div>
-      <Metrics
-        loading={query.isPending}
-        items={[
-          [
-            i18n.text('入组访客'),
-            query.data
-              ? n(
-                  cohorts.some(r => r.visitors === null)
-                    ? null
-                    : cohorts.reduce((s, r) => s + Number(r.visitors), 0),
-                )
-              : null,
-            i18n.text('按所选期间首次访问日期分组'),
-          ],
-          ...summary.map(
-            (s, i) =>
+      {preparing ? (
+        <Notice>
+          {i18n.text('数据准备中，请稍后查看')}{' '}
+          <Button onClick={() => void rawQuery.refetch()}>{i18n.text('重新查看')}</Button>
+        </Notice>
+      ) : (
+        <>
+          <Metrics
+            loading={query.isPending}
+            items={[
               [
-                i === 0
-                  ? i18n.text('次日留存')
-                  : i === 1
-                    ? i18n.text('第 7 天留存')
-                    : i18n.text('第 28 天留存'),
-                s.percentage == null ? i18n.text('待观察') : `${s.percentage.toFixed(2)}%`,
-                i18n.text('完整观察队列'),
-              ] as [string, string, string],
-          ),
-        ]}
-      />
-      <Panel
-        title={i18n.text('日队列留存矩阵')}
-        subtitle={i18n.text('点击单元格查看分子、分母及关联记录。未到观察日的格子显示“待观察”。')}
-      >
-        <QueryState query={query}>
-          <div className="table-wrap">
-            <MatrixTable
-              headings={[
-                i18n.text('入组日期 / 人数'),
-                ...days.map(d => i18n.text('第 {v0} 天', [d])),
-              ]}
-            >
-              <tbody>
-                {cohorts.map(cohort => {
-                  const day = String(cohort.date).slice(0, 10);
-                  return (
-                    <tr key={day}>
-                      <td>
-                        <strong>{day.slice(5)}</strong>
-                        <small style={{ display: 'block' }}>
-                          {n(cohort.visitors)}
-                          {i18n.fragment(' 位访客', true, false)}
-                        </small>
-                      </td>
-                      {days.map(d => {
-                        const target = new Date(`${day}T00:00:00Z`);
-                        target.setUTCDate(target.getUTCDate() + d);
-                        if (target.toISOString().slice(0, 10) > cutoff)
-                          return (
-                            <td key={d}>
-                              <span className="heat-cell unobserved" style={{ display: 'block' }}>
-                                {i18n.text('待观察')}
-                              </span>
-                            </td>
-                          );
-                        const matched = rows.find(
-                          r => String(r.date).slice(0, 10) === day && Number(r.day) === d,
-                        );
-                        const returned =
-                          matched?.returnVisitors === null
-                            ? null
-                            : Number(matched?.returnVisitors || 0);
-                        const pct =
-                          cohort.visitors === null || returned === null
-                            ? null
-                            : (returned / Number(cohort.visitors)) * 100;
-                        return (
-                          <td key={d}>
-                            <button
-                              className="heat-cell"
-                              style={{ background: `rgba(15,98,254,${(pct ?? 0) / 90 + 0.06})` }}
-                              disabled={pct === null}
-                              aria-label={i18n.text('{v0} 入组，第 {v1} 天，留存 {v2}%', [
-                                day,
-                                d,
-                                pct?.toFixed(2),
-                              ])}
-                              onClick={() =>
-                                setDetail({
-                                  day,
-                                  date: day,
-                                  offset: d,
-                                  total: Number(cohort.visitors),
-                                  returned,
-                                })
-                              }
-                            >
-                              {pct === null ? '—' : `${pct.toFixed(2)}%`}
-                            </button>
+                i18n.text('入组访客'),
+                query.data
+                  ? n(
+                      cohorts.some(r => r.visitors === null)
+                        ? null
+                        : cohorts.reduce((s, r) => s + Number(r.visitors), 0),
+                    )
+                  : null,
+                i18n.text('按所选期间首次访问日期分组'),
+              ],
+              ...summary.map(
+                (s, i) =>
+                  [
+                    i === 0
+                      ? i18n.text('次日留存')
+                      : i === 1
+                        ? i18n.text('第 7 天留存')
+                        : i18n.text('第 28 天留存'),
+                    s.percentage == null ? i18n.text('待观察') : `${s.percentage.toFixed(2)}%`,
+                    i18n.text('完整观察队列'),
+                  ] as [string, string, string],
+              ),
+            ]}
+          />
+          <Panel
+            title={i18n.text('日队列留存矩阵')}
+            subtitle={i18n.text(
+              '点击单元格查看分子、分母及关联记录。未到观察日的格子显示“待观察”。',
+            )}
+          >
+            <QueryState query={query}>
+              <div className="table-wrap">
+                <MatrixTable
+                  headings={[
+                    i18n.text('入组日期 / 人数'),
+                    ...days.map(d => i18n.text('第 {v0} 天', [d])),
+                  ]}
+                >
+                  <tbody>
+                    {cohorts.map(cohort => {
+                      const day = String(cohort.date).slice(0, 10);
+                      return (
+                        <tr key={day}>
+                          <td>
+                            <strong>{day.slice(5)}</strong>
+                            <small style={{ display: 'block' }}>
+                              {n(cohort.visitors)}
+                              {i18n.fragment(' 位访客', true, false)}
+                            </small>
                           </td>
-                        );
-                      })}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </MatrixTable>
-          </div>
-          {!cohorts.length && <Notice>{i18n.text('当前月份与人群条件没有入组访客。')}</Notice>}
-          <div className="table-footer">
-            <span>{i18n.text('深浅表示留存比例，百分比同时显示。')}</span>
-            <span>
-              {i18n.fragment('观察截止：', false, true)}
-              {cutoff}
-            </span>
-          </div>
-        </QueryState>
-      </Panel>
-      <Notice>
-        {i18n.text(
-          '按所选期间首次访问日期入组，以第 N 天再次访问衡量留存。汇总只统计已完整观察的队列；0% 与待观察分别表达。',
-        )}
-      </Notice>
-      {info && (
-        <LiekanDialog title={i18n.text('留存计算说明')} onClose={() => setInfo(false)}>
-          <Definition
-            items={[
-              [i18n.text('入组'), i18n.text('按所选期间首次访问日期分组')],
-              [i18n.text('留存'), i18n.text('第 N 天再次访问的人数')],
-              [i18n.text('分母'), i18n.text('当日入组访客数')],
-              [i18n.text('待观察'), i18n.text('尚未达到对应观察日')],
-              [i18n.text('零值'), i18n.text('已经观察，返回人数为 0')],
-            ]}
-          />
-          <hr className="divider" />
-          <Notice>{i18n.text('汇总按入组人数加权，仅纳入观察日已完整结束的队列。')}</Notice>
-        </LiekanDialog>
-      )}
-      {detail && (
-        <LiekanDialog title={i18n.text('留存详情')} onClose={() => setDetail(null)}>
-          <Definition
-            items={[
-              [i18n.text('入组日期'), detail.date],
-              [i18n.text('观察时间'), i18n.text('第 {v0} 天', [detail.offset])],
-              [i18n.text('入组访客'), n(detail.total)],
-              [i18n.text('返回访客'), n(detail.returned)],
-              [i18n.text('留存比例'), percentage(detail.returned, detail.total)],
-            ]}
-          />
-          <hr className="divider" />
-          <DialogActions>
-            <LinkButton
-              page="sessions"
-              params={{
-                ...rest,
-                segment: undefined,
-                cohort: undefined,
-                ...(id ? { [type]: id } : {}),
-                retentionDate: detail.date,
-                retentionDay: detail.offset,
-                date: `range:${startAt}:${endAt}:day`,
-              }}
-            >
-              {i18n.text('查看关联访问记录')}
-            </LinkButton>
-          </DialogActions>
-        </LiekanDialog>
+                          {days.map(d => {
+                            const target = new Date(`${day}T00:00:00Z`);
+                            target.setUTCDate(target.getUTCDate() + d);
+                            if (target.toISOString().slice(0, 10) > cutoff)
+                              return (
+                                <td key={d}>
+                                  <span
+                                    className="heat-cell unobserved"
+                                    style={{ display: 'block' }}
+                                  >
+                                    {i18n.text('待观察')}
+                                  </span>
+                                </td>
+                              );
+                            const matched = rows.find(
+                              r => String(r.date).slice(0, 10) === day && Number(r.day) === d,
+                            );
+                            const returned =
+                              matched?.returnVisitors === null
+                                ? null
+                                : Number(matched?.returnVisitors || 0);
+                            const pct =
+                              cohort.visitors === null || returned === null
+                                ? null
+                                : (returned / Number(cohort.visitors)) * 100;
+                            return (
+                              <td key={d}>
+                                <button
+                                  className="heat-cell"
+                                  style={{
+                                    background: `rgba(15,98,254,${(pct ?? 0) / 90 + 0.06})`,
+                                  }}
+                                  disabled={pct === null}
+                                  aria-label={i18n.text('{v0} 入组，第 {v1} 天，留存 {v2}%', [
+                                    day,
+                                    d,
+                                    pct?.toFixed(2),
+                                  ])}
+                                  onClick={() =>
+                                    setDetail({
+                                      day,
+                                      date: day,
+                                      offset: d,
+                                      total: Number(cohort.visitors),
+                                      returned,
+                                    })
+                                  }
+                                >
+                                  {pct === null ? '—' : `${pct.toFixed(2)}%`}
+                                </button>
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </MatrixTable>
+              </div>
+              {!cohorts.length && <Notice>{i18n.text('当前月份与人群条件没有入组访客。')}</Notice>}
+              <div className="table-footer">
+                <span>{i18n.text('深浅表示留存比例，百分比同时显示。')}</span>
+                <span>
+                  {i18n.fragment('观察截止：', false, true)}
+                  {cutoff}
+                </span>
+              </div>
+            </QueryState>
+          </Panel>
+          <Notice>
+            {i18n.text(
+              '按所选期间首次访问日期入组，以第 N 天再次访问衡量留存。汇总只统计已完整观察的队列；0% 与待观察分别表达。',
+            )}
+          </Notice>
+          {info && (
+            <LiekanDialog title={i18n.text('留存计算说明')} onClose={() => setInfo(false)}>
+              <Definition
+                items={[
+                  [i18n.text('入组'), i18n.text('按所选期间首次访问日期分组')],
+                  [i18n.text('留存'), i18n.text('第 N 天再次访问的人数')],
+                  [i18n.text('分母'), i18n.text('当日入组访客数')],
+                  [i18n.text('待观察'), i18n.text('尚未达到对应观察日')],
+                  [i18n.text('零值'), i18n.text('已经观察，返回人数为 0')],
+                ]}
+              />
+              <hr className="divider" />
+              <Notice>{i18n.text('汇总按入组人数加权，仅纳入观察日已完整结束的队列。')}</Notice>
+            </LiekanDialog>
+          )}
+          {detail && (
+            <LiekanDialog title={i18n.text('留存详情')} onClose={() => setDetail(null)}>
+              <Definition
+                items={[
+                  [i18n.text('入组日期'), detail.date],
+                  [i18n.text('观察时间'), i18n.text('第 {v0} 天', [detail.offset])],
+                  [i18n.text('入组访客'), n(detail.total)],
+                  [i18n.text('返回访客'), n(detail.returned)],
+                  [i18n.text('留存比例'), percentage(detail.returned, detail.total)],
+                ]}
+              />
+              <hr className="divider" />
+              <DialogActions>
+                <LinkButton
+                  page="sessions"
+                  params={{
+                    ...rest,
+                    segment: undefined,
+                    cohort: undefined,
+                    ...(id ? { [type]: id } : {}),
+                    retentionDate: detail.date,
+                    retentionDay: detail.offset,
+                    date: `range:${startAt}:${endAt}:day`,
+                  }}
+                >
+                  {i18n.text('查看关联访问记录')}
+                </LinkButton>
+              </DialogActions>
+            </LiekanDialog>
+          )}
+        </>
       )}
     </>
   );

@@ -558,7 +558,11 @@ export function useManualQueryOptions(options: any) {
     refetchOnMount: (query: any) =>
       reading && visitReads.get(hashKey(key)) === epoch
         ? false
-        : !hasClientFreshness(query.state.data) ||
+        : (options.meta?.revalidatePublishedParts &&
+              (typeof options.refetchOnMount === 'function'
+                ? options.refetchOnMount(query)
+                : options.refetchOnMount) === 'always') ||
+            !hasClientFreshness(query.state.data) ||
             remainingFreshness(query.state.data, query.state.dataUpdatedAt) <= 0
           ? ('always' as const)
           : false,
@@ -713,10 +717,15 @@ export function useRetainedRead(
   const principalPaused =
     options?.meta?.readPurpose === 'ordinary' &&
     (reading?.authorized === false || options.meta.manualAuthorized === false);
-  const relativeClock = options?.meta?.manualClock &&
-    !String(options.meta.manualClock.conditions || '').split('|')[0].startsWith('range:');
-  const liveInterval = reading && readable && !restricted && !principalPaused
-    ? liveReadInterval(key, relativeClock ? options.meta.manualClock.now : Date.now()) : false;
+  const relativeClock =
+    options?.meta?.manualClock &&
+    !String(options.meta.manualClock.conditions || '')
+      .split('|')[0]
+      .startsWith('range:');
+  const liveInterval =
+    reading && readable && !restricted && !principalPaused
+      ? liveReadInterval(key, relativeClock ? options.meta.manualClock.now : Date.now())
+      : false;
   const liveRead = useRef({ result, reading, options });
   liveRead.current = { result, reading, options };
   useEffect(() => {

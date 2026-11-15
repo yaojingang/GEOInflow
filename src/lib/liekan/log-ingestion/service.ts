@@ -195,8 +195,10 @@ export async function listSources(websiteId: string) {
         WHEN latest.state IN ('failed','cancelled') THEN latest.state
         WHEN latest.state='processed' AND upload.inserted>0 THEN 'published'
         WHEN latest.state='processed' THEN 'processed'
+        WHEN upload.batch_id IS NULL THEN
+          CASE WHEN NOT $2::boolean AND latest.has_payload THEN 'queued' ELSE 'queue_unconfirmed' END
         WHEN upload.processed>0 THEN 'processing'
-        WHEN NOT upload.queued THEN 'registered'
+        WHEN upload.queued IS FALSE THEN 'registered'
         ELSE 'queued'
       END,
       'expected',latest.valid,
@@ -206,13 +208,15 @@ export async function listSources(websiteId: string) {
     FROM liekan_log_source s
     LEFT JOIN liekan_log_state log_state ON log_state.website_id=s.website_id
     LEFT JOIN LATERAL (
-      SELECT b.id,b.received_at,b.state,b.valid,b.inserted FROM liekan_ingest_batch b
+      SELECT b.id,b.received_at,b.state,b.valid,b.inserted,b.payload IS NOT NULL AS has_payload
+      FROM liekan_ingest_batch b
       WHERE b.website_id=s.website_id AND b.source_id=s.id AND b.epoch=coalesce(log_state.epoch,1)
       ORDER BY b.received_at DESC,b.id DESC LIMIT 1
     ) latest ON true
     LEFT JOIN liekan_warehouse_upload upload ON upload.batch_id=latest.id AND upload.website_id=s.website_id
     WHERE s.website_id=$1::uuid AND (s.state!='disconnected' OR s.provider_config IS NOT NULL) ORDER BY s.created_at DESC`,
     websiteId,
+    warehouseIntakeEnabled(),
   );
 }
 export async function receiveBatch(request: Request, sourceId: string) {

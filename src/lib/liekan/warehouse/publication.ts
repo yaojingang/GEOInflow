@@ -11,6 +11,7 @@ import { stableOperation } from './identifiers';
 import { LandingStore } from './landing';
 import { projectLogScopeProofs } from './log-scope-proof';
 import { projectRiskProofs } from './risk-proof';
+import { setTimeout as delay } from 'node:timers/promises';
 
 export type ManifestEntry = {
   attemptId: string;
@@ -129,85 +130,100 @@ export class WarehousePublisher {
         throw new WarehouseConflict('warehouse-candidate-attempt-mismatch');
       verified.set(entry, result);
     }
-    return this.db.transaction(async tx => {
-      const { rows: sites } = await tx.query<{ epoch: string; publication: string; state: string }>(
-        // Serialize publication/epoch changes without blocking the foreign-key
-        // locks held by concurrent upload registration and queue discovery.
-        'SELECT epoch,publication,state FROM liekan_warehouse_site WHERE website_id=$1::uuid FOR NO KEY UPDATE',
-        [websiteId],
-      );
-      if (
-        !sites[0] ||
-        BigInt(sites[0].epoch) < BigInt(epoch) ||
-        ((sites[0].epoch !== epoch || sites[0].state !== 'active') &&
-          !(await historicalPublication(tx, websiteId, epoch, entries)))
-      )
-        throw new WarehouseConflict('warehouse-site-changed');
-      const previous = await tx.query<Publication>(
-        'SELECT * FROM liekan_warehouse_publication WHERE operation_id=$1::uuid',
-        [operationId],
-      );
-      if (previous.rows.length) {
-        const p = previous.rows[0];
-        if (p.manifest_digest !== digest || p.website_id !== websiteId || p.epoch !== epoch)
-          throw new WarehouseConflict('warehouse-publication-conflict');
-        return p;
-      }
-      for (const entry of entries) {
-        const [attempt] = (
-          await tx.query<{ website_id: string; epoch: string; version: string; status: string }>(
-            'SELECT website_id,epoch,version,status FROM liekan_warehouse_attempt WHERE attempt_id=$1::uuid',
-            [entry.attemptId],
-          )
-        ).rows;
-        if (attempt) {
-          if (
-            !['confirmed', 'projected'].includes(attempt.status) ||
-            attempt.website_id !== websiteId ||
-            attempt.epoch !== epoch ||
-            verified.get(entry).versions.some(v => v !== attempt.version)
-          )
-            throw new WarehouseConflict('warehouse-publication-unconfirmed');
-        } else {
-          const [page] = (
-            await tx.query<{ migration_id: string; page_key: string }>(
-              `SELECT c.migration_id,c.page_key
+    // Another partition can be between its durable reservation and CH manifest
+    // acknowledgement. Keep our already verified package while it completes;
+    // aborting here used to repeat derivation and impose a two-second retry.
+    // Wait only outside the transaction, with a bounded fallback to recovery.
+    const waitUntil = Date.now() + 1000;
+    for (;;) {
+      const reserved = await this.db.transaction(async tx => {
+        const { rows: sites } = await tx.query<{
+          epoch: string;
+          publication: string;
+          state: string;
+        }>(
+          // Serialize publication/epoch changes without blocking the foreign-key
+          // locks held by concurrent upload registration and queue discovery.
+          'SELECT epoch,publication,state FROM liekan_warehouse_site WHERE website_id=$1::uuid FOR NO KEY UPDATE',
+          [websiteId],
+        );
+        if (
+          !sites[0] ||
+          BigInt(sites[0].epoch) < BigInt(epoch) ||
+          ((sites[0].epoch !== epoch || sites[0].state !== 'active') &&
+            !(await historicalPublication(tx, websiteId, epoch, entries)))
+        )
+          throw new WarehouseConflict('warehouse-site-changed');
+        const previous = await tx.query<Publication>(
+          'SELECT * FROM liekan_warehouse_publication WHERE operation_id=$1::uuid',
+          [operationId],
+        );
+        if (previous.rows.length) {
+          const p = previous.rows[0];
+          if (p.manifest_digest !== digest || p.website_id !== websiteId || p.epoch !== epoch)
+            throw new WarehouseConflict('warehouse-publication-conflict');
+          return p;
+        }
+        for (const entry of entries) {
+          const [attempt] = (
+            await tx.query<{ website_id: string; epoch: string; version: string; status: string }>(
+              'SELECT website_id,epoch,version,status FROM liekan_warehouse_attempt WHERE attempt_id=$1::uuid',
+              [entry.attemptId],
+            )
+          ).rows;
+          if (attempt) {
+            if (
+              !['confirmed', 'projected'].includes(attempt.status) ||
+              attempt.website_id !== websiteId ||
+              attempt.epoch !== epoch ||
+              verified.get(entry).versions.some(v => v !== attempt.version)
+            )
+              throw new WarehouseConflict('warehouse-publication-unconfirmed');
+          } else {
+            const [page] = (
+              await tx.query<{ migration_id: string; page_key: string }>(
+                `SELECT c.migration_id,c.page_key
             FROM liekan_warehouse_checkpoint c JOIN liekan_warehouse_migration m USING(migration_id)
             WHERE c.candidate_id=$1::uuid AND c.family=$2 AND c.status IN ('verified','published')
               AND m.phase IN ('backfill','verify','shadow','frozen') AND m.boundary->'sites'->>$3=$4`,
-              [entry.candidateId, entry.family, websiteId, epoch],
+                [entry.candidateId, entry.family, websiteId, epoch],
+              )
+            ).rows;
+            if (
+              !page ||
+              entry.attemptId !==
+                stableOperation([page.migration_id, entry.family, page.page_key]) ||
+              verified.get(entry).versions.some(v => v !== '0')
             )
-          ).rows;
-          if (
-            !page ||
-            entry.attemptId !== stableOperation([page.migration_id, entry.family, page.page_key]) ||
-            verified.get(entry).versions.some(v => v !== '0')
-          )
-            throw new WarehouseConflict('warehouse-publication-unconfirmed');
+              throw new WarehouseConflict('warehouse-publication-unconfirmed');
+          }
         }
-      }
-      const pending = await tx.query(
-        "SELECT 1 FROM liekan_warehouse_publication WHERE website_id=$1::uuid AND status='reserved'",
-        [websiteId],
-      );
-      if (pending.rows.length) throw new WarehouseConflict('warehouse-publication-pending');
-      // The readback above is shared by derivation and publication. Advance
-      // candidate state in the same transaction as the durable reservation.
-      await tx.query(
-        `UPDATE liekan_warehouse_candidate SET status='verified',updated_at=clock_timestamp()
+        const pending = await tx.query(
+          "SELECT 1 FROM liekan_warehouse_publication WHERE website_id=$1::uuid AND status='reserved'",
+          [websiteId],
+        );
+        if (pending.rows.length) return null;
+        // The readback above is shared by derivation and publication. Advance
+        // candidate state in the same transaction as the durable reservation.
+        await tx.query(
+          `UPDATE liekan_warehouse_candidate SET status='verified',updated_at=clock_timestamp()
         WHERE candidate_id=ANY($1::uuid[]) AND website_id=$2::uuid AND epoch=$3::bigint
           AND status='building'`,
-        [entries.map(entry => entry.candidateId), websiteId, epoch],
-      );
-      return (
-        await tx.query<Publication>(
-          `INSERT INTO liekan_warehouse_publication
+          [entries.map(entry => entry.candidateId), websiteId, epoch],
+        );
+        return (
+          await tx.query<Publication>(
+            `INSERT INTO liekan_warehouse_publication
         (operation_id,website_id,epoch,publication,manifest,manifest_digest,status)
         VALUES($1::uuid,$2::uuid,$3::bigint,$4::bigint+1,$5::jsonb,$6,'reserved') RETURNING *`,
-          [operationId, websiteId, epoch, sites[0].publication, JSON.stringify(entries), digest],
-        )
-      ).rows[0];
-    });
+            [operationId, websiteId, epoch, sites[0].publication, JSON.stringify(entries), digest],
+          )
+        ).rows[0];
+      });
+      if (reserved) return reserved;
+      if (Date.now() >= waitUntil) throw new WarehouseConflict('warehouse-publication-pending');
+      await delay(Math.min(50, waitUntil - Date.now()));
+    }
   }
 
   // All records in this small manifest use one month/insert block. Retrying the

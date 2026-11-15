@@ -40,13 +40,14 @@ export function warehouseFeatureSelection(
   filters: any,
   all = false,
   name = 'selected',
+  projection?: readonly string[],
 ) {
   const { filterQuery, cohortQuery, excludeBounceQuery, queryParams } = clickhouse.parseFilters({
     ...filters,
     websiteId,
   });
   return {
-    cte: `WITH ${name} AS (SELECT website_event.* FROM website_event ${cohortQuery} ${excludeBounceQuery}
+    cte: `WITH ${name} AS (SELECT ${projection ? projection.map(c => `website_event.${c}`).join(',') : 'website_event.*'} FROM website_event ${cohortQuery} ${excludeBounceQuery}
     WHERE website_event.website_id={websiteId:UUID} AND website_event.created_at BETWEEN {startDate:DateTime64(6)} AND {endDate:DateTime64(6)}
     ${all ? '' : 'AND website_event.event_type IN(1,2)'} ${filterQuery})`,
     params: queryParams,
@@ -64,6 +65,22 @@ function attributed(cte: string, source: string, p: { model: string; type: strin
     ${prefix}attributed AS(SELECT c.session_id,s.source.1 AS referrer_domain,s.source.2 AS hostname FROM ${prefix}conversions c LEFT JOIN ${prefix}source s USING(session_id))`;
 }
 export function warehouseSelectedFeatures(websiteId: string, p: any, filters: any) {
+  if (p.kind === 'realtime' && !p.retentionDate && !p.attributionStep) {
+    // These metrics need no geographic anchor. Geography filters, when present,
+    // still appear explicitly in the predicate and select the geographic relation.
+    const fields = ['session_id', 'created_at', 'event_type', 'url_path', 'referrer_domain'];
+    const selection = warehouseFeatureSelection(
+      websiteId,
+      filters,
+      false,
+      'filtered_events',
+      fields,
+    );
+    return {
+      ...selection,
+      cte: selection.cte + `,selected AS(SELECT ${fields.join(',')} FROM filtered_events)`,
+    };
+  }
   let source = p.retentionDate ? 'cohort_events' : 'filtered_events';
   let { cte, params } = warehouseFeatureSelection(websiteId, filters, !!p.retentionDate, source);
   if (p.retentionDate) {
@@ -224,13 +241,19 @@ export async function warehouseFeatureAnalytics(websiteId: string, p: any, filte
     };
   }
   if (p.kind === 'sessions') {
-    const [count] = await run('SELECT uniqExact(session_id) AS count FROM selected');
     const rows = await run(
-      `SELECT session_id AS id,minOrNull(created_at) AS firstAt,maxOrNull(created_at) AS lastAt,uniqExact(visit_id) AS visits,countIf(event_type=1) AS views,countIf(event_type=2) AS events,${seconds()} AS seconds,${first('referrer_domain')} AS referrerDomain,${last('url_path')} AS urlPath,
+      `SELECT count() OVER () AS _page_count,session_id AS id,minOrNull(created_at) AS firstAt,maxOrNull(created_at) AS lastAt,uniqExact(visit_id) AS visits,countIf(event_type=1) AS views,countIf(event_type=2) AS events,${seconds()} AS seconds,${first('referrer_domain')} AS referrerDomain,${last('url_path')} AS urlPath,
       ${getClickHouseCountrySQL(last('liekan_country'))} AS country,${['region', 'city', 'browser', 'os', 'device'].map(c => `${last(`liekan_${c}`)} AS ${c}`).join(',')} FROM selected GROUP BY session_id ORDER BY lastAt DESC,session_id LIMIT 25 OFFSET {offset:UInt64}`,
       { offset: (p.page - 1) * 25 },
     );
-    return { rows, count: count.count, page: p.page, pageSize: 25 };
+    // Count the grouped result before LIMIT in the same scan. Only an out-of-range
+    // page needs a separate count because it has no row carrying the window value.
+    const count = rows.length
+      ? rows[0]._page_count
+      : p.page > 1
+        ? (await run('SELECT uniqExact(session_id) AS count FROM selected'))[0].count
+        : 0;
+    return { rows: rows.map(({ _page_count, ...row }) => row), count, page: p.page, pageSize: 25 };
   }
   if (p.kind === 'realtime') {
     const cutoff = new Date(p.endAt - 5 * 60000);
@@ -246,7 +269,7 @@ export async function warehouseFeatureAnalytics(websiteId: string, p: any, filte
     const { ai, sources } = await warehouseRealtimeSources(
       emit =>
         warehouseNativeStringStream<{ id: string; referrer: string | null }>(
-          `${cte} SELECT DISTINCT session_id AS id,referrer_domain AS referrer FROM selected WHERE created_at>={cutoff:DateTime64(6)}`,
+          `${cte} SELECT DISTINCT session_id AS id,referrer_domain AS referrer FROM selected WHERE created_at>={cutoff:DateTime64(6)} ORDER BY id,referrer`,
           { ...params, cutoff },
           async rows => {
             for (const row of rows) await emit(row);

@@ -134,6 +134,7 @@ export interface InstallationStatus {
       state:
         | 'registered'
         | 'queued'
+        | 'queue_unconfirmed'
         | 'processing'
         | 'published'
         | 'processed'

@@ -102,6 +102,9 @@ export const reportQuery = z.object({
   tablePages: z.record(z.string(), z.coerce.number().int().min(1).max(tablePageMax)).default({}),
 });
 export type ReportQuery = z.output<typeof reportQuery>;
+export const reportVersionSchema = z.string().regex(/^[a-f0-9]{64}$/);
+export const overviewVersionSchema = z.string().regex(/^[a-f0-9]{64}$/);
+export const overviewVersionConflict = 'overview-version-invalidated';
 export const isReportOwnedBy = (key: readonly unknown[], userId: string) =>
   key[0] === 'liekan' && key[14] === userId;
 /** Keep a rolling snapshot within its resource and query conditions. */

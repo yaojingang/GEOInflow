@@ -18,6 +18,40 @@ import {
 } from './features-client';
 import { freshnessExpiry, withClientFreshness } from './client-freshness';
 
+it('returns a scheduled report immediately without polling when the page requests a status result', async () => {
+  vi.useFakeTimers();
+  const fetcher = vi
+    .fn()
+    .mockResolvedValue(
+      Response.json(
+        { status: 'scheduled' },
+        { status: 202, headers: { 'X-Liekan-Read-Path': 'scheduled' } },
+      ),
+    );
+  vi.stubGlobal('fetch', fetcher);
+  try {
+    let received: any;
+    const reading = featureApi
+      .get(
+        '/liekan/websites/11111111-1111-4111-8111-111111111111/page-report',
+        { resource: 'overview', startAt: 1, endAt: 2 },
+        undefined,
+        { waitForResult: false },
+      )
+      .then(value => {
+        received = value;
+      });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(received).toMatchObject({ status: 'preparing' });
+    await reading;
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  }
+});
+
 it('waits for a scheduled overview by rereading the same report', async () => {
   vi.useFakeTimers();
   vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');

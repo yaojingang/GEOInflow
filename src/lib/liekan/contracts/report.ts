@@ -50,12 +50,25 @@ export interface LiekanReport {
   tables: Record<string, Row[]>;
   insights: string[];
   meta: {
+    todayRequests?: {
+      state: 'ready' | 'updating' | 'preparing' | 'failed';
+      range: { startAt: number; endAt: number; timezone: string };
+      dataThrough?: number;
+      generatedAt?: number;
+      intervalMs: number;
+      updateError?: boolean;
+    };
     snapshot?: {
       dataThrough: number;
       version?: string;
       state: 'ready' | 'updating';
       intervalMs: number;
       updateError?: boolean;
+      fallback?: {
+        requestedRange: { startAt: number; endAt: number; timezone: string };
+        sourceRange: { startAt: number; endAt: number; timezone: string };
+        chartPeriod: 'today' | '7d' | '30d' | '24h';
+      };
     };
     population?: BrowserPopulation;
     trendPopulation?: BrowserPopulation;
@@ -189,6 +202,16 @@ export const liekanReportSchema = z.object({
   ),
   insights: z.array(z.string()),
   meta: z.object({
+    todayRequests: z
+      .object({
+        state: z.enum(['ready', 'updating', 'preparing', 'failed']),
+        range: z.object({ startAt: z.number(), endAt: z.number(), timezone: z.string() }),
+        dataThrough: z.number().optional(),
+        generatedAt: z.number().optional(),
+        intervalMs: z.number(),
+        updateError: z.boolean().optional(),
+      })
+      .optional(),
     snapshot: z
       .object({
         dataThrough: z.number(),
@@ -196,6 +219,17 @@ export const liekanReportSchema = z.object({
         state: z.enum(['ready', 'updating']),
         intervalMs: z.number(),
         updateError: z.boolean().optional(),
+        fallback: z
+          .object({
+            requestedRange: z.object({
+              startAt: z.number(),
+              endAt: z.number(),
+              timezone: z.string(),
+            }),
+            sourceRange: z.object({ startAt: z.number(), endAt: z.number(), timezone: z.string() }),
+            chartPeriod: z.enum(['today', '7d', '30d', '24h']),
+          })
+          .optional(),
       })
       .optional(),
     population: browserPopulationSchema.optional(),

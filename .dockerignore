@@ -26,6 +26,7 @@ scripts/seed
 scripts/seed-data.ts
 scripts/test-api.ts
 tests
+!tests/liekan/report-plan-fixture.ts
 playwright.config.ts
 playwright.api.config.ts
 docker-compose.test.yml

@@ -1,5 +1,5 @@
 import { onlineManager, QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { featureDateRange } from '@/lib/liekan/contracts/analysis';
 import { ManualRefreshProvider } from '@/lib/liekan/contracts/manual-refresh';
@@ -13,6 +13,7 @@ const state = vi.hoisted(() => ({
   compare: false,
   date: '30day' as string | undefined,
   dateMode: undefined as string | undefined,
+  selectedRange: undefined as { startDate: Date; endDate: Date } | undefined,
   invalidDate: false,
   push: vi.fn(),
   replace: vi.fn(),
@@ -94,7 +95,10 @@ vi.mock('@/lib/liekan/upstream/client', async () => {
     useFeatureAppState: (select: any) => select({ user: { id: 'current-user' } }),
     useWebsite: () => ({ id: 'site-a', name: '当前网站' }),
     useFeatureDateRange: () => ({
-      dateRange: { startDate: new Date('2026-09-01'), endDate: new Date('2026-10-01') },
+      dateRange: state.selectedRange ?? {
+        startDate: new Date('2026-09-01'),
+        endDate: new Date('2026-10-01'),
+      },
       invalidDate: state.invalidDate,
     }),
     useNavigation: () => ({
@@ -112,11 +116,11 @@ vi.mock('@/lib/liekan/upstream/client', async () => {
   };
 });
 function deferred<T>() {
-  let resolve: (value: T) => void;
+  let resolve: (value: T | PromiseLike<T>) => void;
   const promise = new Promise<T>(done => {
     resolve = done;
   });
-  return { promise, resolve: (value: T) => resolve(value) };
+  return { promise, resolve: (value: T | PromiseLike<T>) => resolve(value) };
 }
 const report = (value: string, range?: { startAt: number; endAt: number; timezone: string }) =>
   freshAggregateFixture({
@@ -145,6 +149,7 @@ beforeEach(() => {
   state.extraQuery = {};
   state.date = '30day';
   state.dateMode = undefined;
+  state.selectedRange = undefined;
   state.invalidDate = false;
   state.updateParams.mockReset().mockReturnValue('/next-range');
   state.push.mockReset();
@@ -171,6 +176,162 @@ function overviewFixture(page: number, path: string, version?: string, requests 
     },
   });
 }
+
+it('switches only the trend to a canonical published period without navigating the report', async () => {
+  state.date = '7day';
+  const pending = deferred<any>();
+  state.get.mockImplementation((_path, params) =>
+    params.chartPeriod === '30d'
+      ? pending.promise
+      : Promise.resolve(overviewFixture(1, '/stable-ranking')),
+  );
+  render(
+    <QueryClientProvider client={client}>
+      <ManualRefreshProvider>
+        <LiekanPage resource="overview" />
+      </ManualRefreshProvider>
+    </QueryClientProvider>,
+  );
+  await screen.findByText('/stable-ranking');
+  const card = screen.getByText('8,737');
+  fireEvent.click(
+    within(screen.getByText('AI 蜘蛛与浏览访问趋势').closest('section')).getByRole('button', {
+      name: '30 天',
+    }),
+  );
+  await waitFor(() =>
+    expect(state.get.mock.calls.some(([, p]) => p.chartPeriod === '30d')).toBe(true),
+  );
+  const trendCall = state.get.mock.calls.find(([, p]) => p.chartPeriod === '30d')[1];
+  const initialCall = state.get.mock.calls.find(([, p]) => p.chartPeriod === '7d')[1];
+  expect(trendCall.startAt).not.toBe(initialCall.startAt);
+  expect(state.push).not.toHaveBeenCalled();
+  expect(screen.getByText('8,737')).toBe(card);
+  expect(screen.getByText('/stable-ranking')).toBeVisible();
+  await act(async () => pending.resolve({ status: 'preparing' }));
+  expect(await screen.findByText('数据准备中，请稍后查看')).toBeVisible();
+  expect(screen.getByText('8,737')).toBe(card);
+  expect(screen.getByText('/stable-ranking')).toBeVisible();
+  expect(document.querySelector('[data-report-trend]')).toContainElement(
+    screen.getByText('数据准备中，请稍后查看'),
+  );
+  expect(document.querySelector('[data-report-trend] [aria-busy="true"]')).toBeNull();
+  expect(within(document.querySelector('[data-report-trend]') as HTMLElement).getByText(/近 30 天/)).toBeVisible();
+  const reads = state.get.mock.calls.length;
+  fireEvent.focus(window);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  expect(state.get).toHaveBeenCalledTimes(reads);
+});
+
+it('keeps bookmarked chart periods out of the main report identity and ignores late trend responses', async () => {
+  state.date = '7day';
+  state.extraQuery = { chartPeriod: '30d' };
+  const late = deferred<any>();
+  state.get.mockImplementation((_path, p) =>
+    p.chartPeriod === '30d' ? late.promise : Promise.resolve(overviewFixture(1, '/stable-ranking')),
+  );
+  render(
+    <QueryClientProvider client={client}>
+      <ManualRefreshProvider>
+        <LiekanPage resource="overview" />
+      </ManualRefreshProvider>
+    </QueryClientProvider>,
+  );
+  await screen.findByText('/stable-ranking');
+  await waitFor(() =>
+    expect(state.get.mock.calls.some(([, p]) => p.chartPeriod === '30d')).toBe(true),
+  );
+  const chart = within(document.querySelector('[data-report-trend]') as HTMLElement);
+  fireEvent.click(chart.getByRole('button', { name: '7 天' }));
+  await act(async () => late.resolve(overviewFixture(1, '/late-30day', undefined, 999)));
+  expect(chart.getByRole('button', { name: '7 天' })).toHaveAttribute('aria-pressed', 'true');
+  expect(chart.getByText(/近 7 天/)).toBeVisible();
+  expect(screen.queryByText('/late-30day')).toBeNull();
+  expect(screen.getByText('8,737')).toBeVisible();
+  expect(state.get.mock.calls.filter(([, p]) => p.chartPeriod === '7d')).toHaveLength(1);
+  expect(state.push).not.toHaveBeenCalled();
+});
+
+it('shows the actual period of a server-validated previous trend and clears it on permission failure', async () => {
+  state.date = '7day';
+  const original = overviewFixture(1, '/stable-ranking');
+  const previous = overviewFixture(1, '/other-ranking', undefined, 999);
+  (previous.meta.snapshot as any).fallback = {
+    sourceRange: previous.range,
+    requestedRange: original.range,
+  } as any;
+  state.get.mockImplementation((_path, p) =>
+    Promise.resolve(p.chartPeriod === '30d' ? previous : original),
+  );
+  render(
+    <QueryClientProvider client={client}>
+      <ManualRefreshProvider>
+        <LiekanPage resource="overview" />
+      </ManualRefreshProvider>
+    </QueryClientProvider>,
+  );
+  await screen.findByText('/stable-ranking');
+  let chart = within(document.querySelector('[data-report-trend]') as HTMLElement);
+  fireEvent.click(chart.getByRole('button', { name: '30 天' }));
+  expect(await chart.findByText(/上次统计：/)).toBeVisible();
+  expect(screen.getByText('8,737')).toBeVisible();
+  expect(screen.queryByText('/other-ranking')).toBeNull();
+  state.get.mockRejectedValue({ status: 403, message: 'Forbidden' });
+  fireEvent.click(chart.getByRole('button', { name: '今天' }));
+  await waitFor(() => expect(screen.queryByText('8,737')).toBeNull());
+  expect(screen.queryByText('/stable-ranking')).toBeNull();
+  expect(screen.queryByText(/上次统计：/)).toBeNull();
+  expect(state.push).not.toHaveBeenCalled();
+});
+
+it('revalidates the parent at most once when a bookmarked trend remains in conflict', async () => {
+  state.date = '7day';
+  state.extraQuery = { chartPeriod: '30d' };
+  state.get.mockImplementation((_path, p) =>
+    p.chartPeriod === '30d'
+      ? Promise.reject({ status: 409, code: 'warehouse-control-changed' })
+      : Promise.resolve(overviewFixture(1, '/stable-ranking')),
+  );
+  render(
+    <QueryClientProvider client={client}>
+      <ManualRefreshProvider>
+        <LiekanPage resource="overview" />
+      </ManualRefreshProvider>
+    </QueryClientProvider>,
+  );
+  await waitFor(() =>
+    expect(
+      state.get.mock.calls.filter(([, p]) => p.chartPeriod === '7d').length,
+    ).toBeGreaterThanOrEqual(2),
+  );
+  await new Promise(resolve => setTimeout(resolve, 150));
+  expect(state.get.mock.calls.filter(([, p]) => p.chartPeriod === '7d')).toHaveLength(2);
+});
+
+it('retains a published trend after a transient refresh failure', async () => {
+  state.date = '7day';
+  state.get.mockImplementation(() => Promise.resolve(overviewFixture(1, '/stable-ranking')));
+  render(
+    <QueryClientProvider client={client}>
+      <ManualRefreshProvider>
+        <LiekanPage resource="overview" />
+      </ManualRefreshProvider>
+    </QueryClientProvider>,
+  );
+  await screen.findByText('/stable-ranking');
+  const section = document.querySelector('[data-report-trend]') as HTMLElement;
+  fireEvent.click(within(section).getByRole('button', { name: '30 天' }));
+  await within(section).findByText(/数据截至/);
+  state.get.mockRejectedValue({ status: 503, message: 'Busy' });
+  await act(async () => {
+    await client.refetchQueries({
+      predicate: q => q.queryKey[3] === 'overview' && q.queryKey[7] === '30d',
+    });
+  });
+  expect(await within(section).findByText('更新失败，当前显示上次读取的数据')).toBeVisible();
+  expect(section.querySelector('#d1')).toBeInTheDocument();
+  expect(screen.getByText('/stable-ranking')).toBeVisible();
+});
 
 it('keeps the overview visible while the TOP table reads its next page', async () => {
   const snapshot = overviewFixture;
@@ -269,6 +430,60 @@ it('uses one overview version when a refresh publishes during a page turn', asyn
   expect(screen.getByText('9,010')).toBeVisible();
 });
 
+it('resets to page one after a pinned overview page expires and ignores an earlier request', async () => {
+  const firstVersion = 'a'.repeat(64);
+  const newerVersion = 'b'.repeat(64);
+  const latePage = deferred<ReturnType<typeof overviewFixture>>();
+  const expired = deferred<ReturnType<typeof overviewFixture>>();
+  let firstReads = 0;
+  state.get.mockImplementation((path, params) => {
+    if (!path.endsWith('/page-report')) return Promise.resolve({});
+    if (params.tp_topBody === 2) return latePage.promise;
+    if (params.tp_topBody === 4) return expired.promise;
+    return Promise.resolve(
+      ++firstReads === 1
+        ? overviewFixture(1, '/old-first', firstVersion)
+        : overviewFixture(1, '/new-first', newerVersion),
+    );
+  });
+  const tree = () => (
+    <QueryClientProvider client={client}>
+      <LiekanPage resource="overview" />
+    </QueryClientProvider>
+  );
+  const view = render(tree());
+  await screen.findByText('/old-first');
+  for (const page of ['2', '4']) {
+    state.extraQuery = { tp_topBody: page };
+    view.rerender(tree());
+    await waitFor(() =>
+      expect(
+        state.get.mock.calls.some(
+          ([, input]) => input.tp_topBody === Number(page) && input.reportVersion === firstVersion,
+        ),
+      ).toBe(true),
+    );
+  }
+  await act(async () => {
+    expired.promise.catch(() => {});
+    expired.resolve(
+      Promise.reject(
+        Object.assign(new Error('Snapshot expired'), {
+          status: 409,
+          code: 'overview-version-invalidated',
+        }),
+      ),
+    );
+  });
+  await waitFor(() => expect(state.updateParams).toHaveBeenCalledWith({ tp_topBody: undefined }));
+  state.extraQuery = {};
+  view.rerender(tree());
+  await screen.findByText('/new-first');
+  await act(async () => latePage.resolve(overviewFixture(2, '/late-page', firstVersion)));
+  expect(screen.queryByText('/late-page')).toBeNull();
+  expect(screen.getByText('/new-first')).toBeVisible();
+});
+
 it('delivers log rows before the independent count and summary finish', async () => {
   const count = deferred<any>(),
     summary = deferred<any>();
@@ -331,6 +546,44 @@ it('hides independently loaded rows when the count read discovers revoked permis
   await waitFor(() => expect(screen.queryByText('private-log-rows')).not.toBeInTheDocument());
   expect(await screen.findByText('无法读取此范围的数据')).toBeVisible();
 });
+
+it.each([true, false])(
+  'bounds log boundary recovery when the next attempt succeeds=%s',
+  async succeeds => {
+    const first = 'a'.repeat(64);
+    const next = 'b'.repeat(64);
+    let entriesRead = 0;
+    state.get.mockImplementation(async (path, input) => {
+      if (path.endsWith('/log-count')) {
+        if (input.readBoundary === first || !succeeds)
+          throw Object.assign(new Error('Logs changed'), {
+            status: 409,
+            code: 'log-read-boundary-conflict',
+          });
+        return { readBoundary: next, total: 17 };
+      }
+      if (path.endsWith('/log-summary')) return { readBoundary: input.readBoundary };
+      if (!path.endsWith('/log-entries')) return {};
+      const read = ++entriesRead;
+      const result = report(`read-${read}`, input);
+      Object.assign(result.meta, { logReadBoundary: read === 1 ? first : next });
+      return result;
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <LiekanPage resource="logs" />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByText('read-2')).toBeVisible();
+    await waitFor(() =>
+      expect(screen.getByTestId('log-count')).toHaveTextContent(succeeds ? '17' : 'pending-count'),
+    );
+    await waitFor(() =>
+      expect(state.get.mock.calls.filter(([path]) => path.endsWith('/log-count'))).toHaveLength(2),
+    );
+    expect(entriesRead).toBe(2);
+  },
+);
 
 it.each([
   [
@@ -890,4 +1143,105 @@ it('keeps exact count and summary visible while refreshing the same log boundary
     summary.resolve(summaryValue);
   });
   await waitFor(() => expect(screen.getByRole('button', { name: '刷新' })).toBeEnabled());
+});
+
+it('finishes loading for a preparing 30-day report and only rereads on an explicit click', async () => {
+  state.get.mockResolvedValue({ status: 'preparing' });
+  render(
+    <QueryClientProvider client={client}>
+      <ManualRefreshProvider>
+        <LiekanPage resource="content" />
+      </ManualRefreshProvider>
+    </QueryClientProvider>,
+  );
+  await screen.findByText('数据准备中，请稍后查看');
+  expect(screen.queryByText('pending')).not.toBeInTheDocument();
+  const initial = state.get.mock.calls.length;
+  fireEvent(window, new Event('focus'));
+  await new Promise(resolve => setTimeout(resolve, 30));
+  expect(state.get).toHaveBeenCalledTimes(initial);
+  fireEvent.click(screen.getByRole('button', { name: '重新查看' }));
+  await waitFor(() => expect(state.get.mock.calls.length).toBeGreaterThan(initial));
+  expect(screen.queryByText('pending')).not.toBeInTheDocument();
+});
+
+it('clears a ready seven-day report when the selected thirty-day result is preparing', async () => {
+  state.date = '7day';
+  state.selectedRange = { startDate: new Date('2026-09-24'), endDate: new Date('2026-10-01') };
+  state.get.mockImplementation((_path, p) =>
+    Promise.resolve(
+      p.chartPeriod === '7d'
+        ? report('seven-day-only', { startAt: p.startAt, endAt: p.endAt, timezone: p.timezone })
+        : { status: 'preparing' },
+    ),
+  );
+  const tree = () => (
+    <QueryClientProvider client={client}>
+      <ManualRefreshProvider>
+        <LiekanPage resource="content" />
+      </ManualRefreshProvider>
+    </QueryClientProvider>
+  );
+  const view = render(tree());
+  await screen.findByText('seven-day-only');
+  state.date = '30day';
+  state.selectedRange = { startDate: new Date('2026-09-01'), endDate: new Date('2026-10-01') };
+  view.rerender(tree());
+  await screen.findByText('数据准备中，请稍后查看');
+  expect(screen.queryByText('seven-day-only')).not.toBeInTheDocument();
+  expect(screen.queryByText('pending')).not.toBeInTheDocument();
+  const requests = state.get.mock.calls.length;
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+  try {
+    fireEvent(window, new Event('focus'));
+    await act(() => vi.advanceTimersByTimeAsync(65000));
+    expect(state.get).toHaveBeenCalledTimes(requests);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('shows the server-validated last report with its actual dates until the requested range is published', async () => {
+  const older = overviewFixture(1, '/retained-ranking', 'a'.repeat(64));
+  const sourceRange = { ...older.range };
+  const source = {
+    ...older,
+    meta: {
+      ...older.meta,
+      snapshot: {
+        ...older.meta.snapshot,
+        state: 'updating',
+        fallback: {
+          sourceRange,
+          requestedRange: {
+            startAt: 1794672000000,
+            endAt: 1794758399999,
+            timezone: 'Asia/Shanghai',
+          },
+          chartPeriod: '7d',
+        },
+      },
+    },
+  };
+  state.get.mockResolvedValue(source);
+  render(
+    <QueryClientProvider client={client}>
+      <ManualRefreshProvider>
+        <LiekanPage resource="overview" />
+      </ManualRefreshProvider>
+    </QueryClientProvider>,
+  );
+  await screen.findByText('/retained-ranking');
+  expect(screen.getByText(/当前区间尚未就绪，显示上次统计/)).toBeInTheDocument();
+  expect(screen.queryByText('数据准备中，请稍后查看')).not.toBeInTheDocument();
+  expect(screen.queryByText('pending')).not.toBeInTheDocument();
+  const initial = state.get.mock.calls.length;
+  fireEvent(window, new Event('focus'));
+  await new Promise(resolve => setTimeout(resolve, 30));
+  expect(state.get).toHaveBeenCalledTimes(initial);
+  state.get.mockResolvedValue(overviewFixture(1, '/new-ranking', 'b'.repeat(64)));
+  fireEvent.click(screen.getByRole('button', { name: '刷新' }));
+  await screen.findByText('/new-ranking');
+  expect(screen.queryByText('/retained-ranking')).not.toBeInTheDocument();
+  expect(screen.queryByText(/当前区间尚未就绪，显示上次统计/)).not.toBeInTheDocument();
 });

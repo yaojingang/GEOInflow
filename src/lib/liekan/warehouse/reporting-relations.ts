@@ -1,5 +1,17 @@
+import {
+  type AnalysisWindow,
+  analysisWindowRelation,
+  analysisReadRelation,
+} from './analysis-context';
+import { analysisBrowserFields, analysisVisitEntryFields, analysisLogFields } from './schema';
 import { factTable, identifier } from './catalog';
-import { boundaryParameters, type FactReadOptions, factRelation, type ReadBoundary } from './read';
+import {
+  boundaryParameters,
+  exactTimeFilter,
+  type FactReadOptions,
+  factRelation,
+  type ReadBoundary,
+} from './read';
 
 export type ReportingMetadata = {
   boundary: ReadBoundary;
@@ -7,6 +19,8 @@ export type ReportingMetadata = {
   controlRevision: string;
   catalogRevision?: string;
   bookmarkRevision?: string;
+  audienceRevision?: string;
+  crawlerRevision?: string;
   logRevision?: string;
   population: Record<string, unknown>;
   reports: { id: string; name: string; type: string; parameters: Record<string, any> }[];
@@ -112,7 +126,48 @@ export function reportingLogRelation(
   options: FactReadOptions = {},
   projection?: readonly string[],
   restrictEvidenceToWindow = false,
+  readWindow?: AnalysisWindow,
 ) {
+  // Key-restricted maintenance reads retain their original relation. Window
+  // pruning must apply equally to the accepted flat records and raw fallback.
+  const supported = Object.keys(options).every(k =>
+    ['columns', 'immutableTimeWindow', 'orderedLogVersions', 'narrowLogWindow'].includes(k),
+  );
+  const modelColumns = [
+    ...new Set([
+      ...(projection ?? [
+        ...factTable('liekan_log').columns.map(c => c.name),
+        ...analysisLogFields.map(c => c[0]),
+      ]),
+      'created_at',
+    ]),
+  ];
+  const projected =
+    supported &&
+    (analysisWindowRelation('log', modelColumns, readWindow) ??
+      analysisReadRelation('log', modelColumns, coveredHours =>
+        reportingLogRelation(
+          options.immutableTimeWindow
+            ? {
+                ...options,
+                immutableTimeWindow: {
+                  ...options.immutableTimeWindow,
+                  excludedHours: coveredHours,
+                },
+              }
+            : options,
+          projection ? [...new Set([...projection, 'created_at'])] : undefined,
+          restrictEvidenceToWindow,
+        ),
+      ));
+  if (projected) {
+    const window = options.immutableTimeWindow;
+    const filter = window ? exactTimeFilter(window).replaceAll('_record_time', 'created_at') : '1';
+    const hours = window?.hours
+      ? ` AND toUnixTimestamp(toStartOfHour(created_at)) IN {${window.hours}:Array(UInt32)}`
+      : '';
+    return `(SELECT ${projection ? projection.map(identifier).join(',') : '*'} FROM ${projected} WHERE ${filter}${hours})`;
+  }
   const overrides: Record<string, string> = {};
   for (const [column, key] of Object.entries({
     bot: 'bot',
@@ -174,13 +229,20 @@ export function reportingLogRelation(
     : options;
   // For a small window, restrict evidence by log ID before building its join
   // state. A wide window keeps the ordinary join and avoids a large key set.
+  // Bound fallback evidence by parent log keys, never by evidence arrival time.
+  const fallbackWindow = options.immutableTimeWindow?.excludedHours
+    ? options.immutableTimeWindow
+    : undefined;
   const evidence = {
     ...(projection ? { columns: [...needed.e] } : {}),
-    ...(restrictEvidenceToWindow ? { evidenceLogWindow: options.immutableTimeWindow } : {}),
+    ...(fallbackWindow || restrictEvidenceToWindow
+      ? { evidenceLogWindow: options.immutableTimeWindow }
+      : {}),
   };
   const repair = factRelation('liekan_history_repair_result', {
     ...(projection ? { columns: [...needed.r] } : {}),
     ...(restrictEvidenceToWindow ? { activeLogRepair: true as const } : {}),
+    ...(fallbackWindow ? { activeLogRepair: true as const, repairLogWindow: fallbackWindow } : {}),
     repairFields: projection ? repairFields.filter(f => needed.r.has(f.name)) : repairFields,
   });
   return `(SELECT ${selected.map(c => `${outputs[c]} AS ${identifier(c)}`).join(',')}
@@ -285,19 +347,43 @@ export function websiteSummaryEventRelation(metadata: ReportingMetadata) {
     WHERE ${browserEventEligibility()} ${metadata.exclusions.length ? browserExclusions({ columns: ['event_id', 'collection_id'] }) : ''})`;
 }
 export function websiteEventRelation(population: 'observed' | 'qualified' = 'qualified') {
+  const projected = analysisReadRelation(
+    'browser',
+    factTable('website_event').columns.map(c => c.name),
+    () => websiteEventRelation(population),
+    population === 'qualified' ? '_qualified_event' : false,
+  );
+  if (projected) return projected;
   return `(SELECT * FROM ${browserEventRelation(population)} UNION ALL SELECT ${columns('website_event', 'e')} FROM ${factRelation('website_event')} e
     WHERE ({wh_resource:String}='link' AND event_type=3) OR ({wh_resource:String}='pixel' AND event_type=4))`;
 }
 
 // The anchor is selected from the complete eligible visit, independently of the
 // caller's report window. A custom event cannot invent a page-view location.
-export function geographicEventRelation() {
-  const events = websiteEventRelation();
+export function geographicEventRelation(relevantVisits = false, includeEntry = false) {
+  const projected = analysisReadRelation(
+    'browser',
+    [
+      ...factTable('website_event').columns.map(c => c.name),
+      ...analysisBrowserFields.filter(c => !c[0].startsWith('_')).map(c => c[0]),
+    ],
+    () => geographicEventRelation(false),
+    true,
+  );
+  if (projected)
+    return relevantVisits
+      ? `(SELECT * FROM ${projected} WHERE (session_id,visit_id) IN report_visit_keys)`
+      : projected;
+  const events = relevantVisits
+    ? `(SELECT * FROM ${websiteEventRelation()} WHERE (session_id,visit_id) IN report_visit_keys)`
+    : websiteEventRelation();
   return `(WITH wh_eligible AS ${events}, wh_anchored AS (
     SELECT *,if(countIf(event_type NOT IN(2,5)) OVER visit>0,
       tupleElement(argMinIf(tuple(event_id),tuple(created_at,event_id),event_type NOT IN(2,5)) OVER visit,1),NULL) AS anchor_id
+      ${includeEntry ? `,argMinIf(tuple(${analysisVisitEntryFields.join(',')}),tuple(created_at,event_id),event_type NOT IN(2,5)) OVER visit AS visit_entry` : ''}
     FROM wh_eligible WINDOW visit AS (PARTITION BY session_id,visit_id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
   ) SELECT ${columns('website_event', 'e')},
+    ${includeEntry ? analysisVisitEntryFields.map((c, i) => `e.visit_entry.${i + 1} AS _entry_${c},`).join('') : ''}
     ${['country', 'region', 'city'].map(c => `if(isNotNull(g.event_id),g.${c},s.${c}) AS liekan_${c}`).join(',')},
     ${['browser', 'os', 'device', 'screen', 'language'].map(c => `if(e.event_type IN(3,4),s.${c},env.${c}) AS liekan_${c}`).join(',')},
     coalesce(env.identity_available,e.event_type IN(3,4)) AS liekan_identity_available
@@ -306,6 +392,34 @@ export function geographicEventRelation() {
     FROM wh_anchored e INNER JOIN ${factRelation('session')} s ON s.session_id=e.session_id AND s.website_id=e.website_id
     LEFT JOIN ${factRelation('liekan_event_geography')} g ON g.website_id=e.website_id AND g.event_id=e.anchor_id
     LEFT JOIN ${factRelation('liekan_event_environment')} env ON env.website_id=e.website_id AND env.event_id=e.event_id)`;
+}
+
+/** Non-geographic metrics retain identity, visit and environment semantics without
+ * calculating a complete-visit geographic anchor or reading the geography family. */
+export function analyticsEventRelation(relevantVisits = false) {
+  const projected = analysisReadRelation(
+    'browser',
+    [
+      ...factTable('website_event').columns.map(c => c.name),
+      ...analysisBrowserFields.filter(c => !c[0].startsWith('_')).map(c => c[0]),
+    ],
+    () => analyticsEventRelation(false),
+    true,
+  );
+  if (projected)
+    return relevantVisits
+      ? `(SELECT * FROM ${projected} WHERE (session_id,visit_id) IN report_visit_keys)`
+      : projected;
+  return `(SELECT ${columns('website_event', 'e')},
+    ${['country', 'region', 'city'].map(c => `CAST(NULL AS Nullable(String)) AS liekan_${c}`).join(',')},
+    ${['browser', 'os', 'device', 'screen', 'language'].map(c => `if(e.event_type IN(3,4),s.${c},env.${c}) AS liekan_${c}`).join(',')},
+    coalesce(env.identity_available,e.event_type IN(3,4)) AS liekan_identity_available,
+    if(e.event_type IN(3,4),s.distinct_id,env.distinct_id) AS liekan_distinct_id,
+    s.created_at AS liekan_session_created_at
+    FROM ${websiteEventRelation()} e
+    INNER JOIN ${factRelation('session')} s ON s.session_id=e.session_id AND s.website_id=e.website_id
+    LEFT JOIN ${factRelation('liekan_event_environment')} env ON env.website_id=e.website_id AND env.event_id=e.event_id
+    ${relevantVisits ? 'WHERE (e.session_id,e.visit_id) IN report_visit_keys' : ''})`;
 }
 
 export function sessionPropertyRelation() {

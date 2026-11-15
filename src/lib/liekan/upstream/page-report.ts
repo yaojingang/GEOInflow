@@ -25,6 +25,7 @@ import { query, reportSnapshot } from './server';
 
 type PageReportWebsite = { id: string; name: string; domain: string };
 export type WarehouseOverviewResult = LiekanPageReport & {
+  rankings?: import('./report-ranking-artifact').ReportRankingArtifact;
   overviewRanking?: { table: 'topBody' | 'visitorTopBody'; rows: Row[] };
 };
 

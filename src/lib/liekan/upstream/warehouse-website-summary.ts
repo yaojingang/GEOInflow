@@ -8,7 +8,7 @@ import {
 } from '../contracts/browser-population';
 import { websiteSummarySchema } from '../contracts/website-summary';
 import {
-  geographicEventRelation,
+  analyticsEventRelation,
   websiteSummaryEventRelation,
 } from '../warehouse/reporting-relations';
 import { factRelation } from '../warehouse/read';
@@ -52,7 +52,7 @@ function customSummarySql() {
   return `WITH visits AS(SELECT if(e.created_at>={start:DateTime64(6)},0,1) AS period,session_id,visit_id,
         countIf(event_type NOT IN(2,5)) AS pv,minOrNullIf(created_at,event_type NOT IN(2,5)) AS first_at,maxOrNullIf(created_at,event_type NOT IN(2,5)) AS last_at,
         countIf(event_type=2) AS custom,countIf(event_type NOT IN(2,5) AND ${channelFilterColumn('e.')}='AI 搜索引荐')>0 AS ai
-        FROM ${geographicEventRelation()} e WHERE (created_at BETWEEN {start:DateTime64(6)} AND {end:DateTime64(6)} OR created_at BETWEEN {previousStart:DateTime64(6)} AND {previousEnd:DateTime64(6)}) AND event_type!=5
+        FROM ${analyticsEventRelation()} e WHERE (created_at BETWEEN {start:DateTime64(6)} AND {end:DateTime64(6)} OR created_at BETWEEN {previousStart:DateTime64(6)} AND {previousEnd:DateTime64(6)}) AND event_type!=5
         GROUP BY period,session_id,visit_id HAVING pv>0)
         SELECT period,sum(pv) AS pageviews,uniqExact(session_id) AS visitors,uniqExact(visit_id) AS visits,countIf(pv=1 AND custom=0) AS bounces,
         sum(floor((toUnixTimestamp64Micro(last_at)-toUnixTimestamp64Micro(first_at))/1000000.0)) AS totaltime,uniqExactIf(visit_id,ai) AS aiVisits FROM visits GROUP BY period`;

@@ -3544,6 +3544,17 @@
       "removalCondition": "Remove when upstream provides equivalent source boundaries and identity coverage with these regression checks"
     },
     {
+      "path": "src/app/api/websites/[websiteId]/sessions/contract.ts",
+      "purpose": "Document publication-pinned session pagination without changing existing statistics fields or share permissions",
+      "tests": [
+        "src/lib/liekan/upstream/warehouse-log-boundary.integration.test.ts",
+        "OpenAPI and generated client consistency"
+      ],
+      "owner": "Liekan analytics maintenance",
+      "constraint": "Reject expired or changed control boundaries; preserve private and existing shared read authorization",
+      "removalCondition": "Remove when upstream provides equivalent pinned publication pagination"
+    },
+    {
       "path": "src/app/api/websites/[websiteId]/sessions/route.ts",
       "purpose": "Browser population isolation and identity availability across collection, analytics and generated contracts",
       "tests": [
@@ -5945,10 +5956,12 @@
     },
     {
       "path": "src/queries/sql/getRealtimeData.ts",
-      "purpose": "Inherited device/geography compatibility",
+      "purpose": "Inherited device/geography compatibility; combine warehouse realtime PV/UV buckets and exact window UV under one pinned boundary, preserving legacy paths",
       "tests": [
         "src/lib/country.test.ts",
-        "src/lib/detect.test.ts"
+        "src/lib/detect.test.ts",
+        "src/lib/liekan/upstream/warehouse-realtime.test.ts",
+        "src/lib/liekan/upstream/warehouse-report-pages.integration.test.ts"
       ],
       "owner": "Liekan compatibility adapters",
       "constraint": "Preserve upstream behavior and protocols outside this recorded purpose: Inherited device/geography compatibility",

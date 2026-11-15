@@ -6,6 +6,21 @@ const mocks = vi.hoisted(() => ({
   pin: vi.fn(),
   population: vi.fn(),
   note: vi.fn(),
+  selection: vi.fn(),
+  relations: vi.fn(),
+  analysis: false,
+}));
+vi.mock('./warehouse-analysis-model', () => ({
+  withAvailableAnalysisModel: async (_site: string, work: () => unknown, selection: unknown) => {
+    mocks.selection(selection);
+    const previous = mocks.analysis;
+    mocks.analysis = true;
+    try {
+      return await work();
+    } finally {
+      mocks.analysis = previous;
+    }
+  },
 }));
 vi.mock('../warehouse/reader-runtime', () => ({
   warehouseReader: () => ({
@@ -17,14 +32,33 @@ vi.mock('../warehouse/reporting-relations', () => ({
   reportingParameters: () => ({ wh_site: 'trusted-site', wh_epoch: '7' }),
 }));
 vi.mock('./warehouse-native-relations', () => ({
-  nativeRelations: () => [
-    'website_event AS (SELECT * FROM accepted_events)',
-    'session_data AS (SELECT * FROM accepted_properties)',
-  ],
+  nativeRelations: (...args: unknown[]) => {
+    mocks.relations(...args);
+    return [
+      'website_event AS (SELECT * FROM accepted_events)',
+      'session_data AS (SELECT * FROM accepted_properties)',
+    ];
+  },
 }));
 vi.mock('./warehouse-report-snapshot', () => ({
   withinWarehouseReport: (work: () => unknown) => work(),
   warehouseReportMetadata: mocks.pin,
+  frozenCountKey: async () => 'fixture-count',
+  readFrozenCount: () => undefined,
+  saveFrozenCount: () => {},
+  warehouseReportResponse: async (
+    _site: string,
+    query: string,
+    params: Record<string, unknown>,
+    format: string,
+  ) =>
+    (
+      await mocks.query({
+        query,
+        query_params: { ...params, wh_site: 'trusted-site', wh_epoch: '7' },
+        format,
+      })
+    ).json(),
   warehouseReportStream: mocks.stream,
 }));
 vi.mock('./geography-query', () => ({
@@ -36,11 +70,16 @@ vi.mock('./browser-population', () => ({
   applyNativePopulation: (rows: unknown) => rows,
 }));
 vi.mock('./cache-context', () => ({ noteBrowserPopulation: mocks.note }));
-import { warehouseNativeQuery, warehouseNativeStringStream } from './warehouse-native-query';
+import {
+  warehouseNativePage,
+  warehouseNativeQuery,
+  warehouseNativeStringStream,
+} from './warehouse-native-query';
 import { warehouseTime } from '../warehouse/fact-input';
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.analysis = false;
   mocks.query.mockResolvedValue({
     json: async () => ({
       meta: [
@@ -55,6 +94,35 @@ beforeEach(() => {
   mocks.stream.mockImplementation(async (_site, _sql, _params, consume) => {
     await consume([{ id: 'identity', referrer: null }]);
   });
+});
+
+it('keeps pagination population checks inside the same verified analysis context', async () => {
+  mocks.population.mockImplementation(async () => {
+    expect(mocks.analysis).toBe(true);
+    return { identity: { status: 'complete' } };
+  });
+  mocks.query.mockResolvedValue({
+    json: async () => ({
+      meta: [
+        { name: '_liekan_page_count', type: 'UInt64' },
+        { name: 'id', type: 'String' },
+      ],
+      data: [{ _liekan_page_count: '1', id: 'one' }],
+    }),
+  });
+  const result = await warehouseNativePage(
+    'SELECT id FROM website_event',
+    {
+      websiteId: 'site',
+      startDate: new Date('2026-11-01T00:00:00Z'),
+      endDate: new Date('2026-11-02T00:00:00Z'),
+    },
+    { page: 1, pageSize: 20 },
+    'getWebsiteSessions',
+  );
+  expect(result.count).toBe(1);
+  expect(mocks.analysis).toBe(false);
+  expect(mocks.population).toHaveBeenCalledTimes(2);
 });
 
 it('shares versioned native relation and parameter preparation without altering ordinary numeric results', async () => {
@@ -99,4 +167,21 @@ it('rejects a streaming query without an explicit website before invoking the re
     warehouseNativeStringStream('SELECT id FROM website_event', {}, async () => {}),
   ).rejects.toThrow('warehouse-native-site-required');
   expect(mocks.stream).not.toHaveBeenCalled();
+});
+
+it('bounds audited totals and model selection to both report and disjoint cohort windows', async () => {
+  const params = {
+    websiteId: 'trusted-site',
+    startDate: new Date('2026-11-13T00:00:00Z'),
+    endDate: new Date('2026-11-14T00:00:00Z'),
+    cohort_startDate: new Date('2026-11-01T00:00:00Z'),
+    cohort_endDate: new Date('2026-11-02T00:00:00Z'),
+  };
+  await warehouseNativeQuery('select count(*) from website_event', params, 'getWebsiteStats');
+  const window = { start: +params.cohort_startDate, end: +params.endDate };
+  expect(mocks.relations.mock.calls[0][1]).toEqual(window);
+  expect(mocks.selection).toHaveBeenCalledWith({ kinds: ['browser'], ...window });
+  mocks.relations.mockClear();
+  await warehouseNativeQuery('select count(*) from website_event', params, 'identity-history');
+  expect(mocks.relations.mock.calls[0][1]).toBeUndefined();
 });

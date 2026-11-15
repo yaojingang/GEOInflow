@@ -100,16 +100,26 @@ export function preparePublicPublication({
     throw new Error('Publication requires materialized source files; submodules are unsupported');
   if (git(target, ['rev-parse', `${parent}^{tree}`]) === sourceTree)
     return { changed: false, branch, commit: parent, sourceCommit, tree: sourceTree };
-  const records = git(target, [
-    'log',
-    '--topo-order',
-    '--format=%H',
-    '--fixed-strings',
-    '--grep=GEOInflow-Source-Revision:',
-    parent,
-  ])
-    .split('\n')
-    .filter(Boolean);
+  // Continue the candidate's publication line before considering publications
+  // merged from main. A sibling publication is not the base of this feature's
+  // changes. The merge-tree check below still protects all merged public work.
+  const publicationRecords = traversal =>
+    git(target, [
+      'log',
+      traversal,
+      '--format=%H',
+      '--fixed-strings',
+      '--grep=GEOInflow-Source-Revision:',
+      parent,
+    ])
+      .split('\n')
+      .filter(Boolean);
+  const records = [
+    ...new Set([
+      ...publicationRecords('--first-parent'),
+      ...publicationRecords('--topo-order'),
+    ]),
+  ];
   let published;
   for (const record of records) {
     const text = git(target, ['show', '-s', '--format=%B', record]);

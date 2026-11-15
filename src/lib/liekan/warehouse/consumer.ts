@@ -47,7 +47,8 @@ export class WarehouseConsumer {
   private stopping = false;
   private operational = false;
   private restartRequired = false;
-  private nextPartition = 0;
+  private readonly scheduled = new Set<number>();
+  private readonly probeAfter = new Map<number, number>();
   private timer?: ReturnType<typeof setInterval>;
   private renewal?: ReturnType<typeof setInterval>;
   private renewing?: Promise<void>;
@@ -100,8 +101,12 @@ export class WarehouseConsumer {
       this.operational = !this.stopping;
       this.restartRequired = false;
       this.assigned.clear();
+      this.scheduled.clear();
+      this.probeAfter.clear();
       for (const partition of e.payload.memberAssignment[queue.installation.topicName] ?? [])
         this.assigned.add(partition);
+      for (const partition of this.assigned) this.scheduled.add(partition);
+      this.pump();
     });
     for (const event of [
       this.consumer.events.REBALANCING,
@@ -111,11 +116,15 @@ export class WarehouseConsumer {
       this.consumer.on(event, () => {
         this.operational = false;
         this.assigned.clear();
+        this.scheduled.clear();
+        this.probeAfter.clear();
       });
     }
     this.consumer.on(this.consumer.events.CRASH, e => {
       this.operational = false;
       this.assigned.clear();
+      this.scheduled.clear();
+      this.probeAfter.clear();
       this.restartRequired = !e.payload.restart;
       // Errors can contain connection URLs or payloads. Record only our fixed
       // conflict code, including when KafkaJS wraps the original cause.
@@ -196,6 +205,51 @@ export class WarehouseConsumer {
     }
   }
 
+  /** Discovery has already committed its durable references. Notifications are
+   * hints only: periodic probes still recover work after restart, cache eviction
+   * or a lost notification. FIFO dispatch preserves the same concurrency and
+   * single-flight partition ownership. */
+  private wake(partition: number) {
+    if (this.stopping || !this.assigned.has(partition)) return;
+    this.scheduled.add(partition);
+    this.pump();
+  }
+
+  private pump() {
+    if (this.stopping) return;
+    for (const partition of this.scheduled) {
+      if (this.running.size >= (this.options.concurrency ?? 2)) break;
+      if (!this.assigned.has(partition)) {
+        this.scheduled.delete(partition);
+        continue;
+      }
+      if (this.running.has(partition)) continue;
+      this.scheduled.delete(partition);
+      let progressed = false;
+      const task = this.drain(partition)
+        .then(value => {
+          progressed = value;
+        })
+        .catch(e =>
+          this.health(
+            e instanceof WarehouseConflict ? e.code : 'warehouse-processing-unavailable',
+            partition,
+          ),
+        )
+        .finally(() => {
+          this.running.delete(partition);
+          this.probeAfter.set(partition, Date.now() + 1000);
+          // A notification arriving while drain awaits must survive. Put a hot
+          // partition at the tail so it cannot displace another ready partition.
+          const notified = this.scheduled.delete(partition);
+          if ((notified || progressed) && this.assigned.has(partition) && !this.stopping)
+            this.scheduled.add(partition);
+          this.pump();
+        });
+      this.running.set(partition, task);
+    }
+  }
+
   async start() {
     await this.queue.assertIdentity();
     await this.consumer.connect();
@@ -263,26 +317,15 @@ export class WarehouseConsumer {
             },
           ]);
           await heartbeat();
+          this.wake(batch.partition);
         }
       },
     });
     this.timer = setInterval(() => {
-      const partitions = [...this.assigned].sort((a, b) => a - b);
-      for (let index = 0; index < partitions.length; index++) {
-        if (this.running.size >= (this.options.concurrency ?? 2)) break;
-        const partition = partitions[(this.nextPartition + index) % partitions.length];
-        if (this.running.has(partition) || this.stopping) continue;
-        const task = this.drain(partition)
-          .catch(e =>
-            this.health(
-              e instanceof WarehouseConflict ? e.code : 'warehouse-processing-unavailable',
-              partition,
-            ),
-          )
-          .finally(() => this.running.delete(partition));
-        this.running.set(partition, task);
-      }
-      this.nextPartition = partitions.length ? (this.nextPartition + 1) % partitions.length : 0;
+      for (const partition of this.assigned)
+        if (!this.running.has(partition) && (this.probeAfter.get(partition) ?? 0) <= Date.now())
+          this.scheduled.add(partition);
+      this.pump();
     }, 100);
     this.renewal = setInterval(() => {
       if (this.renewing || this.stopping) return;
@@ -360,11 +403,13 @@ export class WarehouseConsumer {
   }
 
   private async drain(partition: number) {
+    let progressed = false;
     const owner = await this.owner(partition);
     for (const attempt of await this.control.recovery(owner)) {
       if ((this.deferredRecovery.get(attempt.attempt_id) ?? 0) > Date.now()) continue;
       try {
         await this.restore(owner, attempt);
+        progressed = true;
         this.deferredRecovery.delete(attempt.attempt_id);
       } catch {
         this.deferredRecovery.set(attempt.attempt_id, Date.now() + 2000);
@@ -399,6 +444,7 @@ export class WarehouseConsumer {
           await this.options.authorityProcessor.process(owner, attempt, inputs);
           for (const input of inputs) this.forget(`${partition}:${input.offset}`);
           this.deferred.delete(site);
+          progressed = true;
           continue;
         }
         const state = await this.control.site(site);
@@ -495,6 +541,7 @@ export class WarehouseConsumer {
             : undefined,
         );
         await this.restore(owner, accepted);
+        progressed = true;
         for (const input of inputs) this.forget(`${partition}:${input.offset}`);
         this.deferred.delete(site);
       } catch (error) {
@@ -509,6 +556,7 @@ export class WarehouseConsumer {
       }
     }
     await this.control.safeOffset(owner);
+    return progressed;
   }
 
   async close() {

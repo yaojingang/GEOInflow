@@ -20,7 +20,7 @@ import {
   warehouseReportSignal,
 } from './warehouse-report-snapshot';
 
-const maxDays = 32;
+const maxDays = 64;
 const buildBatchDays = 5;
 const columns = `section,name,vendor,type,botId,path,requests,ai,pages,abnormal,
   classificationVersions,legacyRequests,unclassifiedRequests,lastTime`;

@@ -5,10 +5,17 @@ import {
   warehouseDDL,
   warehouseLogTrendDDL,
   warehouseOverviewLogDDL,
+  warehouseAnalysisDDL,
+  warehouseReportRankDDL,
 } from './schema';
 
 export async function initializeWarehouseAnalytics(client: ClickHouseClient) {
-  for (const query of [warehouseLogTrendDDL, ...warehouseOverviewLogDDL])
+  for (const query of [
+    warehouseLogTrendDDL,
+    ...warehouseOverviewLogDDL,
+    ...warehouseAnalysisDDL,
+    warehouseReportRankDDL,
+  ])
     await client.command({ query });
 }
 

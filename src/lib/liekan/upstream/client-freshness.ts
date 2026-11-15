@@ -15,12 +15,14 @@ interface Freshness {
   deadline: number;
   expiresAt: number;
   generatedAt?: number;
+  dataThrough?: number;
   ttl?: number;
   failedRetryAfterMs?: number;
   failedRead?: Error;
   resources?: CacheResource[];
 }
 export interface SerializedFreshness {
+  dataThrough?: number;
   generatedAt: number;
   expiresAt: number;
   resources: CacheResource[];
@@ -46,6 +48,8 @@ export function observeRequestPriority(client: QueryClient) {
   });
 }
 export const monotonicNow = () => performance.now();
+export const reportDataThrough = (data: unknown) =>
+  data && typeof data === 'object' ? freshness.get(data)?.dataThrough : undefined;
 export const freshnessExpiry = (data: object) => freshness.get(data)?.expiresAt;
 export const hasClientFreshness = (data: unknown) =>
   !!data && typeof data === 'object' && freshness.has(data);
@@ -54,6 +58,7 @@ export function serializeClientFreshness(data: unknown): SerializedFreshness | u
   const value = data && typeof data === 'object' ? freshness.get(data) : undefined;
   if (!value || value.failedRead || !value.resources?.length) return;
   return {
+    dataThrough: value.dataThrough,
     generatedAt: value.generatedAt || 0,
     expiresAt: value.expiresAt || 0,
     resources: value.resources,
@@ -143,6 +148,9 @@ export function rememberResponseFreshness(
     generatedAt: valid ? generatedAt : undefined,
     ttl: valid ? expiresAt - generatedAt : undefined,
     resources,
+    dataThrough: Number.isFinite(timestamp(headers.get('X-Liekan-Data-Through')))
+      ? timestamp(headers.get('X-Liekan-Data-Through'))
+      : undefined,
     deadline: valid ? receivedAt + (expiresAt - serverTime) - transport - precision : -Infinity,
   });
 }

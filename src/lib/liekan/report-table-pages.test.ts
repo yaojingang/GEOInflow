@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   conversions: vi.fn(),
   humanDays: vi.fn(),
   months: vi.fn(),
+  today: vi.fn(async () => ({ requests: 77, accepted: 0, abnormal: 0 })),
 }));
 vi.mock('./upstream/analytics', async importOriginal => ({
   ...(await importOriginal<typeof import('./upstream/analytics')>()),
@@ -17,7 +18,7 @@ vi.mock('./upstream/analytics', async importOriginal => ({
 }));
 vi.mock('./upstream/logs', () => ({
   getLogFacts: mocks.logs,
-  getLogToday: async () => ({ requests: 0, accepted: 0, abnormal: 0 }),
+  getLogToday: mocks.today,
   getContentImpact: async () => [],
   getMonthlyAiShare: mocks.months,
   getPlotLogs: mocks.plotLogs,
@@ -118,6 +119,24 @@ describe('buildReport serialization slicing', () => {
     expect(report.tables.topBody[0].path).toBe('/page-21');
     expect(report.meta.tablePages).toEqual({ topBody: { page: 2, pageSize: 20, total: 25 } });
     expect(Object.keys(report.tables)).toEqual(['topBody']);
+  });
+
+  it('omits the independently published Today card from long-range snapshot construction', async () => {
+    const report = await buildReport(
+      website,
+      false,
+      { ...params, chartPeriod: '30d' },
+      true,
+      false,
+      undefined,
+      {
+        sharedTodayRequests: true,
+      },
+    );
+    expect(mocks.today).not.toHaveBeenCalled();
+    expect(report.cards.some(card => card.label === '今日总请求')).toBe(false);
+    await buildReport(website, false, { ...params, chartPeriod: 'today' }, true);
+    expect(mocks.today).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the prepared current-day cutoff after the adapter finishes later', async () => {

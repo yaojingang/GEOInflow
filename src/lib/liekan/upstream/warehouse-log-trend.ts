@@ -29,7 +29,7 @@ type Load = {
 
 const hourMs = 3600000;
 const hourSeconds = 3600;
-const maxHours = 32 * 24;
+const maxHours = 64 * 24;
 const table = 'warehouse_log_hourly_trend';
 const scope = `website_id={wh_site:UUID} AND epoch={wh_epoch:UInt64} AND control={trendControl:String}`;
 const publicationScope = 'website_id={wh_site:UUID} AND epoch={wh_epoch:UInt64}';

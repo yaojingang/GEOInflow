@@ -1110,6 +1110,7 @@ export const operations = {
       'eventName',
       'propertyName',
       'sessionId',
+      'readBoundary',
       'page',
     ],
     hasBody: false,
@@ -1158,6 +1159,7 @@ export const operations = {
       'eventName',
       'propertyName',
       'sessionId',
+      'readBoundary',
       'page',
     ],
     hasBody: false,
@@ -1328,6 +1330,8 @@ export const operations = {
       'keywordSnapshot',
       'chartPeriod',
       'tablePages',
+      'reportVersion',
+      'overviewVersion',
     ],
     hasBody: false,
   },
@@ -1428,9 +1432,39 @@ export const operations = {
   getLiekanWebsitesWebsiteIdOverviewJobsJobIdResult: {
     operationId: 'getLiekanWebsitesWebsiteIdOverviewJobsJobIdResult',
     method: 'get',
-    path: '/api/liekan/websites/{websiteId}/overview-jobs/{jobId}/{result}',
-    pathParams: ['websiteId', 'jobId', 'result'],
-    queryParams: ['tp_topBody', 'tp_visitorTopBody'],
+    path: '/api/liekan/websites/{websiteId}/overview-jobs/{jobId}/result',
+    pathParams: ['websiteId', 'jobId'],
+    queryParams: [
+      'crawlerIdentityScope',
+      'crawlerMetricsVersion',
+      'botType',
+      'botProductForm',
+      'botCategory',
+      'botId',
+      'botName',
+      'refresh',
+      'resource',
+      'startAt',
+      'endAt',
+      'timezone',
+      'page',
+      'cursor',
+      'seek',
+      'filter',
+      'search',
+      'geoSort',
+      'engine',
+      'evidence',
+      'status',
+      'keywordStatusVersion',
+      'sort',
+      'direction',
+      'keywordSnapshot',
+      'chartPeriod',
+      'tablePages',
+      'reportVersion',
+      'overviewVersion',
+    ],
     hasBody: false,
   },
   getLink: {
@@ -3280,6 +3314,7 @@ export const operations = {
       'pageSize',
       'maxResults',
       'search',
+      'readBoundary',
     ],
     hasBody: false,
   },
@@ -5024,7 +5059,7 @@ export abstract class GeneratedUmamiClient {
   }
 
   /**
-   * Get the status of a warehouse overview job
+   * Read the background report state without waiting for computation
    * `GET /api/liekan/websites/{websiteId}/overview-jobs/{jobId}`
    */
   getLiekanOverviewJob(
@@ -5123,8 +5158,8 @@ export abstract class GeneratedUmamiClient {
   }
 
   /**
-   * Read the published result of a warehouse overview job
-   * `GET /api/liekan/websites/{websiteId}/overview-jobs/{jobId}/{result}`
+   * Read a published report or a completed preparing response
+   * `GET /api/liekan/websites/{websiteId}/overview-jobs/{jobId}/result`
    */
   getLiekanWebsitesWebsiteIdOverviewJobsJobIdResult(
     input: OperationInput<'getLiekanWebsitesWebsiteIdOverviewJobsJobIdResult'>,

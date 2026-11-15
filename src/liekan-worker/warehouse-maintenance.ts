@@ -6,7 +6,10 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { rename, rm, writeFile } from 'node:fs/promises';
 import { WarehouseRuntime, warehouseRuntimeConfig } from '../lib/liekan/warehouse/runtime';
 import { WarehouseRecoveryGC } from '../lib/liekan/warehouse/recovery-gc';
-const runtime = await WarehouseRuntime.connect(warehouseRuntimeConfig());
+const runtime = await WarehouseRuntime.connect({
+  ...warehouseRuntimeConfig(),
+  workload: 'liekan_background',
+});
 const collector = new WarehouseRecoveryGC(runtime.db, runtime.queue);
 const garbage = new WarehouseFactGC(runtime.db, runtime.ch);
 const deletedFacts = new WarehouseDeletionGC(runtime.db, runtime.ch);

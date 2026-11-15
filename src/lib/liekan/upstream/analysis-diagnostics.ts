@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { LiekanError } from './errors';
 
 export const reportQueryGroups = [
+  'analysis-prepare',
   'human',
   'logs',
   'settings',

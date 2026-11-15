@@ -1,3 +1,4 @@
+import type { AnalysisWindow } from '../warehouse/analysis-context';
 import { createHash } from 'node:crypto';
 import { formatInTimeZone, fromZonedTime } from 'date-fns-tz';
 import type { CrawlerMetricOptions } from '../contracts/crawler-metrics';
@@ -10,17 +11,19 @@ import {
   reportingLogRelation,
   websiteEventRelation,
 } from '../warehouse/reporting-relations';
-import { LiekanError } from './errors';
 import { dashboardClock } from './dashboard-clock';
+import { LiekanError } from './errors';
 import { logInputConnectedSql } from './log-input';
-import { decodeWarehouseLogCursor } from './warehouse-log-cursor';
 import { staticRequestExtensionPattern } from './logs';
+import { readLogPageWindows } from './warehouse-log-page';
+import { decodeWarehouseLogCursor } from './warehouse-log-cursor';
 import { type LogTrendRow, readWarehouseLogTrend } from './warehouse-log-trend';
 import {
   warehouseReportMetadata,
   warehouseReportQuery,
   withinWarehouseReport,
 } from './warehouse-report-snapshot';
+import { memoRoundMetric } from './warehouse-round-metrics';
 
 // Counts stay exact in CH. Product contracts use JS numbers, so fail explicitly
 // if a counter exceeds their representable range rather than silently rounding.
@@ -107,6 +110,7 @@ function scoped(
   orderedLogVersions = false,
   window?: { endExclusive: boolean; hours?: boolean },
   restrictEvidenceToWindow = false,
+  readWindow?: AnalysisWindow,
 ) {
   const relation = reportingLogRelation(
     {
@@ -124,6 +128,7 @@ function scoped(
       ...(metrics.crawlerMetricsVersion === 1 ? ['user_agent'] : []),
     ],
     restrictEvidenceToWindow,
+    readWindow,
   );
   return `FROM ${relation} l WHERE true ${crawlerIdentitySql(metrics.crawlerIdentityScope, 'l')}${metrics.crawlerMetricsVersion === 1 ? " AND l.user_agent NOT LIKE 'Liekan-Crawler-Check/%'" : ''}`;
 }
@@ -196,7 +201,7 @@ export async function warehouseLogToday(id: string, start: Date, end: Date) {
     const [rows, imports] = await Promise.all([
       warehouseReportQuery<any>(
         id,
-        `SELECT countIf(NOT match(path,{staticPattern:String})) AS requests,countIf(status>=400) AS abnormal ${scoped(undefined, ['path', 'status'])}`,
+        `SELECT countIf(NOT match(path,{staticPattern:String})) AS requests,countIf(status>=400) AS abnormal ${scoped(undefined, ['path', 'status'], false, undefined, false, { start: +start, end: +end })}`,
         { ...range(start, end), staticPattern: `(?i)${staticRequestExtensionPattern}` },
       ),
       warehouseReader().db.read<{ accepted: string }>(
@@ -224,7 +229,7 @@ export async function warehousePlotLogs(
         await warehouseReportQuery<LogTrendRow>(
           id,
           `SELECT formatDateTime(created_at,'${hour ? '%Y-%m-%d %H:00' : '%Y-%m-%d'}',{timezone:String}) AS day,bot,bot_type AS type,
-       ${counts} ${scoped(metrics, columns, false, { endExclusive })} GROUP BY day,bot,type ORDER BY day`,
+       ${counts} ${scoped(metrics, columns, false, { endExclusive }, false, { start: +from, end: +to, endExclusive })} GROUP BY day,bot,type ORDER BY day`,
           range(from, to, timezone),
         ),
       );
@@ -240,7 +245,7 @@ export async function warehousePlotLogs(
             await warehouseReportQuery<Omit<LogTrendRow, 'day'> & { hour: number }>(
               id,
               `SELECT toUnixTimestamp(toStartOfHour(created_at,'UTC')) AS hour,bot,bot_type AS type,
-               ${counts} ${scoped(metrics, columns, true, { endExclusive: true, hours: true })}
+               ${counts} ${scoped(metrics, columns, true, { endExclusive: true, hours: true }, false, { start: +from, end: +to, endExclusive: true })}
                GROUP BY hour,bot,type SETTINGS optimize_aggregation_in_order=1`,
               { ...range(from, to), logHours },
             ),
@@ -267,7 +272,7 @@ export async function warehouseMonthlyAiShare(
   const rows = warehouseNumbers(
     await warehouseReportQuery<any>(
       id,
-      `SELECT formatDateTime(created_at,'%Y-%m',{timezone:String}) AS month,count() AS total,countIf(${crawlerAiSql('l')}) AS ai ${scoped(metrics, ['created_at', 'bot_type', 'ai_eligible'])} GROUP BY month ORDER BY month`,
+      `SELECT formatDateTime(created_at,'%Y-%m',{timezone:String}) AS month,count() AS total,countIf(${crawlerAiSql('l')}) AS ai ${scoped(metrics, ['created_at', 'bot_type', 'ai_eligible'], false, undefined, false, { start: +start, end: +end })} GROUP BY month ORDER BY month`,
       range(start, end, timezone),
     ),
   );
@@ -311,12 +316,29 @@ export async function warehouseLogQuerySpec(
   id: string,
   reuseOverview = false,
   restrictEvidenceToWindow = false,
+  detailWindow?: AnalysisWindow,
 ) {
   if (reuseOverview && metrics.resource !== 'overview')
     throw new Error('warehouse-overview-reuse-scope-invalid');
-  const aggregateFrom = (columns: readonly string[]) => scoped(metrics, columns);
+  const readWindow = detailWindow ?? {
+    start: previousBots
+      ? Math.max(0, +start - (+end - +start + (metrics.crawlerMetricsVersion === 1 ? 0 : 1)))
+      : +start,
+    end: +end,
+    endExclusive: metrics.crawlerMetricsVersion === 1,
+  };
+  const queryFrom = (columns?: readonly string[]) =>
+    scoped(
+      metrics,
+      columns,
+      restrictEvidenceToWindow,
+      { endExclusive: !!readWindow.endExclusive },
+      restrictEvidenceToWindow,
+      readWindow,
+    );
+  const aggregateFrom = queryFrom;
   const params: Record<string, unknown> = range(start, end, timezone),
-    base = scoped(metrics),
+    base = queryFrom(),
     ai = crawlerAiSql('l'),
     known = `NOT ${unknownCrawlerSql('l')}`;
   const forms = ['ai/bots', 'ai/pages'].includes(metrics.resource);
@@ -361,7 +383,7 @@ export async function warehouseLogQuerySpec(
   const statements: Record<string, string> = {
     summary: `SELECT count() AS requests,countIf(${ai}) AS ai,uniqExactIf(path,${ai}) AS pages,countIf(status>=400) AS abnormal,
         uniqExact(coalesce(reporting_classification_version,'legacy')) AS classificationVersions,countIf(isNull(ai_eligible)) AS legacyRequests,countIf(${unknownCrawlerSql('l')}) AS unclassifiedRequests ${aggregateFrom(logSummaryColumns)}`,
-    daily: `SELECT formatDateTime(created_at,'%Y-%m-%d',{timezone:String}) AS day,bot,vendor,reporting_crawler_id AS botId,count() AS count,countIf(${ai}) AS aiRequests ${scoped(metrics, ['created_at', 'bot', 'vendor', 'reporting_crawler_id', 'ai_eligible', 'bot_type', 'recognition_state'])} AND ${known} GROUP BY day,bot,vendor,botId ORDER BY day`,
+    daily: `SELECT formatDateTime(created_at,'%Y-%m-%d',{timezone:String}) AS day,bot,vendor,reporting_crawler_id AS botId,count() AS count,countIf(${ai}) AS aiRequests ${queryFrom(['created_at', 'bot', 'vendor', 'reporting_crawler_id', 'ai_eligible', 'bot_type', 'recognition_state'])} AND ${known} GROUP BY day,bot,vendor,botId ORDER BY day`,
     bots: botQuery,
     pages: `SELECT path,bot,reporting_crawler_id AS botId,count() AS requests,toString(max(created_at)) AS lastCrawled ${aggregateFrom(
       botColumns.filter(column => column !== 'vendor'),
@@ -372,8 +394,8 @@ export async function warehouseLogQuerySpec(
         AND (isNotNull({botId:Nullable(String)}) OR isNull({botName:Nullable(String)}) OR (isNull(reporting_crawler_id) AND bot={botName:Nullable(String)}))`
         : ''
     } GROUP BY path,bot,botId ORDER BY requests DESC,path,bot,botId`,
-    statuses: `SELECT intDiv(status,100)*100 AS status,count() AS count ${scoped(metrics, ['status', 'ai_eligible', 'bot_type'])} AND ${ai} GROUP BY status ORDER BY status`,
-    hours: `SELECT toHour(toTimeZone(created_at,{timezone:String})) AS hour,count() AS count ${scoped(metrics, ['created_at', 'ai_eligible', 'bot_type'])} AND ${ai} GROUP BY hour ORDER BY hour`,
+    statuses: `SELECT intDiv(status,100)*100 AS status,count() AS count ${queryFrom(['status', 'ai_eligible', 'bot_type'])} AND ${ai} GROUP BY status ORDER BY status`,
+    hours: `SELECT toHour(toTimeZone(created_at,{timezone:String})) AS hour,count() AS count ${queryFrom(['created_at', 'ai_eligible', 'bot_type'])} AND ${ai} GROUP BY hour ORDER BY hour`,
   };
   const filterSql =
     filter === 'ai'
@@ -383,8 +405,10 @@ export async function warehouseLogQuerySpec(
         : filter === 'other'
           ? ` AND ${unknownCrawlerSql('l')}`
           : '';
-  const searchCondition = ` AND positionCaseInsensitiveUTF8(arrayStringConcat(arrayFilter(x->x!='',[coalesce(path,''),coalesce(user_agent,''),coalesce(method,''),toString(status),coalesce(ip_masked,''),coalesce(location,''),coalesce(bot,''),coalesce(bot_type,''),
-      multiIf(verification='verified_range','官方 IP 范围匹配',verification='verified_dns','官方 DNS 双向核验',verification='verified_edge','可信边缘身份核验',verification='range_mismatch','官方范围未匹配','身份未核验')]),' '),{search:String})>0`;
+  const searchCondition = search
+    ? ` AND positionCaseInsensitiveUTF8(arrayStringConcat(arrayFilter(x->x!='',[coalesce(path,''),coalesce(user_agent,''),coalesce(method,''),toString(status),coalesce(ip_masked,''),coalesce(location,''),coalesce(bot,''),coalesce(bot_type,''),
+      multiIf(verification='verified_range','官方 IP 范围匹配',verification='verified_dns','官方 DNS 双向核验',verification='verified_edge','可信边缘身份核验',verification='range_mismatch','官方范围未匹配','身份未核验')]),' '),{search:String})>0`
+    : '';
   const detailBase = `${base}${filterSql}${searchCondition}`;
   params.search = search;
   const previousParams = {
@@ -410,7 +434,7 @@ export async function warehouseLogQuerySpec(
     // and exhausted the query budget even when those operators spilled to disk.
     overview: reuseOverview
       ? renderWarehouseOverviewAggregate(
-          overviewAggregateRows(metrics, restrictEvidenceToWindow, 'counts'),
+          overviewAggregateRows(metrics, restrictEvidenceToWindow, 'counts', readWindow),
         )
       : undefined,
     filterSql,
@@ -427,7 +451,10 @@ export function warehouseOverviewAggregateStates(
   days?: string[],
 ) {
   return {
-    sql: overviewAggregateRows(metrics, restrictEvidenceToWindow, days ? 'days' : 'states'),
+    sql: overviewAggregateRows(metrics, restrictEvidenceToWindow, days ? 'days' : 'states', {
+      start: +start,
+      end: +end,
+    }),
     params: { ...range(start, end, timezone), ...(days ? { overviewDays: days } : {}) },
   };
 }
@@ -447,6 +474,7 @@ function overviewAggregateRows(
   metrics: CrawlerMetricOptions,
   restrictEvidenceToWindow: boolean,
   output: 'counts' | 'states' | 'days',
+  readWindow?: AnalysisWindow,
 ) {
   const ai = crawlerAiSql('l');
   const unknown = unknownCrawlerSql('l');
@@ -469,7 +497,7 @@ function overviewAggregateRows(
     ${unique("coalesce(l.reporting_classification_version,'legacy')", "l._present AND section='summary'")} AS classificationVersions,
     countIf(l._present AND isNull(l.ai_eligible)) AS legacyRequests,
     countIf(l._present AND ${unknown}) AS unclassifiedRequests,max(l.created_at) AS lastTime
-    FROM (SELECT ${columns.map(c => `l.${c}`).join(',')},1 AS _present ${scoped(metrics, columns, true, groupDay ? { endExclusive: true } : undefined, restrictEvidenceToWindow)}
+    FROM (SELECT ${columns.map(c => `l.${c}`).join(',')},1 AS _present ${scoped(metrics, columns, true, groupDay ? { endExclusive: true } : undefined, restrictEvidenceToWindow, readWindow)}
       UNION ALL SELECT ${columns.map(() => 'NULL').join(',')},0 AS _present) l
     ARRAY JOIN arrayFilter(k -> k='summary' OR (l._present AND ((k='bots' AND NOT ${unknown}) OR (k='pages' AND ${ai}))),['summary','bots','pages']) AS section
     ${groupDay ? `WHERE l._present AND ${day} IN {overviewDays:Array(Date32)}` : ''}
@@ -511,7 +539,13 @@ export async function warehouseLogFacts(...args: Parameters<typeof import('./log
     // Limit concurrent scans per report independently of the HTTP concurrency gate.
     for (const [key, sql] of Object.entries(statements))
       if (needs(key))
-        aggregates[key] = warehouseNumbers(await warehouseReportQuery<any>(id, sql, params));
+        aggregates[key] = warehouseNumbers(
+          await (key === 'summary'
+            ? memoRoundMetric(JSON.stringify(['log-summary', id, sql, params]), () =>
+                warehouseReportQuery<any>(id, sql, params),
+              )
+            : warehouseReportQuery<any>(id, sql, params)),
+        );
     const [classification] =
       !detailRead && metrics.crawlerMetricsVersion === 1 && needs('recent')
         ? await warehouseReportQuery<any>(
@@ -558,15 +592,69 @@ export async function warehouseLogFacts(...args: Parameters<typeof import('./log
       ...(boundaryKey ? { cursorAt: boundaryKey[0], cursorId: boundaryKey[1] } : {}),
     });
     const order = cursor && seek === 'before' ? 'ASC' : 'DESC';
-    const detail = needs('recent')
-      ? await warehouseReportQuery<any>(
+    const readDetail = (
+      from: string,
+      queryParams: Record<string, unknown>,
+      limit: number,
+      offset = false,
+    ) =>
+      warehouseReportQuery<any>(
+        id,
+        `SELECT ${warehouseLogDetailColumns(ai)} ${from}
+         ${cursor ? ` AND (created_at,id) ${seek === 'before' ? '>' : '<'} ({cursorAt:DateTime64(6,'UTC')},{cursorId:String})` : ''}
+         ORDER BY created_at ${order},id ${order} LIMIT ${limit}${offset ? ' OFFSET {skip:UInt64}' : ''}`,
+        queryParams,
+      );
+    let detail: any[] = [];
+    if (needs('recent')) {
+      if (detailRead && !fullExport && (cursor || page === 1)) {
+        // Physical timestamps form a conservative superset, including rejected
+        // and obsolete candidates. They can add work, never hide accepted rows.
+        const [extent] = await warehouseReportQuery<{
+          firstHour: string | null;
+          lastHour: string | null;
+        }>(
           id,
-          `SELECT ${warehouseLogDetailColumns(ai)}
-      ${detailBase}${cursor ? ` AND (created_at,id) ${seek === 'before' ? '>' : '<'} ({cursorAt:DateTime64(6,'UTC')},{cursorId:String})` : ''}
-      ORDER BY created_at ${order},id ${order} LIMIT ${fullExport ? 100001 : (detailRead?.limit ?? 100)}${cursor ? '' : ' OFFSET {skip:UInt64}'}`,
+          `SELECT toString(toUnixTimestamp(toStartOfHour(minOrNull(_record_time)))) AS firstHour,
+                  toString(toUnixTimestamp(toStartOfHour(maxOrNull(_record_time)))) AS lastHour
+           ${rawLogWindow(metrics.crawlerMetricsVersion === 1)}`,
           params,
-        )
-      : [];
+        );
+        detail = await readLogPageWindows(
+          { start: +start, end: +end, endExclusive: metrics.crawlerMetricsVersion === 1 },
+          extent?.firstHour != null && extent.lastHour != null
+            ? { firstHour: Number(extent.firstHour), lastHour: Number(extent.lastHour) }
+            : undefined,
+          detailRead.limit,
+          order === 'ASC',
+          boundaryKey?.[0],
+          async (window, remaining) => {
+            const spec = await warehouseLogQuerySpec(
+              new Date(window.start),
+              new Date(window.end),
+              timezone,
+              metrics,
+              filter,
+              search,
+              false,
+              id,
+              false,
+              true,
+              window,
+            );
+            return readDetail(spec.detailBase, { ...params, ...spec.params }, remaining);
+          },
+        );
+      } else {
+        // Offset links and exports retain their complete ordered relation.
+        detail = await readDetail(
+          detailBase,
+          params,
+          fullExport ? 100001 : (detailRead?.limit ?? 100),
+          !cursor,
+        );
+      }
+    }
     const count = needs('count')
       ? exactCount(
           (await warehouseReportQuery<any>(id, `SELECT count() AS count ${detailBase}`, params))[0]

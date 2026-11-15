@@ -33,6 +33,7 @@ export function createWarehouseReader(config: {
     database: config.clickhouseDatabase,
     request_timeout: 60000,
     clickhouse_settings: {
+      workload: 'liekan_interactive',
       max_execution_time: 55,
       max_threads: 2,
       // Several evidence families are joined in an audit. Smaller processing
@@ -57,6 +58,7 @@ export function createWarehouseReader(config: {
     database: config.clickhouseDatabase,
     request_timeout: (exportSeconds + 30) * 1000,
     clickhouse_settings: {
+      workload: 'liekan_background',
       max_execution_time: exportSeconds,
       max_threads: 1,
       max_block_size: '8192',

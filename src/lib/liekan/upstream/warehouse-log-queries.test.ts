@@ -246,7 +246,9 @@ it('preserves microseconds and uses only visible rows for split log page cursors
     time: '2026-11-01 00:00:00.000000',
     recordId: i.toString(16).padStart(64, '0'),
   }));
-  mocks.query.mockResolvedValueOnce(rows);
+  mocks.query
+    .mockResolvedValueOnce([{ firstHour: '1793491200', lastHour: '1793491200' }])
+    .mockResolvedValueOnce(rows);
   const value = await warehouseLogFacts(
     'site',
     start,
@@ -263,11 +265,73 @@ it('preserves microseconds and uses only visible rows for split log page cursors
     undefined,
     { cursorScope: scope, limit: 101 },
   );
-  expect(mocks.query).toHaveBeenCalledTimes(1);
-  expect(mocks.query.mock.calls[0][1]).toContain('LIMIT 101');
+  expect(mocks.query).toHaveBeenCalledTimes(2);
+  expect(mocks.query.mock.calls[1][1]).toContain('LIMIT 101');
   expect(value.recent).toHaveLength(101);
   expect(decodeWarehouseLogCursor(value.nextCursor, scope)).toEqual([
     rows[99].cursorTime,
     rows[99].recordId,
   ]);
+});
+
+it('bounds split log pages by physical timestamps, then filters canonical rows before LIMIT', async () => {
+  mocks.query
+    .mockResolvedValueOnce([{ firstHour: '1793491200', lastHour: '1793574000' }])
+    .mockResolvedValueOnce(
+      Array.from({ length: 101 }, (_, i) => ({
+        cursorTime: '2026-11-01 23:01:00.123456',
+        time: '2026-11-01 23:01:00.123456',
+        recordId: i.toString(16).padStart(64, '0'),
+      })),
+    );
+  await warehouseLogFacts(
+    'site',
+    start,
+    end,
+    'UTC',
+    1,
+    'ai',
+    'needle',
+    '',
+    'after',
+    ['recent'],
+    { crawlerIdentityScope: 'all', crawlerMetricsVersion: 1 },
+    false,
+    undefined,
+    { cursorScope: 'b'.repeat(64), limit: 101 },
+  );
+  expect(mocks.query).toHaveBeenCalledTimes(2);
+  expect(mocks.query.mock.calls[0][1]).toContain('minOrNull');
+  const [, sql, params] = mocks.query.mock.calls[1];
+  expect(params.logStart).toBe('2026-11-01 23:00:00.000000');
+  expect(params.logEnd).toBe('2026-11-02 00:00:00.000000');
+  expect(sql).toContain('warehouse_publication');
+  expect(sql).toContain('warehouse_deletion');
+  expect(sql).toContain('positionCaseInsensitiveUTF8');
+  expect(sql).toContain('LIMIT 101');
+});
+
+it('does not build a wide string search predicate for an empty search', async () => {
+  const empty = await warehouseLogQuerySpec(
+    start,
+    end,
+    'UTC',
+    { crawlerIdentityScope: 'all' },
+    '',
+    '',
+    false,
+    'site',
+  );
+  const searched = await warehouseLogQuerySpec(
+    start,
+    end,
+    'UTC',
+    { crawlerIdentityScope: 'all' },
+    '',
+    'needle',
+    false,
+    'site',
+  );
+  expect(empty.detailBase).not.toContain('positionCaseInsensitiveUTF8');
+  expect(searched.detailBase).toContain('positionCaseInsensitiveUTF8');
 });

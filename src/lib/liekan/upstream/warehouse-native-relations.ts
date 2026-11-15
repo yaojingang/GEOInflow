@@ -1,12 +1,25 @@
+import { type AnalysisWindow, analysisWindowRelation } from '../warehouse/analysis-context';
+import { analysisBrowserFields } from '../warehouse/schema';
 import { factTable, identifier } from '../warehouse/catalog';
 import { factRelation } from '../warehouse/read';
 import {
   geographicEventRelation,
+  analyticsEventRelation,
   sessionLinkRelation,
   sessionPropertyRelation,
 } from '../warehouse/reporting-relations';
 
-export function nativeRelations() {
+export function nativeRelations(geography = true, window?: AnalysisWindow, hourly?: string) {
+  const events =
+    analysisWindowRelation(
+      'browser',
+      [
+        ...factTable('website_event').columns.map(c => c.name),
+        ...analysisBrowserFields.filter(c => !c[0].startsWith('_')).map(c => c[0]),
+      ],
+      window,
+      true,
+    ) ?? (geography ? geographicEventRelation() : analyticsEventRelation());
   const columns = (family: string, alias: string) =>
     factTable(family)
       .columns.map(c => `${alias}.${identifier(c.name)} AS ${identifier(c.name)}`)
@@ -34,7 +47,7 @@ export function nativeRelations() {
   return [
     `website_event AS (SELECT *,liekan_country AS country,liekan_region AS region,liekan_city AS city,
       liekan_browser AS browser,liekan_os AS os,liekan_device AS device,liekan_screen AS screen,
-      liekan_language AS language,liekan_distinct_id AS distinct_id FROM ${geographicEventRelation()})`,
+      liekan_language AS language,liekan_distinct_id AS distinct_id FROM ${events})`,
     `heatmap_event AS ${factRelation('heatmap_event')}`,
     `session_replay AS ${factRelation('session_replay')}`,
     `event_data AS (SELECT ${columns('event_data', 'd')},d.website_event_id AS event_id,e.session_id,e.event_name,e.url_path FROM ${factRelation('event_data')} d
@@ -45,7 +58,9 @@ export function nativeRelations() {
       INNER JOIN website_event e ON e.website_id=r.website_id AND e.event_id=r.event_id)`,
     // This is a query projection, not a second permanent per-path fact store.
     // One event per row also preserves sub-hour range boundaries accurately.
-    `website_event_stats_hourly AS (SELECT e.* EXCEPT(${arrays.join(',')}),
+    hourly
+      ? `website_event_stats_hourly AS ${hourly}`
+      : `website_event_stats_hourly AS (SELECT e.* EXCEPT(${arrays.join(',')}),
       ${arrays.map(c => `${c === 'event_name' ? "if(e.event_type=2,[coalesce(e.event_name,'')],[])" : `arrayFilter(v->v!=''${c === 'referrer_domain' ? " AND v!=coalesce(e.hostname,'')" : ''},[coalesce(e.${c},'')])`} AS ${c}`).join(',')},
       toUInt64(event_type NOT IN(2,5)) AS views,created_at AS min_time,created_at AS max_time,
       arrayReduce('argMinState',[coalesce(e.url_path,'')],[e.created_at]) AS entry_url,

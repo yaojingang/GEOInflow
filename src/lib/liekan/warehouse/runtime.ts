@@ -41,6 +41,7 @@ export class WarehouseRuntime {
     clickhouseUsername?: string;
     clickhousePassword?: string;
     queue: QueueOptions;
+    workload?: 'liekan_publish' | 'liekan_background';
   }) {
     const db = new ControlDatabase(config.databaseURL);
     let ch: ClickHouseClient, queue: WarehouseQueue;
@@ -65,7 +66,11 @@ export class WarehouseRuntime {
         password,
         database: config.clickhouseDatabase,
         request_timeout: 15000,
-        clickhouse_settings: { max_execution_time: 10, max_threads: 2 },
+        clickhouse_settings: {
+          max_execution_time: 10,
+          max_threads: 2,
+          workload: config.workload ?? 'liekan_publish',
+        },
       });
       if (installation.authority === 'clickhouse') await verifyBoundWarehouse(db, ch);
       queue = new WarehouseQueue(config.queue, {

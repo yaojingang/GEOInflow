@@ -1,3 +1,4 @@
+import { LiekanLocaleContext } from '@/lib/liekan/i18n/client';
 import { crawlerCatalog } from '@/lib/liekan/crawlers/catalog';
 import userEvent from '@testing-library/user-event';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
@@ -50,6 +51,31 @@ describe('real data states and interactions', () => {
     expect(screen.getByText('待接入')).toBeInTheDocument();
     expect(screen.queryByText('18,642')).not.toBeInTheDocument();
   });
+  it('shows the shared Today cutoff in both locales independently of the selected report range', () => {
+    const data = report();
+    data.cards[0] = { ...data.cards[0], value: 55, state: 'available' };
+    data.meta.todayRequests = {
+      state: 'updating',
+      range: { startAt: 1, endAt: 2, timezone: 'Asia/Shanghai' },
+      intervalMs: 600000,
+      dataThrough: Date.parse('2026-11-14T01:02:03Z'),
+    };
+    const { rerender } = render(
+      <LiekanLocaleContext.Provider value="zh-CN">
+        <MetricCard label="今日总请求" className="card" valueClass="num" report={data} />
+      </LiekanLocaleContext.Provider>,
+    );
+    expect(screen.getByRole('status')).toHaveTextContent('2026/11/14 09:02:03');
+    expect(screen.getByText('55')).toBeVisible();
+    rerender(
+      <LiekanLocaleContext.Provider value="en-US">
+        <MetricCard label="今日总请求" className="card" valueClass="num" report={data} />
+      </LiekanLocaleContext.Provider>,
+    );
+    expect(screen.getByRole('status')).toHaveTextContent('11/14/2026');
+    expect(screen.getByRole('status')).not.toHaveTextContent('数据截至');
+  });
+
   it('preserves table columns while showing the missing data state', () => {
     render(
       <ReportContext.Provider value={actions()}>

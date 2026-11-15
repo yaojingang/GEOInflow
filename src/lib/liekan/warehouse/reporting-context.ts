@@ -26,6 +26,8 @@ export async function readReportingMetadataForSites(
     control_revision: string;
     catalog_revision: string;
     bookmark_revision: string;
+    audience_revision: string;
+    crawler_revision: string;
     log_revision: string;
     population: Record<string, unknown>;
     reports: ReportingMetadata['reports'];
@@ -46,6 +48,8 @@ export async function readReportingMetadataForSites(
       'governanceProcessing',(SELECT jsonb_build_object('computedAt',b.computed_at,'nextWindow',b.next_window,'errorCode',b.error_code) FROM liekan_browser_risk_state b WHERE b.website_id=s.website_id AND b.epoch=coalesce(ls.epoch,1))) AS population,
     (SELECT coalesce(jsonb_agg(jsonb_build_object('id',d.report_id,'name',d.name,'type',d.type,'parameters',d.parameters) ORDER BY d.created_at,d.report_id),'[]'::jsonb) FROM report d WHERE d.website_id=s.website_id AND d.type IN('goal','funnel')) AS reports,
     coalesce(p.mode,'standard') AS mode,coalesce(p.allowed_hostnames,ARRAY[]::text[]) AS allowed_hostnames,
+    (SELECT md5(coalesce(jsonb_agg(jsonb_build_array(d.segment_id,d.type,d.parameters) ORDER BY d.segment_id)::text,'[]')) FROM segment d WHERE d.website_id=s.website_id) AS audience_revision,
+    (SELECT concat_ws(':',version,revision) FROM liekan_crawler_registry_current WHERE id=1) AS crawler_revision,
     '[]'::jsonb AS hostnames,
     (SELECT coalesce(jsonb_agg(jsonb_build_object('source_id',i.source_id,'starts_us',(extract(epoch FROM i.starts_at)*1000000)::bigint::text,'ends_us',(extract(epoch FROM i.ends_at)*1000000)::bigint::text) ORDER BY i.id),'[]'::jsonb) FROM liekan_log_interval i WHERE i.website_id=s.website_id) AS intervals,
     r.id AS repair_run_id,r.active_generation AS repair_generation,
@@ -70,6 +74,8 @@ export async function readReportingMetadataForSites(
     controlRevision: row.control_revision,
     catalogRevision: row.catalog_revision,
     bookmarkRevision: row.bookmark_revision,
+    audienceRevision: row.audience_revision,
+    crawlerRevision: row.crawler_revision,
     logRevision: row.log_revision,
     population: row.population,
     reports: row.reports,

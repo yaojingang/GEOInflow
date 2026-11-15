@@ -10,6 +10,7 @@ import { browserPopulationSchema } from '../contracts/browser-population';
 import type { ExportFrame, ExportRequest } from '../contracts/exports';
 import { isReportOwnedBy } from '../contracts/query';
 import type { WebsiteSummary } from '../contracts/website-summary';
+import { reportPreparingSchema } from '../contracts/report-status';
 import { defaultLiekanLocale, isLiekanLocale, readLocaleCookie } from '../i18n/locale';
 import {
   analysisAsyncPath,
@@ -152,7 +153,11 @@ export async function featureRequest<T = any>(
   signal?: AbortSignal,
   shareToken?: string,
   tokenOverride?: string,
-  options?: { priority?: 'foreground' | 'prefetch'; onPrevious?: (value: unknown) => void },
+  options?: {
+    priority?: 'foreground' | 'prefetch';
+    onPrevious?: (value: unknown) => void;
+    waitForResult?: boolean;
+  },
 ): Promise<T> {
   const url = new URL(getApiUrl(path), window.location.origin);
   const aggregate = method === 'GET' && isAggregateRequest(path, params);
@@ -210,6 +215,15 @@ export async function featureRequest<T = any>(
       });
     };
     let response = await send();
+    if (response.status === 202 && options?.waitForResult === false) {
+      const accepted = await response.json();
+      // The server validates ownership and the control version of a previous result.
+      if (accepted.previousResult) return accepted.previousResult;
+      return reportPreparingSchema.parse({
+        status: 'preparing',
+        analysisJob: accepted.analysisJob,
+      });
+    }
     if (
       attemptHeaders.Prefer === 'respond-async' &&
       params?.resource === 'overview' &&
@@ -224,6 +238,7 @@ export async function featureRequest<T = any>(
     if (
       attemptHeaders.Prefer === 'respond-async' &&
       response.status === 429 &&
+      options?.waitForResult !== false &&
       data?.error?.code === 'analysis-concurrency-limited'
     ) {
       const websiteId = /\/websites\/([^/]+)\//.exec(path)?.[1];
@@ -276,7 +291,7 @@ export async function featureRequest<T = any>(
               params?.resource === 'overview' &&
               /\/overview-jobs\/[^/]+\/result$/.test(taskPath)
             ) {
-              for (const key of ['tp_topBody', 'tp_visitorTopBody']) {
+              for (const key of ['tp_topBody', 'tp_visitorTopBody', 'overviewVersion']) {
                 if (params[key] != null) taskUrl.searchParams.set(key, String(params[key]));
               }
             }
@@ -345,7 +360,11 @@ export const featureApi = {
     path: string,
     params?: Record<string, any>,
     signal?: AbortSignal,
-    options?: { priority?: 'foreground' | 'prefetch'; onPrevious?: (value: unknown) => void },
+    options?: {
+      priority?: 'foreground' | 'prefetch';
+      onPrevious?: (value: unknown) => void;
+      waitForResult?: boolean;
+    },
   ) => featureRequest<T>('GET', path, params, signal, undefined, undefined, options),
   post: <T = any>(path: string, body?: Record<string, any>, signal?: AbortSignal) =>
     featureRequest<T>('POST', path, body, signal),

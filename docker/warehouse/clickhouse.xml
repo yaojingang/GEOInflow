@@ -1,4 +1,16 @@
 <clickhouse>
+  <!-- Fair CPU time between publication, interactive reads and rebuilds.
+       Shares are work-conserving; background work retains a nonzero share.
+       This does not replace query memory/admission limits or schedule merges. -->
+  <cpu_slot_preemption>true</cpu_slot_preemption>
+  <resources_and_workloads>
+    CREATE RESOURCE liekan_cpu (MASTER THREAD, WORKER THREAD);
+    CREATE WORKLOAD liekan_cpu_root SETTINGS max_concurrent_threads_ratio_to_cores = 1;
+    CREATE WORKLOAD default IN liekan_cpu_root;
+    CREATE WORKLOAD liekan_publish IN liekan_cpu_root SETTINGS weight = 4;
+    CREATE WORKLOAD liekan_interactive IN liekan_cpu_root SETTINGS weight = 2;
+    CREATE WORKLOAD liekan_background IN liekan_cpu_root SETTINGS weight = 1;
+  </resources_and_workloads>
   <max_server_memory_usage_to_ram_ratio>0.7</max_server_memory_usage_to_ram_ratio>
   <mark_cache_size>134217728</mark_cache_size>
   <uncompressed_cache_size>67108864</uncompressed_cache_size>

@@ -62,6 +62,7 @@ export function MetricCard({
   const loading = useDataLoading();
   const card = report?.cards.find(card => card.label === label);
   const place = report?.meta?.geography?.cards?.[label];
+  const today = label === '今日总请求' ? report?.meta.todayRequests : undefined;
   const display =
     place && i18n.locale === 'en-US'
       ? label === '海外 TOP1'
@@ -91,6 +92,17 @@ export function MetricCard({
             {i18n.system(card?.detail || stateLabels[card?.state || 'not_connected']) ||
               i18n.text('当前统计范围')}
             {card?.state === 'estimated' && card.detail ? i18n.text(' · 估算') : ''}
+            {today?.dataThrough !== undefined && (
+              <span className="block" role="status">
+                {i18n.text('数据截至 {v0}', [
+                  new Date(today.dataThrough).toLocaleString(i18n.locale, {
+                    timeZone: today.range.timezone,
+                    hour12: false,
+                  }),
+                ])}
+                {today.updateError && <> · {i18n.text('更新失败，当前显示上次读取的数据')}</>}
+              </span>
+            )}
           </>
         )}
       </p>

@@ -188,7 +188,7 @@ export async function withWarehouseKeywords<T>(
       async emit => {
         await warehouseReportStream(
           site,
-          `${warehouseVisitsSQL()} SELECT v.referrer,v.utmSource,v.utmMedium,v.utmCampaign,v.referrerPath,v.referrerQuery,v.utmTerm,
+          `${warehouseVisitsSQL(false, false, { start: p.startAt, end: p.endAt })} SELECT v.referrer,v.utmSource,v.utmMedium,v.utmCampaign,v.referrerPath,v.referrerQuery,v.utmTerm,
           count() AS sessions,countIf(v.pv=1 AND v.custom=0) AS bounces,countIf(v.converted) AS conversions
           FROM visits v GROUP BY v.referrer,v.utmSource,v.utmMedium,v.utmCampaign,v.referrerPath,v.referrerQuery,v.utmTerm`,
           params,

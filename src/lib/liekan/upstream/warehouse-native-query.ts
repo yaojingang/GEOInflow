@@ -1,23 +1,52 @@
-import { randomUUID } from 'node:crypto';
+import { withAvailableAnalysisModel } from './warehouse-analysis-model';
 import { DEFAULT_PAGE_SIZE } from '@/lib/constants';
 import type { QueryFilters } from '@/lib/types';
 import { identityUsable } from '../contracts/browser-population';
 import { warehouseTime } from '../warehouse/fact-input';
-import { warehouseReader } from '../warehouse/reader-runtime';
-import { reportingParameters } from '../warehouse/reporting-relations';
 import { applyNativePopulation, readBrowserPopulation } from './browser-population';
 import { noteBrowserPopulation } from './cache-context';
 import { geographyQueryParams, withClickHouseGeographySQL } from './geography-query';
+import { nativeHourlyStats } from './warehouse-native-hours';
 import { nativeRelations } from './warehouse-native-relations';
 import {
-  warehouseReportMetadata,
+  frozenCountKey,
+  readFrozenCount,
+  saveFrozenCount,
+  warehouseReportResponse,
   warehouseReportStream,
   withinWarehouseReport,
 } from './warehouse-report-snapshot';
 
-function prepareNativeQuery(query: string, params: Record<string, unknown>) {
+// Only these audited queries restrict all event reads to the report/cohort windows.
+// Other native queries may intentionally follow identities outside the selected range.
+const boundedNativeQueries = new Set([
+  'getWebsiteSessions',
+  'getRetention',
+  'getRealtimeActivity',
+  'getRealtimeStats',
+  'getPageviewStats',
+  'getSessionStats',
+  'getWebsiteStats',
+]);
+function nativeWindow(params: Record<string, unknown>, name?: string) {
+  if (!boundedNativeQueries.has(name) || !params.startDate || !params.endDate) return;
+  const starts = [+new Date(params.startDate as string)];
+  const ends = [+new Date(params.endDate as string)];
+  if (params.cohort_startDate || params.cohort_endDate) {
+    starts.push(+new Date(params.cohort_startDate as string));
+    ends.push(+new Date(params.cohort_endDate as string));
+  }
+  if (![...starts, ...ends].every(Number.isFinite)) return;
+  return { start: Math.min(...starts), end: Math.max(...ends) };
+}
+function prepareNativeQuery(query: string, params: Record<string, unknown>, name?: string) {
   if (typeof params.websiteId !== 'string') throw new Error('warehouse-native-site-required');
-  const relations = nativeRelations();
+  // An unqualified star can expose geographic fields; keep its complete shape.
+  const relations = nativeRelations(
+    /\b(?:country|region|city)\b|(?:select|,)\s*(?:[a-z_]+\.)?\*/i.test(query),
+    nativeWindow(params, name),
+    nativeHourlyStats(name, query, params, nativeWindow(params, name)),
+  );
   // These relations already select the accepted version and deletion fences.
   query = query
     .replace(/\bsession_data\s+final\b/gi, 'session_data')
@@ -50,13 +79,19 @@ export async function warehouseNativeStringStream<T extends Record<string, strin
   consume: (rows: T[]) => Promise<void>,
   signal?: AbortSignal,
 ) {
-  const prepared = prepareNativeQuery(sql, params);
-  return warehouseReportStream<T>(
+  return withAvailableAnalysisModel(
     String(params.websiteId),
-    `${prepared.query.trim().replace(/;$/, '')} SETTINGS group_by_use_nulls=1`,
-    prepared.parameters,
-    consume,
-    signal,
+    async () => {
+      const prepared = prepareNativeQuery(sql, params);
+      return warehouseReportStream<T>(
+        String(params.websiteId),
+        `${prepared.query.trim().replace(/;$/, '')} SETTINGS group_by_use_nulls=1`,
+        prepared.parameters,
+        consume,
+        signal,
+      );
+    },
+    browserSelection(params),
   );
 }
 
@@ -77,58 +112,72 @@ export async function warehouseNativeQuery<T = unknown>(
         );
       return rows as T;
     }
-    const prepared = prepareNativeQuery(query, params);
-    query = prepared.query;
-    const site = String(params.websiteId);
-    const metadata = await warehouseReportMetadata(site);
-    const response = await warehouseReader().admission.run(() =>
-      warehouseReader()
-        .ch.query({
-          query,
-          query_id: `liekan-${_name ?? 'page-count'}-${randomUUID()}`,
-          query_params: {
-            ...prepared.parameters,
-            ...reportingParameters(metadata),
-          },
-          format: 'JSON',
-          clickhouse_settings: { group_by_use_nulls: 1 },
-        })
-        .then(r =>
-          r.json<{ meta: { name: string; type: string }[]; data: Record<string, unknown>[] }>(),
-        ),
+    return withAvailableAnalysisModel(
+      String(params.websiteId),
+      async () => {
+        const prepared = prepareNativeQuery(query, params, _name);
+        query = prepared.query;
+        const site = String(params.websiteId);
+        const response = await warehouseReportResponse<{
+          meta: { name: string; type: string }[];
+          data: Record<string, unknown>[];
+        }>(site, query, prepared.parameters, 'JSON');
+        let rows = response.data.map(row =>
+          Object.fromEntries(
+            response.meta.map(column => {
+              const value = row[column.name],
+                type = column.type.replace(/^Nullable\((.*)\)$/, '$1');
+              if (
+                value !== null &&
+                (/^(U?Int\d+|Float\d+)$/.test(type) ||
+                  (type.startsWith('Decimal') && ['totaltime', 'duration'].includes(column.name)))
+              ) {
+                const n = Number(value);
+                if (/Float/.test(type) && !Number.isFinite(n)) return [column.name, null];
+                if (!Number.isFinite(n) || (/Int/.test(type) && !Number.isSafeInteger(n)))
+                  throw new Error('warehouse-native-number-out-of-range');
+                return [column.name, n];
+              }
+              return [column.name, value];
+            }),
+          ),
+        );
+        if (params.startDate && _name) {
+          const population = await readBrowserPopulation(
+            site,
+            new Date(params.startDate as string),
+            params.endDate ? new Date(params.endDate as string) : new Date(),
+            String(params.timezone ?? 'UTC'),
+          );
+          noteBrowserPopulation(site, population);
+          rows = applyNativePopulation(rows, _name, population);
+        }
+        return rows as T;
+      },
+      browserSelection(params, _name),
     );
-    let rows = response.data.map(row =>
-      Object.fromEntries(
-        response.meta.map(column => {
-          const value = row[column.name],
-            type = column.type.replace(/^Nullable\((.*)\)$/, '$1');
-          if (
-            value !== null &&
-            (/^(U?Int\d+|Float\d+)$/.test(type) ||
-              (type.startsWith('Decimal') && ['totaltime', 'duration'].includes(column.name)))
-          ) {
-            const n = Number(value);
-            if (/Float/.test(type) && !Number.isFinite(n)) return [column.name, null];
-            if (!Number.isFinite(n) || (/Int/.test(type) && !Number.isSafeInteger(n)))
-              throw new Error('warehouse-native-number-out-of-range');
-            return [column.name, n];
-          }
-          return [column.name, value];
-        }),
-      ),
-    );
-    if (params.startDate && _name) {
-      const population = await readBrowserPopulation(
-        site,
-        new Date(params.startDate as string),
-        params.endDate ? new Date(params.endDate as string) : new Date(),
-        String(params.timezone ?? 'UTC'),
-      );
-      noteBrowserPopulation(site, population);
-      rows = applyNativePopulation(rows, _name, population);
-    }
-    return rows as T;
   });
+}
+
+function browserSelection(params: Record<string, unknown>, name?: string) {
+  const window = nativeWindow(params, name);
+  return {
+    kinds: ['browser' as const],
+    start: window?.start ?? (params.startDate ? +new Date(params.startDate as string) : undefined),
+    end: window?.end ?? (params.endDate ? +new Date(params.endDate as string) : Date.now()),
+  };
+}
+
+/** Keep the page and its population on the same verified model. Leaving this
+ * scope between them would miss the model-specific memo and scan raw facts. */
+export function withWarehouseNativeRead<T>(
+  params: Record<string, unknown>,
+  name: string | undefined,
+  work: () => Promise<T>,
+): Promise<T> {
+  return withinWarehouseReport(() =>
+    withAvailableAnalysisModel(String(params.websiteId), work, browserSelection(params, name)),
+  );
 }
 
 export async function warehouseNativePage(
@@ -137,7 +186,7 @@ export async function warehouseNativePage(
   filters: QueryFilters,
   name?: string,
 ) {
-  return withinWarehouseReport(async () => {
+  return withWarehouseNativeRead(params, name, async () => {
     const page = Number(filters.page ?? 1),
       pageSize = Number(filters.pageSize ?? DEFAULT_PAGE_SIZE),
       offset = (page - 1) * pageSize;
@@ -153,15 +202,41 @@ export async function warehouseNativePage(
     if (order && !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(order))
       throw new Error('warehouse-invalid-order');
     const body = query.trim().replace(/;$/, '');
-    const [count] = await warehouseNativeQuery<{ num: number }[]>(
-      `SELECT count() AS num FROM (${body})`,
-      params,
-    );
-    const data = await warehouseNativeQuery<unknown[]>(
-      `SELECT * FROM (${body}) ${order ? `ORDER BY "${order}" ${filters.sortDescending ? 'DESC' : 'ASC'}` : ''} LIMIT {wh_page_size:UInt64} OFFSET {wh_page_offset:UInt64}`,
-      { ...params, wh_page_size: pageSize, wh_page_offset: offset },
-      name,
-    );
+    let count: number, data: unknown[];
+    if (name === 'getWebsiteSessions') {
+      const countKey = await frozenCountKey(String(params.websiteId), body, params);
+      const knownCount = readFrozenCount(countKey);
+      const rows = await warehouseNativeQuery<Record<string, unknown>[]>(
+        `SELECT *${knownCount === undefined ? ',count() OVER () AS _liekan_page_count' : ''} FROM (${body}) ${order ? `ORDER BY "${order}" ${filters.sortDescending ? 'DESC' : 'ASC'},id` : 'ORDER BY createdAt DESC,id'} LIMIT {wh_page_size:UInt64} OFFSET {wh_page_offset:UInt64}`,
+        { ...params, wh_page_size: pageSize, wh_page_offset: offset },
+        name,
+      );
+      count =
+        knownCount ??
+        (rows.length
+          ? Number(rows[0]._liekan_page_count)
+          : offset > 0
+            ? (
+                await warehouseNativeQuery<{ num: number }[]>(
+                  `SELECT count() AS num FROM (${body})`,
+                  params,
+                  name,
+                )
+              )[0].num
+            : 0);
+      saveFrozenCount(countKey, count);
+      data = rows.map(({ _liekan_page_count, ...row }) => row);
+    } else {
+      [{ num: count }] = await warehouseNativeQuery<{ num: number }[]>(
+        `SELECT count() AS num FROM (${body})`,
+        params,
+      );
+      data = await warehouseNativeQuery<unknown[]>(
+        `SELECT * FROM (${body}) ${order ? `ORDER BY "${order}" ${filters.sortDescending ? 'DESC' : 'ASC'}` : ''} LIMIT {wh_page_size:UInt64} OFFSET {wh_page_offset:UInt64}`,
+        { ...params, wh_page_size: pageSize, wh_page_offset: offset },
+        name,
+      );
+    }
     const population =
       params.websiteId && params.startDate && params.endDate
         ? await readBrowserPopulation(
@@ -180,7 +255,7 @@ export async function warehouseNativePage(
       ].includes(name) && !identityUsable(population);
     return {
       data: unavailable ? [] : data,
-      count: unavailable ? null : count.num,
+      count: unavailable ? null : count,
       page,
       pageSize,
       orderBy: order,

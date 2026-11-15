@@ -1224,9 +1224,7 @@ describe('core form flows', () => {
     };
     mocks.context.query = { section: 'install' };
     render(<CorePages page="website-settings" />);
-    expect(
-      screen.getByRole('heading', { name: '接入设置已保存', level: 3 }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '接入设置已保存', level: 3 })).toBeInTheDocument();
     expect(screen.getAllByText('检查已延后')).toHaveLength(2);
     expect(screen.getByRole('link', { name: '服务器安装页面' })).toHaveAttribute(
       'href',

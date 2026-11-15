@@ -1,3 +1,6 @@
+import { warehouseEnabled } from '@/lib/liekan/warehouse/authority-routing';
+import { requestWarehouseRetention } from '@/lib/liekan/upstream/warehouse-overview-snapshots';
+import { authorize } from '@/lib/liekan/upstream/server';
 import { requestApi } from '@/lib/liekan/http';
 import {
   analysisAsyncRequested,
@@ -18,6 +21,8 @@ async function getResponse(
   if (error) return error();
   const { websiteId } = await params;
   if (!(await canViewWebsiteSection(auth, websiteId, 'retention'))) return unauthorized();
+  if (warehouseEnabled() && auth?.user)
+    return requestWarehouseRetention(await authorize(request, websiteId), query, request.signal);
   const filters = await getQueryFilters(query, websiteId);
   const parameters = { ...query, ...filters } as RetentionParameters;
   return json(await getRetention(websiteId, parameters, filters));

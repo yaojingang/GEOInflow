@@ -31,6 +31,7 @@ function LatestLogBatch({
   const status = {
     registered: () => i18n.text('已登记，等待入队'),
     queued: () => i18n.text('已入队'),
+    queue_unconfirmed: () => i18n.text('入队状态未确认'),
     processing: () => i18n.text('处理中（{v0}/{v1} 条）', [batch.processed, batch.expected]),
     published: () => i18n.text('已发布，可查询'),
     processed: () =>

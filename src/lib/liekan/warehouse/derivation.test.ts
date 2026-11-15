@@ -10,7 +10,10 @@ import { LandingStore } from './landing';
 import { WarehousePublisher } from './publication';
 
 vi.mock('./derivation-plan', () => ({ deriveCandidates: vi.fn() }));
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
 
 function fixture(busy = false) {
   const attempt = {
@@ -28,6 +31,8 @@ function fixture(busy = false) {
     digest: 'a'.repeat(64),
   };
   const operations: string[] = [];
+  let active = false;
+  let siteEpoch = attempt.epoch;
   vi.mocked(deriveCandidates).mockReturnValue({
     groups: new Map([[entry.family, [{} as StoredFact]]]),
     manifest: [entry],
@@ -50,7 +55,7 @@ function fixture(busy = false) {
     if (sql.includes('SELECT digest,row_count'))
       return { rows: [{ digest: entry.digest, row_count: entry.rowCount }] };
     if (sql.includes('SELECT epoch,publication,state'))
-      return { rows: [{ epoch: attempt.epoch, publication: '8', state: 'active' }] };
+      return { rows: [{ epoch: siteEpoch, publication: '8', state: 'active' }] };
     if (sql.includes('SELECT website_id,epoch,version,status')) return { rows: [attempt] };
     if (sql.includes('SELECT 1 FROM liekan_warehouse_publication') && busy)
       return { rows: [{ exists: true }] };
@@ -67,7 +72,14 @@ function fixture(busy = false) {
   });
   const db = {
     read: async () => [attempt],
-    transaction: async (work: (tx: { query: typeof query }) => Promise<unknown>) => work({ query }),
+    transaction: async (work: (tx: { query: typeof query }) => Promise<unknown>) => {
+      active = true;
+      try {
+        return await work({ query });
+      } finally {
+        active = false;
+      }
+    },
   } as unknown as ControlDatabase;
   return {
     deriver: new WarehouseDeriver(db, {} as ClickHouseClient),
@@ -75,6 +87,13 @@ function fixture(busy = false) {
     operations,
     verify,
     project,
+    setBusy: (value: boolean) => {
+      busy = value;
+    },
+    setEpoch: (value: string) => {
+      siteEpoch = value;
+    },
+    active: () => active,
   };
 }
 
@@ -85,10 +104,42 @@ test('verifies persisted facts once before marking candidates and reserving publ
 });
 
 test('a busy site leaves candidates retryable and publishes no competing operation', async () => {
+  vi.useFakeTimers();
   const f = fixture(true);
-  await expect(f.deriver.derive(f.attempt.attempt_id)).rejects.toMatchObject({
+  const rejected = expect(f.deriver.derive(f.attempt.attempt_id)).rejects.toMatchObject({
     code: 'warehouse-publication-pending',
   });
+  await vi.advanceTimersByTimeAsync(1000);
+  await rejected;
+  expect(f.operations).toEqual(['append', 'verify']);
+  expect(f.project).not.toHaveBeenCalled();
+});
+
+test('waits outside the transaction for an earlier publication without repeating candidate writes or verification', async () => {
+  vi.useFakeTimers();
+  const f = fixture(true);
+  const result = f.deriver.derive(f.attempt.attempt_id);
+  await vi.advanceTimersByTimeAsync(200);
+  expect(f.active()).toBe(false);
+  expect(f.operations).toEqual(['append', 'verify']);
+  f.setBusy(false);
+  await vi.advanceTimersByTimeAsync(50);
+  await result;
+  expect(f.operations).toEqual(['append', 'verify', 'verified', 'reserved', 'published']);
+  expect(f.verify).toHaveBeenCalledTimes(1);
+});
+
+test('rechecks the epoch after waiting and never publishes a stale package', async () => {
+  vi.useFakeTimers();
+  const f = fixture(true);
+  const rejected = expect(f.deriver.derive(f.attempt.attempt_id)).rejects.toMatchObject({
+    code: 'warehouse-site-changed',
+  });
+  await vi.advanceTimersByTimeAsync(100);
+  f.setBusy(false);
+  f.setEpoch('2');
+  await vi.advanceTimersByTimeAsync(50);
+  await rejected;
   expect(f.operations).toEqual(['append', 'verify']);
   expect(f.project).not.toHaveBeenCalled();
 });

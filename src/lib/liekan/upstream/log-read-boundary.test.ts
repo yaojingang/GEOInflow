@@ -90,18 +90,10 @@ it('keeps a source revision fence when incremental capture is disabled', async (
   ).rejects.toMatchObject({ status: 409 });
 });
 
-it.each(['logRevision', 'control'] as const)(
-  'uses the ClickHouse publication context and rejects changes to %s',
-  async key => {
-    warehouse.enabled = true;
-    const boundary = await logReadBoundary(undefined, id, parseLogRead(input));
-    const next = parseLogRead({ ...input, page: 2, cursor: 'next', readBoundary: boundary });
-    warehouse.publication = '13';
-    expect(await logReadBoundary(undefined, id, next)).toBe(boundary);
-    warehouse[key] = 'changed';
-    await expect(logReadBoundary(undefined, id, next)).rejects.toMatchObject({
-      status: 409,
-      code: 'log-read-boundary-conflict',
-    });
-  },
-);
+it('requires the protected warehouse log context rather than reconstructing an unpinned token', async () => {
+  warehouse.enabled = true;
+  await expect(logReadBoundary(undefined, id, parseLogRead(input))).rejects.toMatchObject({
+    status: 409,
+    code: 'log-read-boundary-conflict',
+  });
+});
