@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { featureDateRange } from '@/lib/liekan/contracts/analysis';
 import { ManualRefreshProvider } from '@/lib/liekan/contracts/manual-refresh';
 import { LiekanLocaleContext } from '@/lib/liekan/i18n/client';
+import { readFeatureDateRange } from '@/lib/liekan/upstream/date-range';
 import { freshAggregateFixture } from '@/test/liekan-freshness';
 import { setTestUrl } from '@/test/navigation';
 import { LiekanPage } from './LiekanPage';
@@ -179,6 +180,15 @@ function overviewFixture(page: number, path: string, version?: string, requests 
 
 it('switches only the trend to a canonical published period without navigating the report', async () => {
   state.date = '7day';
+  // The date hook must agree with the selected preset in every runner timezone.
+  state.selectedRange = readFeatureDateRange(
+    '7day',
+    '',
+    0,
+    'Asia/Shanghai',
+    'zh-CN',
+    Date.parse('2026-10-01T04:00:00Z'),
+  ).dateRange;
   const pending = deferred<any>();
   state.get.mockImplementation((_path, params) =>
     params.chartPeriod === '30d'
@@ -204,7 +214,8 @@ it('switches only the trend to a canonical published period without navigating t
   );
   const trendCall = state.get.mock.calls.find(([, p]) => p.chartPeriod === '30d')[1];
   const initialCall = state.get.mock.calls.find(([, p]) => p.chartPeriod === '7d')[1];
-  expect(trendCall.startAt).not.toBe(initialCall.startAt);
+  expect(trendCall.startAt).toBe(Date.parse('2026-08-31T16:00:00Z'));
+  expect(initialCall.startAt).toBe(Date.parse('2026-09-23T16:00:00Z'));
   expect(state.push).not.toHaveBeenCalled();
   expect(screen.getByText('8,737')).toBe(card);
   expect(screen.getByText('/stable-ranking')).toBeVisible();
