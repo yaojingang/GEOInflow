@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -54,7 +53,10 @@ test('secret scan exceptions match known metadata while new secrets remain detec
   const metadata = scan('metadata');
   assert.equal(metadata.status, 0, metadata.error?.message || metadata.stderr);
 
-  const unexpectedSecret = randomBytes(32).toString('base64url');
+  // Random strings can match upstream stop words or lack digits, so they are
+  // not reliable positive controls. Keep these synthetic high-entropy values
+  // deterministic; detection must still work in every allowlisted path.
+  const unexpectedSecret = ['Q7v9M2p4R6x8B1n3D5k0', 'F2j4H6z8L1s3N5w7P9y0T2u'].join('');
   for (const file of [...files, 'unexpected-source.ts']) {
     await writeFile(join(source, file), `const api_key = "${unexpectedSecret}";\n`);
   }
@@ -64,7 +66,10 @@ test('secret scan exceptions match known metadata while new secrets remain detec
   const detected = new Set(findings.map(finding => finding.File));
   for (const file of [...files, 'unexpected-source.ts']) assert.ok(detected.has(file), file);
 
-  const unexpectedHexSecret = randomBytes(32).toString('hex');
+  const unexpectedHexSecret = [
+    'd7a42f809be6135c0129ed674cb38a5f',
+    'b6e190ad5724c38f91d06a2b85e73c49',
+  ].join('');
   for (const file of [...files, 'unexpected-source.ts']) {
     await writeFile(join(source, file), `const api_key = "${unexpectedHexSecret}";\n`);
   }
