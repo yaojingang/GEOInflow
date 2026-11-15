@@ -1,5 +1,7 @@
-import { author, license, version } from '../../../../package.json';
+import packageJson from '../../../../package.json';
 import { HELP_REVIEWED_AT, type HelpArticle } from '../help/types';
+
+const { author, license, version } = packageJson;
 
 export const liekanProduct = {
   name: 'GEOInflow',

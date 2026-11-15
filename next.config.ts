@@ -336,7 +336,9 @@ export default withNextIntl({
   },
   experimental: {
     useTypeScriptCli: true,
-    cpus: 2,
+    cpus: 1,
+    webpackBuildWorker: true,
+    webpackMemoryOptimizations: true,
   },
   async headers() {
     return [...headers, ...asyncAnalysisHeaders];

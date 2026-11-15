@@ -379,6 +379,7 @@
   padding: 0 5px;
   border-radius: 4px;
 }
+/* cssmodules-pure-ignore */
 :global([data-manual-reading]) > span:first-child:not([role]) {
   display: none;
 }

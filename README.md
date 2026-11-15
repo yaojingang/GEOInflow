@@ -115,7 +115,7 @@ Compose builds the image from source and runs database migrations in a container
 
 ### PostgreSQL installation
 
-Start Docker Engine / Docker Desktop and Docker Compose V2, and ensure that image and dependency download sources are reachable. Source builds require at least **6 GiB total Docker memory**; **8 GiB or more and at least 2 CPUs** are recommended, with free memory reserved for compilation. Run `sh scripts/liekan-deploy.sh --check` to check the build floor. See [deployment requirements](docs/deployment.en.md#requirements) for runtime capacity. After obtaining the source code, run this command from the project root:
+Start Docker Engine / Docker Desktop, Docker Buildx, and Docker Compose with `build --builder` support. Ensure that image and dependency download sources are reachable. Source builds require at least **6 GiB total Docker memory and 6 GiB currently available**; **8 GiB or more and at least 2 CPUs** are recommended. Deployment caps builds at **1 CPU and 5 GiB memory**, with a half-CPU cap on single-core hosts. Run `sh scripts/liekan-deploy.sh --check` to check resources. See [deployment requirements](docs/deployment.en.md#requirements) for details and runtime capacity. After obtaining the source code, run this command from the project root:
 
 ```sh
 sh scripts/liekan-deploy.sh

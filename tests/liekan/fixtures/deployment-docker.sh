@@ -8,8 +8,17 @@ if [ "$1" = compose ] && [ "$2" = -f ] && [ "$4" = -f ]; then
   set -- compose -f docker-compose.liekan.yml "$@"
 fi
 if [ "$1" = compose ] && [ "${4:-}" = build ]; then
+  if [ "${5:-}" = --help ]; then
+    printf '%s\n' "${DEPLOY_TEST_BUILD_HELP---builder string}"; exit 0
+  fi
+  if [ "${5:-}" = --builder ]; then
+    builder=$6
+    shift 6
+    set -- compose -f docker-compose.liekan.yml build "$@"
+  fi
   revision=${6#LIEKAN_REVISION=}
   printf '%s' "$revision" > "$DEPLOY_TEST_CALLS.revision"
+  printf '%s' "${DOCKER_BUILDKIT:-}" > "$DEPLOY_TEST_CALLS.buildkit"
   cp "$override" "$DEPLOY_TEST_CALLS.build-override"
   set -- compose -f docker-compose.liekan.yml build app
 fi
@@ -20,7 +29,34 @@ db_container=${DEPLOY_TEST_DB_CONTAINER:-}
 cache_container=${DEPLOY_TEST_CACHE_CONTAINER:-}
 candidate=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 case "$*" in
+  'compose build --help') printf '%s\n' "${DEPLOY_TEST_BUILD_HELP---builder string}" ;;
   'info --format {{.MemTotal}}') printf '%s\n' "${DEPLOY_TEST_MEMORY_BYTES-8589934592}" ;;
+  'info --format {{.MemoryLimit}} {{.SwapLimit}} {{.CPUCfsQuota}} {{.CPUCfsPeriod}}') printf '%s\n' "${DEPLOY_TEST_RESOURCE_SUPPORT-true true true true}" ;;
+  'info --format {{.NCPU}}') printf '%s\n' "${DEPLOY_TEST_CPUS-2}" ;;
+  'info --format {{.ID}}') printf '%s\n' daemon-fixture ;;
+  'buildx version') exit "${DEPLOY_TEST_BUILDX_STATUS:-0}" ;;
+  run\ *)
+    if [ -e "$DEPLOY_TEST_CALLS.probed" ]; then
+      printf '%s\n' "${DEPLOY_TEST_LATER_AVAILABLE_KIB-${DEPLOY_TEST_AVAILABLE_KIB-6291456}}"
+    else printf '%s\n' "${DEPLOY_TEST_AVAILABLE_KIB-6291456}"; fi
+    touch "$DEPLOY_TEST_CALLS.probed"
+    exit "${DEPLOY_TEST_PROBE_STATUS:-0}" ;;
+  'buildx inspect '*)
+    if [ ! -e "$DEPLOY_TEST_CALLS.builder" ]; then exit 1; fi
+    printf 'Name: fixture\nDriver: %s\nNodes:\nName: fixture0\n' "${DEPLOY_TEST_BUILDER_DRIVER:-docker-container}" ;;
+  'buildx create '*)
+    if [ "${DEPLOY_TEST_BUILDER_CREATE_STATUS:-0}" != 0 ]; then exit "$DEPLOY_TEST_BUILDER_CREATE_STATUS"; fi
+    touch "$DEPLOY_TEST_CALLS.builder" ;;
+  'buildx stop '*) exit "${DEPLOY_TEST_BUILDER_STOP_STATUS:-0}" ;;
+  'create --name geoinflow-build-lease '*)
+    if [ "${DEPLOY_TEST_LEASE_STATUS:-0}" != 0 ]; then exit "$DEPLOY_TEST_LEASE_STATUS"; fi
+    if [ -n "${DEPLOY_TEST_LEASE_PATH:-}" ]; then mkdir "$DEPLOY_TEST_LEASE_PATH" || exit 1; fi
+    printf '%s\n' ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff ;;
+  'rm ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')
+    if [ -n "${DEPLOY_TEST_LEASE_PATH:-}" ]; then rmdir "$DEPLOY_TEST_LEASE_PATH"; fi ;;
+  'inspect --format {{.HostConfig.Memory}}|{{.HostConfig.MemorySwap}}|{{.HostConfig.CpuPeriod}}|{{.HostConfig.CpuQuota}} buildx_buildkit_'*)
+    quota=100000; if [ "${DEPLOY_TEST_CPUS-2}" = 1 ]; then quota=50000; fi
+    printf '%s\n' "${DEPLOY_TEST_BUILDER_LIMITS-5368709120|5368709120|100000|$quota}" ;;
   'compose version'|info|'compose -f docker-compose.liekan.yml config --quiet') exit 0 ;;
   'volume ls --format {{.Name}}')
     if [ "${DEPLOY_TEST_VOLUME_EXISTS:-1}" = 0 ]; then printf '%s\n' "${DEPLOY_TEST_VOLUME_NAME:-${compose_project}_liekan-data}"; fi ;;
@@ -63,7 +99,7 @@ case "$*" in
     touch "$DEPLOY_TEST_CALLS.started.$2" ;;
   'compose -f docker-compose.liekan.yml build app')
     if [ "${DEPLOY_TEST_KILL_DEPLOY:-0}" = 1 ]; then kill -KILL "$PPID"; fi
-    if [ "${DEPLOY_TEST_BLOCK_BUILD:-0}" = 1 ]; then touch "$DEPLOY_TEST_CALLS.building"; sleep 2; fi
+    if [ "${DEPLOY_TEST_BLOCK_BUILD:-0}" = 1 ]; then touch "$DEPLOY_TEST_CALLS.building"; sleep "${DEPLOY_TEST_BUILD_DELAY:-2}"; fi
     exit "${DEPLOY_TEST_BUILD_STATUS:-0}" ;;
   'compose -f docker-compose.liekan.yml stop log-worker analytics-worker')
     if [ "${DEPLOY_TEST_WORKER_STOP_STATUS:-0}" != 0 ]; then exit "$DEPLOY_TEST_WORKER_STOP_STATUS"; fi
