@@ -1,4 +1,4 @@
-import { DEFAULT_RESET_DATE } from '@/lib/constants';
+import { DEFAULT_RESET_DATE } from '../upstream/collection-defaults';
 import type { ControlSQL } from './control-db';
 
 export type BrowserEventTime = { at: string; page: boolean };
