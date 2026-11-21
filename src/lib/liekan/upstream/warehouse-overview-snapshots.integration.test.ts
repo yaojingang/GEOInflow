@@ -1,10 +1,13 @@
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { expect, it, vi } from 'vitest';
 import { readViewState } from '@/components/liekan/viewState';
 import { featureDateRange } from '../contracts/analysis';
 import { ControlDatabase, WarehouseConflict } from '../warehouse/control-db';
+import { dashboardClock } from './dashboard-clock';
 import { readFeatureDateRange } from './date-range';
 import { WarehouseBackgroundDeferred } from './warehouse-background-budget';
+import { offlineReportLagMs } from './warehouse-report-round';
 
 const harness = vi.hoisted(() => ({
   db: undefined as ControlDatabase | undefined,
@@ -18,6 +21,8 @@ const harness = vi.hoisted(() => ({
   backfill: vi.fn(),
   rankingPage: vi.fn(),
   collect: vi.fn(async () => {}),
+  fairClaim: false,
+  claimAfter: vi.fn<() => Promise<number | undefined>>(async () => undefined),
   reportContext: vi.fn((work: () => unknown, _options?: unknown) => work()),
 }));
 vi.mock('./warehouse-analysis-gc', () => ({ collectAnalysisArtifacts: harness.collect }));
@@ -28,11 +33,16 @@ vi.mock('../contracts/scheduled-reports', () => ({
   isScheduledReport: (r: string) => harness.resources.includes(r),
 }));
 vi.mock('./warehouse-retention-result', () => ({
-  computeWarehouseRetention: async () => ({
+  computeWarehouseRetention: async (
+    _site: string,
+    _p: unknown,
+    _conditions: unknown,
+    cutoff: number,
+  ) => ({
     kind: 'retention',
     rows: [],
     population: {},
-    dataThrough: Date.now(),
+    dataThrough: cutoff,
   }),
 }));
 vi.mock('./warehouse-analysis-model', () => ({
@@ -83,11 +93,28 @@ vi.mock('./crawler-registry-context', () => ({
   withPublishedRegistry: (work: () => unknown) => work(),
 }));
 vi.mock('./warehouse-report-snapshot', () => ({
+  warehouseBackgroundClaimAfter: harness.claimAfter,
+  warehouseFairClaimDue: () => harness.fairClaim,
+  withWarehouseReportClaim: (work: () => unknown) => work(),
+  warehouseReportCheckpoint: async () => {},
   warehouseControlFingerprint: () => harness.control,
   warehouseReportMetadata: async (websiteId: string) => ({
     boundary: { websiteId, epoch: '0', deletionRevision: '0', publication: harness.publication },
   }),
   withinWarehouseReport: harness.reportContext,
+}));
+vi.mock('./warehouse-website-summary', () => ({
+  computeWebsiteSummary: async (site: { id: string }) => ({
+    id: site.id,
+    views: 0,
+    visitors: 0,
+    pageviews: 0,
+    visits: 0,
+    bounces: 0,
+    totaltime: 0,
+    aiVisits: 0,
+    comparison: { visitors: 0, pageviews: 0, visits: 0, bounces: 0, totaltime: 0, aiVisits: 0 },
+  }),
 }));
 vi.mock('./page-report', () => ({ computeWarehouseOverview: harness.compute }));
 vi.mock('./warehouse-browser-page-report', () => ({
@@ -135,18 +162,31 @@ it.skipIf(!database)(
     expect(url.pathname).toMatch(/^\/overview_schedule_test(?:_[a-f0-9]{32})?$/);
     const db = new ControlDatabase(database);
     harness.db = db;
-    const now = Date.now();
+    const wallNow = Date.now();
+    const now = Math.max(
+      wallNow,
+      ...[timezone, 'America/New_York'].map(
+        zone => reportRequest('0day', wallNow, zone).startAt + offlineReportLagMs + 60000,
+      ),
+    );
     const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
     const compute = (
       _site?: unknown,
       p?: { chartPeriod: string; startAt: number; endAt: number; timezone: string },
     ) => {
+      const cutoff = dashboardClock()?.cutoff ?? Date.now();
       const visitorOnly = p?.chartPeriod === '7d';
       const table = visitorOnly ? 'visitorTopBody' : 'topBody';
       const ranking = p?.chartPeriod === '30d' || visitorOnly;
       return {
+        contractVersion: 2,
+        website: access.website,
+        resource: 'overview',
+        states: { human: 'available', logs: 'available', catalog: 'available', goals: 'available' },
+        charts: {},
+        insights: [],
         range: p
-          ? { startAt: p.startAt, endAt: p.endAt, timezone: p.timezone }
+          ? { startAt: p.startAt, endAt: Math.min(p.endAt, cutoff - 1), timezone: p.timezone }
           : reportRequest('0day', now),
         cards: [
           {
@@ -158,9 +198,14 @@ it.skipIf(!database)(
         ],
         tables: { [table]: [{ path: '/first' }] },
         meta: {
+          demo: false,
+          canManage: true,
+          latestImportAt: null,
+          ruleCount: 0,
           generatedAt: Date.now(),
           aiCrawlerEnabled: !visitorOnly,
-          snapshot: { dataThrough: now },
+          expiresAt: now + 1800000,
+          snapshot: { dataThrough: cutoff, state: 'ready', intervalMs: 1800000 },
           tablePages: {
             [table]: { page: 1, pageSize: 20, total: visitorOnly || !ranking ? 41 : 65 },
           },
@@ -183,7 +228,7 @@ it.skipIf(!database)(
         CREATE TABLE team (team_id uuid PRIMARY KEY, deleted_at timestamptz);
         CREATE TABLE team_user (user_id uuid, team_id uuid);
         CREATE TABLE website (website_id uuid PRIMARY KEY, name text, domain text,
-          user_id uuid, team_id uuid, deleted_at timestamptz);
+          user_id uuid, team_id uuid, deleted_at timestamptz, created_at timestamptz DEFAULT now());
         CREATE TABLE liekan_account_preferences (user_id uuid PRIMARY KEY, timezone text);
         CREATE TABLE liekan_warehouse_site (website_id uuid PRIMARY KEY, resource_type text,
           state text, publication bigint);
@@ -209,12 +254,17 @@ it.skipIf(!database)(
         ADD COLUMN deletion_revision bigint NOT NULL DEFAULT 0`);
       await db.read(await readFile('db/liekan/migrations/097_warehouse_report_rounds.sql', 'utf8'));
       await db.read(await readFile('db/liekan/migrations/098_warehouse_round_metrics.sql', 'utf8'));
+      await db.read(
+        await readFile('db/liekan/migrations/099_warehouse_analysis_build.sql', 'utf8'),
+      );
       const snapshots = () =>
         db.read<{
           id: string;
-          parameters: { timezone: string; chartPeriod: string };
+          parameters: { timezone: string; chartPeriod: string; endAt: number };
           next_attempt_at: Date;
-        }>(`SELECT * FROM liekan_warehouse_overview_snapshot ORDER BY query_key`);
+        }>(
+          `SELECT * FROM liekan_warehouse_overview_snapshot WHERE NOT (parameters ? 'siteSummary') ORDER BY query_key`,
+        );
       const input = reportRequest('0day', now);
       expect((await requestWarehouseOverview(access, { ...input, refresh: '1' })).status).toBe(202);
       expect(await snapshots()).toHaveLength(0);
@@ -243,7 +293,7 @@ it.skipIf(!database)(
           );
           const body = await response.json();
           expect(body.cards.find(card => card.label === '今日总请求')?.value).toBe(20);
-          expect(body.meta.todayRequests.dataThrough).toBe(now);
+          expect(body.meta.todayRequests.dataThrough).toBe(now - offlineReportLagMs);
           expect(body.meta.snapshot.intervalMs).toBe(
             { today: 600000, '7d': 21600000, '30d': 43200000 }[parameters.chartPeriod],
           );
@@ -251,6 +301,93 @@ it.skipIf(!database)(
         }
       }
       expect(await snapshots()).toEqual(original);
+      // Serialize an actual format-2 public payload with inline pages. Current
+      // tasks remain queued; compatibility never rewrites their format or data.
+      {
+        const [currentThirty] = await db.read<any>(
+          "SELECT * FROM liekan_warehouse_overview_snapshot WHERE parameters->>'chartPeriod'='30d' AND parameters->>'timezone'=$1",
+          [timezone],
+        );
+        const legacyId = '99999999-1111-4111-8111-111111111111';
+        const legacy = { ...currentThirty.result };
+        delete legacy.rankings;
+        await db.read(
+          `INSERT INTO liekan_warehouse_overview_snapshot
+        (id,website_id,query_key,parameters,catalog_version,format_version,preset,control_version,publication,generated_at,result)
+        VALUES($1,$2,'legacy-upgrade',$3,$4,2,true,$5,$6,$7,$8)`,
+          [
+            legacyId,
+            websiteId,
+            currentThirty.parameters,
+            currentThirty.catalog_version,
+            currentThirty.control_version,
+            currentThirty.publication,
+            new Date(+currentThirty.generated_at - 60000),
+            legacy,
+          ],
+        );
+        await db.read(
+          'UPDATE liekan_warehouse_overview_snapshot SET result=NULL,generated_at=NULL,publication=NULL WHERE id=$1',
+          [currentThirty.id],
+        );
+        const legacyResponse = await requestWarehouseOverview(access, reportRequest('30day', now));
+        expect(legacyResponse.status).toBe(200);
+        const legacyBody = await legacyResponse.json();
+        expect(legacyBody.meta.snapshot.state).toBe('updating');
+        expect(legacyBody.range).toEqual(legacy.range);
+        const legacyPage = await requestWarehouseOverview(access, {
+          ...reportRequest('30day', now),
+          tp_topBody: '2',
+          reportVersion: legacyBody.meta.snapshot.version,
+        });
+        expect(legacyPage.status).toBe(200);
+        expect((await legacyPage.json()).tables.topBody[0].path).toBe('/rank-21');
+        await db.read(
+          'UPDATE liekan_warehouse_overview_snapshot SET result=$2,generated_at=$3,publication=$4 WHERE id=$1',
+          [
+            currentThirty.id,
+            currentThirty.result,
+            currentThirty.generated_at,
+            currentThirty.publication,
+          ],
+        );
+        // The first offline build can finish later while covering less data.
+        const lagging = structuredClone(currentThirty.result);
+        lagging.meta.snapshot.dataThrough -= 60000;
+        lagging.range.endAt = lagging.meta.snapshot.dataThrough - 1;
+        await db.read('UPDATE liekan_warehouse_overview_snapshot SET result=$2 WHERE id=$1', [
+          currentThirty.id,
+          lagging,
+        ]);
+        await db.read(
+          `UPDATE liekan_warehouse_overview_snapshot
+          SET preset=false,last_requested_at=now()-interval '2 days'
+          WHERE id=$1`,
+          [legacyId],
+        );
+        await pumpWarehouseOverview();
+        const request = reportRequest('30day', now);
+        const legacyVersion = legacyBody.meta.snapshot.version;
+        for (const response of [
+          await requestWarehouseOverview(access, request),
+          await readWarehouseOverviewJob(access, currentThirty.id, true),
+        ]) {
+          const body = await response.json();
+          expect(body.meta.snapshot.version).toBe(legacyVersion);
+          expect(body.meta.snapshot.dataThrough).toBe(legacy.meta.snapshot.dataThrough);
+        }
+        await db.read('UPDATE liekan_warehouse_overview_snapshot SET result=$2 WHERE id=$1', [
+          currentThirty.id,
+          currentThirty.result,
+        ]);
+        expect(
+          (await (await requestWarehouseOverview(access, request)).json()).meta.snapshot.version,
+        ).not.toBe(legacyVersion);
+        await expect(
+          requestWarehouseOverview(access, { ...request, reportVersion: legacyVersion }),
+        ).rejects.toMatchObject({ status: 409 });
+        await db.read('DELETE FROM liekan_warehouse_overview_snapshot WHERE id=$1', [legacyId]);
+      }
       expect(
         await db.read(`SELECT count(DISTINCT mod((extract(epoch FROM next_attempt_at)*1000)::bigint,600000))::int AS slots,
           bool_and(next_attempt_at>generated_at
@@ -268,8 +405,62 @@ it.skipIf(!database)(
         row => row.parameters.timezone === timezone && row.parameters.chartPeriod === 'today',
       )!;
       const [savedToday] = await db.read<any>(
-        'SELECT result,generated_at,publication,error_code FROM liekan_warehouse_overview_snapshot WHERE id=$1',
+        'SELECT result,generated_at,started_at,publication,error_code FROM liekan_warehouse_overview_snapshot WHERE id=$1',
         [todayRow.id],
+      );
+      const legacyToday = structuredClone(savedToday.result);
+      legacyToday.meta.snapshot.dataThrough += 30000;
+      legacyToday.range.endAt = Math.min(
+        todayRow.parameters.endAt,
+        legacyToday.meta.snapshot.dataThrough - 1,
+      );
+      legacyToday.cards[0].value = 123;
+      const legacyTodayId = randomUUID();
+      await db.read(
+        `INSERT INTO liekan_warehouse_overview_snapshot
+        (id,website_id,query_key,parameters,catalog_version,format_version,preset,control_version,publication,generated_at,result)
+        SELECT $2,website_id,'upgrade-today',parameters,catalog_version,2,true,control_version,publication,
+          generated_at-interval '1 minute',$3 FROM liekan_warehouse_overview_snapshot WHERE id=$1`,
+        [todayRow.id, legacyTodayId, legacyToday],
+      );
+      for (const period of presets) {
+        const body = await (
+          await requestWarehouseOverview(access, reportRequest(period, now))
+        ).json();
+        expect(body.cards[0].value).toBe(123);
+        expect(body.meta.todayRequests.dataThrough).toBe(legacyToday.meta.snapshot.dataThrough);
+      }
+      await db.read(
+        'UPDATE liekan_warehouse_overview_snapshot SET control_version=$2 WHERE id=$1',
+        [legacyTodayId, 'revoked-old-control'],
+      );
+      const allowedToday = await (
+        await requestWarehouseOverview(access, reportRequest('30day', now))
+      ).json();
+      expect(allowedToday.cards[0].value).toBe(savedToday.result.cards[0].value);
+      await db.read('DELETE FROM liekan_warehouse_overview_snapshot WHERE id=$1', [legacyTodayId]);
+      // A recovered round with an older frozen clock must release its lease
+      // and keep the newer, still-authorized same-format publication in place.
+      await db.read(
+        `UPDATE liekan_warehouse_overview_snapshot SET result=$2,
+        next_attempt_at=now()-interval '1 minute' WHERE id=$1`,
+        [todayRow.id, legacyToday],
+      );
+      expect(await pumpWarehouseOverview()).toBe(true);
+      const [kept] = await db.read<any>(
+        `SELECT result,generated_at,lease_token,next_attempt_at>now() AS delayed
+        FROM liekan_warehouse_overview_snapshot WHERE id=$1`,
+        [todayRow.id],
+      );
+      expect(kept).toMatchObject({
+        result: legacyToday,
+        generated_at: savedToday.generated_at,
+        lease_token: null,
+        delayed: true,
+      });
+      await db.read(
+        'UPDATE liekan_warehouse_overview_snapshot SET result=$2,next_attempt_at=$3,started_at=$4 WHERE id=$1',
+        [todayRow.id, savedToday.result, todayRow.next_attempt_at,savedToday.started_at],
       );
       const windowInput = reportRequest('30day', now);
       const beforeShared = await (await requestWarehouseOverview(access, windowInput)).json();
@@ -324,6 +515,15 @@ it.skipIf(!database)(
 
       // A new calendar day has a different key, but must retain the last published report.
       clock.mockReturnValue(now + 86400000);
+      // Retiring yesterday's registration must not retire its published card.
+      await db.read('UPDATE liekan_warehouse_overview_snapshot SET preset=false WHERE id=$1', [todayRow.id]);
+      // Incompatible archival bodies ahead of the latest readable one must not mask it.
+      await db.read(`INSERT INTO liekan_warehouse_overview_snapshot
+        (id,website_id,query_key,parameters,catalog_version,format_version,preset,control_version,publication,generated_at,result)
+        SELECT gen_random_uuid(),website_id,'invalid-archive-'||n,parameters,catalog_version,2,false,control_version,publication,
+          generated_at,jsonb_set(result - 'cards','{meta,snapshot,dataThrough}',to_jsonb($2::bigint+n))
+        FROM liekan_warehouse_overview_snapshot CROSS JOIN generate_series(1,9) AS n WHERE id=$1`,
+        [todayRow.id, now]);
       for (const date of presets) {
         const requested = reportRequest(date, now + 86400000);
         const response = await requestWarehouseOverview(access, requested);
@@ -338,9 +538,15 @@ it.skipIf(!database)(
             chartPeriod: source.chartPeriod,
           },
         });
-        expect(value.range).toMatchObject({ startAt: source.startAt, endAt: source.endAt });
-        expect(value.meta.snapshot.dataThrough).toBe(now);
-        expect(value.meta.todayRequests).toMatchObject({ state: 'updating', dataThrough: now });
+        expect(value.range).toMatchObject({
+          startAt: source.startAt,
+          endAt: Math.min(source.endAt, now - offlineReportLagMs - 1),
+        });
+        expect(value.meta.snapshot.dataThrough).toBe(now - offlineReportLagMs);
+        expect(value.meta.todayRequests).toMatchObject({
+          state: 'updating',
+          dataThrough: now - offlineReportLagMs,
+        });
         expect(value.meta.todayRequests.range.startAt).toBe(reportRequest('0day', now).startAt);
         if (date === '30day') {
           const page = await requestWarehouseOverview(access, {
@@ -354,6 +560,8 @@ it.skipIf(!database)(
           expect(second.tables.topBody[0].path).toBe('/rank-21');
         }
       }
+      await db.read("DELETE FROM liekan_warehouse_overview_snapshot WHERE query_key LIKE 'invalid-archive-%'");
+      await db.read('UPDATE liekan_warehouse_overview_snapshot SET preset=true WHERE id=$1', [todayRow.id]);
       // Without a result for the same period, another period is explicit fallback.
       const [thirty] = await db.read<any>(
         "SELECT * FROM liekan_warehouse_overview_snapshot WHERE parameters->>'chartPeriod'='30d' AND parameters->>'timezone'=$1",
@@ -419,7 +627,11 @@ it.skipIf(!database)(
       clock.mockReturnValue(now + 10000);
       expect((await requestWarehouseOverview(access, input)).status).toBe(202);
       expect(await snapshots()).toEqual(original);
-      for (let i = 0; i < 6; i++) await pumpWarehouseOverview();
+      // Eligibility uses the database clock. An empty poll is not a completed job.
+      const invalidationDeadline = performance.now() + 5000;
+      while (harness.compute.mock.calls.length < 12 && performance.now() < invalidationDeadline) {
+        if (!(await pumpWarehouseOverview())) await new Promise(resolve => setTimeout(resolve, 25));
+      }
       expect((await requestWarehouseOverview(access, input)).status).toBe(200);
       expect(harness.compute).toHaveBeenCalledTimes(12);
 
@@ -647,12 +859,12 @@ it.skipIf(!database)(
       );
       expect(lastSlot.filter(result => result.status === 'fulfilled')).toHaveLength(1);
       expect(lastSlot.find(result => result.status === 'rejected')).toMatchObject({
-        reason: { status: 429, code: 'analysis-concurrency-limited' },
+        reason: { status: 429, code: 'warehouse-report-no-valid-snapshot' },
       });
       expect((await requestWarehouseOverview(access, customInput(2))).status).toBe(202);
       await expect(requestWarehouseOverview(access, customInput(11))).rejects.toMatchObject({
         status: 429,
-        code: 'analysis-concurrency-limited',
+        code: 'warehouse-report-no-valid-snapshot',
       });
       const beforeCapacityFallback = await snapshots();
       const atCapacity = await requestWarehouseOverview(access, {
@@ -682,64 +894,44 @@ it.skipIf(!database)(
       );
       clock.mockReturnValue(now + 2 * 86400000);
       harness.concurrency = 2;
-      const active = new Map<string, () => void>();
-      let notify: () => void;
-      const both = new Promise<void>(resolve => {
-        notify = resolve;
-      });
-      let executions = 0;
+      let releaseFirst: () => void;
+      let active = 0;
       let peak = 0;
-      const calls = new Map<string, number>();
-      harness.compute.mockImplementation(async ({ id }: { id: string }) => {
-        executions++;
-        calls.set(id, (calls.get(id) ?? 0) + 1);
-        expect(active.has(id)).toBe(false);
-        await new Promise<void>(resolve => {
-          active.set(id, resolve);
-          peak = Math.max(peak, active.size);
-          if (active.size === 2) notify();
-          if (executions > 2) resolve();
-        });
-        active.delete(id);
+      let executions = 0;
+      harness.compute.mockImplementation(async () => {
+        peak = Math.max(peak, ++active);
+        if (++executions === 1)
+          await new Promise<void>(resolve => {
+            releaseFirst = resolve;
+          });
+        active--;
         return compute();
       });
       const drain = drainWarehouseOverview(new AbortController().signal);
       try {
-        await Promise.race([
-          both,
-          drain.then(() => {
-            throw new Error('Two sites did not start');
-          }),
-        ]);
-        expect([...active.keys()].sort()).toEqual([websiteId, otherSite]);
+        await vi.waitFor(() => expect(executions).toBe(1));
         expect(
           await db.read(`SELECT count(*)::int AS leases FROM liekan_warehouse_overview_snapshot
           WHERE lease_until>now()`),
-        ).toEqual([{ leases: 2 }]);
+        ).toEqual([{ leases: 1 }]);
         await db.read(
           `UPDATE liekan_warehouse_overview_snapshot SET lease_until=now()-interval '1 second'
-          WHERE website_id=$1 AND lease_token IS NOT NULL`,
-          [websiteId],
+          WHERE lease_token IS NOT NULL`,
         );
         expect(await pumpWarehouseOverview()).toBe(false);
-        const held = active.get(websiteId);
-        active.get(otherSite)();
-        for (let i = 0; i < 40 && (calls.get(otherSite) ?? 0) < 3; i++)
-          await new Promise(resolve => setTimeout(resolve, 20));
-        expect(calls.get(otherSite)).toBe(3);
-        expect(calls.get(websiteId)).toBe(1);
-        expect(active.get(websiteId)).toBe(held);
+        expect(executions).toBe(1);
       } finally {
-        for (const settle of active.values()) settle();
+        releaseFirst?.();
         await drain;
       }
-      expect(peak).toBe(2);
+      expect(peak).toBe(1);
+      await drainWarehouseOverview(new AbortController().signal);
       expect(
         await db.read(`SELECT count(*)::int AS ready FROM liekan_warehouse_overview_snapshot
-        WHERE generated_at IS NOT NULL`),
+        WHERE generated_at IS NOT NULL AND NOT (parameters ? 'siteSummary')`),
       ).toEqual([{ ready: 9 }]);
 
-      // A long cold report leaves the other slot available for shorter reports.
+      // Long cold reports use the same single queue and lease.
       await db.read(
         `UPDATE liekan_warehouse_overview_snapshot
         SET generated_at=NULL,next_attempt_at=now()-interval '1 second'
@@ -761,7 +953,7 @@ it.skipIf(!database)(
       expect(longCount).toBe(2);
       expect(longPeak).toBe(1);
 
-      // Recurring refreshes keep one worker even when two cold slots are configured.
+      // Recurring refreshes also stay serial with two interactive read permits.
       await db.read(
         `UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()-interval '1 second'`,
       );
@@ -792,7 +984,7 @@ it.skipIf(!database)(
       const [{ count: dueShort }] = await db.read<{ count: number }>(
         `WITH due AS (
            UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()-interval '1 second'
-           WHERE parameters->>'chartPeriod' IN ('today','7d') RETURNING id
+           WHERE parameters->>'chartPeriod' IN ('today','7d') AND NOT (parameters ? 'siteSummary') RETURNING id
          ) SELECT count(*)::int FROM due`,
       );
       let completed = 0;
@@ -834,14 +1026,25 @@ it.skipIf(!database)(
       harness.compute.mockImplementation(compute);
       harness.hasLogFacts.mockResolvedValue(false);
       clock.mockReturnValue(now + 3 * 86400000);
-      await drainWarehouseOverview(new AbortController().signal);
-      await drainWarehouseOverview(new AbortController().signal);
-      await drainWarehouseOverview(new AbortController().signal);
-      expect(
-        await db.read(
-          `SELECT count(*)::int AS ready,count(DISTINCT parameters->>'resource')::int AS resources FROM liekan_warehouse_overview_snapshot WHERE generated_at IS NOT NULL`,
-        ),
-      ).toEqual([{ ready: 111, resources: 11 }]);
+      let generated: { ready: number; resources: number }[];
+      // Discovery uses the mocked application clock. SQL eligibility uses the
+      // real PG clock, which may move backwards briefly on a local VM.
+      const discoveryDeadline = performance.now() + 5000;
+      for (let tick = 0; tick < 3 || performance.now() < discoveryDeadline; tick++) {
+        await drainWarehouseOverview(new AbortController().signal);
+        generated = await db.read<{ ready: number; resources: number }>(
+          `SELECT count(*)::int AS ready,count(DISTINCT parameters->>'resource')::int AS resources FROM liekan_warehouse_overview_snapshot WHERE generated_at IS NOT NULL AND NOT (parameters ? 'siteSummary')`,
+        );
+        if (generated[0].ready === 102) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+        clock.mockReturnValue(now + 3 * 86400000 + (tick + 1) * 5000);
+      }
+      expect(generated).toEqual([{ ready: 102, resources: 11 }]);
+      expect(await db.read(
+        `SELECT count(*)::int AS months FROM liekan_warehouse_overview_snapshot
+         WHERE preset AND parameters ? 'nativeRetention' AND
+         (parameters->>'endAt')::bigint-(parameters->>'startAt')::bigint > 27*86400000::bigint`,
+      )).toEqual([{ months: 3 }]);
       expect(harness.collect).toHaveBeenCalled();
       // The page's default sort must hit unattended presets, not create a custom job.
       for (const date of presets) {
@@ -864,6 +1067,163 @@ it.skipIf(!database)(
           'SELECT count(*)::int AS count FROM liekan_warehouse_overview_snapshot WHERE NOT preset',
         ),
       ).toEqual([{ count: 0 }]);
+      // Upgrade an old rolling-retention row with a live lease. Discovery must
+      // keep both the readable payload and the in-flight owner's receipt.
+      const oldRetentionId = randomUUID();
+      const oldLease = randomUUID();
+      const [savedRetention] = await db.read<{ digest: string }>(
+        `INSERT INTO liekan_warehouse_overview_snapshot
+          (id,website_id,query_key,parameters,catalog_version,format_version,preset,control_version,
+           publication,result,generated_at,lease_token,lease_until)
+         SELECT $1,website_id,'retired-retention-fixture',parameters || '{"nativeRetention":{}}'::jsonb,
+           catalog_version,format_version,true,control_version,publication,result,generated_at,$2,now()+interval '1 minute'
+         FROM liekan_warehouse_overview_snapshot WHERE parameters->>'resource'='human/overview'
+           AND parameters->>'chartPeriod'='7d' AND NOT parameters ? 'nativeRetention'
+           AND result IS NOT NULL LIMIT 1
+         RETURNING md5(result::text) AS digest`,
+        [oldRetentionId, oldLease],
+      );
+      expect(savedRetention.digest).toMatch(/^[0-9a-f]{32}$/);
+      clock.mockReturnValue(Date.now() + 31000);
+      await pumpWarehouseOverview();
+      expect(
+        await db.read(
+          'SELECT preset,lease_token,md5(result::text) AS digest FROM liekan_warehouse_overview_snapshot WHERE id=$1',
+          [oldRetentionId],
+        ),
+      ).toEqual([{ preset: false, lease_token: oldLease, digest: savedRetention.digest }]);
+      await db.read('DELETE FROM liekan_warehouse_overview_snapshot WHERE id=$1', [oldRetentionId]);
+      // An owner that claimed a scheduled job before retirement may finish its
+      // verified result. Its original scheduling flag cannot undo retirement.
+      await db.read("UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()+interval '5 days'");
+      const [retiringJob] = await db.read<{ id: string }>(
+        `UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()-interval '1 minute'
+         WHERE id=(SELECT id FROM liekan_warehouse_overview_snapshot WHERE preset
+           AND website_id=$1 AND parameters->>'resource'='overview' AND parameters->>'timezone'=$2
+           AND parameters->>'chartPeriod'='today' AND result IS NOT NULL LIMIT 1)
+         RETURNING id`,
+        [websiteId, timezone],
+      );
+      harness.compute.mockImplementationOnce(async (site, params) => {
+        const retired = await db.read(
+          'UPDATE liekan_warehouse_overview_snapshot SET preset=false WHERE id=$1 AND lease_until>now() RETURNING id',
+          [retiringJob.id],
+        );
+        expect(retired).toEqual([{ id: retiringJob.id }]);
+        const value = compute(site, params);
+        value.cards[0].value = 127;
+        return value;
+      });
+      await pumpWarehouseOverview();
+      expect(
+        await db.read(
+          `SELECT preset,lease_token, result->'cards'->0->>'value' AS value
+           FROM liekan_warehouse_overview_snapshot WHERE id=$1`,
+          [retiringJob.id],
+        ),
+      ).toEqual([{ preset: false, lease_token: null, value: '127' }]);
+      await db.read('UPDATE liekan_warehouse_overview_snapshot SET preset=true WHERE id=$1', [retiringJob.id]);
+      // Two failing cold reports can become eligible again while each other runs.
+      // Persisted due times must give overdue refreshes a turn after a restart.
+      const coldReports = await db.read<{ id: string }>(
+        `SELECT id FROM liekan_warehouse_overview_snapshot WHERE website_id=$1
+          AND parameters->>'timezone'=$2 AND parameters->>'resource'='ai/preference'
+          AND parameters->>'chartPeriod' IN ('7d','30d') ORDER BY id`,
+        [websiteId, timezone],
+      );
+      const todayReports = await db.read<{ id: string }>(
+        `SELECT id FROM liekan_warehouse_overview_snapshot WHERE website_id IN ($1,$2)
+          AND parameters->>'timezone'=$3 AND parameters->>'resource'='overview'
+          AND parameters->>'chartPeriod'='today' ORDER BY id`,
+        [websiteId, otherSite, timezone],
+      );
+      expect(coldReports).toHaveLength(2);
+      expect(todayReports).toHaveLength(2);
+      const coldIds = coldReports.map(row => row.id);
+      const todayIds = todayReports.map(row => row.id);
+      const attempts: string[] = [];
+      let requestCount = 0;
+      harness.compute.mockImplementation(async (site, p) => {
+        attempts.push(`${p.resource}:${site.id}`);
+        if (p.resource === 'ai/preference') throw new Error('controlled cold failure');
+        const report = compute(site, p);
+        report.cards[0].value = requestCount;
+        return report;
+      });
+      await db.read(
+        "UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()+interval '5 days'",
+      );
+      await db.read(
+        `UPDATE liekan_warehouse_overview_snapshot SET generated_at=NULL,result=NULL,
+          error_code='warehouse-overview-unavailable',next_attempt_at=now()-interval '1 second'
+         WHERE id=ANY($1::uuid[])`,
+        [coldIds],
+      );
+      // Under sustained ingestion, one slot favors Today and the next one
+      // returns to persisted eligibility order, including overdue retries.
+      harness.fairClaim = true;
+      const previousCollections = harness.collect.mock.calls.length;
+      await db.read(
+        "UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()-interval '1 hour' WHERE id=ANY($1::uuid[])",
+        [coldIds],
+      );
+      await db.read(
+        "UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()-interval '3 minutes' WHERE id=ANY($1::uuid[])",
+        [todayIds],
+      );
+      await pumpWarehouseOverview();
+      await pumpWarehouseOverview();
+      expect(attempts.splice(0).map(task => task.split(':')[0])).toEqual([
+        'overview',
+        'ai/preference',
+      ]);
+      await pumpWarehouseOverview();
+      await pumpWarehouseOverview();
+      expect(attempts.splice(0).map(task => task.split(':')[0]).sort()).toEqual([
+        'ai/preference',
+        'overview',
+      ]);
+      expect(harness.collect).toHaveBeenCalledTimes(previousCollections);
+      harness.fairClaim = false;
+      await db.read(
+        "UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()-interval '1 second' WHERE id=ANY($1::uuid[])",
+        [coldIds],
+      );
+      for (let cycle = 0; cycle < 2; cycle++) {
+        requestCount = 100 * (cycle + 1);
+        await db.read(
+          `UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()-interval '20 minutes'
+           WHERE id=ANY($1::uuid[])`,
+          [todayIds],
+        );
+        for (const _ of todayIds) await pumpWarehouseOverview();
+        expect(attempts.splice(0).sort()).toEqual(
+          [`overview:${websiteId}`, `overview:${otherSite}`].sort(),
+        );
+        expect(
+          await db.read(
+            `SELECT count(*)::int AS n FROM liekan_warehouse_overview_snapshot
+            WHERE id=ANY($1::uuid[]) AND next_attempt_at>now() AND error_code IS NULL
+              AND result->'cards'->0->>'value'=$2`,
+            [todayIds, String(requestCount)],
+          ),
+        ).toEqual([{ n: 2 }]);
+        for (const _ of coldIds) await pumpWarehouseOverview();
+        expect(attempts.splice(0)).toEqual(Array(2).fill(`ai/preference:${websiteId}`));
+        expect(
+          await db.read(
+            `SELECT count(*)::int AS n FROM liekan_warehouse_overview_snapshot
+            WHERE id=ANY($1::uuid[]) AND next_attempt_at>now()+interval '4 minutes'`,
+            [coldIds],
+          ),
+        ).toEqual([{ n: 2 }]);
+        await db.read(
+          `UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()-interval '1 second'
+           WHERE id=ANY($1::uuid[])`,
+          [coldIds],
+        );
+      }
+      harness.compute.mockImplementation(compute);
       // Resource deferral keeps the old valid result and retries as a schedule,
       // not a failed report. No query/data quota should turn it into a 503.
       await db.read(
@@ -878,6 +1238,14 @@ it.skipIf(!database)(
         [websiteId, timezone],
       );
       const callsBeforeDeferral = harness.compute.mock.calls.length;
+      harness.claimAfter.mockResolvedValueOnce(Date.now() + 2000);
+      expect(await pumpWarehouseOverview()).toBe(false);
+      expect(harness.compute).toHaveBeenCalledTimes(callsBeforeDeferral);
+      expect(
+        await db.read('SELECT lease_token FROM liekan_warehouse_overview_snapshot WHERE id=$1', [
+          deferred.id,
+        ]),
+      ).toEqual([{ lease_token: null }]);
       harness.compute.mockRejectedValueOnce(new WarehouseBackgroundDeferred());
       await pumpWarehouseOverview();
       expect(harness.compute).toHaveBeenCalledTimes(callsBeforeDeferral + 1);
@@ -908,13 +1276,135 @@ it.skipIf(!database)(
           { error_code: null, lease_token: null, digest: deferred.digest, delayed: true },
         ]);
       }
+      // A preset discovered after freezing this site's members must wait
+      // before taking a lease. Another site can continue in the meantime.
+      const [late] = await db.read<{ id: string }>(
+        `UPDATE liekan_warehouse_overview_snapshot SET control_version='',started_at=NULL,
+          generated_at=NULL,result=NULL,next_attempt_at=now()-interval '10 minutes'
+         WHERE id=(SELECT id FROM liekan_warehouse_overview_snapshot
+           WHERE website_id=$1 AND id<>$2 AND parameters->>'timezone'=$3
+           AND parameters->>'resource'='overview' AND parameters->>'chartPeriod'='7d' LIMIT 1)
+         RETURNING id`,
+        [websiteId, deferred.id, timezone],
+      );
+      await db.read(
+        `UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()-interval '1 second'
+         WHERE website_id=$1 AND parameters->>'timezone'=$2 AND parameters->>'resource'='overview'
+           AND parameters->>'chartPeriod'='today'`,
+        [otherSite, timezone],
+      );
+      await pumpWarehouseOverview();
+      expect(harness.compute.mock.lastCall?.[0].id).toBe(otherSite);
+      expect(
+        await db.read('SELECT started_at FROM liekan_warehouse_overview_snapshot WHERE id=$1', [
+          late.id,
+        ]),
+      ).toEqual([{ started_at: null }]);
+
+      // Today's due time can land after this site's 30-day round froze.
+      // Keep the old snapshots while the long job defers, then recover
+      // today's and seven-day results even when the long job fails.
+      await db.read('DELETE FROM liekan_warehouse_report_round');
+      await db.read(
+        "UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()+interval '1 day'",
+      );
+      const overlap = await db.read<{ id: string; site: string; period: string }>(
+        `SELECT id, website_id AS site, parameters->>'chartPeriod' AS period
+         FROM liekan_warehouse_overview_snapshot
+         WHERE website_id=ANY($1::uuid[]) AND parameters->>'timezone'=$2
+           AND parameters->>'resource'='overview'`,
+        [[websiteId, otherSite], timezone],
+      );
+      const job = (site: string, period: string) =>
+        overlap.find(row => row.site === site && row.period === period)!.id;
+      const long = job(websiteId, '30d');
+      const today = job(websiteId, 'today');
+      const week = job(websiteId, '7d');
+      const otherToday = job(otherSite, 'today');
+      // Publish the seven-day row reset by the preceding discovery scenario.
+      await db.read(
+        "UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()-interval '1 second' WHERE id=$1",
+        [week],
+      );
+      await pumpWarehouseOverview();
+      const previousResults = await db.read<{ id: string; digest: string }>(
+        `SELECT id,md5(result::text) AS digest FROM liekan_warehouse_overview_snapshot
+         WHERE id=ANY($1::uuid[]) AND generated_at IS NOT NULL AND result IS NOT NULL ORDER BY id`,
+        [[long, today, week]],
+      );
+      expect(previousResults).toHaveLength(3);
+      const stages: string[] = [];
+      let longAttempts = 0;
+      const blocked = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      harness.compute.mockImplementation(async (site, params) => {
+        stages.push(`${site.id}:${params.chartPeriod}`);
+        if (site.id === websiteId && params.chartPeriod === '30d') {
+          if (++longAttempts === 1) {
+            await blocked;
+            throw new WarehouseBackgroundDeferred();
+          }
+          throw new Error('controlled overlap failure');
+        }
+        const value = compute(site, params);
+        value.cards[0].value = 456;
+        return value;
+      });
+      await db.read(
+        "UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()-interval '1 second' WHERE id=$1",
+        [long],
+      );
+      running = pumpWarehouseOverview();
+      await vi.waitFor(() => expect(longAttempts).toBe(1));
+      await db.read(
+        `UPDATE liekan_warehouse_overview_snapshot
+         SET next_attempt_at=now()-CASE WHEN id=$2 THEN interval '10 seconds' ELSE interval '1 second' END
+         WHERE id=ANY($1::uuid[])`,
+        [[today, week, otherToday], today],
+      );
+      release();
+      await running;
+      expect(
+        await db.read(
+          `SELECT id,md5(result::text) AS digest FROM liekan_warehouse_overview_snapshot
+           WHERE id=ANY($1::uuid[]) ORDER BY id`,
+          [[long, today, week]],
+        ),
+      ).toEqual(previousResults);
+      await pumpWarehouseOverview();
+      expect(stages).toEqual([`${websiteId}:30d`, `${otherSite}:today`]);
+      await db.read(
+        "UPDATE liekan_warehouse_overview_snapshot SET next_attempt_at=now()-interval '1 second' WHERE id=$1",
+        [long],
+      );
+      for (let attempts = 0; attempts < 3; attempts++) await pumpWarehouseOverview();
+      expect(stages.slice(0, 3)).toEqual([
+        `${websiteId}:30d`,
+        `${otherSite}:today`,
+        `${websiteId}:30d`,
+      ]);
+      expect(stages.slice(3)).toEqual([`${websiteId}:today`, `${websiteId}:7d`]);
+      expect(
+        await db.read(
+          `SELECT count(*)::int AS ready FROM liekan_warehouse_overview_snapshot WHERE id=ANY($1::uuid[])
+          AND error_code IS NULL AND result->'cards'->0->>'value'='456'`,
+          [[today, week, otherToday]],
+        ),
+      ).toEqual([{ ready: 3 }]);
+      expect(
+        await db.read(
+          'SELECT error_code, result IS NOT NULL AS previous FROM liekan_warehouse_overview_snapshot WHERE id=$1',
+          [long],
+        ),
+      ).toEqual([{ error_code: 'warehouse-overview-unavailable', previous: true }]);
       // First-generation failures must be failures, not endless preparing states.
       await db.read('DELETE FROM liekan_warehouse_overview_snapshot');
       harness.resources = ['overview'];
       harness.control = 'first-failure';
       clock.mockReturnValue(now + 4 * 86400000);
       harness.compute.mockRejectedValue(new Error('controlled fixture failure'));
-      await pumpWarehouseOverview();
+      await drainWarehouseOverview(new AbortController().signal);
       const [failure] = await db.read<any>(
         'SELECT parameters,error_code,control_version FROM liekan_warehouse_overview_snapshot WHERE error_code IS NOT NULL',
       );

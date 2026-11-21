@@ -49,7 +49,12 @@ export async function captureReportRankings<T>(
   site: string,
   snapshot: string,
   work: () => Promise<T>,
-  options: { previous?: ReportRankingArtifact; round?: string; byteBudget?: number } = {},
+  options: {
+    previous?: ReportRankingArtifact;
+    round?: string;
+    byteBudget?: number;
+    shouldPause?: () => Promise<boolean>;
+  } = {},
 ) {
   const previous = options.previous;
   if (previous && (!options.round || previous.round !== options.round))
@@ -61,6 +66,7 @@ export async function captureReportRankings<T>(
   // bounded chunks, without a cumulative result-size quota.
   const budget = options.round ? (options.byteBudget ?? 128 * 1024 * 1024) : Infinity;
   let bytes = 0;
+  let paused = false;
   await warehouseReportMetadata(site);
   const value = await sinks.run(
     {
@@ -69,9 +75,14 @@ export async function captureReportRankings<T>(
         const start = totals[table] ?? 0;
         totals[table] = start + rows.length;
         counts[table] ??= 0;
+        let chunks = 0;
         for (let i = Math.max(0, counts[table] - start); i < rows.length; ) {
           const offset = start + i;
-          if (offset !== counts[table] || bytes >= budget) break;
+          if (offset !== counts[table] || bytes >= budget || paused) break;
+          if (options.round && chunks % 8 === 0 && (await options.shouldPause?.())) {
+            paused = true;
+            break;
+          }
           const payload: { ordinal: number; row: string; geography: string | null }[] = [];
           let chunkBytes = 0;
           while (i < rows.length && payload.length < 500) {
@@ -103,6 +114,7 @@ export async function captureReportRankings<T>(
             55,
           );
           counts[table] = offset + payload.length;
+          chunks++;
         }
         counts[table] ??= 0;
       },

@@ -140,7 +140,7 @@ if (run.startsWith('warehouse_feature_data_')) {
     );
 }
 await check('website-list totals and raw collection presence', async () => {
-  const { warehouseWebsiteSummaries } = await import(
+  const { computeWebsiteSummary } = await import(
     '../../src/lib/liekan/upstream/warehouse-website-summary'
   );
   const { warehouseReader } = await import('../../src/lib/liekan/warehouse/reader-runtime');
@@ -155,16 +155,16 @@ await check('website-list totals and raw collection presence', async () => {
   SELECT sum(pv) AS pageviews,count(DISTINCT session_id) AS visitors,count(DISTINCT visit_id) AS visits,count(*) FILTER(WHERE pv=1 AND custom=0) AS bounces,sum(floor(extract(epoch FROM last_at-first_at))) AS totaltime FROM visits`,
     [site, start, end],
   );
-  const [actual] = await warehouseWebsiteSummaries(
-    [{ id: site, createdAt: business.created_at }],
-    input,
-  );
+  const actual = await computeWebsiteSummary({ id: site, createdAt: business.created_at }, input);
   for (const k of Object.keys(expected)) assert.equal(actual[k], Number(expected[k]), k);
   const [presence] = await db.read<any>(
     'SELECT EXISTS(SELECT 1 FROM website_event WHERE website_id=$1 AND created_at BETWEEN $2 AND now() AND event_type NOT IN(2,5)) AS received',
     [site, business.created_at],
   );
-  assert.equal(actual.received, presence.received);
+  const { readBrowserPresence } = await import(
+    '../../src/lib/liekan/upstream/warehouse-browser-presence'
+  );
+  assert.equal((await readBrowserPresence(site))?.received, presence.received);
 });
 await check('geography diagnostics', async () => {
   const { geographyDiagnostics } = await import(

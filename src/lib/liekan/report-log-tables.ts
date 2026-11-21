@@ -11,12 +11,13 @@ const pct = (a: number, b: number): number | null => (b ? Math.round((a / b) * 1
 export function reportLogRange(p: ReportQuery) {
   const clock = dashboardClock();
   const now = clock?.cutoff ?? Date.now();
+  const dayAt = clock?.dayAt ?? now;
   let latestEnd: number;
   try {
     new Intl.DateTimeFormat('en', { timeZone: p.timezone }).format();
     latestEnd = Math.max(
-      now + 86400000,
-      +fromZonedTime(endOfDay(toZonedTime(now, p.timezone)), p.timezone) + 1,
+      dayAt + 86400000,
+      +fromZonedTime(endOfDay(toZonedTime(dayAt, p.timezone)), p.timezone) + 1,
     );
   } catch {
     throw new LiekanError('时区无效');

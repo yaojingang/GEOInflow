@@ -83,9 +83,8 @@ export class TransitionApplier {
         // A shadow applies the sealed authority outcome. It never invokes the
         // browser/log planner against newer policy, receipts or deletion state.
         const landing = new LandingStore(this.ch);
-        await landing.stage(accepted, data.decisions);
-        await landing.projectDecision(accepted);
-        await new WarehouseDeriver(this.db, this.ch).derive(accepted.attempt_id);
+        const staged = await landing.stage(accepted, data.decisions);
+        await new WarehouseDeriver(this.db, this.ch).derive(accepted.attempt_id, undefined, staged);
       }
     } else {
       if (!this.applyControl)

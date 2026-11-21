@@ -10,18 +10,23 @@ import {
   type LandedDecision,
   LandingStore,
   type Receipt,
+  type StagedLanding,
 } from './landing';
 import { validateLogPackage } from './log-planner';
+import { PublicationTrace, tracePublication } from './publication-timing';
 import { QueueReplayReader } from './replay-reader';
 import { route, routingKey, validateEnvelope } from './routing';
 import { validateTask } from './tasks';
 import type { WarehouseQueue } from './transport';
 
-export type DecisionPlanner = (
+export type DecisionPlanner = ((
   inputs: InputPosition[],
   state: SiteState,
   receipts: Receipt[],
-) => Promise<LandedDecision[]>;
+  trace?: PublicationTrace,
+) => Promise<LandedDecision[]>) & {
+  receiptKeys?: (inputs: InputPosition[]) => string[];
+};
 export type ConsumerHealth = {
   code: string;
   at: string;
@@ -87,7 +92,7 @@ export class WarehouseConsumer {
     )
       throw new Error('Invalid warehouse consumer concurrency');
     this.landing = new LandingStore(ch);
-    this.deriver = new WarehouseDeriver(control.db, ch);
+    this.deriver = new WarehouseDeriver(control.db, ch, { ingestionLogFlushLimitMs: 60 });
     this.replay = new QueueReplayReader(queue);
     this.consumer = queue.kafka.consumer({
       groupId: options.groupId,
@@ -263,11 +268,17 @@ export class WarehouseConsumer {
       partitionsConsumedConcurrently: 2,
       eachBatch: async ({ batch, isStale, isRunning, resolveOffset, heartbeat }) => {
         if (!isRunning() || isStale() || this.stopping) return;
+        const measure = process.env.LIEKAN_WAREHOUSE_PUBLICATION_TIMING === '1';
+        const fetchedAtMs = measure ? Date.now() : 0;
+        const fetched = measure ? performance.now() : 0;
         await this.queue.assertIdentity();
         if (!isRunning() || isStale() || this.stopping) return;
+        const identityChecked = measure ? performance.now() : 0;
         const owner = await this.owner(batch.partition);
+        const ownershipChecked = measure ? performance.now() : 0;
         for (let start = 0; start < batch.messages.length; start += 1000) {
           const messages = batch.messages.slice(start, start + 1000);
+          const validationStarted = measure ? performance.now() : 0;
           const parsed: { message: KafkaMessage; input: ReturnType<typeof validateEnvelope> }[] =
             [];
           for (const message of messages) {
@@ -306,18 +317,44 @@ export class WarehouseConsumer {
             });
             if (valid) this.remember(batch.partition, message);
           }
-          await this.control.discover(owner, references, messages.at(-1).offset);
+          const discoveredThrough = messages.at(-1).offset;
+          const validated = measure ? performance.now() : 0;
+          await this.control.discover(owner, references, discoveredThrough);
+          const registered = measure ? performance.now() : 0;
+          const registeredAtMs = measure ? Date.now() : 0;
           if (isStale() || !isRunning() || this.stopping) return;
           for (const message of messages) resolveOffset(message.offset);
           await this.consumer.commitOffsets([
             {
               topic: batch.topic,
               partition: batch.partition,
-              offset: (BigInt(messages.at(-1).offset) + 1n).toString(),
+              offset: (BigInt(discoveredThrough) + 1n).toString(),
             },
           ]);
+          const offsetsCommitted = measure ? performance.now() : 0;
           await heartbeat();
           this.wake(batch.partition);
+          if (measure) {
+            console.info(
+              JSON.stringify({
+                event: 'warehouse-discovery-timing',
+                topicId: owner.topicId,
+                partition: batch.partition,
+                firstOffset: messages[0].offset,
+                discoveredThrough,
+                inputs: messages.length,
+                fetchedAtMs,
+                registeredAtMs,
+                notifiedAtMs: Date.now(),
+                identityMs: Math.round(identityChecked - fetched),
+                ownershipMs: Math.round(ownershipChecked - identityChecked),
+                validationMs: Math.round(validated - validationStarted),
+                registrationMs: Math.round(registered - validated),
+                offsetCommitMs: Math.round(offsetsCommitted - registered),
+                heartbeatAndNotifyMs: Math.round(performance.now() - offsetsCommitted),
+              }),
+            );
+          }
         }
       },
     });
@@ -391,30 +428,75 @@ export class WarehouseConsumer {
     return inputs;
   }
 
-  private async restore(owner: Ownership, attempt: Attempt) {
+  private async restore(
+    owner: Ownership,
+    attempt: Attempt,
+    timing?: (stage: string, ms: number) => void,
+    staged?: StagedLanding,
+    trace?: PublicationTrace,
+  ) {
     if (this.options.authorityProcessor)
       return this.options.authorityProcessor.recover(owner, attempt);
-    await this.landing.projectDecision(attempt);
-    await this.deriver.derive(attempt.attempt_id);
+    await this.deriver.derive(attempt.attempt_id, timing, staged, trace, staged === undefined);
     // A receipt retry must wait for its original package's publication, including
     // link/pixel packages without PG effects. Releasing the key after the decision
     // alone would let an empty duplicate package acknowledge unpublished facts.
-    await this.control.decisionProjected(owner, attempt.attempt_id);
+    await tracePublication(trace, 'decision.release', () =>
+      this.control.decisionProjected(owner, attempt.attempt_id),
+    );
   }
 
   private async drain(partition: number) {
     let progressed = false;
     const owner = await this.owner(partition);
-    for (const attempt of await this.control.recovery(owner)) {
-      if ((this.deferredRecovery.get(attempt.attempt_id) ?? 0) > Date.now()) continue;
+    const recoveryLimit = 50;
+    const pendingRecovery = await this.control.recovery(owner, recoveryLimit);
+    let recoveryBlocked = false;
+    for (const attempt of pendingRecovery) {
+      if ((this.deferredRecovery.get(attempt.attempt_id) ?? 0) > Date.now()) {
+        if (this.options.authorityProcessor) continue;
+        recoveryBlocked = true;
+        break;
+      }
+      const startedAtMs = Date.now();
+      const trace =
+        !this.options.authorityProcessor && process.env.LIEKAN_WAREHOUSE_PUBLICATION_TIMING === '1'
+          ? new PublicationTrace()
+          : undefined;
+      let outcome = 'deferred';
       try {
-        await this.restore(owner, attempt);
+        await this.restore(owner, attempt, undefined, undefined, trace);
         progressed = true;
         this.deferredRecovery.delete(attempt.attempt_id);
+        outcome = 'published';
       } catch {
         this.deferredRecovery.set(attempt.attempt_id, Date.now() + 2000);
         this.health('warehouse-projection-deferred', partition);
+        if (!this.options.authorityProcessor) {
+          recoveryBlocked = true;
+          break;
+        }
+      } finally {
+        if (trace)
+          console.info(
+            JSON.stringify({
+              event: 'warehouse-recovery-timing',
+              attemptId: attempt.attempt_id,
+              partition,
+              startedAtMs,
+              finishedAtMs: Date.now(),
+              outcome,
+              details: trace.spans,
+            }),
+          );
       }
+    }
+    if (
+      recoveryBlocked ||
+      (!this.options.authorityProcessor && pendingRecovery.length === recoveryLimit)
+    ) {
+      if (progressed) await this.control.safeOffset(owner);
+      return progressed;
     }
     const excluded = [...this.deferred].filter(([, at]) => at > Date.now()).map(([site]) => site);
     const ready = await this.control.ready(owner, 500, excluded);
@@ -427,6 +509,22 @@ export class WarehouseConsumer {
     for (const [site, work] of groups) {
       if (!this.assigned.has(partition) || this.stopping) break;
       let attempt: Attempt | undefined;
+      const stages =
+        process.env.LIEKAN_WAREHOUSE_PUBLICATION_TIMING === '1'
+          ? ({} as Record<string, number>)
+          : undefined;
+      const timing =
+        stages &&
+        ((stage: string, ms: number) => {
+          stages[stage] = Math.round(ms * 10) / 10;
+        });
+      const started = performance.now();
+      const trace = stages ? new PublicationTrace(started) : undefined;
+      let claimedAtMs: number | undefined;
+      let stageStarted = started;
+      let outcome = 'deferred';
+      let inputCount = 0;
+      let confirming = false;
       try {
         // Use the already bounded ready/replay batch. A second 100-row cap
         // fragmented bulk logs into many tiny CH parts and repeated the full
@@ -434,12 +532,15 @@ export class WarehouseConsumer {
         // bounds bytes and rows per fact family, including large properties.
         const chosen = work.slice(0, 500);
         const inputs = await this.payloads(owner, chosen);
+        inputCount = inputs.length;
         attempt = await this.control.intent(
           owner,
           site,
           inputs.map(i => i.offset),
           inputDigest(inputs),
         );
+        if (stages) claimedAtMs = Date.now();
+        timing?.('read-and-claim', performance.now() - stageStarted);
         if (this.options.authorityProcessor) {
           await this.options.authorityProcessor.process(owner, attempt, inputs);
           for (const input of inputs) this.forget(`${partition}:${input.offset}`);
@@ -447,45 +548,37 @@ export class WarehouseConsumer {
           progressed = true;
           continue;
         }
-        const state = await this.control.site(site);
-        const receipts = await this.landing.receipts(
-          {
-            websiteId: site,
-            epoch: attempt.epoch,
-            publication: state.publication,
-            deletionRevision: attempt.deletion_revision,
-          },
-          inputs.map(i => routingKey(i.envelope)),
-        );
+        const state = await tracePublication(trace, 'plan.site', () => this.control.site(site));
+        stageStarted = performance.now();
+        const boundary = {
+          websiteId: site,
+          epoch: attempt.epoch,
+          publication: state.publication,
+          deletionRevision: attempt.deletion_revision,
+        };
         // Reset discards the old collection epoch. Policy changes preserve raw
         // evidence; the planner re-evaluates against the current control snapshot,
         // and confirm fences a concurrent revision change. Never discard an
         // already acknowledged log merely because policy changed in the queue.
-        const deleted = await this.landing.deletedInputs(
-          {
-            websiteId: site,
-            epoch: attempt.epoch,
-            publication: state.publication,
-            deletionRevision: attempt.deletion_revision,
-          },
-          inputs,
+        const deleted = await tracePublication(trace, 'plan.deleted', () =>
+          this.landing.deletedInputs(boundary, inputs),
         );
         const stale = inputs.filter(
           i => i.envelope.epoch !== attempt.epoch || deleted.has(i.envelope.inputId),
         );
         const usable = inputs.filter(i => !stale.includes(i));
-        const replayed = await this.landing.acceptedInputs(
-          {
-            websiteId: site,
-            epoch: attempt.epoch,
-            publication: state.publication,
-            deletionRevision: attempt.deletion_revision,
-          },
-          usable,
+        const replayed = await tracePublication(trace, 'plan.replay', () =>
+          this.landing.acceptedInputs(boundary, usable),
         );
         const unaccepted = usable.filter(i => !replayed.has(i.envelope.inputId));
+        const receiptKeys =
+          this.planner.receiptKeys?.(unaccepted) ?? inputs.map(i => routingKey(i.envelope));
+        const receipts =
+          unaccepted.length && receiptKeys.length
+            ? await this.landing.receipts(boundary, receiptKeys)
+            : [];
         const decisions: LandedDecision[] = [
-          ...(unaccepted.length ? await this.planner(unaccepted, state, receipts) : []),
+          ...(unaccepted.length ? await this.planner(unaccepted, state, receipts, trace) : []),
           ...replayed.values(),
           ...stale.map(input => {
             const batchId =
@@ -526,7 +619,13 @@ export class WarehouseConsumer {
             };
           }),
         ];
-        await this.landing.stage(attempt, decisions);
+        timing?.('plan', performance.now() - stageStarted);
+        stageStarted = performance.now();
+        const staged = await this.landing.stage(attempt, decisions);
+        timing?.('landing-write', performance.now() - stageStarted);
+        stageStarted = performance.now();
+        // A lost confirmation response can already represent durable work.
+        confirming = true;
         const accepted = await this.control.confirm(
           owner,
           attempt.attempt_id,
@@ -540,7 +639,9 @@ export class WarehouseConsumer {
             ? (tx, a) => this.options.acceptResult(tx, a, decisions)
             : undefined,
         );
-        await this.restore(owner, accepted);
+        timing?.('pg-confirm', performance.now() - stageStarted);
+        await this.restore(owner, accepted, timing, staged, trace);
+        outcome = 'published';
         progressed = true;
         for (const input of inputs) this.forget(`${partition}:${input.offset}`);
         this.deferred.delete(site);
@@ -553,6 +654,24 @@ export class WarehouseConsumer {
           error instanceof WarehouseConflict ? error.code : 'warehouse-site-deferred',
           partition,
         );
+        // Reconcile durable work before issuing later groups in this partition.
+        if (confirming) break;
+      } finally {
+        if (stages && attempt && !this.options.authorityProcessor)
+          console.info(
+            JSON.stringify({
+              event: 'warehouse-publication-timing',
+              attemptId: attempt.attempt_id,
+              partition,
+              inputs: inputCount,
+              claimedAtMs,
+              finishedAtMs: Date.now(),
+              outcome,
+              wallMs: Math.round(performance.now() - started),
+              stages,
+              details: trace.spans,
+            }),
+          );
       }
     }
     await this.control.safeOffset(owner);

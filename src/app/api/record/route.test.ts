@@ -225,3 +225,35 @@ test('warehouse heatmap publication failure returns retryable status with CORS',
   expect(result.headers.get('Access-Control-Allow-Origin')).toBe('*');
   expect(await result.json()).toEqual({ error: 'collection_unavailable' });
 });
+
+test.each([undefined, '1'])(
+  'stops reading an oversized stream even with Content-Length %s',
+  async length => {
+    let read = 0;
+    const cancel = vi.fn();
+    const stream = new ReadableStream(
+      {
+        pull(controller) {
+          read++;
+          controller.enqueue(new Uint8Array(600_000));
+          if (read === 8) controller.close();
+        },
+        cancel,
+      },
+      { highWaterMark: 0 },
+    );
+    const response = await POST(
+      new Request('http://localhost/api/record', {
+        method: 'POST',
+        body: stream,
+        duplex: 'half',
+        headers: length ? { 'Content-Length': length } : {},
+      } as RequestInit),
+    );
+    expect(response.status).toBe(413);
+    expect(read).toBe(2);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(parseRequestMock).not.toHaveBeenCalled();
+    expect(saveRecording).not.toHaveBeenCalled();
+  },
+);

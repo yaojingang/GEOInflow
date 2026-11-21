@@ -291,7 +291,38 @@ export function browserEventRelation(
 }
 
 /** The summary needs both observed and qualified traffic from the same event rows. */
-export function websiteSummaryEventRelation(metadata: ReportingMetadata) {
+export function websiteSummaryEventRelation(metadata: ReportingMetadata, window?: AnalysisWindow) {
+  const eventColumns = [
+    'created_at',
+    'session_id',
+    'visit_id',
+    'event_type',
+    'utm_source',
+    'utm_medium',
+    'referrer_domain',
+  ];
+  const columns = [
+    ...eventColumns,
+    '_qualified',
+    '_qualified_event',
+    '_identity_version',
+    '_rule_version',
+    '_catalog_version',
+  ];
+  const model =
+    analysisWindowRelation('browser', columns, window) ??
+    analysisReadRelation(
+      'browser',
+      columns,
+      () =>
+        `(SELECT ${eventColumns.join(',')},qualified AS _qualified,qualified AS _qualified_event,
+        identity_version AS _identity_version,rule_version AS _rule_version,catalog_version AS _catalog_version
+        FROM ${websiteSummaryEventRelation(metadata)})`,
+    );
+  if (model)
+    return `(SELECT ${eventColumns.join(',')},(_qualified AND _qualified_event) AS qualified,
+    _identity_version AS identity_version,_rule_version AS rule_version,_catalog_version AS catalog_version FROM ${model})`;
+
   const qualityColumns = [
     'event_id',
     'website_id',

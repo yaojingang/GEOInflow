@@ -19,6 +19,7 @@ import {
   useState,
 } from 'react';
 import { getClientAuthToken } from '@/lib/client';
+import { invalidatesRetainedRead } from '../contracts/report-status';
 import { AUTH_TOKEN } from '@/lib/constants';
 import { setUser, useApp } from '@/store/app';
 import { useBrowserCacheClock, useBrowserCacheQuery } from './cache-client';
@@ -713,7 +714,11 @@ export function useRetainedRead(
   const partialFailure = aggregateReadFailure(result.data);
   if (result.data !== undefined && !result.isPlaceholderData && !partialFailure)
     previous.current = { owner, id, epoch, data: result.data };
-  const restricted = [401, 403, 404, 409, 410].includes(result.error?.status);
+  const restricted = invalidatesRetainedRead(result.error);
+  useEffect(() => {
+    if (restricted && query?.state.error === result.error && query.state.data !== undefined)
+      query.setState({ data: undefined });
+  }, [query, restricted, result.error]);
   const principalPaused =
     options?.meta?.readPurpose === 'ordinary' &&
     (reading?.authorized === false || options.meta.manualAuthorized === false);
@@ -738,7 +743,7 @@ export function useRetainedRead(
         document.visibilityState === 'hidden' ||
         navigator.onLine === false ||
         liveRead.current.reading?.authorized === false ||
-        [401, 403, 404, 409, 410].includes((active.state.error as any)?.status)
+        invalidatesRetainedRead(active.state.error)
       )
         return;
       const now = performance.now();
@@ -785,12 +790,7 @@ export function useRetainedRead(
     partialFailure && Array.isArray(result.data) && Array.isArray(retained)
       ? result.data.map(row => {
           const old = retained.find(previous => previous.id === row.id);
-          return row.error &&
-            ![401, 403, 404, 409, 410].includes(row.error.status) &&
-            old &&
-            !old.error
-            ? old
-            : row;
+          return row.error && !invalidatesRetainedRead(row.error) && old && !old.error ? old : row;
         })
       : (result.data ?? retained);
   if (partialFailure && data !== undefined) previous.current = { owner, id, epoch, data };

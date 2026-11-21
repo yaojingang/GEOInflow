@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { logCountExpressions, logCountPattern, logCountVersion } from './warehouse-log-hour-counts';
 import {
   type AnalysisBucket,
   type AnalysisKind,
@@ -25,17 +26,25 @@ import {
   forgetWarehouseReportMemo,
   memoWarehouseReport,
   warehouseControlFingerprint,
+  warehouseReportCheckpoint,
   warehouseReportCommand,
   warehouseReportMetadata,
   warehouseReportQuery,
   warehouseReportSignal,
   withinWarehouseReport,
 } from './warehouse-report-snapshot';
+import {
+  analysisBuildStep,
+  AnalysisBuildAbandoned,
+  type AnalysisBuild,
+  type AnalysisBuildStore,
+} from './warehouse-analysis-build';
 import { memoRoundMetric } from './warehouse-round-metrics';
 
 export const analysisModelVersion = 'analysis-model-v2';
 export const analysisModelDays = 64;
 const hour = 3600;
+const maxLogBuildAttempts = 1024;
 const sourceFamilies = {
   browser: [
     'website_event',
@@ -62,6 +71,7 @@ type Checkpoint = {
   log_publication: string;
   browser: string;
   log: string;
+  log_counts?: string;
 };
 function parseBuckets(value: string | undefined): AnalysisBucket[] {
   if (!value) return [];
@@ -87,7 +97,7 @@ function parseBuckets(value: string | undefined): AnalysisBucket[] {
     throw new Error('warehouse-analysis-coverage-duplicate');
   return rows;
 }
-export function analysisSource(kind: AnalysisKind) {
+export function analysisSource(kind: AnalysisKind, reuseLogAttempts = false) {
   return withoutAnalysisRead(() => {
     const immutableTimeWindow = {
       start: 'modelStart',
@@ -95,7 +105,14 @@ export function analysisSource(kind: AnalysisKind) {
       endExclusive: true,
       hours: 'modelWindowHours',
     };
-    if (kind === 'log') return reportingLogRelation({ immutableTimeWindow });
+    if (kind === 'log')
+      return reportingLogRelation(
+        {
+          immutableTimeWindow,
+          ...(reuseLogAttempts ? { logAttemptIdsParameter: 'modelLogAttempts' } : {}),
+        },
+        fields(kind),
+      );
     const cols = factTable('website_event')
       .columns.map(c => `e.${identifier(c.name)} AS ${identifier(c.name)}`)
       .join(',');
@@ -152,10 +169,17 @@ async function changedHours(
     // fingerprint; unrelated candidate writes do not dirty all covered hours.
     if (!names.size) return new Set<number>();
   }
+  const bucketHours = buckets.map(b => b[0]);
+  const bucketHour = 'toInt64(toUnixTimestamp(toStartOfHour(_record_time)))';
+  const coveredDays = `toDate32(_record_time) BETWEEN
+    toDate32(toDateTime({modelFirstHour:Int64},'UTC')) AND
+    toDate32(toDateTime({modelLastHour:Int64},'UTC'))`;
+  const coveredHour = `${bucketHour} IN {modelCoveredHours:Array(Int64)}`;
   let sql: string;
   if (kind === 'log') {
-    sql = `SELECT DISTINCT toInt64(toUnixTimestamp(toStartOfHour(_record_time))) AS hour FROM warehouse_liekan_log
-      WHERE ${rawScope} AND (_attempt_id IN (${attempts('liekan_log')}) ${names.has('liekan_crawler_evidence') ? `OR id IN (SELECT log_id FROM warehouse_liekan_crawler_evidence WHERE ${rawScope} AND _attempt_id IN (${attempts('liekan_crawler_evidence')}))` : ''})`;
+    sql = `SELECT DISTINCT ${bucketHour} AS hour FROM warehouse_liekan_log
+      PREWHERE ${rawScope} AND ${coveredDays}
+      WHERE ${coveredHour} AND (_attempt_id IN (${attempts('liekan_log')}) ${names.has('liekan_crawler_evidence') ? `OR id IN (SELECT log_id FROM warehouse_liekan_crawler_evidence WHERE ${rawScope} AND _attempt_id IN (${attempts('liekan_crawler_evidence')}))` : ''})`;
   } else {
     const eventSources = [
       'liekan_event_quality',
@@ -175,10 +199,16 @@ async function changedHours(
       WHERE ${rawScope} AND (_attempt_id IN (${attempts('website_event')})
         ${changedEvents ? `OR event_id IN (${changedEvents})` : ''}
         ${names.has('session') ? `OR session_id IN (SELECT session_id FROM warehouse_session WHERE ${rawScope} AND _attempt_id IN (${attempts('session')}))` : ''}))
-      SELECT DISTINCT toInt64(toUnixTimestamp(toStartOfHour(_record_time))) AS hour FROM warehouse_website_event
-      WHERE ${rawScope} AND (session_id,visit_id) IN changed_visits`;
+      SELECT DISTINCT ${bucketHour} AS hour FROM warehouse_website_event
+      PREWHERE ${rawScope} AND ${coveredDays}
+      WHERE ${coveredHour} AND (session_id,visit_id) IN changed_visits`;
   }
-  const rows = await warehouseReportQuery<{ hour: string }>(site, sql, { modelPrevious: previous });
+  const rows = await warehouseReportQuery<{ hour: string }>(site, sql, {
+    modelPrevious: previous,
+    modelFirstHour: Math.min(...bucketHours),
+    modelLastHour: Math.max(...bucketHours),
+    modelCoveredHours: bucketHours,
+  });
   return new Set(rows.map(r => Number(r.hour)));
 }
 type AnalysisSelection = {
@@ -187,31 +217,45 @@ type AnalysisSelection = {
   end?: number;
   preserveOther?: boolean;
 };
-async function loadModel(site: string, selection?: AnalysisSelection) {
+async function loadModel(
+  site: string,
+  selection?: AnalysisSelection,
+  recovery?: { prepared?: AnalysisRead; onCheckpoint?: (value: AnalysisRead) => Promise<void> },
+) {
   const metadata = await warehouseReportMetadata(site);
   const control = createHash('sha256')
     .update(JSON.stringify([analysisModelVersion, warehouseControlFingerprint(metadata)]))
     .digest('hex');
-  const [checkpoint] = await warehouseReportQuery<Checkpoint>(
-    site,
-    `SELECT toString(c.publication) AS publication,toString(c.browser_publication) AS browser_publication,toString(c.log_publication) AS log_publication,browser,log FROM warehouse_analysis_coverage_v1 c WHERE ${scope} AND control={modelControl:String} AND c.publication<={wh_publication:UInt64} ORDER BY c.publication DESC,recorded_at DESC,checkpoint DESC LIMIT 1`,
-    { modelControl: control },
-  );
-  const result: AnalysisRead = {
-    site,
-    control,
-    publication: {
-      browser: checkpoint?.browser_publication ?? '0',
-      log: checkpoint?.log_publication ?? '0',
-    },
-    browser: parseBuckets(checkpoint?.browser),
-    log: parseBuckets(checkpoint?.log),
-  };
+  const [checkpoint] = recovery?.prepared
+    ? []
+    : await warehouseReportQuery<Checkpoint>(
+        site,
+        `SELECT toString(c.publication) AS publication,toString(c.browser_publication) AS browser_publication,toString(c.log_publication) AS log_publication,browser,log,log_counts FROM warehouse_analysis_coverage_v1 c WHERE ${scope} AND control={modelControl:String} AND c.publication<={wh_publication:UInt64} ORDER BY c.publication DESC,recorded_at DESC,checkpoint DESC LIMIT 1`,
+        { modelControl: control },
+      );
+  const result: AnalysisRead = recovery?.prepared
+    ? structuredClone(recovery.prepared)
+    : {
+        site,
+        control,
+        publication: {
+          browser: checkpoint?.browser_publication ?? '0',
+          log: checkpoint?.log_publication ?? '0',
+        },
+        browser: parseBuckets(checkpoint?.browser),
+        log: parseBuckets(checkpoint?.log),
+        ...(checkpoint?.log_counts && { logCounts: JSON.parse(checkpoint.log_counts) }),
+      };
   for (const kind of ['browser', 'log'] as const) {
     if (selection?.kinds && !selection.kinds.includes(kind)) {
       if (!selection.preserveOther) result[kind] = [];
       continue;
     }
+    if (
+      result.checkedFamilies?.includes(kind) &&
+      result.publication[kind] === metadata.boundary.publication
+    )
+      continue;
     // Request-time integrity checks only cover buckets that this request can
     // use. Cross-window anchors still come from the authoritative fallback.
     if (Number.isFinite(selection?.start) && Number.isFinite(selection?.end))
@@ -219,7 +263,7 @@ async function loadModel(site: string, selection?: AnalysisSelection) {
         b => (b[0] + hour) * 1000 > selection.start && b[0] * 1000 <= selection.end,
       );
     const dirty =
-      checkpoint && result.publication[kind] !== metadata.boundary.publication
+      result[kind].length && result.publication[kind] !== metadata.boundary.publication
         ? await changedHours(site, kind, result.publication[kind], result[kind])
         : new Set<number>();
     result[kind] = result[kind].filter(b => !dirty.has(b[0]));
@@ -232,6 +276,7 @@ async function loadModel(site: string, selection?: AnalysisSelection) {
           modelHours: result[kind].map(b => b[0]),
           modelBuilds: result[kind].map(b => b[1]),
         },
+        { traceStage: 'analysis-coverage' },
       );
       const found = new Map(counts.map(c => [`${c.hour}:${c.build}`, Number(c.rows)]));
       // Missing nonempty data is absent coverage, never a zero-valued report.
@@ -245,12 +290,17 @@ async function loadModel(site: string, selection?: AnalysisSelection) {
             modelHours: result.browser.map(b => b[0]),
             modelBuilds: result.browser.map(b => b[1]),
           },
+          { traceStage: 'analysis-coverage' },
         );
         const counts = new Map(visits.map(c => [`${c.hour}:${c.build}`, Number(c.rows)]));
         result.browser = result.browser.filter(b => (counts.get(`${b[0]}:${b[1]}`) ?? 0) === b[3]);
       }
     }
     result.publication[kind] = metadata.boundary.publication;
+    if (recovery) {
+      result.checkedFamilies = [...new Set([...(result.checkedFamilies ?? []), kind])];
+      await recovery.onCheckpoint?.(structuredClone(result));
+    }
   }
   return result;
 }
@@ -320,6 +370,7 @@ export async function withVerifiedAnalysisRead<T>(
         WHERE ${rawScope} AND (isNull(created_at) OR
           toInt64(toUnixTimestamp(toStartOfHour(created_at))) NOT IN {modelCoveredHours:Array(Int64)}) LIMIT 1`,
           { modelCoveredHours: hours },
+          { traceStage: 'analysis-proof' },
         );
         return missing.length === 0;
       }),
@@ -357,6 +408,7 @@ export async function withVerifiedAnalysisRead<T>(
                AND toInt64(toUnixTimestamp(toStartOfHour(created_at)))
                  NOT IN {modelCoveredHours:Array(Int64)})) LIMIT 1`,
                   { modelCoveredHours: hours, modelWindowStart: start, modelWindowEnd: end },
+                  { traceStage: 'analysis-proof' },
                 )
               ).length === 0,
           ));
@@ -369,14 +421,17 @@ export async function withVerifiedAnalysisRead<T>(
 
 /** Only the existing background report lock calls this builder. Each batch writes
  * immutable candidates, verifies them, then publishes coverage. Interrupted or
- * superseded candidates are unreachable; retries get a different build UUID. */
+ * superseded candidates are unreachable. Durable receipts resume confirmed
+ * stages; ambiguous partial candidates receive a new build UUID. */
 export async function prepareAnalysisModel(
   site: string,
   start: Date,
   end: Date,
   options: {
     kinds?: AnalysisKind[];
+    completeThrough?: number;
     prepared?: AnalysisRead;
+    buildStore?: AnalysisBuildStore;
     onCheckpoint?: (value: AnalysisRead) => Promise<void>;
   } = {},
 ) {
@@ -404,12 +459,19 @@ export async function prepareAnalysisModel(
             throw new Error('warehouse-analysis-prepared-boundary');
         }
       }
-      const result =
-        reusable &&
-        kinds.every(kind => reusable.publication?.[kind] === metadata.boundary.publication)
-          ? structuredClone(reusable)
-          : await loadModel(site, { kinds, preserveOther: true });
-      const last = Math.ceil(+end / 3600000) * hour;
+      const store = options.buildStore;
+      const pending = store?.current();
+      const required = pending && !kinds.includes(pending.kind) ? [...kinds, pending.kind] : kinds;
+      const result = await loadModel(
+        site,
+        { kinds: required, preserveOther: true },
+        { prepared: reusable, onCheckpoint: options.onCheckpoint },
+      );
+      const last =
+        Math.min(
+          Math.ceil(+end / 3600000),
+          Math.floor((options.completeThrough ?? Infinity) / 3600000),
+        ) * hour;
       const recentEnd = Math.max(last, Math.floor(Date.now() / 3600000) * hour);
       const retentionStart = recentEnd - analysisModelDays * 86400;
       const first = Math.max(Math.floor(+start / 3600000) * hour, retentionStart);
@@ -422,121 +484,332 @@ export async function prepareAnalysisModel(
       )
         throw new Error('warehouse-analysis-build-range');
       const requested = Array.from({ length: (last - first) / hour }, (_, i) => first + i * hour);
+      const buildGroup = async (state: AnalysisBuild) => {
+        if (state.control !== result.control || state.publication !== metadata.boundary.publication)
+          throw new Error('warehouse-analysis-build-boundary');
+        try {
+          await buildAnalysisGroup(site, result, state, store, options.onCheckpoint);
+          await store?.save(null);
+          await warehouseReportCheckpoint(store);
+        } catch (error) {
+          if (error instanceof AnalysisBuildAbandoned) await store?.save(null);
+          throw error;
+        }
+      };
+      if (pending) await buildGroup(pending);
       for (const kind of kinds) {
         result[kind] = result[kind].filter(b => b[0] >= retentionStart && b[0] < recentEnd);
         const have = new Set(result[kind].map(b => b[0]));
         const missing = requested.filter(h => !have.has(h));
-        // Physical versions are a superset of the frozen accepted input. A missing
-        // hour here proves an empty build without running its canonical joins,
-        // INSERT and two checksums. Nonempty candidates still take full verification.
-        const physical = missing.length
-          ? await warehouseReportQuery<{ hour: string }>(
-              site,
-              `SELECT DISTINCT toInt64(toUnixTimestamp(toStartOfHour(_record_time))) AS hour
-           FROM warehouse_${kind === 'browser' ? 'website_event' : 'liekan_log'}
-           WHERE ${rawScope} AND toInt64(toUnixTimestamp(toStartOfHour(_record_time))) IN {modelMissingHours:Array(Int64)}`,
-              { modelMissingHours: missing },
-            )
-          : [];
-        const occupied = new Set(physical.map(r => Number(r.hour)));
         for (let offset = 0; offset < missing.length; offset += 128) {
           warehouseReportSignal()?.throwIfAborted();
-          const coveredHours = missing.slice(offset, offset + 128),
-            hours = coveredHours.filter(h => occupied.has(h)),
-            build = randomUUID(),
-            columns = fields(kind),
-            source = analysisSource(kind);
-          const params = {
-            modelControl: result.control,
-            modelBuild: build,
-            modelHours: hours,
-            modelWindowHours: hours,
-            modelStart: warehouseTime(new Date(coveredHours[0] * 1000)),
-            modelEnd: warehouseTime(
-              new Date((coveredHours[coveredHours.length - 1] + hour) * 1000),
-            ),
+          const state: AnalysisBuild = {
+            id: randomUUID(),
+            sourceBuild: randomUUID(),
+            checkpoint: randomUUID(),
+            kind,
+            hours: missing.slice(offset, offset + 128),
+            control: result.control,
+            publication: metadata.boundary.publication,
+            receipts: {},
           };
-          const window = `toInt64(toUnixTimestamp(toStartOfHour(created_at))) IN {modelHours:Array(Int64)}`;
-          if (hours.length)
-            await warehouseReportCommand(
-              site,
-              `INSERT INTO warehouse_analysis_${kind}_v1 (${columns.map(identifier).join(',')},epoch,_control,_hour,_build,_publication)
-          SELECT ${columns.map(identifier).join(',')},{wh_epoch:UInt64},{modelControl:String},toInt64(toUnixTimestamp(toStartOfHour(created_at))),{modelBuild:UUID},{wh_publication:UInt64}
-          FROM ${source} WHERE ${window}`,
-              params,
-              55,
-            );
-          const digest = (relation: string, where: string) =>
-            `SELECT toInt64(toUnixTimestamp(toStartOfHour(created_at))) AS hour,count() AS rows,toString(sum(cityHash64(tuple(${columns.map(identifier).join(',')})))) AS checksum FROM ${relation} WHERE ${where} GROUP BY hour ORDER BY hour`;
-          const expected = hours.length
-            ? await warehouseReportQuery<{
-                hour: string;
-                rows: string;
-                checksum: string;
-              }>(site, digest(source, window), params)
-            : [];
-          const actual = hours.length
-            ? await warehouseReportQuery<{
-                hour: string;
-                rows: string;
-                checksum: string;
-              }>(
-                site,
-                digest(
-                  `warehouse_analysis_${kind}_v1`,
-                  `${bucketScope} AND _build={modelBuild:UUID}`,
-                ),
-                params,
-              )
-            : [];
-          if (JSON.stringify(actual) !== JSON.stringify(expected))
-            throw new Error('warehouse-analysis-verification-failed');
-          if (kind === 'browser' && hours.length)
-            await warehouseReportCommand(
-              site,
-              `INSERT INTO warehouse_analysis_visit_hour_v1
-          (website_id,session_id,visit_id,epoch,_control,_hour,_build,_publication,pv,custom,first_pv,last_pv,visitors)
-          SELECT website_id,session_id,visit_id,epoch,_control,_hour,_build,{wh_publication:UInt64},countIf(event_type NOT IN(2,5)),countIf(event_type=2),minOrNullIf(created_at,event_type NOT IN(2,5)),maxOrNullIf(created_at,event_type NOT IN(2,5)),uniqExactState(session_id)
-          FROM warehouse_analysis_browser_v1 WHERE ${bucketScope} AND _build={modelBuild:UUID} AND _qualified GROUP BY website_id,session_id,visit_id,epoch,_control,_hour,_build`,
-              params,
-              55,
-            );
-          const visitCounts =
-            kind === 'browser' && hours.length
-              ? await warehouseReportQuery<{ hour: string; rows: string }>(
-                  site,
-                  `SELECT _hour AS hour,count() AS rows FROM warehouse_analysis_visit_hour_v1 WHERE ${bucketScope} AND _build={modelBuild:UUID} GROUP BY _hour`,
-                  params,
-                )
-              : [];
-          const fragments = new Map(visitCounts.map(r => [Number(r.hour), Number(r.rows)]));
-          const counts = new Map(actual.map(r => [Number(r.hour), Number(r.rows)]));
-          result[kind].push(
-            ...coveredHours.map(
-              h => [h, build, counts.get(h) ?? 0, fragments.get(h) ?? 0] as AnalysisBucket,
-            ),
-          );
-          result[kind].sort((a, b) => a[0] - b[0]);
-          // Publish each verified group so a canceled 64-day build resumes from it.
-          await warehouseReportCommand(
-            site,
-            `INSERT INTO warehouse_analysis_coverage_v1 (website_id,epoch,control,publication,checkpoint,browser,log,browser_publication,log_publication)
-          SELECT {wh_site:UUID},{wh_epoch:UInt64},{modelControl:String},{wh_publication:UInt64},{modelCheckpoint:UUID},{modelBrowser:String},{modelLog:String},{modelBrowserPublication:UInt64},{modelLogPublication:UInt64}`,
-            {
-              modelControl: result.control,
-              modelCheckpoint: randomUUID(),
-              modelBrowser: JSON.stringify(result.browser),
-              modelLog: JSON.stringify(result.log),
-              modelBrowserPublication: result.publication.browser,
-              modelLogPublication: result.publication.log,
-            },
-            55,
-          );
-          await options.onCheckpoint?.(structuredClone(result));
+          await store?.save(state);
+          await buildGroup(state);
         }
       }
       forgetWarehouseReportMemo(`analysis-model:${site}:`, true);
       return result;
     }),
   );
+}
+
+type BuildDigest = { hour: string; rows: string; checksum: string; countVersion?: string; requests?: string; abnormal?: string };
+type PhysicalHourProbe = { hour: string } | { hours: string[]; attempts: string[] };
+async function buildAnalysisGroup(
+  site: string,
+  result: AnalysisRead,
+  state: AnalysisBuild,
+  store?: AnalysisBuildStore,
+  checkpoint?: (value: AnalysisRead) => Promise<void>,
+) {
+  const step = <T>(name: string, work: () => Promise<T>, recover?: () => Promise<T>) =>
+    analysisBuildStep(state, store, name, work, recover);
+  const kind = state.kind,
+    coveredHours = state.hours;
+  if (
+    !['browser', 'log'].includes(kind) ||
+    !coveredHours.length ||
+    coveredHours.length > 128 ||
+    coveredHours.some(h => !Number.isSafeInteger(h) || h % hour) ||
+    new Set(coveredHours).size !== coveredHours.length ||
+    (state.sourceBuild !== undefined &&
+      (state.sourceBuild === state.id || !/^[-a-f0-9]{36}$/.test(state.sourceBuild)))
+  )
+    throw new Error('warehouse-analysis-build-plan-invalid');
+  const modelStart = warehouseTime(new Date(Math.min(...coveredHours) * 1000));
+  const modelEnd = warehouseTime(new Date((Math.max(...coveredHours) + hour) * 1000));
+  const physicalHour = 'toInt64(toUnixTimestamp(toStartOfHour(_record_time)))';
+  const physical = await step('physical', () =>
+    warehouseReportQuery<PhysicalHourProbe>(
+      site,
+      `SELECT ${
+        kind === 'log'
+          ? `groupUniqArray(${physicalHour}) AS hours,
+          groupUniqArray(${maxLogBuildAttempts + 1})(_attempt_id) AS attempts`
+          : `DISTINCT ${physicalHour} AS hour`
+      }
+     FROM warehouse_${kind === 'browser' ? 'website_event' : 'liekan_log'}
+     PREWHERE ${rawScope}
+       AND toDate32(_record_time) BETWEEN toDate32({modelStart:DateTime64(6,'UTC')})
+         AND toDate32(subtractMicroseconds({modelEnd:DateTime64(6,'UTC')},1))
+     WHERE ${physicalHour} IN {modelMissingHours:Array(Int64)}`,
+      { modelMissingHours: coveredHours, modelStart, modelEnd },
+    ),
+  );
+  // An old receipt has only the list of hours. A saturated set is also
+  // incomplete. Both cases fall back to the source relation's inline scan.
+  const probe = physical[0];
+  const logProbe = probe && 'hours' in probe ? probe : undefined;
+  const logAttempts =
+    logProbe && logProbe.attempts.length <= maxLogBuildAttempts ? logProbe.attempts : undefined;
+  const occupied = new Set(
+    (logProbe?.hours ?? physical.flatMap(row => ('hour' in row ? [row.hour] : []))).map(Number),
+  );
+  const hours = coveredHours.filter(h => occupied.has(h)),
+    columns = fields(kind),
+    source = analysisSource(kind, logAttempts !== undefined);
+  const sourceControl = createHash('sha256').update(`source-build:${result.control}`).digest('hex');
+  const params = {
+    staticPattern: logCountPattern,
+    countVersion: logCountVersion,
+    modelControl: result.control,
+    modelBuild: state.id,
+    ...(state.sourceBuild ? { modelSourceBuild: state.sourceBuild, sourceControl } : {}),
+    modelHours: hours,
+    modelWindowHours: hours,
+    modelStart,
+    modelEnd,
+    ...(logAttempts ? { modelLogAttempts: logAttempts } : {}),
+  };
+  const writeRows = (table: string, names: string[], select: string, staging = false) =>
+    warehouseReportCommand(
+      site,
+      `INSERT INTO ${table} (${names.map(identifier).join(',')}) ${select}`,
+      {
+        ...params,
+        writeBuild: staging ? state.sourceBuild : state.id,
+        writeControl: staging ? sourceControl : result.control,
+      },
+      55,
+    );
+  const stageScope = `${scope} AND _control={sourceControl:String} AND _build={modelSourceBuild:UUID}`;
+  const stageRows = async (name: string, table: string, names: string[], select: string) => {
+    if (!state.sourceBuild) return;
+    // No published coverage refers to this build. Confirm a complete source
+    // write before allowing its content to become the expected digest.
+    const rows = await step(
+      name,
+      async () => {
+        const reply = await writeRows(table, names, select, true);
+        return reply.summary?.written_rows ?? null;
+      },
+      async () => {
+        throw new AnalysisBuildAbandoned();
+      },
+    );
+    const projection = names.map(name =>
+      name === '_build'
+        ? '{writeBuild:UUID}'
+        : name === '_control'
+          ? '{writeControl:String}'
+          : identifier(name),
+    );
+    return { rows, select: `SELECT ${projection.join(',')} FROM ${table} WHERE ${stageScope}` };
+  };
+  const verifySourceRows = (expectedRows: string | null | undefined, digests: BuildDigest[]) => {
+    if (
+      expectedRows != null &&
+      BigInt(expectedRows) !== digests.reduce((total, digest) => total + BigInt(digest.rows), 0n)
+    )
+      throw new AnalysisBuildAbandoned();
+  };
+  const factTableName = `warehouse_analysis_${kind}_v1`;
+  const window = `toInt64(toUnixTimestamp(toStartOfHour(created_at))) IN {modelHours:Array(Int64)}`;
+  const factColumns = [...columns, 'epoch', '_control', '_hour', '_build', '_publication'];
+  const factSelect = `SELECT ${columns.map(identifier).join(',')},{wh_epoch:UInt64},{writeControl:String},toInt64(toUnixTimestamp(toStartOfHour(created_at))),{writeBuild:UUID},{wh_publication:UInt64}
+       FROM ${source} WHERE ${window}`;
+  // Groups already in progress from the previous version finish with the
+  // original protocol, so an old pending insert is never replayed as a new one.
+  const stagedFacts = hours.length
+    ? await stageRows('source-facts', factTableName, factColumns, factSelect)
+    : undefined;
+  const digest = (relation: string, where: string) =>
+    `SELECT toInt64(toUnixTimestamp(toStartOfHour(created_at))) AS hour,count() AS rows,toString(sum(cityHash64(tuple(${columns.map(identifier).join(',')})))) AS checksum
+      ${kind === 'log' ? `,{countVersion:String} AS countVersion,${logCountExpressions}` : ''} FROM ${relation} WHERE ${where} GROUP BY hour ORDER BY hour`;
+  const expected = await step('source', () =>
+    hours.length
+      ? warehouseReportQuery<BuildDigest>(
+          site,
+          stagedFacts ? digest(factTableName, stageScope) : digest(source, window),
+          params,
+        )
+      : Promise.resolve([]),
+  );
+  verifySourceRows(stagedFacts?.rows, expected);
+  if (hours.length && !Object.hasOwn(state.receipts, 'facts') && !state.intent)
+    await warehouseReportCheckpoint(store);
+  const verifyFacts = async () => {
+    const actual = hours.length
+      ? await warehouseReportQuery<BuildDigest>(
+          site,
+          digest(factTableName, `${bucketScope} AND _build={modelBuild:UUID}`),
+          params,
+        )
+      : [];
+    if (actual.length !== expected.length || expected.some((r, i) =>
+      r.hour !== actual[i].hour || r.rows !== actual[i].rows || r.checksum !== actual[i].checksum ||
+      (r.countVersion === logCountVersion && (r.requests !== actual[i].requests || r.abnormal !== actual[i].abnormal))
+    )) throw new AnalysisBuildAbandoned();
+    return actual;
+  };
+  await step(
+    'facts',
+    async () => {
+      if (hours.length)
+        await writeRows(factTableName, factColumns, stagedFacts?.select ?? factSelect);
+      return true;
+    },
+    async () => {
+      await step('verified', verifyFacts);
+      return true;
+    },
+  );
+  const actual = await step('verified', verifyFacts);
+  const visitsSource = `SELECT website_id,session_id,visit_id,epoch,_control,_hour,_build,
+    countIf(event_type NOT IN(2,5)) AS pv,countIf(event_type=2) AS custom,
+    minOrNullIf(created_at,event_type NOT IN(2,5)) AS first_pv,
+    maxOrNullIf(created_at,event_type NOT IN(2,5)) AS last_pv,uniqExactState(session_id) AS visitors
+    FROM warehouse_analysis_browser_v1 WHERE ${bucketScope} AND _build={modelBuild:UUID} AND _qualified
+    GROUP BY website_id,session_id,visit_id,epoch,_control,_hour,_build`;
+  const visitDigest = (
+    relation: string,
+    where = `${bucketScope} AND _build={modelBuild:UUID}`,
+  ) => `SELECT _hour AS hour,count() AS rows,
+    toString(sum(cityHash64(tuple(website_id,session_id,visit_id,pv,custom,first_pv,last_pv,finalizeAggregation(visitors))))) AS checksum
+    FROM ${relation} WHERE ${where} GROUP BY _hour ORDER BY _hour`;
+  const hasVisits = kind === 'browser' && hours.length > 0;
+  const visitTable = 'warehouse_analysis_visit_hour_v1';
+  const visitColumns = [
+    'website_id',
+    'session_id',
+    'visit_id',
+    'epoch',
+    '_control',
+    '_hour',
+    '_build',
+    'pv',
+    'custom',
+    'first_pv',
+    'last_pv',
+    'visitors',
+    '_publication',
+  ];
+  const visitSelect = `SELECT website_id,session_id,visit_id,epoch,{writeControl:String},_hour,{writeBuild:UUID},pv,custom,first_pv,last_pv,visitors,{wh_publication:UInt64} FROM (${visitsSource})`;
+  if (
+    hasVisits &&
+    !Object.hasOwn(state.receipts, state.sourceBuild ? 'source-visits' : 'visit-source') &&
+    !state.intent
+  )
+    await warehouseReportCheckpoint(store);
+  const stagedVisits = hasVisits
+    ? await stageRows('source-visits', visitTable, visitColumns, visitSelect)
+    : undefined;
+  const expectedVisits = await step('visit-source', () =>
+    hasVisits
+      ? warehouseReportQuery<BuildDigest>(
+          site,
+          stagedVisits ? visitDigest(visitTable, stageScope) : visitDigest(`(${visitsSource})`),
+          params,
+        )
+      : Promise.resolve([]),
+  );
+  verifySourceRows(stagedVisits?.rows, expectedVisits);
+  if (hasVisits && !Object.hasOwn(state.receipts, 'visits') && !state.intent)
+    await warehouseReportCheckpoint(store);
+  const verifyVisits = async () => {
+    const actualVisits = hasVisits
+      ? await warehouseReportQuery<BuildDigest>(site, visitDigest(visitTable), params)
+      : [];
+    if (JSON.stringify(actualVisits) !== JSON.stringify(expectedVisits))
+      throw new AnalysisBuildAbandoned();
+    return actualVisits;
+  };
+  await step(
+    'visits',
+    async () => {
+      if (hasVisits) await writeRows(visitTable, visitColumns, stagedVisits?.select ?? visitSelect);
+      return true;
+    },
+    async () => {
+      await step('visit-verified', verifyVisits);
+      return true;
+    },
+  );
+  const visits = await step('visit-verified', verifyVisits);
+  const fragments = new Map(visits.map(r => [Number(r.hour), Number(r.rows)]));
+  const counts = new Map(actual.map(r => [Number(r.hour), Number(r.rows)]));
+  const next = structuredClone(result),
+    replaced = new Set(coveredHours);
+  next[kind] = [
+    ...next[kind].filter(b => !replaced.has(b[0])),
+    ...coveredHours.map(
+      h => [h, state.id, counts.get(h) ?? 0, fragments.get(h) ?? 0] as AnalysisBucket,
+    ),
+  ].sort((a, b) => a[0] - b[0]);
+  const hoursWithCounts: NonNullable<AnalysisRead['logCounts']>['hours'] = {};
+  const sourceCounts = new Map(expected.map(r => [Number(r.hour), r]));
+  const targetCounts = new Map(actual.map(r => [Number(r.hour), r]));
+  for (const [h, build, rows] of next.log) {
+    const saved = result.logCounts?.version === logCountVersion && result.logCounts.hours[h];
+    if (saved && saved[0] === build) hoursWithCounts[h] = saved;
+    if (kind === 'log' && build === state.id && rows > 0) {
+      const s = sourceCounts.get(h), t = targetCounts.get(h);
+      if (s?.countVersion === logCountVersion && t?.countVersion === logCountVersion &&
+        s.requests !== undefined && s.abnormal !== undefined && s.requests === t.requests && s.abnormal === t.abnormal)
+        hoursWithCounts[h] = [build, Number(s.requests), Number(s.abnormal)];
+    }
+  }
+  next.logCounts = { version: logCountVersion, hours: hoursWithCounts };
+  const coverageParams = {
+    modelControl: next.control,
+    modelCheckpoint: state.checkpoint,
+    modelBrowser: JSON.stringify(next.browser),
+    modelLog: JSON.stringify(next.log),
+    modelLogCounts: JSON.stringify(next.logCounts),
+    modelBrowserPublication: next.publication.browser,
+    modelLogPublication: next.publication.log,
+  };
+  const publish = async () => {
+    await warehouseReportCommand(
+      site,
+      `INSERT INTO warehouse_analysis_coverage_v1 (website_id,epoch,control,publication,checkpoint,browser,log,browser_publication,log_publication,log_counts)
+       SELECT {wh_site:UUID},{wh_epoch:UInt64},{modelControl:String},{wh_publication:UInt64},{modelCheckpoint:UUID},{modelBrowser:String},{modelLog:String},{modelBrowserPublication:UInt64},{modelLogPublication:UInt64},{modelLogCounts:String}`,
+      coverageParams,
+      55,
+    );
+    return true;
+  };
+  await step('coverage', publish, async () => {
+    const found = await warehouseReportQuery(
+      site,
+      `SELECT 1 FROM warehouse_analysis_coverage_v1 WHERE ${scope} AND control={modelControl:String}
+       AND publication={wh_publication:UInt64} AND checkpoint={modelCheckpoint:UUID}
+       AND browser={modelBrowser:String} AND log={modelLog:String} AND log_counts={modelLogCounts:String} LIMIT 1`,
+      coverageParams,
+    );
+    // Identical manifest retries do not add facts or change counts.
+    return found.length ? true : publish();
+  });
+  await checkpoint?.(next);
+  Object.assign(result, next);
 }

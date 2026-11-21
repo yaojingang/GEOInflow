@@ -7,6 +7,7 @@ import { secret } from '@/lib/crypto';
 import { getClientInfo, hasBlockedIp } from '@/lib/detect';
 import { parseToken } from '@/lib/jwt';
 import { CollectionConflictError } from '@/lib/liekan/upstream/collection-write';
+import { CollectionBodyTooLarge, readCollectionJson } from '@/lib/liekan/upstream/collection-body';
 import { WarehouseUnavailable } from '@/lib/liekan/warehouse/completion';
 import { warehouseIntakeEnabled } from '@/lib/liekan/warehouse/runtime';
 import { fetchAccount, fetchTeam } from '@/lib/load';
@@ -86,45 +87,14 @@ function getUrlPath(url: string) {
   }
 }
 
-async function getRequestBodySize(request: Request): Promise<number | null> {
-  const contentLength = request.headers.get('content-length');
-
-  if (contentLength) {
-    const size = Number(contentLength);
-
-    if (Number.isFinite(size)) {
-      return size;
-    }
-  }
-
-  try {
-    const text = await request.clone().text();
-
-    return new TextEncoder().encode(text).length;
-  } catch {
-    return null;
-  }
-}
-
 export function OPTIONS() {
   return corsPreflight();
 }
 
 export async function POST(request: Request) {
   try {
-    const requestBodySize = await getRequestBodySize(request);
-
-    if (requestBodySize && requestBodySize > MAX_RECORD_REQUEST_BYTES) {
-      return withCorsHeaders(
-        payloadTooLarge({
-          reason: 'payload_too_large',
-          maxBytes: MAX_RECORD_REQUEST_BYTES,
-          size: requestBodySize,
-        }),
-      );
-    }
-
-    const { body, error } = await parseRequest(request, schema, { skipAuth: true });
+    const input = await readCollectionJson(request, MAX_RECORD_REQUEST_BYTES);
+    const { body, error } = await parseRequest(request, schema, { skipAuth: true, body: input });
 
     if (error) {
       return withCorsHeaders(error());
@@ -257,6 +227,10 @@ export async function POST(request: Request) {
 
     return withCorsHeaders(json({ ok: true }));
   } catch (e) {
+    if (e instanceof CollectionBodyTooLarge)
+      return withCorsHeaders(
+        payloadTooLarge({ reason: 'payload_too_large', maxBytes: e.maxBytes, size: e.size }),
+      );
     if (e instanceof WarehouseUnavailable)
       return withCorsHeaders(Response.json({ error: 'collection_unavailable' }, { status: 503 }));
     if (e instanceof CollectionConflictError)

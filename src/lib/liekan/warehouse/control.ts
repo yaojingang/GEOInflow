@@ -185,8 +185,15 @@ export class WarehouseControl {
 
   async recovery(owner: Ownership, limit = 50): Promise<Attempt[]> {
     return this.db.read<Attempt>(
-      `SELECT * FROM liekan_warehouse_attempt WHERE topic_id=$1 AND partition=$2
-      AND ((status='confirmed' AND ($4='clickhouse' OR NOT decision_projected)) OR (status='projected' AND NOT decision_projected)) ORDER BY created_at LIMIT $3`,
+      // An older worker may already have reserved the site's next publication for
+      // one of several confirmed attempts. Complete that fixed slot before trying
+      // to allocate a new one. New work waits for partition recovery in the consumer.
+      `SELECT a.* FROM liekan_warehouse_attempt a WHERE topic_id=$1 AND partition=$2
+      AND ((a.status='confirmed' AND ($4='clickhouse' OR NOT decision_projected)) OR (a.status='projected' AND NOT decision_projected))
+      ORDER BY ($4='clickhouse' AND a.status='confirmed' AND EXISTS(
+        SELECT 1 FROM liekan_warehouse_publication p WHERE p.status='reserved' AND p.website_id=a.website_id
+        AND p.epoch=a.epoch AND p.manifest @> jsonb_build_array(jsonb_build_object('attemptId',a.attempt_id))
+      )) DESC, a.created_at,a.first_offset,a.attempt_id LIMIT $3`,
       [owner.topicId, owner.partition, limit, this.authority],
     );
   }

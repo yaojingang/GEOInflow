@@ -218,7 +218,9 @@ function MetricRows({
   labels = true,
   readAt,
   loading = false,
+  historical = false,
 }: {
+  historical?: boolean;
   today: number | null;
   yesterday: number | null;
   timezone: string;
@@ -228,7 +230,7 @@ function MetricRows({
   loading?: boolean;
 }) {
   const i18n = useLiekanI18n();
-  const estimate = kind === 'count' ? projectToday(today, timezone, readAt) : null;
+  const estimate = kind === 'count' && !historical ? projectToday(today, timezone, readAt) : null;
   const trend = projectTrend(estimate, yesterday);
   return (
     <div className="site-metrics" aria-busy={loading || undefined}>
@@ -238,7 +240,7 @@ function MetricRows({
             className="site-metric-label"
             title={i18n.system(formatInTimeZone(readAt, timezone, 'yyyy-MM-dd'))}
           >
-            {i18n.text('今日')}
+            {historical ? formatInTimeZone(readAt, timezone, 'MM/dd') : i18n.text('今日')}
           </span>
         )}
         <span className="site-metric-value">
@@ -254,7 +256,13 @@ function MetricRows({
         </span>
       </div>
       <div className={labels ? 'site-metric' : 'site-metric site-metric-bare'}>
-        {labels && <span className="site-metric-label">{i18n.text('昨日')}</span>}
+        {labels && (
+          <span className="site-metric-label">
+            {historical
+              ? formatInTimeZone(websiteDayWindow(timezone, readAt).startAt - 1, timezone, 'MM/dd')
+              : i18n.text('昨日')}
+          </span>
+        )}
         <span className="site-metric-value">
           {loading ? (
             <Skeleton width="3em" />
@@ -435,7 +443,18 @@ function Websites() {
   const selected = siteRequests.map(site => result(site.selected));
   const daily = siteRequests.map(site => result(site.daily));
   const selectedPending = !canRead || selected.some(read => !read || read.pending);
-  const readable = selected.flatMap(read => (read?.row ? [read.row] : []));
+  const readable = selected.flatMap(read => {
+    const row = read?.row;
+    if (
+      !row ||
+      (row.snapshot &&
+        (row.snapshot.state === 'preparing' ||
+          row.snapshot.startAt !== startAt ||
+          row.snapshot.endAt !== endAt))
+    )
+      return [];
+    return [row];
+  });
   const failures = (showsToday ? selected : [...daily, ...selected]).filter(read => read?.error);
   const selectedFailure = selected.find(read => read?.error)?.error;
   const retryFailures = () => Promise.allSettled(failures.map(read => read.refetch()));
@@ -516,6 +535,19 @@ function Websites() {
           ],
         ]}
       />
+      {!showsToday && readable.some(row => row.snapshot?.dataThrough != null) && (
+        <Notice>
+          {i18n.text('数据截至 {v0}', [
+            new Date(
+              Math.min(
+                ...readable.flatMap(row =>
+                  row.snapshot?.dataThrough != null ? [row.snapshot.dataThrough] : [],
+                ),
+              ),
+            ).toLocaleString(i18n.locale, { timeZone: timezone }),
+          ])}
+        </Notice>
+      )}
       {populationNotice && <Notice>{i18n.text(populationNotice)}</Notice>}
       <Panel
         title={i18n.text('网站列表')}
@@ -561,15 +593,21 @@ function Websites() {
             const day = daily[index];
             const error = read?.error ?? day?.error;
             const stat = read?.row;
-            const status = error
-              ? errorLabel(error)
-              : stat?.received
-                ? '已收到浏览数据'
-                : stat
-                  ? '待验证'
-                  : '等待查询';
+            const collection = day?.row?.collectionKnown !== undefined ? day.row : stat;
+            const status =
+              error && !collection
+                ? errorLabel(error)
+                : collection?.received
+                  ? '已收到浏览数据'
+                  : collection && collection.collectionKnown !== false
+                    ? '待验证'
+                    : '等待查询';
             const dayLoading = !day || day.pending;
             const dayRead = day?.row;
+            const through = dayRead?.snapshot?.dataThrough;
+            const metricAt = through ?? readAt;
+            const previousDay =
+              !!dayRead?.snapshot && dayRead.snapshot.startAt !== todayWindow.startAt;
             const yesterday = dayRead ? dayRead.comparison : null;
             return [
               <>
@@ -580,6 +618,16 @@ function Websites() {
                   {site.name}
                 </Link>
                 <span className="table-meta">{site.domain}</span>
+                {through != null && (
+                  <span className="table-meta">
+                    {i18n.text('数据截至 {v0}', [
+                      new Date(through).toLocaleString(i18n.locale, { timeZone: timezone }),
+                    ])}
+                  </span>
+                )}
+                {dayRead?.snapshot?.state === 'preparing' && (
+                  <span className="table-meta">{i18n.text('数据准备中，请稍后查看')}</span>
+                )}
               </>,
               <TableCell
                 sortValue={
@@ -602,7 +650,7 @@ function Websites() {
                       ? [401, 403].includes(error.status)
                         ? 'gray'
                         : 'red'
-                      : stat?.received
+                      : collection?.received
                         ? 'green'
                         : 'amber'
                   }
@@ -615,7 +663,8 @@ function Websites() {
                 loading={dayLoading}
                 kind="count"
                 timezone={c.range.timezone}
-                readAt={readAt}
+                readAt={metricAt}
+                historical={previousDay}
                 today={dayRead ? dayRead.views : null}
                 yesterday={yesterday ? yesterday.pageviews : null}
               />,
@@ -625,7 +674,8 @@ function Websites() {
                 kind="count"
                 labels={false}
                 timezone={c.range.timezone}
-                readAt={readAt}
+                readAt={metricAt}
+                historical={previousDay}
                 today={dayRead ? dayRead.visitors : null}
                 yesterday={yesterday ? yesterday.visitors : null}
               />,
@@ -635,7 +685,8 @@ function Websites() {
                 kind="percent"
                 labels={false}
                 timezone={c.range.timezone}
-                readAt={readAt}
+                readAt={metricAt}
+                historical={previousDay}
                 today={dayRead ? bounceRateLabel(dayRead) : null}
                 yesterday={yesterday ? bounceRateLabel(yesterday) : null}
               />,
@@ -645,7 +696,8 @@ function Websites() {
                 kind="count"
                 labels={false}
                 timezone={c.range.timezone}
-                readAt={readAt}
+                readAt={metricAt}
+                historical={previousDay}
                 today={dayRead ? dayRead.aiVisits : null}
                 yesterday={yesterday ? yesterday.aiVisits : null}
               />,

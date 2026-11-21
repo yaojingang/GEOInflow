@@ -77,6 +77,9 @@ export type FactReadOptions = {
   recordKeysParameter?: string;
   sessionIdsParameter?: string;
   immutableTimeWindow?: FactTimeWindow;
+  // A build may reuse the complete set of physical attempts from its hour probe.
+  // The manifest still decides which candidate, if any, is accepted at the cut.
+  logAttemptIdsParameter?: string;
   // Log ingestion deduplicates IDs instead of changing their event time. Use
   // their physical day/key order for version aggregation in large overviews.
   orderedLogVersions?: true;
@@ -102,6 +105,13 @@ export type FactReadOptions = {
   }[];
 };
 export function factRelation(name: string, options: FactReadOptions = {}): string {
+  if (
+    options.logAttemptIdsParameter !== undefined &&
+    (name !== 'liekan_log' ||
+      !options.immutableTimeWindow?.hours ||
+      !validParameterName(options.logAttemptIdsParameter))
+  )
+    throw new Error('Invalid warehouse log build attempts');
   if (options.orderedLogVersions && (name !== 'liekan_log' || !options.immutableTimeWindow))
     throw new Error('Invalid warehouse ordered log read');
   if (options.narrowLogWindow && (!options.orderedLogVersions || options.immutableTimeWindow.hours))
@@ -319,8 +329,9 @@ export function factRelation(name: string, options: FactReadOptions = {}): strin
   ]
     .filter(Boolean)
     .join('\n');
-  const attemptPrefilter =
-    boundedFilter && !narrowWindow
+  const attemptPrefilter = options.logAttemptIdsParameter
+    ? `AND attempt_id IN {${options.logAttemptIdsParameter}:Array(UUID)}`
+    : boundedFilter && !narrowWindow
       ? `AND attempt_id IN (SELECT _attempt_id FROM ${identifier(`warehouse_${name}`)}
          WHERE _website_id={wh_site:UUID} AND _epoch={wh_epoch:UInt64} ${boundedFilter})`
       : '';

@@ -29,6 +29,7 @@ export type LandedDecision = {
   facts: FactMutation[];
   effects?: PublicationEffect[];
 };
+export type StagedLanding = (confirmed: Attempt) => LandedDecision[];
 type LandingRow = {
   website_id: string;
   epoch: string;
@@ -150,7 +151,26 @@ export class LandingStore {
     )
       throw new Error('Landing input digest mismatch');
     const values = decisions.map(d => landingRow(attempt, d));
-    await this.writePackage(attempt.website_id, attempt.epoch, attempt.attempt_id, values);
+    const verified = await this.writePackage(
+      attempt.website_id,
+      attempt.epoch,
+      attempt.attempt_id,
+      values,
+      { direct: true },
+    );
+    const envelopes = verified.map(row => row.envelope);
+    const read: StagedLanding = confirmed => {
+      if (
+        confirmed.attempt_id !== attempt.attempt_id ||
+        confirmed.website_id !== attempt.website_id ||
+        confirmed.epoch !== attempt.epoch ||
+        confirmed.input_digest !== attempt.input_digest ||
+        confirmed.input_count !== envelopes.length
+      )
+        throw new Error('Landing readback attempt mismatch');
+      return envelopes.map(envelope => JSON.parse(envelope) as LandedDecision);
+    };
+    return read;
   }
 
   private async writePackage(
@@ -158,11 +178,18 @@ export class LandingStore {
     epoch: string,
     attemptId: string,
     values: LandingRow[],
-    verifyOnly = false,
+    options?: { verifyOnly?: boolean; direct?: boolean },
   ) {
     if (!values.length || values.length > 10000) throw new Error('Invalid landing package size');
-    if (!verifyOnly)
-      await this.ch.insert({ table: 'warehouse_landing', values, format: 'JSONEachRow' });
+    if (!options?.verifyOnly)
+      await this.ch.insert({
+        table: 'warehouse_landing',
+        values,
+        format: 'JSONEachRow',
+        // The live batch is already aggregated by the consumer and is verified
+        // synchronously before confirmation.
+        ...(options?.direct ? { clickhouse_settings: { async_insert: 0 } } : {}),
+      });
     const rows = await this.ch
       .query({
         query: `SELECT DISTINCT * FROM warehouse_landing
@@ -178,6 +205,7 @@ export class LandingStore {
       .then(r => r.json<LandingRow>());
     if (rows.length !== values.length || landingDigest(rows) !== landingDigest(values))
       throw new Error('Landing package verification failed');
+    return rows;
   }
 
   // Receipts precede fact backfill. Their response identity comes from the immutable
@@ -227,7 +255,7 @@ export class LandingStore {
         received_at: item.recordTime,
       };
     });
-    await this.writePackage(site, epoch, attemptId, values, verifyOnly);
+    await this.writePackage(site, epoch, attemptId, values, { verifyOnly });
     await this.projectDecision(
       {
         website_id: site,
@@ -276,6 +304,7 @@ export class LandingStore {
     if (recheck) throw new Error('Confirmed decision projection is not visible');
     await this.ch.insert({
       table: 'warehouse_decision',
+      clickhouse_settings: { async_insert: 0 },
       values: [
         {
           website_id: attempt.website_id,

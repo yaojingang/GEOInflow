@@ -18,11 +18,11 @@ import prisma, { getRawQueryClient } from './prisma';
 export async function parseRequest(
   request: Request,
   schema?: any,
-  options?: { skipAuth: boolean },
+  options?: { skipAuth: boolean; body?: unknown },
 ): Promise<any> {
   const url = new URL(request.url);
   let query = Object.fromEntries(url.searchParams);
-  let body = await getJsonBody(request);
+  let body = options && 'body' in options ? options.body : await getJsonBody(request);
   let error: () => undefined | undefined | Response;
   let auth = null;
 

@@ -12,7 +12,7 @@ vi.mock('./warehouse-report-snapshot', () => ({
   warehouseReportMetadata: io.metadata,
   warehouseReportSignal: () => undefined,
 }));
-import { readWarehouseLogTrend } from './warehouse-log-trend';
+import { readWarehouseAiHourDistribution, readWarehouseLogTrend } from './warehouse-log-trend';
 import { withDashboardClock } from './dashboard-clock';
 
 const start = new Date('2026-11-01T00:30:00Z');
@@ -146,4 +146,129 @@ it('leaves missing hourly history out of the first overview snapshot', async () 
   ).toBeUndefined();
   expect(load.hours).not.toHaveBeenCalled();
   expect(io.insert).not.toHaveBeenCalled();
+});
+
+it('shares verified whole hours across overlapping cold reporting windows', async () => {
+  const load = {
+    hours: vi.fn(async (hours: number[]) => hours.map(hour => ({ hour, ...count }))),
+    edge: vi.fn(async () => []),
+    coveredHours: vi.fn(() => true),
+  };
+  io.query.mockResolvedValueOnce([]);
+  const run = (from: Date) =>
+    withDashboardClock(
+      +end,
+      () => readWarehouseLogTrend('site', from, end, 'UTC', false, metrics, load),
+      'first',
+    );
+  expect(await run(start)).toEqual([{ ...edge, count: 4, aiRequests: 2 }]);
+  io.query
+    .mockResolvedValueOnce(io.insert.mock.calls[1][0].values)
+    .mockResolvedValueOnce(io.insert.mock.calls[0][0].values.filter(row => row.hour === h2));
+  expect(await run(new Date(h2 * 1000))).toEqual([edge]);
+  expect(load.hours).toHaveBeenCalledExactlyOnceWith([h1, h2]);
+  expect(io.insert).toHaveBeenCalledTimes(2);
+});
+
+it('combines both UTC hours of a repeated local hour and keeps the next hour separate', async () => {
+  io.query.mockResolvedValue([]);
+  const from = new Date('2026-11-01T05:00:00Z');
+  const to = new Date('2026-11-01T08:00:00Z');
+  const load = {
+    hours: vi.fn(async (hours: number[]) => hours.map(hour => ({ hour, ...count }))),
+    edge: vi.fn(async () => []),
+  };
+  expect(
+    await readWarehouseLogTrend('site', from, to, 'America/New_York', true, metrics, load),
+  ).toEqual([
+    { ...count, day: '2026-11-01 01:00', count: 4, aiRequests: 2 },
+    { ...count, day: '2026-11-01 02:00' },
+  ]);
+});
+
+it('uses exact source edges if a UTC hour straddles local midnight', async () => {
+  const from = new Date('2026-11-01T17:00:00Z');
+  const to = new Date('2026-11-01T20:00:00Z');
+  expect(
+    await readWarehouseLogTrend('site', from, to, 'Asia/Kathmandu', false, metrics, {
+      hours: vi.fn(),
+      edge: vi.fn(),
+    }),
+  ).toBeUndefined();
+  expect(io.metadata).not.toHaveBeenCalled();
+});
+
+it('merges both occurrences of a repeated clock hour and passes both partial edges to SQL', async () => {
+  const from = new Date('2026-11-01T04:30:00Z');
+  const to = new Date('2026-11-01T07:20:00Z');
+  const first = Date.parse('2026-11-01T05:00:00Z') / 1000;
+  const remainder = vi.fn(async () => [{ hour: 2, count: 3 }]);
+  const payload = JSON.stringify([count]);
+  io.query
+    .mockResolvedValueOnce([
+      {
+        publication: '5',
+        payload: JSON.stringify([
+          [first, 'a'],
+          [first + 3600, 'b'],
+        ]),
+      },
+    ])
+    .mockResolvedValueOnce([
+      { hour: first, payload },
+      { hour: first + 3600, payload },
+    ]);
+  expect(
+    await readWarehouseAiHourDistribution(
+      'site',
+      from,
+      to,
+      'America/New_York',
+      metrics,
+      undefined,
+      remainder,
+    ),
+  ).toEqual([
+    { hour: 1, count: 2 },
+    { hour: 2, count: 3 },
+  ]);
+  expect(remainder).toHaveBeenCalledExactlyOnceWith([first - 3600, first + 7200]);
+  expect(io.insert).not.toHaveBeenCalled();
+});
+
+it('leaves fractional-offset clock hours and sub-hour ranges to the original histogram', async () => {
+  for (const [zone, to] of [
+    ['Asia/Kathmandu', end],
+    ['UTC', new Date(+start + 1000)],
+  ] as const)
+    expect(
+      await readWarehouseAiHourDistribution('site', start, to, zone, metrics, undefined, vi.fn()),
+    ).toBeUndefined();
+  expect(io.query).not.toHaveBeenCalled();
+});
+
+it('distinguishes a verified empty hour from a missing payload and includes the legacy endpoint', async () => {
+  io.query
+    .mockResolvedValueOnce([
+      {
+        publication: '5',
+        payload: JSON.stringify([
+          [h1, 'a'],
+          [h2, 'b'],
+        ]),
+      },
+    ])
+    .mockResolvedValueOnce([{ hour: h1, payload: '[]' }]);
+  const remainder = vi.fn(async () => [{ hour: 3, count: 1 }]);
+  const result = await readWarehouseAiHourDistribution(
+    'site',
+    new Date(h1 * 1000),
+    new Date((h2 + 3600) * 1000),
+    'UTC',
+    { crawlerIdentityScope: 'all' },
+    undefined,
+    remainder,
+  );
+  expect(result).toEqual([{ hour: 3, count: 1 }]);
+  expect(remainder).toHaveBeenCalledExactlyOnceWith([h2, h2 + 3600]);
 });

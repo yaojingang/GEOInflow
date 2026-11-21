@@ -2,12 +2,18 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 
 export type AnalysisKind = 'browser' | 'log';
 export type AnalysisBucket = [hour: number, build: string, rows: number, visits: number];
+export type LogHourCounts = {
+  version: string;
+  hours: Record<string, [build: string, requests: number, abnormal: number]>;
+};
 export type AnalysisRead = {
   site: string;
   control: string;
   publication?: Record<AnalysisKind, string>;
+  checkedFamilies?: AnalysisKind[];
   browser: AnalysisBucket[];
   log: AnalysisBucket[];
+  logCounts?: LogHourCounts;
 };
 // Completeness is a scoped runtime proof, never a persisted checkpoint flag.
 // Nested/unqualified reads must establish their own proof for their own buckets.
@@ -26,6 +32,10 @@ export const withAnalysisRead = <T>(
 ) =>
   context.run({ value, complete: new Set(complete), verified: new Set(verified), windows }, work);
 export const currentAnalysisRead = () => context.getStore()?.value;
+export function verifiedLogModel(site: string) {
+  const current = context.getStore();
+  if (current?.verified.has('log') && current.value?.site === site) return current.value;
+}
 export const withoutAnalysisRead = <T>(work: () => T) => context.run(undefined, work);
 export function analysisReadParameters() {
   const value = currentAnalysisRead();

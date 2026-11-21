@@ -118,5 +118,8 @@
   "095_warehouse_repair_continuation.sql": "7f5828e6c6bace325bdbdc3b00c5125d87f875dc8b7bb18520ad7eed3e3ed5e8",
   "096_warehouse_report_boundaries.sql": "e9cba215e91c261c547f99b0ceeee39368064adfc73c1786b7448b41e781c58a",
   "097_warehouse_report_rounds.sql": "96628511521fb720307528e550f175ccf64e239aa9835e006b776da5b487ee2a",
-  "098_warehouse_round_metrics.sql": "2a37d4738eebe5f009f4cc41f86e848e6c710476224bdde65562bd3612df9a2e"
+  "098_warehouse_round_metrics.sql": "2a37d4738eebe5f009f4cc41f86e848e6c710476224bdde65562bd3612df9a2e",
+  "099_warehouse_analysis_build.sql": "84dc4e2f7b80c241aa70d0869a49d168cd7c693981a48e5e613e701aa093e767",
+  "100_warehouse_browser_presence.sql": "61c5279b1411f904cd4ea80472fafaf2da556e0c32cdca0789df6bfafb388e3c",
+  "101_geo_coverage_revision.sql": "d3e763473203ce8e4c5c7d12fe9116f9e939b11bcfed9dc3bdb0862dd97671d3"
 }

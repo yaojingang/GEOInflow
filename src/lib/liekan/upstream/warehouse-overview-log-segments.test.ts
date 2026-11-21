@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { beforeEach, expect, it, vi } from 'vitest';
 import type { ReportQuery } from '../contracts/query';
+import { withAnalysisRead } from '../warehouse/analysis-context';
 import { withDashboardClock } from './dashboard-clock';
 import { prepareWarehouseOverviewLogSegments } from './warehouse-overview-log-segments';
 
@@ -170,4 +171,33 @@ it('lets a cold report read facts while multiple daily segments are missing', as
     ),
   ).toBeUndefined();
   expect(io.command).not.toHaveBeenCalled();
+});
+
+it('reuses verified cold day states on a second overlapping range', async () => {
+  const run = (from: Date, period: '7d' | '30d') =>
+    withAnalysisRead(
+      { site: 'site', browser: [], log: [], control: 'control' },
+      () =>
+        withDashboardClock(
+          +end,
+          () =>
+            prepareWarehouseOverviewLogSegments('site', from, end, {
+              ...metrics,
+              chartPeriod: period,
+            }),
+          'first',
+        ),
+      [],
+      ['log'],
+      { log: { start: +start, end: +end, endExclusive: true } },
+    );
+  const long = await run(start, '30d');
+  const payload = io.command.mock.calls[1][2].overviewCoverage;
+  io.query.mockResolvedValueOnce([{ publication: '8', payload }]);
+  const short = await run(new Date('2026-11-02T05:00:00Z'), '7d');
+  expect(long.params.overviewDays).toEqual(['2026-11-01', '2026-11-02']);
+  expect(short.params.overviewDays).toEqual(['2026-11-02']);
+  expect(short.params.overviewBuilds).toEqual([long.params.overviewBuilds[1]]);
+  expect(short.sql).toContain('uniqExactMerge(pages)');
+  expect(io.command).toHaveBeenCalledTimes(2);
 });

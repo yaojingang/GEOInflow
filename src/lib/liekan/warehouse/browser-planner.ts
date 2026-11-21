@@ -155,11 +155,19 @@ export function browserPlanner(db: ControlDatabase): DecisionPlanner {
         if (fact.family === 'liekan_event_quality')
           fact.row.repair_scope_id = context?.repair_scope_id ?? null;
       }
+      const event = selected.find(f => f.family === 'website_event')?.row;
+      const browserEvent = event?.created_at
+        ? {
+            at: String(event.created_at).replace(' ', 'T') + 'Z',
+            page: ![2, 5].includes(Number(event.event_type)),
+          }
+        : undefined;
       if (status !== 'conflict' && e.data.hasQuality === true && e.kind !== 'identify') {
         const observation = selected.find(f => f.family === 'liekan_event_observation')?.row;
         effects.push({
           kind: 'collection-state',
           diagnosticAt: e.receivedAt,
+          ...(browserEvent && { browserEvent }),
           ...(observation
             ? {
                 observation: {
@@ -185,6 +193,8 @@ export function browserPlanner(db: ControlDatabase): DecisionPlanner {
             last_at: e.receivedAt,
           }),
         });
+      } else if (browserEvent) {
+        effects.push({ kind: 'collection-state', browserEvent });
       }
       return {
         input,

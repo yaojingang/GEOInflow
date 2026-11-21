@@ -1,62 +1,115 @@
-import { setTimeout as delay } from 'node:timers/promises';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+// Queue-head age tracks live publication backlog. Hysteresis leaves room
+// for brief fluctuations while an already admitted report segment finishes.
+const pauseAgeMs = 6000;
+const resumeAgeMs = 3000;
+const pressureRecheckMs = 1000;
+
+export type WarehouseIngestionPressure = {
+  oldestMs: number;
+  publishedP95Ms: number | null;
+  samples: number;
+};
+type BudgetStage = 'budget-queue' | 'budget-probe' | 'query-admission' | 'query-execution';
 
 export class WarehouseBackgroundDeferred extends Error {
-  constructor() {
+  constructor(readonly retryAt?: number) {
     super('warehouse-background-deferred');
   }
 }
 
-/** Cooperative scheduling for the single leased report builder. Foreground
- * reads and ingestion never enter this governor. While ingestion is pending
- * or has only briefly been idle,
- * target a one-sixth duty cycle between background queries; do not
- * hold a query permit or database transaction during the recovery interval.
- * This is a scheduling budget, not a data/result quota or a CPU reservation. */
+/** Pressure controls claims and durable segment boundaries. SQL within a
+ * segment shares one execution lane and its original wall-clock deadline. */
 export class WarehouseBackgroundBudget {
-  private next = 0;
-  private busyUntil = 0;
+  private paused = false;
+  private nextFairClaim = 0;
+  private pressureGapMs = 0;
+  private readonly progress = new AsyncLocalStorage<{ active: boolean }>();
   private tail: Promise<unknown> = Promise.resolve();
-  constructor(private readonly pending: () => Promise<boolean>) {}
 
-  private async ingestionBusy() {
-    // Batches can empty the queue between arrivals. Require a short quiet
-    // interval before bypassing recovery debt, rather than starting another
-    // heavy query in every inter-batch gap. This never delays ingestion.
-    if (await this.pending()) this.busyUntil = Date.now() + 2000;
-    return Date.now() < this.busyUntil;
+  constructor(
+    private readonly pressure: () => Promise<WarehouseIngestionPressure>,
+    private readonly observe: (stage: BudgetStage, ms: number) => void = () => {},
+  ) {}
+
+  // Only the serial report scheduler may request the starvation allowance.
+  // Maintenance and checkpoints outside an admitted claim keep yielding.
+  async claimAfter(reportClaim = false) {
+    if (this.progress.getStore()?.active) return;
+    const started = performance.now();
+    try {
+      const { oldestMs } = await this.pressure();
+      this.paused = this.paused ? oldestMs > resumeAgeMs : oldestMs >= pauseAgeMs;
+      const now = Date.now();
+      if (!this.paused) {
+        this.nextFairClaim = 0;
+        return;
+      }
+      // Sample frequently so an empty queue resumes immediately. Under continuous
+      // pressure, leave ingestion an exclusive interval before the next claim.
+      this.pressureGapMs = Math.min(60000, Math.max(10000, oldestMs));
+      if (!this.nextFairClaim) this.nextFairClaim = now + this.pressureGapMs;
+      if (!reportClaim || now < this.nextFairClaim) return now + pressureRecheckMs;
+    } finally {
+      this.observe('budget-probe', performance.now() - started);
+    }
   }
 
-  run<T>(work: () => Promise<T>, signal: AbortSignal, deadline?: number): Promise<T> {
-    // Reserve the scheduling turn before probing. Concurrent page components
-    // must not all observe the same idle interval and bypass the shared budget.
-    const result = this.tail.then(() => this.dispatch(work, signal, deadline));
-    this.tail = result.catch(() => {});
-    return result;
+  get fairClaimDue() {
+    return this.paused && this.nextFairClaim > 0 && Date.now() >= this.nextFairClaim;
   }
 
-  private async dispatch<T>(
+  // Called after the database lease has been acquired. One complete claim
+  // keeps its normal deadline, abort signal, fences and low-priority CH lane.
+  async withClaim<T>(work: () => Promise<T>): Promise<T> {
+    if (!this.fairClaimDue) return work();
+    const grant = { active: true };
+    try {
+      return await this.progress.run(grant, work);
+    } finally {
+      grant.active = false;
+      this.nextFairClaim = Date.now() + this.pressureGapMs;
+    }
+  }
+
+  async checkpoint(signal: AbortSignal, deferUntil?: (value: number) => Promise<void>) {
+    signal.throwIfAborted();
+    const retryAt = await this.claimAfter();
+    signal.throwIfAborted();
+    if (retryAt !== undefined) {
+      await deferUntil?.(retryAt);
+      throw new WarehouseBackgroundDeferred(retryAt);
+    }
+  }
+
+  run<T>(
     work: () => Promise<T>,
     signal: AbortSignal,
     deadline?: number,
+    admit: (execute: () => Promise<T>) => Promise<T> = execute => execute(),
   ): Promise<T> {
-    signal.throwIfAborted();
-    if (deadline !== undefined && deadline <= Date.now() + 1000)
-      throw new WarehouseBackgroundDeferred();
-    let busy = await this.ingestionBusy();
-    while (busy && this.next > Date.now()) {
-      if (deadline !== undefined && this.next >= deadline - 1000)
+    const queued = performance.now();
+    const result = this.tail.then(async () => {
+      this.observe('budget-queue', performance.now() - queued);
+      signal.throwIfAborted();
+      if (deadline !== undefined && deadline <= Date.now() + 1000)
         throw new WarehouseBackgroundDeferred();
-      await delay(Math.min(200, this.next - Date.now()), undefined, { signal });
-      busy = await this.ingestionBusy();
-    }
-    signal.throwIfAborted();
-    const started = Date.now();
-    try {
-      return await work();
-    } finally {
-      // Also account for a query that started while idle: ingestion may have
-      // arrived during that query. A subsequent idle probe bypasses the debt.
-      this.next = Date.now() + 5 * (Date.now() - started);
-    }
+      const waiting = performance.now();
+      return admit(async () => {
+        const started = performance.now();
+        this.observe('query-admission', started - waiting);
+        signal.throwIfAborted();
+        if (deadline !== undefined && deadline <= Date.now() + 1000)
+          throw new WarehouseBackgroundDeferred();
+        try {
+          return await work();
+        } finally {
+          this.observe('query-execution', performance.now() - started);
+        }
+      });
+    });
+    this.tail = result.catch(() => {});
+    return result;
   }
 }

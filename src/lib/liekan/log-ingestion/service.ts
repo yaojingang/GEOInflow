@@ -296,13 +296,17 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
     if (principal.source.provider_job_id === live.source.provider_job_id)
       for (const record of parsed.records)
         applyTrustedEdgeIdentity(record, live.source, settings.crawlerRules);
-    const old = (
-      await tx.$queryRawUnsafe(
-        'SELECT id,digest,valid,rejected,state,inserted,duplicates FROM liekan_ingest_batch WHERE id=$1::uuid',
-        batchId,
-      )
-    )[0];
-    const queueState = warehouse
+    const [receipt] = await tx.$queryRawUnsafe(
+      `SELECT b.id,b.digest,b.valid,b.rejected,b.state,i.id AS import_id,i.digest AS import_digest
+       FROM (VALUES ($1::uuid)) AS input(id)
+       LEFT JOIN liekan_ingest_batch b ON b.id=input.id
+       LEFT JOIN liekan_import i ON i.id=input.id AND i.source_id=$2::uuid AND i.kind='automatic'
+       WHERE b.id IS NOT NULL OR i.id IS NOT NULL`,
+      batchId,
+      sourceId,
+    );
+    const old = receipt?.id ? receipt : undefined;
+    const queueState = warehouse && receipt
       ? (
           await tx.$queryRawUnsafe(
             'SELECT queued FROM liekan_warehouse_upload WHERE batch_id=$1::uuid',
@@ -313,8 +317,8 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
     if (old && warehouse && old.state === 'pending' && !queueState)
       throw new LiekanError('旧日志批次需要完成迁移后继续处理', 503);
     if (old && old.digest !== digest) throw new LiekanError('同一批次标识的内容已改变', 409);
-    if (old && !(warehouse && queueState && !queueState.queued)) {
-      if (old.digest !== digest) throw new LiekanError('同一批次标识的内容已改变', 409);
+    const needsDispatch = queueState?.queued === false;
+    if (old && !needsDispatch) {
       return {
         requestBatchId: upload.batchId,
         epoch: live.epoch,
@@ -325,15 +329,8 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
         duplicate: true,
       };
     }
-    const ledger = (
-      await tx.$queryRawUnsafe(
-        "SELECT id,digest FROM liekan_import WHERE id=$1::uuid AND source_id=$2::uuid AND kind='automatic'",
-        batchId,
-        sourceId,
-      )
-    )[0];
-    if (ledger && !(warehouse && queueState && !queueState.queued)) {
-      if (ledger.digest !== digest) throw new LiekanError('同一批次标识的内容已改变', 409);
+    if (receipt?.import_id && !needsDispatch) {
+      if (receipt.import_digest !== digest) throw new LiekanError('同一批次标识的内容已改变', 409);
       return {
         requestBatchId: upload.batchId,
         epoch: live.epoch,

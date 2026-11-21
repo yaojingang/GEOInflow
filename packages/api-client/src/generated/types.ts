@@ -38394,6 +38394,7 @@ export interface operations {
             aiVisits: number | null;
             /** @description Number of visits with only one pageview. */
             bounces: number | null;
+            collectionKnown?: boolean;
             /** @description Analytics for the comparison period. */
             comparison: {
               aiVisits: number | null;
@@ -38514,6 +38515,166 @@ export interface operations {
               versionSetsTruncated: boolean;
             };
             received: boolean;
+            snapshot?: {
+              dataThrough: number | null;
+              /** @description End of the date range as a Unix timestamp in milliseconds. */
+              endAt: number;
+              /** @description Start of the date range as a Unix timestamp in milliseconds. */
+              startAt: number;
+              /** @enum {string} */
+              state: 'ready' | 'updating' | 'preparing';
+            };
+            /** @description Total visit duration in seconds. */
+            totaltime: number | null;
+            /** @description Pageview counts for the selected period. */
+            views: number | null;
+            /** @description Unique visitor counts for the selected period. */
+            visitors: number | null;
+            /** @description Visit counts for the selected period. */
+            visits: number | null;
+          }[];
+        };
+      };
+      /** @description A site summary is preparing. Available rows retain their published cutoff. */
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': {
+            aiVisits: number | null;
+            /** @description Number of visits with only one pageview. */
+            bounces: number | null;
+            collectionKnown?: boolean;
+            /** @description Analytics for the comparison period. */
+            comparison: {
+              aiVisits: number | null;
+              /** @description Number of visits with only one pageview. */
+              bounces: number | null;
+              /** @description Pageview counts for the selected period. */
+              pageviews: number | null;
+              population?: {
+                /** @enum {string} */
+                capability: 'supported' | 'unsupported';
+                catalogVersions: string[];
+                epoch: string | null;
+                governanceProcessing?: {
+                  computedAt: string | null;
+                  errorCode: string | null;
+                  nextWindow: string | null;
+                  /** @enum {string} */
+                  state: 'observed' | 'unknown';
+                };
+                governanceRevision: string | null;
+                governanceWatermark: string | null;
+                historyActiveGeneration: string | null;
+                historyRevision: string | null;
+                identity: {
+                  coverage: number | null;
+                  eligibleEvents: number | null;
+                  eligiblePV: number | null;
+                  qualifiedPV: number | null;
+                  qualifiedVersions?: string[];
+                  qualifiedVisitors: number | null;
+                  /** @enum {string} */
+                  status: 'complete' | 'partial' | 'unavailable' | 'empty' | 'unsupported';
+                  versions: string[];
+                };
+                /** @constant */
+                metricScope?: 'qualified-browser';
+                policyRevision: string | null;
+                populationVersion: string;
+                range: {
+                  /** @description End of the date range as a Unix timestamp in milliseconds. */
+                  endAt: number;
+                  endExclusive?: boolean;
+                  /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                  startAt: number;
+                  /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                  timezone: string;
+                };
+                resourceId?: string;
+                /** @enum {string} */
+                resourceKind: 'website' | 'link' | 'pixel' | 'unknown';
+                ruleVersions: string[];
+                /** @constant */
+                scope: 'resource-window';
+                versionSetsTruncated: boolean;
+              };
+              /** @description Total visit duration in seconds. */
+              totaltime: number | null;
+              /** @description Unique visitor counts for the selected period. */
+              visitors: number | null;
+              /** @description Visit counts for the selected period. */
+              visits: number | null;
+            };
+            /**
+             * Format: uuid
+             * @description Unique identifier of the resource.
+             */
+            id: string;
+            /** @description Date and time of the most recent recorded activity. */
+            lastAt: string | null;
+            /** @description Pageview counts for the selected period. */
+            pageviews: number | null;
+            population?: {
+              /** @enum {string} */
+              capability: 'supported' | 'unsupported';
+              catalogVersions: string[];
+              epoch: string | null;
+              governanceProcessing?: {
+                computedAt: string | null;
+                errorCode: string | null;
+                nextWindow: string | null;
+                /** @enum {string} */
+                state: 'observed' | 'unknown';
+              };
+              governanceRevision: string | null;
+              governanceWatermark: string | null;
+              historyActiveGeneration: string | null;
+              historyRevision: string | null;
+              identity: {
+                coverage: number | null;
+                eligibleEvents: number | null;
+                eligiblePV: number | null;
+                qualifiedPV: number | null;
+                qualifiedVersions?: string[];
+                qualifiedVisitors: number | null;
+                /** @enum {string} */
+                status: 'complete' | 'partial' | 'unavailable' | 'empty' | 'unsupported';
+                versions: string[];
+              };
+              /** @constant */
+              metricScope?: 'qualified-browser';
+              policyRevision: string | null;
+              populationVersion: string;
+              range: {
+                /** @description End of the date range as a Unix timestamp in milliseconds. */
+                endAt: number;
+                endExclusive?: boolean;
+                /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                startAt: number;
+                /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                timezone: string;
+              };
+              resourceId?: string;
+              /** @enum {string} */
+              resourceKind: 'website' | 'link' | 'pixel' | 'unknown';
+              ruleVersions: string[];
+              /** @constant */
+              scope: 'resource-window';
+              versionSetsTruncated: boolean;
+            };
+            received: boolean;
+            snapshot?: {
+              dataThrough: number | null;
+              /** @description End of the date range as a Unix timestamp in milliseconds. */
+              endAt: number;
+              /** @description Start of the date range as a Unix timestamp in milliseconds. */
+              startAt: number;
+              /** @enum {string} */
+              state: 'ready' | 'updating' | 'preparing';
+            };
             /** @description Total visit duration in seconds. */
             totaltime: number | null;
             /** @description Pageview counts for the selected period. */

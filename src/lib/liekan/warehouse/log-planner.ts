@@ -5,6 +5,7 @@ import type { ControlDatabase } from './control-db';
 import type { SiteState } from './control';
 import { stableOperation } from './identifiers';
 import type { FactMutation, LandedDecision } from './landing';
+import { tracePublication } from './publication-timing';
 import type { LogPackage } from './log-package';
 import { boundaryParameters, factRelation } from './read';
 import type { InputEnvelope } from './routing';
@@ -67,19 +68,21 @@ export function logPlanner(
     ids: string[],
   ) => Promise<{ id: string; event_digest: string | null }[]>,
 ): DecisionPlanner {
-  return async (inputs, state) => {
+  return async (inputs, state, _receipts, trace) => {
     const parsed = inputs.map(input => ({ input, ...validateLogPackage(input.envelope) }));
-    const uploads = await db.read<{
-      batch_id: string;
-      source_id: string | null;
-      source_epoch: number;
-      status: string;
-      kind: string;
-      import_present: boolean;
-      repair_scope_id: string | null;
-    }>(
-      'SELECT u.*,i.id IS NOT NULL AS import_present,i.repair_scope_id FROM liekan_warehouse_upload u LEFT JOIN liekan_import i ON i.id=u.batch_id AND i.website_id=u.website_id WHERE u.website_id=$1::uuid AND u.batch_id=ANY($2::uuid[])',
-      [state.website_id, parsed.map(p => p.packet.batchId)],
+    const uploads = await tracePublication(trace, 'log.upload', () =>
+      db.read<{
+        batch_id: string;
+        source_id: string | null;
+        source_epoch: number;
+        status: string;
+        kind: string;
+        import_present: boolean;
+        repair_scope_id: string | null;
+      }>(
+        'SELECT u.*,i.id IS NOT NULL AS import_present,i.repair_scope_id FROM liekan_warehouse_upload u LEFT JOIN liekan_import i ON i.id=u.batch_id AND i.website_id=u.website_id WHERE u.website_id=$1::uuid AND u.batch_id=ANY($2::uuid[])',
+        [state.website_id, parsed.map(p => p.packet.batchId)],
+      ),
     );
     for (const { packet } of parsed) {
       const upload = uploads.find(u => u.batch_id === packet.batchId);
@@ -93,36 +96,40 @@ export function logPlanner(
         throw new Error('warehouse-log-upload-unavailable');
     }
     const permitted = authorize
-      ? await authorize(
-          uploads.map(u => ({
-            batchId: u.batch_id,
-            websiteId: state.website_id,
-            epoch: state.epoch,
-          })),
+      ? await tracePublication(trace, 'log.authorize', () =>
+          authorize(
+            uploads.map(u => ({
+              batchId: u.batch_id,
+              websiteId: state.website_id,
+              epoch: state.epoch,
+            })),
+          ),
         )
       : new Set(uploads.map(u => u.batch_id));
-    const rows = lookup
-      ? await lookup(
-          state,
-          parsed.map(p => String(p.facts.find(f => f.family === 'liekan_log').row.id)),
-        )
-      : await ch
-          .query({
-            query: `SELECT id,event_digest FROM ${factRelation('liekan_log', { recordKeysParameter: 'logKeys' })}`,
-            query_params: {
-              ...boundaryParameters({
-                websiteId: state.website_id,
-                epoch: state.epoch,
-                publication: state.publication,
-                deletionRevision: state.deletion_revision,
-              }),
-              logKeys: parsed.map(p =>
-                recordKey('liekan_log', p.facts.find(f => f.family === 'liekan_log').row),
-              ),
-            },
-            format: 'JSONEachRow',
-          })
-          .then(r => r.json<{ id: string; event_digest: string | null }>());
+    const rows = await tracePublication(trace, 'log.duplicate', () =>
+      lookup
+        ? lookup(
+            state,
+            parsed.map(p => String(p.facts.find(f => f.family === 'liekan_log').row.id)),
+          )
+        : ch
+            .query({
+              query: `SELECT id,event_digest FROM ${factRelation('liekan_log', { recordKeysParameter: 'logKeys' })}`,
+              query_params: {
+                ...boundaryParameters({
+                  websiteId: state.website_id,
+                  epoch: state.epoch,
+                  publication: state.publication,
+                  deletionRevision: state.deletion_revision,
+                }),
+                logKeys: parsed.map(p =>
+                  recordKey('liekan_log', p.facts.find(f => f.family === 'liekan_log').row),
+                ),
+              },
+              format: 'JSONEachRow',
+            })
+            .then(r => r.json<{ id: string; event_digest: string | null }>()),
+    );
     const existing = new Map(rows.map(r => [r.id, r.event_digest]));
     return parsed.map(({ input, packet, facts }) => {
       const row = facts.find(f => f.family === 'liekan_log').row,

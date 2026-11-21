@@ -195,6 +195,39 @@ it.skipIf(!enabled)(
             ['generatedAt', 'expiresAt'].includes(key) ? undefined : value,
           ),
         );
+      // A registered path participates in preference; an uncatalogued path still
+      // contributes to the site-wide summary and bot totals.
+      await db.read(
+        `INSERT INTO liekan_catalog(website_id,path,title,content_type,word_count,structure_score)
+         VALUES($1,'/page/0','Registered page','article',400,75),
+               ($1,'/unseen','Unseen page','interactive',600,50)`,
+        [f.site],
+      );
+      const preference = parseReportQuery({
+        resource: 'ai/preference',
+        startAt: start,
+        endAt: end,
+        timezone: 'UTC',
+        chartPeriod: '30d',
+        crawlerMetricsVersion: 1,
+      });
+      if (!preference.success) throw new Error('fixture-preference-parameters');
+      await work(async () => {
+        const regular = await buildReport(website, false, preference.data, true);
+        const unbounded = await buildReport(website, false, preference.data, true, true);
+        expect(regular.cards).toEqual(unbounded.cards);
+        expect(regular.charts).toEqual(unbounded.charts);
+        expect(regular.insights).toEqual(unbounded.insights);
+        expect(regular.tables.prefList).toEqual(unbounded.tables.prefList);
+        expect(regular.tables.pathList).toEqual(unbounded.tables.pathList);
+        expect(regular.charts.pf2.rows).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ path: '/page/0', requests: 1 }),
+            expect.objectContaining({ path: '/unseen', requests: 0 }),
+          ]),
+        );
+      });
+      await db.read('DELETE FROM liekan_catalog WHERE website_id=$1', [f.site]);
       await work(() => prepareAnalysisModel(f.site, new Date(start), new Date(end)));
       for (const days of process.env.LIEKAN_REPORT_PLAN_ONLY_DETAILS === '1' ? [] : [1, 7, 30, 3])
         for (const resource of scheduledReportResources) {
@@ -285,16 +318,22 @@ it.skipIf(!enabled)(
         { unit: 'minute', browser: 'eq.Chrome' },
         { unit: 'minute', url: 'eq./page/1' },
         { unit: 'minute', excludeBounce: true },
-      ]) await work(async () => {
-        const input = { ...filters, ...extra } as any;
-        const [pageviews, sessions, totals] = await Promise.all([
-          getPageviewStats(f.site, input), getSessionStats(f.site, input), getWebsiteStats(f.site, input),
-        ]);
-        const combined = await warehouseRealtimeStats(f.site, input);
-        expect(combined.pageviews).toEqual(pageviews);
-        expect(combined.sessions).toEqual(sessions);
-        expect(combined.totals).toEqual({ visitors: totals.visitors, population: totals.population });
-      });
+      ])
+        await work(async () => {
+          const input = { ...filters, ...extra } as any;
+          const [pageviews, sessions, totals] = await Promise.all([
+            getPageviewStats(f.site, input),
+            getSessionStats(f.site, input),
+            getWebsiteStats(f.site, input),
+          ]);
+          const combined = await warehouseRealtimeStats(f.site, input);
+          expect(combined.pageviews).toEqual(pageviews);
+          expect(combined.sessions).toEqual(sessions);
+          expect(combined.totals).toEqual({
+            visitors: totals.visitors,
+            population: totals.population,
+          });
+        });
       for (const [name, read] of [
         ['retention', () => getRetention(f.site, filters, filters)],
         ['sessions', () => getWebsiteSessions(f.site, { ...filters, page: 1, pageSize: 20 })],
@@ -343,23 +382,56 @@ it.skipIf(!enabled)(
       let gapExpected: unknown;
       await work(async () => {
         process.env.LIEKAN_WAREHOUSE_ANALYSIS_READS = '0';
-        try { gapExpected = await getWebsiteSessions(f.site, gapFilters); }
-        finally { delete process.env.LIEKAN_WAREHOUSE_ANALYSIS_READS; }
-        await withAvailableAnalysisModel(f.site, async () => {
-          expect(nativeRelations(true, gapWindow)[0]).not.toContain('warehouse_website_event');
-          expect(normalize(await getWebsiteSessions(f.site, gapFilters))).toEqual(normalize(gapExpected));
-        }, { kinds: ['browser'], ...gapWindow });
+        try {
+          gapExpected = await getWebsiteSessions(f.site, gapFilters);
+        } finally {
+          delete process.env.LIEKAN_WAREHOUSE_ANALYSIS_READS;
+        }
+        await withAvailableAnalysisModel(
+          f.site,
+          async () => {
+            expect(nativeRelations(true, gapWindow)[0]).not.toContain('warehouse_website_event');
+            expect(normalize(await getWebsiteSessions(f.site, gapFilters))).toEqual(
+              normalize(gapExpected),
+            );
+          },
+          { kinds: ['browser'], ...gapWindow },
+        );
       });
       // Even an unaccepted candidate in the gap forbids the shortcut. It remains
       // invisible to analytics; the fallback must still produce the same answer.
-      await f.put('website_event', [{ event_id: randomUUID(), session_id: f.session,
-        visit_id: randomUUID(), event_type: 1, created_at: new Date(end + 3600000).toISOString(),
-        url_path: '/unaccepted-gap', hostname: 'fixture.test' }], { accepted: false });
-      await work(() => withAvailableAnalysisModel(f.site, async () => {
-        expect(nativeRelations(true, gapWindow)[0]).toContain('warehouse_website_event');
-        expect(normalize(await getWebsiteSessions(f.site, gapFilters))).toEqual(normalize(gapExpected));
-      }, { kinds: ['browser'], ...gapWindow }));
-      await record({ resource: 'sessions-empty-hour', exact: true, unacceptedCandidateFallback: true });
+      await f.put(
+        'website_event',
+        [
+          {
+            event_id: randomUUID(),
+            session_id: f.session,
+            visit_id: randomUUID(),
+            event_type: 1,
+            created_at: new Date(end + 3600000).toISOString(),
+            url_path: '/unaccepted-gap',
+            hostname: 'fixture.test',
+          },
+        ],
+        { accepted: false },
+      );
+      await work(() =>
+        withAvailableAnalysisModel(
+          f.site,
+          async () => {
+            expect(nativeRelations(true, gapWindow)[0]).toContain('warehouse_website_event');
+            expect(normalize(await getWebsiteSessions(f.site, gapFilters))).toEqual(
+              normalize(gapExpected),
+            );
+          },
+          { kinds: ['browser'], ...gapWindow },
+        ),
+      );
+      await record({
+        resource: 'sessions-empty-hour',
+        exact: true,
+        unacceptedCandidateFallback: true,
+      });
       const { readLogEntries, readLogCount, readLogSummary } = await import('./log-read');
       const { warehouseFeatureAnalytics } = await import('./warehouse-feature-analytics');
       await work(async () => {
@@ -447,6 +519,7 @@ it.skipIf(!enabled)(
         const {
           drainWarehouseOverview,
           requestWarehouseOverview,
+          readPublishedWebsiteSummaries,
           requestWarehouseRetention,
           readWarehouseOverviewJob,
         } = await import('./warehouse-overview-snapshots');
@@ -457,7 +530,7 @@ it.skipIf(!enabled)(
           const realCommand = ch.command.bind(ch);
           const commandSpy = vi.spyOn(ch, 'command').mockImplementation(async args => {
             const kind = args.query.match(/^INSERT INTO warehouse_analysis_(browser|log)_v1/)?.[1];
-            if (kind)
+            if (kind && args.query_params?.writeBuild === args.query_params?.modelSourceBuild)
               for (const h of (args.query_params?.modelHours ?? []) as number[]) {
                 const key = `${kind}:${h}`;
                 builds.set(key, (builds.get(key) ?? 0) + 1);
@@ -526,7 +599,9 @@ it.skipIf(!enabled)(
         const snapshots = await db.read<any>(
           'SELECT id,parameters,generated_at,error_code,publication FROM liekan_warehouse_overview_snapshot WHERE preset',
         );
-        expect(snapshots.length).toBeGreaterThanOrEqual(37);
+        expect(snapshots.filter(row => !row.parameters.siteSummary)).toHaveLength(34);
+        expect(snapshots.filter(row => row.parameters.siteSummary)).toHaveLength(1);
+        expect(snapshots.filter(row => row.parameters.nativeRetention)).toHaveLength(1);
         expect(new Set(snapshots.map(s => s.publication)).size).toBe(1);
         expect(
           snapshots
@@ -540,6 +615,13 @@ it.skipIf(!enabled)(
         const readTimes: number[] = [];
         for (const row of snapshots) {
           const started = performance.now();
+          if (row.parameters.siteSummary) {
+            const [summary] = await work(() =>
+              readPublishedWebsiteSummaries([website.id], row.parameters),
+            );
+            expect(summary.snapshot?.state).toBe('ready');
+            continue;
+          }
           const response = await work(() =>
             row.parameters.nativeRetention
               ? requestWarehouseRetention({ website, canManage: false } as any, {
@@ -609,7 +691,7 @@ it.skipIf(!enabled)(
           const { withDashboardClock } = await import('./dashboard-clock');
           const samples =
             await db.read<any>(`SELECT parameters,result,publication FROM liekan_warehouse_overview_snapshot
-            WHERE preset AND parameters->>'chartPeriod'='today' AND NOT (parameters ? 'nativeRetention')
+            WHERE preset AND parameters->>'chartPeriod'='today' AND NOT (parameters ?| ARRAY['nativeRetention','siteSummary'])
               AND parameters->>'resource' IN ('overview','human/overview','ai/overview')`);
           expect(samples).toHaveLength(3);
           const previousReads = process.env.LIEKAN_WAREHOUSE_ANALYSIS_READS;

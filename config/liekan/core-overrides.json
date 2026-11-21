@@ -382,6 +382,28 @@
       "removalCondition": "Remove when an equivalent maintained deployment contract replaces these warehouse services"
     },
     {
+      "path": "docker/warehouse/diagnostic-logs.xml",
+      "purpose": "Set ClickHouse system log retention and retain slow, failed and sampled queries",
+      "tests": [
+        "docker compose config --quiet",
+        "Inspect SHOW CREATE TABLE system.query_log after warehouse startup"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Apply retention only to ClickHouse diagnostic tables",
+      "removalCondition": "Remove when the standard warehouse deployment supplies equivalent diagnostic retention"
+    },
+    {
+      "path": "docker/warehouse/diagnostic-profile.xml",
+      "purpose": "Configure default query logging and disable routine per-processor profiling",
+      "tests": [
+        "docker compose config --quiet",
+        "Check log_processors_profiles and log_queries in system.settings for the default profile"
+      ],
+      "owner": "Liekan warehouse maintenance",
+      "constraint": "Keep finished queries and exceptions available for the query log retention policy",
+      "removalCondition": "Remove when the standard warehouse deployment supplies equivalent query logging settings"
+    },
+    {
       "path": "docker/warehouse/kafka-start.sh",
       "purpose": "Start the pinned Kafka KRaft queue with a persistent cluster identity and refuse foreign engine data",
       "tests": [
@@ -5387,12 +5409,21 @@
       "removalCondition": "Remove when an upstream extension point provides this behavior and the registered regression checks pass"
     },
     {
+      "path": "src/lib/request.test.ts",
+      "purpose": "Verify bounded collection bodies are parsed once while preserving saved query filters",
+      "owner": "Liekan upstream compatibility",
+      "constraint": "Preserve request authorization and validation behavior",
+      "tests": ["pnpm exec vitest run src/lib/request.test.ts"],
+      "removalCondition": "Remove when upstream accepts bounded parsed collection bodies and the regression passes"
+    },
+    {
       "path": "src/lib/request.ts",
-      "purpose": "Connect approved supplementary UI, exact filtered statistics, live share authorization or typed API responses",
+      "purpose": "Preserve request auth and query compatibility while accepting size-bounded parsed collection bodies",
       "owner": "Liekan upstream compatibility",
       "constraint": "Keep tracker, SDK identities, database schema and existing route behavior compatible; UI ownership remains in Liekan directories",
       "removalCondition": "Remove when the upstream exposes an equivalent extension point and regression checks pass",
       "tests": [
+        "pnpm exec vitest run src/lib/liekan/upstream/collection-body.test.ts src/app/api/record/route.test.ts src/lib/liekan/upstream/shared-report-authorization.test.ts",
         "pnpm liekan:verify",
         "Supplemental UI/API regression and isolated Docker acceptance"
       ]

@@ -3,6 +3,7 @@ import { formatInTimeZone } from 'date-fns-tz';
 import { calendarDateRange, calendarDayRange } from '../contracts/calendar';
 import type { ReportQuery } from '../contracts/query';
 import { CRAWLER_POPULATION_VERSION } from '../rules/population';
+import { analysisWindowRelation } from '../warehouse/analysis-context';
 import { warehouseTime } from '../warehouse/fact-input';
 import { warehouseOverviewLogCoverage, warehouseOverviewLogDays } from '../warehouse/schema';
 import { analysisErrorReason, timeReportQuery } from './analysis-diagnostics';
@@ -160,7 +161,14 @@ export async function prepareWarehouseOverviewLogSegments(
     if (checkpoint && checkpoint.publication !== publication)
       await invalidateDays(site, timezone, checkpoint.publication, saved);
     const missing = days.filter(day => !saved.has(day.key));
-    if (!backfill && scheduledOverview === 'first' && missing.length > 1) return;
+    const covered =
+      missing.length > 0 &&
+      !!analysisWindowRelation('log', ['created_at'], {
+        start: missing[0].start,
+        end: missing.at(-1).next,
+        endExclusive: true,
+      });
+    if (!backfill && !covered && scheduledOverview === 'first' && missing.length > 1) return;
     let buildDays = missing;
     if (backfill && missing.length) {
       const firstMissing = days.indexOf(missing[0]);
@@ -171,6 +179,7 @@ export async function prepareWarehouseOverviewLogSegments(
     // deadline. The idle worker fills this coverage in bounded batches.
     if (
       !backfill &&
+      !covered &&
       missing.length &&
       (missing.length > 7 || missing.at(-1).next - missing[0].start > 8 * 86400000)
     )

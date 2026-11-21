@@ -1316,7 +1316,7 @@
     {
       "name": "@next/env",
       "versions": [
-        "16.4.2"
+        "16.4.5"
       ],
       "license": "MIT",
       "homepage": "https://github.com/vercel/next.js#readme"
@@ -1324,7 +1324,7 @@
     {
       "name": "@next/swc-darwin-arm64",
       "versions": [
-        "16.4.2"
+        "16.4.5"
       ],
       "license": "MIT",
       "homepage": "https://github.com/vercel/next.js#readme"
@@ -5478,7 +5478,7 @@
     {
       "name": "next",
       "versions": [
-        "16.4.2"
+        "16.4.5"
       ],
       "license": "MIT",
       "homepage": "https://nextjs.org"

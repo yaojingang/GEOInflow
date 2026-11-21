@@ -150,7 +150,14 @@ describe.skipIf(!enabled)('durable GEO snapshots in an owned PostgreSQL database
       CREATE TABLE liekan_crawler_range_snapshot(version text);
       CREATE TABLE liekan_log(id text,website_id uuid,created_at timestamptz);
       CREATE TABLE liekan_crawler_evidence(website_id uuid,log_id text,measurement jsonb);`);
-    await q(await readFile('db/liekan/migrations/036_geo_weight_snapshots.sql', 'utf8'));
+    await q('CREATE TABLE liekan_warehouse_installation(id integer PRIMARY KEY,authority text)');
+    for (const migration of [
+      '036_geo_weight_snapshots.sql',
+      '071_warehouse_geo_publication.sql',
+      '101_geo_coverage_revision.sql',
+    ]) {
+      await q(await readFile(`db/liekan/migrations/${migration}`, 'utf8'));
+    }
     boss = new PgBoss({
       connectionString: url.toString(),
       schema: 'liekan_jobs',
@@ -164,7 +171,7 @@ describe.skipIf(!enabled)('durable GEO snapshots in an owned PostgreSQL database
   }, 30000);
   beforeEach(async () => {
     await q(
-      `TRUNCATE liekan_geo_weight_request,liekan_geo_weight_head,liekan_geo_weight_snapshot,liekan_geo_weight_evidence_revision,"user",website,liekan_log_state,liekan_log_source,liekan_log,liekan_crawler_evidence,liekan_crawler_quality,liekan_crawler_rule_version,liekan_crawler_registry_version,liekan_crawler_range_snapshot,liekan_log_interval,liekan_crawler_state CASCADE`,
+      `TRUNCATE liekan_warehouse_installation,liekan_geo_weight_request,liekan_geo_weight_head,liekan_geo_weight_snapshot,liekan_geo_weight_evidence_revision,"user",website,liekan_log_state,liekan_log_source,liekan_log,liekan_crawler_evidence,liekan_crawler_quality,liekan_crawler_rule_version,liekan_crawler_registry_version,liekan_crawler_range_snapshot,liekan_log_interval,liekan_crawler_state CASCADE`,
     );
     await boss.deleteAllJobs(GEO_SNAPSHOT_QUEUE);
     await q('INSERT INTO "user"(user_id,role) VALUES($1,\'admin\')', actor.id);
@@ -602,6 +609,51 @@ describe.skipIf(!enabled)('durable GEO snapshots in an owned PostgreSQL database
     expect((await readGeoWeightSnapshot(actor, site, input())).snapshotId).toBe(old.snapshotId);
     await q("UPDATE liekan_crawler_quality SET state='partial'");
     expect((await readGeoWeightSnapshot(actor, site, input())).result).toBeNull();
+  });
+  it('revises GEO evidence for new warehouse coverage without invalidating site reports', async () => {
+    await q("INSERT INTO liekan_warehouse_installation VALUES(1,'clickhouse')");
+    const published = await ready();
+    const source = randomUUID();
+    const revisions = async () =>
+      (
+        await q(
+          `SELECT policy_revision::int AS policy,(SELECT coalesce(max(revision),0)::int
+       FROM liekan_geo_weight_evidence_revision WHERE website_id=$1) AS proof
+       FROM liekan_log_state WHERE website_id=$1`,
+          site,
+        )
+      )[0];
+    const before = await revisions();
+    await q(
+      `INSERT INTO liekan_crawler_quality VALUES($1,$2,current_date-10,current_date-5,
+       'complete','{"classificationVersion":"original"}',now())`,
+      site,
+      source,
+    );
+    const added = await revisions();
+    expect(added.policy).toBe(before.policy);
+    expect(added.proof).toBeGreaterThan(before.proof);
+    expect(published.snapshotId).toBeTruthy();
+    expect((await readGeoWeightSnapshot(actor, site, input())).result).toBeNull();
+
+    await q(`UPDATE liekan_crawler_quality SET ends_at=current_date-2,
+      evidence=evidence || '{"toBatchId":"next"}'::jsonb`);
+    const extended = await revisions();
+    expect(extended.policy).toBe(before.policy);
+    expect(extended.proof).toBeGreaterThan(added.proof);
+    await q('UPDATE liekan_crawler_quality SET recorded_at=clock_timestamp()');
+    expect(await revisions()).toEqual(extended);
+
+    await q("UPDATE liekan_crawler_quality SET state='partial'");
+    const corrected = await revisions();
+    expect(corrected.policy).toBeGreaterThan(extended.policy);
+    expect(corrected.proof).toBeGreaterThan(extended.proof);
+    await q('UPDATE liekan_crawler_quality SET ends_at=current_date-1');
+    const partialExtension = await revisions();
+    expect(partialExtension.policy).toBe(corrected.policy);
+    expect(partialExtension.proof).toBeGreaterThan(corrected.proof);
+    await q('DELETE FROM liekan_crawler_quality WHERE source_id=$1', source);
+    expect((await revisions()).policy).toBeGreaterThan(corrected.policy);
   });
   it('reuses a result published after the first inspection and before locked registration', async () => {
     let resume: () => void;

@@ -1,4 +1,13 @@
 import pg from 'pg';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+const readTiming = new AsyncLocalStorage<(queueMs: number, sqlMs: number) => void>();
+export function withControlReadTiming<T>(
+  observe: (queueMs: number, sqlMs: number) => void,
+  work: () => T,
+) {
+  return readTiming.run(observe, work);
+}
 
 export interface ControlSQL {
   query<T = Record<string, unknown>>(
@@ -68,7 +77,24 @@ export class ControlDatabase {
 
   async read<T = Record<string, unknown>>(sql: string, values?: unknown[]): Promise<T[]> {
     try {
-      return (await this.pool.query(sql, values)).rows;
+      const observe = readTiming.getStore();
+      if (!observe) return (await this.pool.query(sql, values)).rows;
+      const entered = performance.now();
+      const client = await this.pool.connect().catch(error => {
+        observe(performance.now() - entered, 0);
+        throw error;
+      });
+      const started = performance.now();
+      let failed = false;
+      try {
+        return (await client.query(sql, values)).rows;
+      } catch (error) {
+        failed = true;
+        throw error;
+      } finally {
+        client.release(failed);
+        observe(started - entered, performance.now() - started);
+      }
     } catch (error) {
       throw controlFailure(error) ?? error;
     }

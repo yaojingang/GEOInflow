@@ -37,6 +37,7 @@ import {
   saveFrozenCount,
   withinWarehouseReport,
   warehouseReportQuery,
+  warehouseReportCheckpoint,
   warehouseReportMetadata,
   warehouseReportStream,
 } from './warehouse-report-snapshot';
@@ -44,20 +45,28 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.admission = new ReadAdmission(1);
   mocks.metadata.mockResolvedValue({ boundary: { publication: '1' }, policy: '1' });
-  mocks.pending.mockResolvedValue([{ pending: false }]);
+  mocks.pending.mockResolvedValue([{ oldestMs: 0, publishedP95Ms: null, samples: 0 }]);
   mocks.query.mockResolvedValue({ json: async () => [{ count: 1 }] });
 });
 afterEach(() => {
   mocks.admission.close();
   vi.useRealTimers();
 });
-it('applies the background budget only to explicitly marked jobs and inherits it in nested reads', async () => {
+it('inherits the background lane and checks live pressure at an explicit checkpoint only', async () => {
   await withinWarehouseReport(() => warehouseReportQuery('site', 'SELECT 1'));
   expect(mocks.pending).not.toHaveBeenCalled();
   expect(mocks.query.mock.calls[0][0].clickhouse_settings.max_threads).toBeUndefined();
   expect(mocks.query.mock.calls[0][0].clickhouse_settings.workload).toBe('liekan_interactive');
-  await withinWarehouseReport(() => warehouseReportQuery('site', 'SELECT 1'), { background: true });
-  expect(mocks.pending).toHaveBeenCalledTimes(1);
+  await withinWarehouseReport(
+    async () => {
+      await warehouseReportQuery('site', 'SELECT 1');
+      await warehouseReportQuery('site', 'SELECT 2');
+      expect(mocks.pending).not.toHaveBeenCalled();
+      await warehouseReportCheckpoint();
+    },
+    { background: true },
+  );
+  expect(mocks.pending).toHaveBeenCalledOnce();
   expect(mocks.query.mock.calls[1][0].clickhouse_settings.max_threads).toBe(1);
   expect(mocks.query.mock.calls[1][0].clickhouse_settings.workload).toBe('liekan_background');
 });

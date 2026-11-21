@@ -81,6 +81,58 @@ function page(
   );
 }
 
+it('shows the previous published date and cutoff when the current day is preparing', async () => {
+  const today = websiteDayWindow('Asia/Shanghai');
+  const yesterday = websiteDayWindow('Asia/Shanghai', today.startAt - 1);
+  const dataThrough = yesterday.startAt + 12 * 3600000;
+  render(page(false, today));
+  await act(async () =>
+    resolveSummary([
+      {
+        ...summary[0],
+        collectionKnown: true,
+        snapshot: { state: 'updating', ...yesterday, dataThrough },
+      },
+    ]),
+  );
+  const table = within(screen.getByRole('table'));
+  expect(await table.findByText(/数据截至/)).toHaveTextContent(
+    new Date(dataThrough).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }),
+  );
+  expect(table.queryByText('今日')).toBeNull();
+  expect(table.getAllByText('9').length).toBeGreaterThan(0);
+  expect(table.getByText('已收到浏览数据')).toBeVisible();
+});
+
+it('shows raw browser collection while no statistics have been published yet', async () => {
+  const today = websiteDayWindow('Asia/Shanghai');
+  const missing = {
+    pageviews: null,
+    views: null,
+    visitors: null,
+    visits: null,
+    bounces: null,
+    aiVisits: null,
+  };
+  render(page(false, today));
+  await act(async () =>
+    resolveSummary([
+      {
+        ...missing,
+        id: site.id,
+        comparison: missing,
+        received: true,
+        collectionKnown: true,
+        snapshot: { state: 'preparing', ...today, dataThrough: null },
+      },
+    ]),
+  );
+  const table = within(screen.getByRole('table'));
+  expect(await table.findByText('数据准备中，请稍后查看')).toBeVisible();
+  expect(table.getByText('已收到浏览数据')).toBeVisible();
+  expect(table.queryByText('0')).toBeNull();
+});
+
 it('shares a single natural-day request between the totals and the website rows', async () => {
   const range = websiteDayWindow('Asia/Shanghai');
   render(page(false, range));

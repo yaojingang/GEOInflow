@@ -1,4 +1,4 @@
-import { DEFAULT_RESET_DATE } from '@/lib/constants';
+import { refreshBrowserPresence } from './warehouse-browser-presence';
 import { getCompareDate } from '@/lib/date';
 import { calendarDayRange } from '../contracts/calendar';
 import {
@@ -11,7 +11,6 @@ import {
   analyticsEventRelation,
   websiteSummaryEventRelation,
 } from '../warehouse/reporting-relations';
-import { factRelation } from '../warehouse/read';
 import { warehouseTime } from '../warehouse/fact-input';
 import { populationFromRow, readBrowserPopulation } from './browser-population';
 import {
@@ -58,95 +57,85 @@ function customSummarySql() {
         sum(floor((toUnixTimestamp64Micro(last_at)-toUnixTimestamp64Micro(first_at))/1000000.0)) AS totaltime,uniqExactIf(visit_id,ai) AS aiVisits FROM visits GROUP BY period`;
 }
 
-export async function warehouseWebsiteSummaries(
-  sites: { id: string; createdAt: Date }[],
+const summaryMetrics = websiteSummarySchema.element.omit({
+  received: true,
+  lastAt: true,
+  snapshot: true,
+  collectionKnown: true,
+});
+
+export async function computeWebsiteSummary(
+  site: { id: string; createdAt: Date },
   p: { startAt: number; endAt: number; timezone: string },
+  cutoff = p.endAt,
 ) {
   return withinWarehouseReport(async () => {
     const start = new Date(p.startAt),
-      end = new Date(p.endAt),
-      previous = getCompareDate('prev', start, end, p.timezone),
-      result = [];
+      end = new Date(Math.min(p.endAt, cutoff)),
+      previous = getCompareDate('prev', start, new Date(p.endAt), p.timezone);
     const day = calendarDayRange(p.startAt, p.timezone);
     const fullDay = day.startAt === p.startAt && day.endAt === p.endAt;
     const zero = { pageviews: 0, visitors: 0, visits: 0, bounces: 0, totaltime: 0, aiVisits: 0 };
-    for (const site of sites) {
-      const params = {
-        start: warehouseTime(start),
-        end: warehouseTime(end),
-        previousStart: warehouseTime(previous.startDate),
-        previousEnd: warehouseTime(previous.endDate),
+    const params = {
+      start: warehouseTime(start),
+      end: warehouseTime(end),
+      previousStart: warehouseTime(previous.startDate),
+      previousEnd: warehouseTime(previous.endDate),
+    };
+    await refreshBrowserPresence(site);
+    const metadata = fullDay ? await warehouseReportMetadata(site.id) : undefined;
+    const totals = await warehouseReportQuery<any>(
+      site.id,
+      metadata
+        ? calendarSummarySql(
+            websiteSummaryEventRelation(metadata, {
+              start: +previous.startDate,
+              end: +end,
+            }),
+          )
+        : customSummarySql(),
+      params,
+    );
+    const readPopulation = (period: number, from: Date, to: Date) => {
+      if (!metadata) return readBrowserPopulation(site.id, from, to, p.timezone);
+      return {
+        ...populationFromRow(
+          {
+            eligibleEvents: 0,
+            qualifiedEvents: 0,
+            eligiblePV: 0,
+            qualifiedPV: 0,
+            qualifiedVisitors: 0,
+            ...metadata.population,
+            ...totals.find(row => Number(row.period) === period),
+            metricScope: 'qualified-browser',
+          },
+          { startAt: +from, endAt: +to, timezone: p.timezone },
+        ),
+        resourceId: site.id,
       };
-      const [presence] = await warehouseReportQuery<any>(
-        site.id,
-        `SELECT countIf(event_type NOT IN(2,5) AND created_at BETWEEN {created:DateTime64(6)} AND {now:DateTime64(6)})>0 AS received,
-        maxOrNullIf(created_at,created_at>={reset:DateTime64(6)}) AS lastAt,
-        countIf(created_at BETWEEN {previousStart:DateTime64(6)} AND {end:DateTime64(6)})>0 AS hasEvents
-        FROM ${factRelation('website_event', { columns: ['created_at', 'event_type'] })}`,
-        {
-          ...params,
-          created: warehouseTime(site.createdAt),
-          now: warehouseTime(new Date()),
-          reset: warehouseTime(new Date(DEFAULT_RESET_DATE)),
-        },
-      );
-      const metadata = fullDay ? await warehouseReportMetadata(site.id) : undefined;
-      const totals =
-        metadata && !Number(presence.hasEvents)
-          ? []
-          : await warehouseReportQuery<any>(
-              site.id,
-              metadata
-                ? calendarSummarySql(websiteSummaryEventRelation(metadata))
-                : customSummarySql(),
-              params,
-            );
-      const readPopulation = (period: number, from: Date, to: Date) => {
-        if (!metadata) return readBrowserPopulation(site.id, from, to, p.timezone);
-        return {
-          ...populationFromRow(
-            {
-              eligibleEvents: 0,
-              qualifiedEvents: 0,
-              eligiblePV: 0,
-              qualifiedPV: 0,
-              qualifiedVisitors: 0,
-              ...metadata.population,
-              ...totals.find(row => Number(row.period) === period),
-              metricScope: 'qualified-browser',
-            },
-            { startAt: +from, endAt: +to, timezone: p.timezone },
-          ),
-          resourceId: site.id,
-        };
-      };
-      const population = await readPopulation(0, start, end);
-      const comparisonPopulation = await readPopulation(1, previous.startDate, previous.endDate);
-      const normalize = (period: number, pop: typeof population) => {
-        const row = totals.find(r => Number(r.period) === period) ?? zero;
-        const values = Object.fromEntries(Object.keys(zero).map(k => [k, Number(row[k] ?? 0)]));
-        return identityUsable(pop)
-          ? values
-          : unavailableFields(values, [
-              ...totalIdentityFields,
-              'aiVisits',
-              ...(pop.metricScope === 'qualified-browser' ? ['pageviews'] : []),
-            ]);
-      };
-      const current = normalize(0, population),
-        comparison = normalize(1, comparisonPopulation);
-      result.push({
-        id: site.id,
-        ...current,
-        population,
-        comparison: { ...comparison, population: comparisonPopulation },
-        views: current.pageviews,
-        received: !!presence.received,
-        lastAt: presence.lastAt
-          ? new Date(String(presence.lastAt).replace(' ', 'T') + 'Z').toISOString()
-          : null,
-      });
-    }
-    return websiteSummarySchema.parse(result);
+    };
+    const population = await readPopulation(0, start, end);
+    const comparisonPopulation = await readPopulation(1, previous.startDate, previous.endDate);
+    const normalize = (period: number, pop: typeof population) => {
+      const row = totals.find(r => Number(r.period) === period) ?? zero;
+      const values = Object.fromEntries(Object.keys(zero).map(k => [k, Number(row[k] ?? 0)]));
+      return identityUsable(pop)
+        ? values
+        : unavailableFields(values, [
+            ...totalIdentityFields,
+            'aiVisits',
+            ...(pop.metricScope === 'qualified-browser' ? ['pageviews'] : []),
+          ]);
+    };
+    const current = normalize(0, population),
+      comparison = normalize(1, comparisonPopulation);
+    return summaryMetrics.parse({
+      id: site.id,
+      ...current,
+      population,
+      comparison: { ...comparison, population: comparisonPopulation },
+      views: current.pageviews,
+    });
   });
 }

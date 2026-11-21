@@ -15,7 +15,9 @@ import {
   reportAnalysisKinds,
   saveRoundPreparation,
   reportRoundMetrics,
+  reportRoundBuild,
 } from './warehouse-report-round';
+import { analysisBuildStep } from './warehouse-analysis-build';
 
 it('declares real data dependencies including browser population on AI and log summaries on human pages', () => {
   expect(reportAnalysisKinds({ resource: 'human/sources' } as any)).toEqual(['browser', 'log']);
@@ -43,11 +45,12 @@ it.skipIf(process.env.LIEKAN_REPORT_PLAN_PAGES !== '1')(
         '092_warehouse_overview_snapshots.sql',
         '097_warehouse_report_rounds.sql',
         '098_warehouse_round_metrics.sql',
+        '099_warehouse_analysis_build.sql',
       ])
         await db.read(await readFile(`db/liekan/migrations/${file}`, 'utf8'));
       const site = randomUUID(),
         catalog = randomUUID(),
-        ids = [randomUUID(), randomUUID(), randomUUID()];
+        ids = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
       await db.read('INSERT INTO website VALUES($1)', [site]);
       await db.read("INSERT INTO liekan_warehouse_site VALUES($1,0,10,0,'active')", [site]);
       for (const id of ids)
@@ -55,13 +58,123 @@ it.skipIf(process.env.LIEKAN_REPORT_PLAN_PAGES !== '1')(
           `INSERT INTO liekan_warehouse_overview_snapshot
       (id,website_id,query_key,parameters,catalog_version,format_version,preset,control_version)
       VALUES($1::uuid,$2,$1::text,$3,$4,2,true,'control')`,
-          [id, site, { endAt: Date.now() + 86400000 }, catalog],
+          [
+            id,
+            site,
+            {
+              timezone: 'Asia/Shanghai',
+              startAt: Date.now() - (id === ids[3] ? 60000 : 86400000),
+              endAt: Date.now() + 86400000,
+            },
+            catalog,
+          ],
         );
       const job = (i: number) => ({ id: ids[i], website_id: site, catalog_version: catalog });
       const metadata = {
         boundary: { websiteId: site, epoch: '0', publication: '10', deletionRevision: '0' },
       } as any;
       const first = await acquireReportRound(job(0), metadata, 'control', 2, Date.now());
+      expect(first.pending).toEqual(expect.arrayContaining(ids.slice(0, 3)));
+      expect(first.pending).not.toContain(ids[3]);
+      // On-demand requests can arrive after the round and its source reference were frozen.
+      const late = randomUUID();
+      await db.read(
+        `INSERT INTO liekan_warehouse_overview_snapshot
+          (id,website_id,query_key,parameters,catalog_version,format_version,preset,control_version,lease_until)
+         SELECT $2::uuid,website_id,$2::text,parameters,catalog_version,format_version,false,
+           'other-control',now()+interval '3 minutes' FROM liekan_warehouse_overview_snapshot WHERE id=$1`,
+        [ids[0], late],
+      );
+      const lateJob = { ...job(0), id: late };
+      await expect(acquireReportRound(lateJob, metadata, 'control', 2, Date.now())).rejects.toThrow(
+        'warehouse-background-deferred',
+      );
+      await db.read(
+        "UPDATE liekan_warehouse_overview_snapshot SET control_version='control',parameters=jsonb_set(parameters,'{timezone}','\"UTC\"') WHERE id=$1",
+        [late],
+      );
+      await expect(acquireReportRound(lateJob, metadata, 'control', 2, Date.now())).rejects.toThrow(
+        'warehouse-background-deferred',
+      );
+      await db.read(
+        'UPDATE liekan_warehouse_overview_snapshot dst SET parameters=src.parameters FROM liekan_warehouse_overview_snapshot src WHERE src.id=$1 AND dst.id=$2',
+        [ids[0], late],
+      );
+      const joined = await acquireReportRound(lateJob, metadata, 'control', 2, Date.now());
+      expect(joined.id).toBe(first.id);
+      expect(joined.pending).toContain(late);
+      expect(joined.reference_id).toBe(first.reference_id);
+      // Completion consumes this member's slot for the round. Repeated requests
+      // cannot extend the same round forever or reenroll the job as a preset.
+      await finishReportRound(joined, late);
+      await expect(acquireReportRound(lateJob, metadata, 'control', 2, Date.now())).rejects.toThrow(
+        'warehouse-background-deferred',
+      );
+      expect(await db.read('SELECT preset FROM liekan_warehouse_overview_snapshot WHERE id=$1', [late])).toEqual([
+        { preset: false },
+      ]);
+      const token = randomUUID();
+      await db.read(
+        "UPDATE liekan_warehouse_overview_snapshot SET lease_token=$2,lease_until=now()+interval '3 minutes' WHERE id=$1",
+        [ids[0], token],
+      );
+      const receiptStore = reportRoundBuild(first, { id: ids[0], token });
+      await receiptStore.save({
+        id: randomUUID(),
+        checkpoint: randomUUID(),
+        kind: 'log',
+        hours: [3600],
+        control: 'model-control',
+        publication: '10',
+        receipts: {},
+      });
+      const write = vi.fn(async () => {
+        throw new Error('lost acknowledgement');
+      });
+      await expect(
+        analysisBuildStep(receiptStore.current(), receiptStore, 'facts', write, async () => true),
+      ).rejects.toThrow('lost acknowledgement');
+      const retryAt = Date.now() + 67835;
+      await receiptStore.deferUntil(retryAt);
+      await db.close();
+      db = new ControlDatabase(`postgresql://postgres@127.0.0.1:25489/${name}`);
+      harness.db = db;
+      const recoveredBuild = await acquireReportRound(job(0), metadata, 'control', 2, Date.now());
+      const recoveredStore = reportRoundBuild(recoveredBuild, { id: ids[0], token });
+      expect(recoveredStore.notBefore()).toBe(retryAt);
+      const verify = vi.fn(async () => true);
+      await analysisBuildStep(recoveredStore.current(), recoveredStore, 'facts', write, verify);
+      expect(write).toHaveBeenCalledOnce();
+      expect(verify).toHaveBeenCalledOnce();
+      await db.read(
+        "UPDATE liekan_warehouse_report_round SET created_at=now()-interval '31 minutes' WHERE id=$1",
+        [first.id],
+      );
+      expect((await acquireReportRound(job(0), metadata, 'control', 2, Date.now())).id).toBe(
+        first.id,
+      );
+      await db.read('UPDATE liekan_warehouse_report_round SET created_at=now() WHERE id=$1', [
+        first.id,
+      ]);
+      await recoveredStore.save(null);
+      expect(
+        (
+          await db.read<any>(
+            'SELECT analysis_build FROM liekan_warehouse_report_round WHERE id=$1',
+            [first.id],
+          )
+        )[0].analysis_build,
+      ).toBeNull();
+      await expect(
+        acquireReportRound({ ...job(0), id: randomUUID() }, metadata, 'control', 2, Date.now()),
+      ).rejects.toThrow('warehouse-background-deferred');
+      await db.read('UPDATE liekan_warehouse_overview_snapshot SET lease_token=$2 WHERE id=$1', [
+        ids[0],
+        randomUUID(),
+      ]);
+      await expect(recoveredStore.save(null)).rejects.toMatchObject({
+        code: 'warehouse-read-reference-lost',
+      });
       const prepared = {
         site,
         control: 'model-control',

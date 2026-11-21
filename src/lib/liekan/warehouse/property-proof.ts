@@ -1,3 +1,4 @@
+import { persistPublicationProof, type ProofMode } from './publication-proof';
 import type { ClickHouseClient } from '@clickhouse/client';
 import { rowDigest } from './codec';
 import type { Attempt } from './control';
@@ -10,7 +11,7 @@ export async function projectPropertyProofs(
   attempt: Attempt,
   decisions: LandedDecision[],
   manifest: ManifestEntry[],
-  write = true,
+  mode: ProofMode = 'write',
 ) {
   const proofs = new Map<string, string>();
   for (const decision of decisions)
@@ -32,34 +33,12 @@ export async function projectPropertyProofs(
     }
   if (!proofs.size) return;
   const candidate = manifest.find(m => m.family === 'liekan_session_data_source');
-  if (write)
-    await ch.insert({
-      table: 'warehouse_control_projection',
-      format: 'JSONEachRow',
-      values: [...proofs].map(([key, value]) => ({
-        website_id: attempt.website_id,
-        epoch: attempt.epoch,
-        kind: 'pg-session-property-v2',
-        revision: attempt.version,
-        key,
-        value,
-        created_at: warehouseTime(decisions[0].input.envelope.receivedAt),
-      })),
-    });
-  const rows = await ch
-    .query({
-      query: `SELECT DISTINCT key,value FROM warehouse_control_projection
-    WHERE website_id={site:UUID} AND epoch={epoch:UInt64} AND kind='pg-session-property-v2' AND revision={version:UInt64}
-    AND JSONExtractString(value,'candidateId')={candidate:String}`,
-      query_params: {
-        site: attempt.website_id,
-        epoch: attempt.epoch,
-        version: attempt.version,
-        candidate: candidate.candidateId,
-      },
-      format: 'JSONEachRow',
-    })
-    .then(r => r.json<{ key: string; value: string }>());
-  if (rows.length !== proofs.size || rows.some(r => proofs.get(r.key) !== r.value))
-    throw new Error('warehouse-property-proof-mismatch');
+  await persistPublicationProof(ch, attempt, candidate, proofs, {
+    kind: 'pg-session-property-v2',
+    revision: attempt.version,
+    createdAt: warehouseTime(decisions[0].input.envelope.receivedAt),
+    mismatch: 'warehouse-property-proof-mismatch',
+    mode,
+    verifyAfterWrite: true,
+  });
 }

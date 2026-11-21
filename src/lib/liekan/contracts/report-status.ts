@@ -2,6 +2,17 @@ import { z } from 'zod';
 import { analysisJobSchema } from './analysis-acceleration';
 import type { UseQueryResult } from '@tanstack/react-query';
 
+export const warehouseReportNoValidSnapshot = 'warehouse-report-no-valid-snapshot';
+
+export function invalidatesRetainedRead(error: unknown) {
+  if (!error || typeof error !== 'object' || !('status' in error)) return false;
+  const { status } = error;
+  return (
+    (typeof status === 'number' && [401, 403, 404, 409, 410].includes(status)) ||
+    ('code' in error && error.code === warehouseReportNoValidSnapshot)
+  );
+}
+
 /** A completed HTTP read with no published result. It contains no synthetic metrics. */
 export const reportPreparingSchema = z.object({
   status: z.literal('preparing'),

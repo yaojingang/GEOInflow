@@ -33,7 +33,7 @@ it.skipIf(process.env.LIEKAN_REPORT_PLAN_PAGES !== '1')(
         'CREATE TABLE liekan_migration(name text PRIMARY KEY,checksum varchar(64) NOT NULL,applied_at timestamptz NOT NULL DEFAULT now())',
       );
       for (const file of (await readdir('db/liekan/migrations'))
-        .filter(n => /^\d.*\.sql$/.test(n) && !/^09[678]_/.test(n))
+        .filter(n => /^\d.*\.sql$/.test(n) && !/^09[6789]_/.test(n))
         .sort()) {
         const sql = await readFile(`db/liekan/migrations/${file}`, 'utf8');
         await db.query(sql);
@@ -57,10 +57,10 @@ it.skipIf(process.env.LIEKAN_REPORT_PLAN_PAGES !== '1')(
         });
       const upgraded = (await run()).stdout;
       expect(upgraded).toContain('096_warehouse_report_boundaries.sql');
-      expect(upgraded).toContain('098_warehouse_round_metrics.sql');
+      expect(upgraded).toContain('099_warehouse_analysis_build.sql');
       const after = (await db.query('SELECT * FROM liekan_migration ORDER BY name')).rows;
-      expect(after.filter(r => !/^09[678]_/.test(r.name))).toEqual(before);
-      expect(after).toHaveLength(before.length + 3);
+      expect(after.filter(r => !/^09[6789]_/.test(r.name))).toEqual(before);
+      expect(after).toHaveLength(before.length + 4);
       expect((await run()).stdout).not.toContain('migration applied');
       expect((await db.query('SELECT * FROM liekan_migration ORDER BY name')).rows).toEqual(after);
       expect((await db.query('SELECT * FROM "user" ORDER BY user_id')).rows).toEqual(accounts);

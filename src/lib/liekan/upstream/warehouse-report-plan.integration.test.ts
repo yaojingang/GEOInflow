@@ -2,6 +2,7 @@
 import { randomUUID, randomBytes } from 'node:crypto';
 import { expect, it, vi } from 'vitest';
 import { reportFixture } from '../../../../tests/liekan/report-plan-fixture';
+import type { ReportQuery } from '../contracts/query';
 import {
   currentAnalysisRead,
   withAnalysisRead,
@@ -10,7 +11,15 @@ import {
 import { createWarehouseClient } from '../warehouse/client';
 import { ReadAdmission } from '../warehouse/read-admission';
 import { reportingLogRelation } from '../warehouse/reporting-relations';
-import { warehouseAnalysisDDL, warehouseDDL, warehouseReportRankDDL } from '../warehouse/schema';
+import {
+  journalDDL,
+  factDDL,
+  warehouseAnalysisDDL,
+  warehouseDDL,
+  warehouseLogTrendDDL,
+  warehouseOverviewLogDDL,
+  warehouseReportRankDDL,
+} from '../warehouse/schema';
 import {
   captureReportRankings,
   readReportRanking,
@@ -32,7 +41,12 @@ vi.mock('../warehouse/read-reference', () => ({
   },
 }));
 
-import { prepareAnalysisModel, withAvailableAnalysisModel } from './warehouse-analysis-model';
+import { withDashboardClock } from './dashboard-clock';
+import {
+  prepareAnalysisModel,
+  withAvailableAnalysisModel,
+  withVerifiedAnalysisRead,
+} from './warehouse-analysis-model';
 import { warehouseBrowserPopulation } from './warehouse-browser-population';
 import {
   warehouseBrowserFacts,
@@ -45,10 +59,380 @@ import {
   warehouseLogQuerySpec,
   warehouseLogDetailColumns,
   warehouseLogDetailRow,
+  warehousePlotLogs,
 } from './warehouse-log-queries';
+import { prepareWarehouseOverviewLogSegments } from './warehouse-overview-log-segments';
 import { warehouseReportQuery, withinWarehouseReport } from './warehouse-report-snapshot';
 
 const url = process.env.LIEKAN_REPORT_PLAN_CH_URL;
+it.skipIf(!url)(
+  'matches the 24 AI clock hours for today, 7d and 30d at one publication',
+  async () => {
+    expect(url).toBe('http://127.0.0.1:28169');
+    const database = `report_clock_${randomUUID().replaceAll('-', '')}`;
+    const admin = createWarehouseClient({ url });
+    const ch = createWarehouseClient({
+      url,
+      database,
+      clickhouse_settings: { max_threads: 1, max_memory_usage: '320000000', join_use_nulls: 1 },
+    });
+    const admission = new ReadAdmission(1);
+    try {
+      await admin.command({ query: `CREATE DATABASE ${database}` });
+      for (const query of [
+        ...journalDDL,
+        ...['liekan_log', 'liekan_crawler_evidence', 'liekan_history_repair_result'].map(factDDL),
+        warehouseLogTrendDDL,
+      ])
+        await ch.command({ query });
+      const f = reportFixture(ch);
+      harness.reader = { ch, db: {}, admission, verifyIdentity: async () => {} };
+      harness.metadata = f.metadata;
+      const log = (local: string, extra: Record<string, unknown> = {}) => ({
+        created_at: local + '+08:00',
+        id: randomBytes(32).toString('hex'),
+        import_id: f.site,
+        path: '/fixture',
+        method: 'GET',
+        status: 200,
+        bytes: 0,
+        ip_masked: '',
+        ip_hash: '',
+        location: '',
+        user_agent: 'fixture',
+        bot: 'Fixture',
+        vendor: 'Fixture',
+        bot_type: '搜索',
+        verification: 'verified_range',
+        ai_eligible: true,
+        ...extra,
+      });
+      await f.put('liekan_log', [
+        log('2026-10-19T23:59:59'),
+        log('2026-10-20T23:22:00'),
+        log('2026-11-12T00:00:00'),
+        log('2026-11-13T11:12:00'),
+        log('2026-11-19T00:00:00'),
+        log('2026-11-19T00:22:00', { verification: 'unknown' }),
+        log('2026-11-19T01:22:00', { user_agent: 'Liekan-Crawler-Check/fixture' }),
+        log('2026-11-19T01:24:00', { ai_eligible: false }),
+        log('2026-11-19T02:33:00', { verification: 'verified_dns' }),
+        log('2026-11-19T11:32:59'),
+        log('2026-11-19T11:33:00'),
+      ]);
+      const publication = f.metadata.boundary.publication;
+      await f.put('liekan_log', [log('2026-11-19T00:20:00')], { accepted: false });
+      const zone = 'Asia/Shanghai',
+        cutoff = new Date('2026-11-19T11:33:00+08:00');
+      const metrics = {
+        resource: 'ai/overview',
+        crawlerIdentityScope: 'all',
+        crawlerMetricsVersion: 1,
+      } as const;
+      const midnight = (date: string) => new Date(date + 'T00:00:00+08:00');
+      const today = midnight('2026-11-19');
+      const read = (from: Date, scope: ReportQuery['crawlerIdentityScope'] = 'all') =>
+        warehouseLogFacts(f.site, from, cutoff, zone, 1, '', '', '', 'after', ['hours'], {
+          ...metrics,
+          crawlerIdentityScope: scope,
+        }).then(r => r.hours);
+      const bins = (rows: { hour: number; count: unknown }[]) => {
+        const values = Array<number>(24).fill(0);
+        for (const r of rows) values[r.hour] = Number(r.count);
+        return values;
+      };
+      const spy = vi.spyOn(ch, 'query');
+      const factReads = () =>
+        spy.mock.calls
+          .map(([q]) => q)
+          .filter(
+            q =>
+              q.query.includes('GROUP BY hour ORDER BY hour') ||
+              q.query.includes('GROUP BY hour,bot,type'),
+          );
+      await withinWarehouseReport(async () => {
+        // The legacy summary includes the self-check. A differently scoped v1
+        // summary excludes the unverified event. Neither can supply the all/v1 chart.
+        for (const other of [
+          { crawlerIdentityScope: 'all' } as const,
+          { crawlerIdentityScope: 'verified_range', crawlerMetricsVersion: 1 } as const,
+        ])
+          await withDashboardClock(
+            +cutoff,
+            () => warehousePlotLogs(f.site, today, cutoff, zone, true, other),
+            'refresh',
+          );
+
+        const src = async (from: Date) => {
+          const spec = await warehouseLogQuerySpec(
+            from,
+            cutoff,
+            zone,
+            metrics,
+            '',
+            '',
+            false,
+            f.site,
+          );
+          return bins(await warehouseReportQuery(f.site, spec.statements.hours, spec.params));
+        };
+        const todayBins = await src(today);
+        expect(todayBins.filter(Boolean)).toEqual([2, 1, 1]);
+        spy.mockClear();
+        expect(bins(await read(today))).toEqual(todayBins);
+        expect(spy.mock.calls.some(([q]) => q.query.includes('(hour,build) IN'))).toBe(false);
+        expect(factReads()).toHaveLength(1);
+
+        const hour = 3600000;
+        await withDashboardClock(
+          +cutoff,
+          () =>
+            warehousePlotLogs(
+              f.site,
+              new Date(+today + hour),
+              new Date(+today + 3 * hour),
+              zone,
+              true,
+              metrics,
+            ),
+          'refresh',
+        );
+        spy.mockClear();
+        expect(bins(await withDashboardClock(+cutoff, () => read(today), 'first'))).toEqual(
+          todayBins,
+        );
+        const partial = factReads();
+        expect(partial).toHaveLength(1);
+        expect(partial[0].query_params.logHours).toEqual(
+          [0, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(h => +today / 1000 + h * 3600),
+        );
+        expect(bins(await read(today, 'verified_range')).filter(Boolean)).toEqual([1, 1]);
+
+        for (const [date, total] of [
+          ['2026-11-19', 4],
+          ['2026-11-12', 6],
+          ['2026-10-20', 7],
+        ] as const) {
+          const from = midnight(date);
+          const expected = await src(from);
+          expect(expected.reduce((a, b) => a + b, 0)).toBe(total);
+          const handCount = Array<number>(24).fill(0);
+          handCount[0] = date === '2026-11-19' ? 2 : 3;
+          handCount[2] = 1;
+          handCount[11] = date === '2026-11-19' ? 1 : 2;
+          handCount[23] = date === '2026-10-20' ? 1 : 0;
+          expect(expected).toEqual(handCount);
+          expect(bins(await withDashboardClock(+cutoff, () => read(from), 'refresh'))).toEqual(
+            expected,
+          );
+          spy.mockClear();
+          expect(bins(await read(from))).toEqual(expected);
+          const warm = factReads();
+          expect(warm).toHaveLength(1);
+          expect(warm[0].query_params.logHours).toEqual([+today / 1000 + 11 * 3600]);
+          expect(warm[0].query_params.logStart).toBe('2026-11-19 03:00:00.000000');
+          expect(warm[0].query_params.logEnd).toBe('2026-11-19 03:33:00.000000');
+          expect(spy.mock.calls.every(([q]) => q.query_params.wh_publication === publication)).toBe(
+            true,
+          );
+        }
+      });
+
+      // Late publication dirties only its hour. A read pinned to the old
+      // publication must still use the old build, even after the new one exists.
+      await f.put('liekan_log', [log('2026-11-19T02:40:00')]);
+      const updated = bins(await withDashboardClock(+cutoff, () => read(today), 'refresh'));
+      expect(updated[2]).toBe(2);
+      const old = await withinWarehouseReport(() => read(today), {
+        publication: { websiteId: f.site, publication },
+      });
+      expect(bins(old)[2]).toBe(1);
+    } finally {
+      admission.close();
+      await ch.close();
+      await admin.command({ query: `DROP DATABASE IF EXISTS ${database} SYNC` });
+      await admin.close();
+    }
+  },
+  45000,
+);
+
+it.skipIf(!url)(
+  'shares cold exact log summaries and trends across overlapping verified windows',
+  async () => {
+    expect(url).toBe('http://127.0.0.1:28169');
+    const database = `report_overlap_${randomUUID().replaceAll('-', '')}`;
+    const admin = createWarehouseClient({ url });
+    await admin.command({ query: `CREATE DATABASE ${database}` });
+    const ch = createWarehouseClient({
+      url,
+      database,
+      clickhouse_settings: { max_threads: 1, max_memory_usage: '1000000000', join_use_nulls: 1 },
+    });
+    harness.reader = {
+      ch,
+      db: {},
+      admission: new ReadAdmission(1),
+      verifyIdentity: async () => {},
+    };
+    try {
+      for (const query of [
+        ...warehouseDDL(),
+        ...warehouseAnalysisDDL,
+        ...warehouseOverviewLogDDL,
+        warehouseLogTrendDDL,
+      ])
+        await ch.command({ query });
+      const f = reportFixture(ch);
+      harness.metadata = f.metadata;
+      const from = new Date('2026-11-01T00:00:00Z');
+      const later = new Date('2026-11-02T00:00:00Z');
+      const cutoff = new Date('2026-11-03T02:30:00Z');
+      await f.put(
+        'liekan_log',
+        [
+          '2026-11-01T03:12:00Z',
+          '2026-11-02T06:25:00Z',
+          '2026-11-03T02:15:00Z',
+          '2026-11-03T02:30:00Z',
+        ].map((created_at, i) => ({
+          id: randomBytes(32).toString('hex'),
+          import_id: randomUUID(),
+          created_at,
+          path: i === 3 ? '/end-exclusive' : '/repeated-path',
+          status: i === 1 ? 404 : 200,
+          method: 'GET',
+          bytes: 0,
+          ip_masked: '',
+          ip_hash: '',
+          user_agent: 'fixture',
+          location: '',
+          bot: 'Fixture',
+          vendor: 'Fixture',
+          bot_type: '搜索',
+          verification: '',
+          ai_eligible: true,
+        })),
+      );
+      const params = {
+        resource: 'overview',
+        chartPeriod: '30d',
+        timezone: 'UTC',
+        crawlerIdentityScope: 'all',
+        crawlerMetricsVersion: 1,
+      } as ReportQuery;
+      const model = await withinWarehouseReport(() =>
+        prepareAnalysisModel(f.site, from, cutoff, {
+          kinds: ['log'],
+          completeThrough: +cutoff,
+        }),
+      );
+      const { warehouseLogToday } = await import('./warehouse-log-queries');
+      harness.reader.db = { read: async () => [{ accepted: '9' }] };
+      const reference = await withinWarehouseReport(() => warehouseLogToday(f.site, from, cutoff));
+      expect(reference).toEqual({ requests: 4, abnormal: 1, accepted: 9 });
+      const querySpy = vi.spyOn(ch, 'query');
+      try {
+        const observed = await withinWarehouseReport(() =>
+          withVerifiedAnalysisRead(model, () => warehouseLogToday(f.site, from, cutoff)),
+        );
+        expect(observed).toEqual(reference);
+        const reads = querySpy.mock.calls.map(([o]) => o).filter(o => o.query.includes(' AS requests,countIf(status>=400) AS abnormal'));
+        expect(reads).toHaveLength(1);
+        expect(reads[0].query_params?.logStart).toBe('2026-11-03 02:00:00.000000');
+      } finally {
+        querySpy.mockRestore();
+      }
+      const run = (start: Date, chartPeriod: '7d' | '30d') =>
+        withinWarehouseReport(async () => {
+          const metrics = { ...params, chartPeriod };
+          const raw = await warehouseLogQuerySpec(
+            start,
+            cutoff,
+            'UTC',
+            metrics,
+            'all',
+            '',
+            false,
+            f.site,
+            true,
+          );
+          const expected = await warehouseReportQuery(f.site, raw.overview, raw.params);
+          const trend = await warehousePlotLogs(f.site, start, cutoff, 'UTC', false, metrics);
+          return withVerifiedAnalysisRead(model, () =>
+            withDashboardClock(
+              +cutoff,
+              async () => {
+                const saved = await prepareWarehouseOverviewLogSegments(
+                  f.site,
+                  start,
+                  cutoff,
+                  metrics,
+                );
+                expect(saved).toBeDefined();
+                expect(await warehouseReportQuery(f.site, saved.sql, saved.params)).toEqual(
+                  expected,
+                );
+                expect(
+                  await warehousePlotLogs(f.site, start, cutoff, 'UTC', false, metrics),
+                ).toEqual(trend);
+                return saved.params.overviewBuilds;
+              },
+              'first',
+            ),
+          );
+        });
+      const builds = await run(from, '30d');
+      expect(await run(later, '7d')).toEqual([builds[1]]);
+      const [summary] = await ch
+        .query({
+          query: `SELECT countIf(hour=0) AS manifests,countIf(hour!=0) AS hours FROM warehouse_log_hourly_trend`,
+          format: 'JSONEachRow',
+        })
+        .then(result => result.json());
+      expect(summary).toEqual({ manifests: '1', hours: '50' });
+      const late = {
+        id: randomBytes(32).toString('hex'), import_id: randomUUID(),
+        created_at: '2026-11-01T03:59:00Z', path: '/bundle.JS?q=a', status: 500,
+        method: 'GET', bytes: 0, ip_masked: '', ip_hash: '', user_agent: 'fixture',
+        location: '', bot: '', vendor: '', bot_type: '', verification: '', ai_eligible: false,
+      };
+      async function compareCounts(requests: number, abnormal: number) {
+        return withinWarehouseReport(async () => {
+          const counts = () => warehouseLogToday(f.site, from, cutoff);
+          const expected = await counts();
+          expect(expected).toEqual({ requests, abnormal, accepted: 9 });
+          const built = await prepareAnalysisModel(f.site, from, cutoff, {
+            kinds: ['log'], completeThrough: +cutoff,
+          });
+          expect(await withVerifiedAnalysisRead(built, counts)).toEqual(expected);
+          return new Map(built.log.map(([hour, build]) => [hour, build]));
+        });
+      }
+      await f.put('liekan_log', [late]);
+      const afterLate = await compareCounts(4, 2);
+      await f.put('liekan_log', [late]);
+      const replayed = await compareCounts(4, 2);
+      const oldHour = Date.parse('2026-11-01T03:00:00Z') / 1000;
+      expect([...afterLate].filter(([h,b]) => replayed.get(h) !== b).map(([h]) => h)).toEqual([oldHour]);
+      // Replace the old event at its original time and publish the corrected
+      // event on the next day. Both complete UTC hours must get new builds.
+      await f.put('liekan_log', [late], { deleted: true });
+      await f.put('liekan_log', [{
+        ...late, created_at: '2026-11-02T06:10:00Z', path: '/corrected', status: 200,
+      }]);
+      const moved = await compareCounts(5, 1);
+      expect([...replayed].filter(([h,b]) => moved.get(h) !== b).map(([h]) => h))
+        .toEqual([oldHour, Date.parse('2026-11-02T06:00:00Z') / 1000]);
+    } finally {
+      await ch.close();
+      await admin.command({ query: `DROP DATABASE ${database} SYNC` });
+      await admin.close();
+    }
+  },
+  60000,
+);
+
 it.skipIf(!url)(
   'keeps partial log fallback canonical with late evidence, deletion and filtered pagination',
   async () => {
@@ -123,6 +507,233 @@ it.skipIf(!url)(
         verification: '',
       }));
       await f.put('liekan_log', fields);
+      const partialHour = await withinWarehouseReport(() =>
+        prepareAnalysisModel(
+          f.site,
+          new Date('2026-11-01T00:00:00Z'),
+          new Date('2026-11-01T00:30:00Z'),
+          {
+            kinds: ['log'],
+            completeThrough: Date.parse('2026-11-01T00:30:00Z'),
+          },
+        ),
+      );
+      expect(partialHour.log).toEqual([]);
+      // A real CH insert can succeed even when its response is lost. Restart
+      // from serialized stage state and verify that the immutable build is
+      // reused, with no duplicate append or unverified coverage.
+      let savedBuild: any = null,
+        savedPrepared: any;
+      const buildStore = {
+        current: () => structuredClone(savedBuild),
+        save: async (value: any) => {
+          savedBuild = JSON.parse(JSON.stringify(value));
+        },
+        notBefore: () => 0,
+        deferUntil: async () => {},
+      };
+      const command = ch.command.bind(ch);
+      let lost = false,
+        appends = 0;
+      const authoritativeReads: string[] = [];
+      const sourceQuery = ch.query.bind(ch);
+      const sourceReads = vi.spyOn(ch, 'query').mockImplementation(options => {
+        if (options.query.includes('{modelWindowHours:')) authoritativeReads.push('read');
+        return sourceQuery(options);
+      });
+      const writesLogTarget = (options: {
+        query: string;
+        query_params?: Record<string, unknown>;
+      }) =>
+        options.query.startsWith('INSERT INTO warehouse_analysis_log_v1') &&
+        options.query_params?.writeBuild !== options.query_params?.modelSourceBuild;
+      const commandSpy = vi.spyOn(ch, 'command').mockImplementation(async options => {
+        if (options.query.includes('{modelWindowHours:')) authoritativeReads.push('write');
+        const reply = await command(options);
+        if (writesLogTarget(options)) {
+          appends++;
+          if (!lost) {
+            lost = true;
+            throw new Error('fixture-response-lost');
+          }
+        }
+        return reply;
+      });
+      const prepare = (background = false) =>
+        withinWarehouseReport(
+          () =>
+            prepareAnalysisModel(
+              f.site,
+              new Date('2026-11-01T00:00:00Z'),
+              new Date('2026-11-01T01:00:00Z'),
+              {
+                kinds: ['log'],
+                buildStore,
+                prepared: savedPrepared,
+                onCheckpoint: async value => {
+                  savedPrepared = JSON.parse(JSON.stringify(value));
+                },
+              },
+            ),
+          { background },
+        );
+      await expect(prepare()).rejects.toThrow('fixture-response-lost');
+      expect(savedBuild.intent).toBe('facts');
+      const buildId = savedBuild.id;
+      const verify = vi.spyOn(ch, 'query');
+      verify.mockClear();
+      try {
+        harness.reader.db = {
+          read: async () => [{ oldestMs: 7000, publishedP95Ms: null, samples: 0 }],
+        };
+        await expect(prepare(true)).rejects.toThrow('warehouse-background-deferred');
+        expect(savedBuild).toBeNull();
+        expect(savedPrepared.log.some(bucket => bucket[1] === buildId)).toBe(true);
+        await prepare();
+        const targetReads = verify.mock.calls.filter(
+          ([options]) =>
+            options.query.includes('FROM warehouse_analysis_log_v1 WHERE') &&
+            options.query.includes('_build={modelBuild:UUID}') &&
+            options.query.includes(' AS checksum'),
+        );
+        expect(targetReads).toHaveLength(1);
+      } finally {
+        harness.reader.db = {};
+        verify.mockRestore();
+      }
+      expect(savedBuild).toBeNull();
+      expect(appends).toBe(1);
+      expect(authoritativeReads).toHaveLength(1);
+      sourceReads.mockRestore();
+      const rows = await ch
+        .query({
+          query:
+            'SELECT count() AS n,uniqExact(id) AS unique FROM warehouse_analysis_log_v1 WHERE _build={id:UUID}',
+          query_params: { id: buildId },
+          format: 'JSONEachRow',
+        })
+        .then(r => r.json<{ n: string; unique: string }>());
+      expect(rows).toEqual([{ n: '400', unique: '400' }]);
+      commandSpy.mockRestore();
+      let partialBuild: string | undefined;
+      const partial = vi.spyOn(ch, 'command').mockImplementation(async options => {
+        if (!partialBuild && writesLogTarget(options)) {
+          partialBuild = String(options.query_params.modelBuild);
+          await command({ ...options, query: options.query + ' LIMIT 10' });
+          throw new Error('fixture-partial-write');
+        }
+        return command(options);
+      });
+      const prepareSecond = () =>
+        withinWarehouseReport(() =>
+          prepareAnalysisModel(
+            f.site,
+            new Date('2026-11-01T01:00:00Z'),
+            new Date('2026-11-01T02:00:00Z'),
+            {
+              kinds: ['log'],
+              buildStore,
+              prepared: savedPrepared,
+              onCheckpoint: async value => {
+                savedPrepared = JSON.parse(JSON.stringify(value));
+              },
+            },
+          ),
+        );
+      await expect(prepareSecond()).rejects.toThrow('fixture-partial-write');
+      await expect(prepareSecond()).rejects.toThrow('warehouse-analysis-build-unverified');
+      expect(savedBuild).toBeNull();
+      expect(savedPrepared.log.some(bucket => bucket[1] === partialBuild)).toBe(false);
+      await prepareSecond();
+      const repaired = savedPrepared.log.find(
+        bucket => bucket[0] === +new Date('2026-11-01T01:00:00Z') / 1000,
+      );
+      expect(repaired[1]).not.toBe(partialBuild);
+      expect(repaired[2]).toBe(400);
+      partial.mockRestore();
+      let interruptedSource = false;
+      const partialSource = vi.spyOn(ch, 'command').mockImplementation(async options => {
+        if (!interruptedSource && options.query.includes('{modelWindowHours:')) {
+          interruptedSource = true;
+          await command({ ...options, query: options.query + ' LIMIT 10' });
+          throw new Error('fixture-source-response-lost');
+        }
+        return command(options);
+      });
+      const thirdHour = +new Date('2026-11-01T02:00:00Z') / 1000;
+      const prepareThird = () =>
+        withinWarehouseReport(() =>
+          prepareAnalysisModel(
+            f.site,
+            new Date(thirdHour * 1000),
+            new Date((thirdHour + 3600) * 1000),
+            {
+              kinds: ['log'],
+              buildStore,
+              prepared: savedPrepared,
+              onCheckpoint: async value => {
+                savedPrepared = JSON.parse(JSON.stringify(value));
+              },
+            },
+          ),
+        );
+      try {
+        await expect(prepareThird()).rejects.toThrow('fixture-source-response-lost');
+        expect(savedBuild.intent).toBe('source-facts');
+        const abandonedId = savedBuild.id;
+        await expect(prepareThird()).rejects.toThrow('warehouse-analysis-build-unverified');
+        expect(savedBuild).toBeNull();
+        expect(savedPrepared.log.some(bucket => bucket[0] === thirdHour)).toBe(false);
+        expect(partialSource.mock.calls.some(([options]) => writesLogTarget(options))).toBe(false);
+        await prepareThird();
+        const published = savedPrepared.log.find(bucket => bucket[0] === thirdHour);
+        expect(published[1]).not.toBe(abandonedId);
+        expect(published[2]).toBe(400);
+      } finally {
+        partialSource.mockRestore();
+      }
+      // Even with both manifest watermarks at the frozen publication, a log
+      // check interrupted after browser readiness must still run on resume.
+      let checked: typeof savedPrepared;
+      let interruptLogCheck = true;
+      const query = ch.query.bind(ch);
+      const coverageCheck = vi.spyOn(ch, 'query').mockImplementation(options => {
+        if (interruptLogCheck && options.query.includes('AS rows FROM warehouse_analysis_log_v1')) {
+          interruptLogCheck = false;
+          throw new Error('fixture-log-coverage-interrupted');
+        }
+        return query(options);
+      });
+      const checkBothFamilies = () =>
+        withinWarehouseReport(() =>
+          prepareAnalysisModel(
+            f.site,
+            new Date('2026-11-01T00:00:00Z'),
+            new Date('2026-11-01T01:00:00Z'),
+            {
+              prepared: checked,
+              onCheckpoint: async value => {
+                checked = JSON.parse(JSON.stringify(value));
+              },
+            },
+          ),
+        );
+      try {
+        await expect(checkBothFamilies()).rejects.toThrow('fixture-log-coverage-interrupted');
+        expect(checked.checkedFamilies).toEqual(['browser']);
+        coverageCheck.mockClear();
+        await checkBothFamilies();
+        expect(checked.checkedFamilies).toEqual(['browser', 'log']);
+        const resumedQueries = coverageCheck.mock.calls.map(([options]) => options.query);
+        expect(
+          resumedQueries.some(sql => sql.includes('FROM warehouse_analysis_coverage_v1 c')),
+        ).toBe(false);
+        expect(
+          resumedQueries.some(sql => sql.includes('AS rows FROM warehouse_analysis_log_v1')),
+        ).toBe(true);
+      } finally {
+        coverageCheck.mockRestore();
+      }
       const read = (filter = '', offset = 0) =>
         warehouseReportQuery(
           f.site,
@@ -270,6 +881,18 @@ it.skipIf(!url)(
       const prepared = await withinWarehouseReport(() =>
         prepareAnalysisModel(f.site, start, end, { kinds: ['log'] }),
       );
+      await f.put('liekan_log', [
+        { ...fields[0], id: randomUUID(), created_at: '2026-11-01T03:50:00Z' },
+      ]);
+      const cutoff = Date.parse('2026-11-01T03:30:00Z');
+      const delayed = await withinWarehouseReport(() =>
+        prepareAnalysisModel(f.site, start, new Date(cutoff), {
+          kinds: ['log'],
+          completeThrough: cutoff,
+        }),
+      );
+      expect(delayed.log).toEqual(prepared.log);
+      expect(delayed.publication.log).toBe(f.metadata.boundary.publication);
       const oldLogPublication = prepared.publication.log;
       // Independent browser preparation must not advance the unexamined log family.
       await f.put('liekan_crawler_evidence', [
@@ -611,6 +1234,22 @@ it.skipIf(!url)(
             byteBudget: 1024,
           });
         expect(progress.rankings.pending).toBe(false);
+        const pausedRank = randomUUID();
+        const pause = await captureReportRankings(f.site, pausedRank, produce, {
+          round: roundId,
+          shouldPause: async () => true,
+        });
+        expect(pause.rankings).toMatchObject({ pending: true, counts: { topBody: 0 } });
+        const resumed = await captureReportRankings(f.site, pausedRank, produce, {
+          round: roundId,
+          previous: pause.rankings,
+          shouldPause: async () => false,
+        });
+        expect(resumed.rankings).toMatchObject({ pending: false, build: pause.rankings.build });
+        expect(
+          (await readReportRanking(f.site, pausedRank, resumed.rankings, 'topBody', 30, 20, 1503))
+            .rows,
+        ).toEqual(large.slice(580, 600));
         expect(
           (await readReportRanking(f.site, rankId, progress.rankings, 'topBody', 30, 20, 1503))
             .rows,

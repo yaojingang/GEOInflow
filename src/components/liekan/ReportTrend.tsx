@@ -1,7 +1,11 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { useLiekanI18n } from '@/lib/liekan/i18n/client';
-import { isReportPreparing, type ReportPreparing } from '@/lib/liekan/contracts/report-status';
+import {
+  invalidatesRetainedRead,
+  isReportPreparing,
+  type ReportPreparing,
+} from '@/lib/liekan/contracts/report-status';
 import { useApi } from '@/lib/liekan/upstream/client';
 import { pageReportQuery, trendReportInput } from '@/lib/liekan/upstream/page-report-client';
 import { DataLoading, useDataLoading } from './DataLoading';
@@ -57,7 +61,7 @@ function PublishedReportTrend(props: Props) {
   // a 202 or a control/permission error must not resurrect an invalid cached chart.
   const displayed = !separate
     ? report
-    : invalidated || preparing
+    : invalidatesRetainedRead(query.error) || preparing
       ? undefined
       : (query.data as LiekanReport | undefined);
   const pending = separate && query.isPending && !query.error;

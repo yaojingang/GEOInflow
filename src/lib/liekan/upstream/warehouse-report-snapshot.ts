@@ -8,12 +8,14 @@ import { warehouseReader } from '../warehouse/reader-runtime';
 import { readReportingMetadata } from '../warehouse/reporting-context';
 import { type ReportingMetadata, reportingParameters } from '../warehouse/reporting-relations';
 import { AnalyticsRestart, AnalyticsUnavailable } from './analytics-budget';
+import { noteBackgroundInterval, noteReportTiming } from './analysis-diagnostics';
 import { analyticsRemaining } from './analytics-deadline';
 import { currentAnalyticsSignal, currentCacheContext } from './cache-context';
 import { processSingleton } from './process-singleton';
-import { traceSerialization, traceWarehouseRead } from './report-read-diagnostics';
+import { traceSerialization, traceWarehouseRead, type ReadStage } from './report-read-diagnostics';
 import { cachedRoundMetric, memoRoundMetric } from './warehouse-round-metrics';
 import { WarehouseBackgroundBudget } from './warehouse-background-budget';
+import { warehouseIngestionPressure } from './warehouse-ingestion-pressure';
 
 const snapshots = processSingleton(
   'warehouse-report-snapshot',
@@ -248,27 +250,40 @@ function trackRead<T>(work: () => Promise<T>): Promise<T> {
 const backgroundBudget = processSingleton(
   'warehouse-background-budget',
   () =>
-    new WarehouseBackgroundBudget(async () => {
-      const [row] = await warehouseReader().db.read<{ pending: boolean }>(
-        `SELECT EXISTS (SELECT 1 FROM liekan_warehouse_work w
-       JOIN liekan_warehouse_installation i ON i.topic_id=w.topic_id
-       WHERE w.status IN ('pending','working') LIMIT 1) AS pending`,
-      );
-      return row.pending;
-    }),
+    new WarehouseBackgroundBudget(
+      warehouseIngestionPressure(() => warehouseReader().db),
+      (stage, ms) => {
+        noteReportTiming(stage, ms);
+        if (stage === 'query-execution') noteBackgroundInterval(stage, ms);
+      },
+    ),
 );
+export const warehouseBackgroundClaimAfter = (reportClaim = false) =>
+  backgroundBudget.claimAfter(reportClaim);
+export const warehouseFairClaimDue = () => backgroundBudget.fairClaimDue;
+export const withWarehouseReportClaim = <T>(work: () => Promise<T>) =>
+  backgroundBudget.withClaim(work);
+
+export async function warehouseReportCheckpoint(store?: {
+  deferUntil(value: number): Promise<void>;
+}) {
+  const context = snapshots.getStore();
+  if (context?.background)
+    await backgroundBudget.checkpoint(context.signal, store && (value => store.deferUntil(value)));
+}
+
 function dispatchRead<T>(work: () => Promise<T>, longRunning = false) {
   const reader = warehouseReader(),
     context = snapshots.getStore();
-  const dispatch = () =>
+  const admit = (execute: () => Promise<T>) =>
     (longRunning ? reader.exportAdmission : reader.admission).run(
-      work,
+      execute,
       context.signal,
       context.deadline,
     );
   return context.background
-    ? backgroundBudget.run(dispatch, context.signal, context.deadline)
-    : dispatch();
+    ? backgroundBudget.run(work, context.signal, context.deadline, admit)
+    : admit(work);
 }
 
 /** Derived tables share the report's pinned publication, deadline and admission. */
@@ -284,7 +299,7 @@ export async function warehouseReportCommand(
       const reader = warehouseReader();
       const context = snapshots.getStore();
       const { readonly: _readonly, ...settings } = querySettings(timeoutSeconds);
-      await dispatchRead(() =>
+      return dispatchRead(() =>
         reader.ch.command({
           query: sql,
           query_params: {
@@ -293,17 +308,26 @@ export async function warehouseReportCommand(
             ...analysisReadParameters(),
           },
           abort_signal: context.signal,
-          clickhouse_settings: { ...settings, wait_end_of_query: 1, async_insert: 0 },
+          clickhouse_settings: {
+            ...settings,
+            wait_end_of_query: 1,
+            async_insert: 0,
+            read_overflow_mode: 'throw',
+            group_by_overflow_mode: 'throw',
+            timeout_overflow_mode: 'throw',
+          },
         }),
       );
     }),
   );
 }
+type ReportReadOptions = { signal?: AbortSignal; timeoutSeconds?: number; traceStage?: ReadStage };
+
 export async function warehouseReportQuery<T = Record<string, unknown>>(
   site: string,
   sql: string,
   params: Record<string, unknown> = {},
-  options: { signal?: AbortSignal; timeoutSeconds?: number } = {},
+  options: ReportReadOptions = {},
 ): Promise<T[]> {
   return warehouseReportResponse<T[]>(site, sql, params, 'JSONEachRow', options);
 }
@@ -315,7 +339,7 @@ export async function warehouseReportResponse<T>(
   sql: string,
   params: Record<string, unknown>,
   format: 'JSON' | 'JSONEachRow',
-  options: { signal?: AbortSignal; timeoutSeconds?: number } = {},
+  options: ReportReadOptions = {},
 ): Promise<T> {
   return withinWarehouseReport(
     () =>
@@ -346,6 +370,7 @@ export async function warehouseReportResponse<T>(
               result.close?.();
             }
           },
+          options.traceStage,
         );
       }),
     { signal: options.signal },

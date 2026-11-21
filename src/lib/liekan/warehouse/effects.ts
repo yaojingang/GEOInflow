@@ -1,3 +1,8 @@
+import {
+  applyBrowserPresence,
+  type BrowserEventTime,
+  type BrowserPublication,
+} from './browser-presence';
 import type { ControlSQL } from './control-db';
 import { WarehouseConflict } from './control-db';
 import { applyWarehouseTask } from './tasks';
@@ -14,7 +19,8 @@ export type UploadEffect = {
 };
 export type CollectionStateEffect = {
   kind: 'collection-state';
-  diagnosticAt: string;
+  diagnosticAt?: string;
+  browserEvent?: BrowserEventTime;
   observation?: { epoch: string; receivedAt: string; version: string };
 };
 export type PublicationEffect =
@@ -32,7 +38,11 @@ export function validateEffects(effects: PublicationEffect[], inputs: number): P
     }
     if (e.kind === 'collection-state') {
       if (
-        !Number.isFinite(Date.parse(e.diagnosticAt)) ||
+        (!e.diagnosticAt && !e.browserEvent) ||
+        (e.diagnosticAt !== undefined && !Number.isFinite(Date.parse(e.diagnosticAt))) ||
+        (e.browserEvent &&
+          (!Number.isFinite(Date.parse(e.browserEvent.at)) ||
+            typeof e.browserEvent.page !== 'boolean')) ||
         (e.observation &&
           (!/^\d+$/.test(e.observation.epoch) ||
             !Number.isFinite(Date.parse(e.observation.receivedAt)) ||
@@ -64,7 +74,11 @@ export function validateEffects(effects: PublicationEffect[], inputs: number): P
     throw new Error('Invalid warehouse publication effect count');
   return effects;
 }
-export async function applyPublicationEffects(tx: ControlSQL, attemptIds: string[]) {
+export async function applyPublicationEffects(
+  tx: ControlSQL,
+  attemptIds: string[],
+  browserPublication?: BrowserPublication,
+) {
   const attempts = (
     await tx.query<{ website_id: string; effects: PublicationEffect[] }>(
       `SELECT website_id,effects FROM liekan_warehouse_attempt
@@ -74,6 +88,7 @@ export async function applyPublicationEffects(tx: ControlSQL, attemptIds: string
   ).rows;
   const batches = new Map<string, UploadEffect & { websiteId: string }>();
   const collection = new Map<string, CollectionStateEffect[]>();
+  const browserEvents: BrowserEventTime[] = [];
   const geoDays = new Map<string, Set<string>>();
   for (const attempt of attempts)
     for (const e of attempt.effects) {
@@ -82,6 +97,9 @@ export async function applyPublicationEffects(tx: ControlSQL, attemptIds: string
         continue;
       }
       if (e.kind === 'collection-state') {
+        if (e.browserEvent && attempt.website_id === browserPublication?.site)
+          browserEvents.push(e.browserEvent);
+        if (!e.diagnosticAt) continue;
         const rows = collection.get(attempt.website_id) ?? [];
         rows.push(e);
         collection.set(attempt.website_id, rows);
@@ -106,10 +124,11 @@ export async function applyPublicationEffects(tx: ControlSQL, attemptIds: string
       sum.cancelled += e.cancelled ?? 0;
       batches.set(e.batchId, sum);
     }
+  if (browserPublication) await applyBrowserPresence(tx, browserPublication, browserEvents);
   for (const [site, days] of geoDays) {
-    // This runs in the same publication commit. Replayed attempts never advance
-    // proof twice, and ordinary unreferenced days create no control rows.
-    const changed = await tx.query(
+    // GEO readers validate the affected evidence window. Reports already in
+    // flight can complete at the publication selected before this append.
+    await tx.query(
       `WITH ranges AS(
       SELECT d::date::timestamp AT TIME ZONE 'UTC' AS starts,(d::date+1)::timestamp AT TIME ZONE 'UTC' AS ends FROM unnest($2::text[]) d
     ) INSERT INTO liekan_geo_weight_evidence_revision(website_id,starts_at,ends_at)
@@ -121,11 +140,6 @@ export async function applyPublicationEffects(tx: ControlSQL, attemptIds: string
       ON CONFLICT(website_id,starts_at,ends_at) DO UPDATE SET revision=nextval('liekan_geo_weight_evidence_revision_revision_seq'),created_at=now()`,
       [site, [...days]],
     );
-    if (changed.rowCount)
-      await tx.query(
-        'UPDATE liekan_log_state SET policy_revision=policy_revision+1 WHERE website_id=$1',
-        [site],
-      );
   }
   for (const [site, states] of collection) {
     const diagnosticAt = states

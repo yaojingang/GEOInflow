@@ -1,3 +1,4 @@
+import { persistPublicationProof, type ProofMode } from './publication-proof';
 import type { ClickHouseClient } from '@clickhouse/client';
 import type { Attempt } from './control';
 import { warehouseTime } from './fact-input';
@@ -11,7 +12,7 @@ export async function projectLogScopeProofs(
   attempt: Attempt,
   decisions: LandedDecision[],
   manifest: ManifestEntry[],
-  write = true,
+  mode: ProofMode = 'write',
 ) {
   const candidate = manifest.find(m => m.family === 'liekan_log');
   if (!candidate) return;
@@ -32,34 +33,14 @@ export async function projectLogScopeProofs(
     }
   }
   if (!proofs.size) throw new Error('warehouse-log-scope-proof-missing');
-  if (write)
-    await ch.insert({
-      table: 'warehouse_control_projection',
-      format: 'JSONEachRow',
-      values: [...proofs].map(([key, value]) => ({
-        website_id: attempt.website_id,
-        epoch: attempt.epoch,
-        kind: 'log-import-scope-v1',
-        revision: '0',
-        key,
-        value,
-        created_at: warehouseTime(decisions[0].input.envelope.receivedAt),
-      })),
-    });
-  const rows = await ch
-    .query({
-      query: `SELECT DISTINCT key,value FROM warehouse_control_projection WHERE website_id={site:UUID} AND epoch={epoch:UInt64}
-    AND kind='log-import-scope-v1' AND revision=0 AND JSONExtractString(value,'candidateId')={candidate:String}`,
-      query_params: {
-        site: attempt.website_id,
-        epoch: attempt.epoch,
-        candidate: candidate.candidateId,
-      },
-      format: 'JSONEachRow',
-    })
-    .then(r => r.json<{ key: string; value: string }>());
-  if (rows.length !== proofs.size || rows.some(r => proofs.get(r.key) !== r.value))
-    throw new Error('warehouse-log-scope-proof-mismatch');
+  await persistPublicationProof(ch, attempt, candidate, proofs, {
+    kind: 'log-import-scope-v1',
+    revision: '0',
+    createdAt: warehouseTime(decisions[0].input.envelope.receivedAt),
+    mismatch: 'warehouse-log-scope-proof-mismatch',
+    mode,
+    verifyAfterWrite: false,
+  });
 }
 
 // A frozen repair reads the original import's scope without transferring a

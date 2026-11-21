@@ -5,16 +5,18 @@ import type { LiekanReport } from './types';
 
 export function fallbackReportRangeLabel(report: LiekanReport | undefined, locale: LiekanLocale) {
   if (!report?.meta.snapshot?.fallback) return undefined;
-  return [report.range.startAt, report.range.endAt]
-    .map(value =>
-      new Date(value).toLocaleDateString(locale, {
-        timeZone: report.range.timezone,
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-      }),
-    )
-    .join(' – ');
+  const { startAt, endAt, timezone } = report.range;
+  const display = new Intl.DateTimeFormat(locale, {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const last =
+    report.meta.crawlerMetrics?.timeBoundary === 'half_open' ? Math.max(startAt, endAt - 1) : endAt;
+  const from = display.format(startAt);
+  const to = display.format(last);
+  return from === to ? from : `${from} – ${to}`;
 }
 
 export function ReportSnapshotNotice({ report }: { report: LiekanReport }) {
@@ -37,6 +39,9 @@ export function ReportSnapshotNotice({ report }: { report: LiekanReport }) {
       ])}
       {snapshot.updateError && (
         <span role="status"> · {i18n.text('更新失败，当前显示上次读取的数据')}</span>
+      )}
+      {!snapshot.updateError && !rangeLabel && snapshot.state === 'updating' && (
+        <span role="status"> · {i18n.text('后台正在更新，当前显示上次完成的数据')}</span>
       )}
     </span>
   );

@@ -3,6 +3,11 @@ import { LiekanError } from './errors';
 
 export const reportQueryGroups = [
   'analysis-prepare',
+  'budget-queue',
+  'budget-probe',
+  'budget-yield',
+  'query-admission',
+  'query-execution',
   'human',
   'logs',
   'settings',
@@ -23,6 +28,21 @@ type GroupTiming = { wallMs: number; calls: number; failures: number };
 export type ReportTimings = Partial<Record<QueryGroup, GroupTiming>>;
 const reports = new AsyncLocalStorage<ReportTimings>();
 const wallMs = (value: number) => Math.round(Math.max(0, value) * 10) / 10;
+
+export function noteBackgroundInterval(
+  stage: 'claim-yield' | 'budget-yield' | 'query-execution',
+  duration: number,
+) {
+  if (process.env.LIEKAN_WAREHOUSE_ANALYTICS_TIMING === '1')
+    console.info(
+      JSON.stringify({
+        event: 'warehouse-analytics-interval',
+        stage,
+        endAt: Date.now(),
+        wallMs: wallMs(duration),
+      }),
+    );
+}
 export const analysisTargetCategory = (target: string) =>
   ({
     'feature:page-report': 'page-report',
@@ -66,6 +86,14 @@ export function analysisErrorReason(error: unknown) {
 export async function captureReportTimings<T>(work: () => Promise<T>, timings: ReportTimings = {}) {
   return reports.run(timings, work);
 }
+export function noteReportTiming(group: QueryGroup, elapsed: number, failed = false) {
+  const timings = reports.getStore();
+  if (!timings) return;
+  const timing = (timings[group] ||= { wallMs: 0, calls: 0, failures: 0 });
+  timing.wallMs = wallMs(timing.wallMs + elapsed);
+  timing.calls++;
+  if (failed) timing.failures++;
+}
 /** Includes promise/connection queuing within the existing report transaction, in wall-clock ms. */
 export async function timeReportQuery<T>(group: QueryGroup, work: () => Promise<T>): Promise<T> {
   const timings = reports.getStore();
@@ -78,10 +106,7 @@ export async function timeReportQuery<T>(group: QueryGroup, work: () => Promise<
     failed = true;
     throw error;
   } finally {
-    const timing = (timings[group] ||= { wallMs: 0, calls: 0, failures: 0 });
-    timing.wallMs = wallMs(timing.wallMs + performance.now() - start);
-    timing.calls++;
-    if (failed) timing.failures++;
+    noteReportTiming(group, performance.now() - start, failed);
   }
 }
 export const reportServerTiming = (timings: ReportTimings) =>

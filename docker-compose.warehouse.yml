@@ -43,6 +43,8 @@ services:
     volumes:
       - liekan-warehouse-ch:/var/lib/clickhouse
       - ./docker/warehouse/clickhouse.xml:/etc/clickhouse-server/config.d/liekan.xml:ro
+      - ./docker/warehouse/diagnostic-logs.xml:/etc/clickhouse-server/config.d/liekan-diagnostics.xml:ro
+      - ./docker/warehouse/diagnostic-profile.xml:/etc/clickhouse-server/users.d/liekan-diagnostics.xml:ro
     cpus: ${LIEKAN_CH_CPUS:-4}
     mem_limit: ${LIEKAN_CH_MEMORY:-4g}
     ulimits: {nofile: {soft: 262144, hard: 262144}}

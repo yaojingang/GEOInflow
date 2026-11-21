@@ -8,6 +8,7 @@ import {
 } from '@tanstack/react-query';
 import { useEffect } from 'react';
 import type { CacheResource } from '../contracts/cache-manifest';
+import { invalidatesRetainedRead } from '../contracts/report-status';
 import { statisticsCacheTtl, uniqueCacheResources } from './cache-policy';
 import { promoteRequestConsumer } from './request-pool';
 
@@ -269,7 +270,7 @@ export function useFreshnessLifecycle<T>(
 ): UseQueryResult<T, any> & { isStaleAggregate?: boolean } {
   const client = useQueryClient();
   const key = JSON.stringify(options.queryKey);
-  const restricted = [401, 403, 404, 409, 410].includes(result.error?.status);
+  const restricted = invalidatesRetainedRead(result.error);
   useEffect(() => {
     if (options.enabled !== false) promoteQueryRequest(options.queryKey);
   }, [key, options.enabled]);

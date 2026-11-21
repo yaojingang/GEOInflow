@@ -43,9 +43,10 @@ export async function prepareWarehouseUpload(
     input.websiteId,
   );
   if (site?.state !== 'active') throw new LiekanError('网站数据正在维护，请稍后重试', 503);
-  await tx.$executeRawUnsafe(
+  const [inserted] = await tx.$queryRawUnsafe(
     `INSERT INTO liekan_warehouse_upload(batch_id,website_id,source_id,source_epoch,kind,digest,expected,actor_id,warehouse_epoch)
-    VALUES($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7,$8::uuid,$9::bigint) ON CONFLICT(batch_id) DO NOTHING`,
+    VALUES($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7,$8::uuid,$9::bigint) ON CONFLICT(batch_id) DO NOTHING
+    RETURNING *,warehouse_epoch::text AS bound_epoch`,
     input.batchId,
     input.websiteId,
     input.sourceId,
@@ -56,10 +57,11 @@ export async function prepareWarehouseUpload(
     input.actorId ?? null,
     site.epoch,
   );
-  const [upload] = await tx.$queryRawUnsafe<any[]>(
+  // A conflicting insert may have committed after the INSERT statement's snapshot.
+  const upload = inserted ?? (await tx.$queryRawUnsafe(
     'SELECT *,warehouse_epoch::text AS bound_epoch FROM liekan_warehouse_upload WHERE batch_id=$1::uuid FOR SHARE',
     input.batchId,
-  );
+  ))[0];
   if (
     upload.website_id !== input.websiteId ||
     upload.digest !== input.digest ||

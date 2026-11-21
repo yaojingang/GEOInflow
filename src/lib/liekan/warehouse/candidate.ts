@@ -2,6 +2,12 @@ import { createHash } from 'node:crypto';
 import type { ClickHouseClient } from '@clickhouse/client';
 import { factTable, identifier } from './catalog';
 import { recordKey, rowDigest, validateWireRow, type WireRow } from './codec';
+import {
+  flushOutsidePublicationSpan,
+  linkPublicationQuery,
+  type PublicationTrace,
+  tracePublication,
+} from './publication-timing';
 import { factMetadata } from './schema';
 
 export type FactPosition = {
@@ -89,8 +95,89 @@ export function candidateDigest(name: string, rows: StoredFact[]): string {
   return hash.digest('hex');
 }
 
+const insertRows = 5000;
+const insertBytes = 8 * 1024 * 1024;
+function verifyRows(name: string, rows: StoredFact[], expectedCount: number, digest: string) {
+  if (rows.length !== expectedCount || candidateDigest(name, rows) !== digest)
+    throw new Error(`Warehouse candidate verification failed: ${name}`);
+  return {
+    rowCount: String(rows.length),
+    digest,
+    attempts: [...new Set(rows.map(r => r._attempt_id))],
+    versions: [...new Set(rows.map(r => r._version))],
+  };
+}
+function verificationColumns(name: string) {
+  return [...factTable(name).columns.map(c => c.name), ...factMetadata.map(([key]) => key)]
+    .map(identifier)
+    .join(',');
+}
+type PendingInsert = {
+  queryId?: string;
+  rows: StoredFact[];
+  bytes: number;
+  receipts: { resolve: () => void; reject: (error: unknown) => void }[];
+};
+
 export class CandidateWriter {
-  constructor(private readonly client: ClickHouseClient) {}
+  private readonly pending?: Map<string, PendingInsert>;
+
+  constructor(
+    private readonly client: ClickHouseClient,
+    private readonly options?: { coalesce: boolean; ingestionLogFlushLimitMs?: number },
+  ) {
+    if (options?.coalesce) this.pending = new Map();
+  }
+
+  private async insert(name: string, rows: StoredFact[], queryId?: string) {
+    const maxWait = this.options?.ingestionLogFlushLimitMs;
+    const ingestionLog = name === 'liekan_log' || name === 'liekan_log_geography';
+    await this.client.insert({
+      ...(ingestionLog && maxWait !== undefined && {
+        clickhouse_settings: { async_insert_busy_timeout_max_ms: maxWait },
+      }),
+      table: `warehouse_${name}`,
+      values: rows,
+      ...(queryId && { query_id: queryId }),
+      format: 'JSONEachRow',
+    });
+  }
+
+  private flush(name: string, batch: PendingInsert) {
+    if (this.pending.get(name) !== batch) return;
+    this.pending.delete(name);
+    // An acknowledgement or ambiguous failure belongs to every insert caller.
+    // Publication still independently verifies each candidate from storage.
+    void flushOutsidePublicationSpan(() => this.insert(name, batch.rows, batch.queryId)).then(
+      () => batch.receipts.forEach(request => request.resolve()),
+      error => batch.receipts.forEach(request => request.reject(error)),
+    );
+  }
+
+  private write(name: string, rows: StoredFact[], bytes: number) {
+    if (!this.pending) return this.insert(name, rows);
+    return new Promise<void>((resolve, reject) => {
+      let batch = this.pending.get(name);
+      if (
+        batch &&
+        (batch.rows.length + rows.length > insertRows || batch.bytes + bytes > insertBytes)
+      ) {
+        this.flush(name, batch);
+        batch = undefined;
+      }
+      if (!batch) {
+        const next: PendingInsert = { rows: [], bytes: 0, receipts: [] };
+        this.pending.set(name, next);
+        // Share writes already ready in this turn. No timed wait for more work.
+        setImmediate(() => this.flush(name, next));
+        batch = next;
+      }
+      batch.queryId = linkPublicationQuery(batch.queryId);
+      batch.rows.push(...rows);
+      batch.bytes += bytes;
+      batch.receipts.push({ resolve, reject });
+    });
+  }
 
   async append(name: string, rows: StoredFact[]) {
     factTable(name);
@@ -100,18 +187,13 @@ export class CandidateWriter {
     let batch: StoredFact[] = [],
       bytes = 0;
     const flush = async () => {
-      if (batch.length)
-        await this.client.insert({
-          table: `warehouse_${name}`,
-          values: batch,
-          format: 'JSONEachRow',
-        });
+      if (batch.length) await this.write(name, batch, bytes);
       batch = [];
       bytes = 0;
     };
     for (const row of rows) {
-      const size = Buffer.byteLength(JSON.stringify(row));
-      if (batch.length && (batch.length >= 5000 || bytes + size > 8 * 1024 * 1024)) await flush();
+      const size = Buffer.byteLength(JSON.stringify(row)) + 1;
+      if (batch.length && (batch.length >= insertRows || bytes + size > insertBytes)) await flush();
       batch.push(row);
       bytes += size;
     }
@@ -125,29 +207,47 @@ export class CandidateWriter {
     candidateId: string,
     expectedCount: number,
     expectedDigest: string,
+    recoveryRows?: StoredFact[],
+    trace?: PublicationTrace,
   ) {
-    const table = factTable(name);
     if (!Number.isSafeInteger(expectedCount) || expectedCount < 0 || expectedCount > 15000)
       throw new Error('Invalid candidate verification bound');
-    const columns = [...table.columns.map(c => c.name), ...factMetadata.map(([key]) => key)]
-      .map(identifier)
-      .join(',');
-    const rows = await this.client
-      .query({
-        query: `SELECT DISTINCT ${columns}
+    const columns = verificationColumns(name);
+    const read = () =>
+      this.client
+        .query({
+          query: `SELECT DISTINCT ${columns}
       FROM ${identifier(`warehouse_${name}`)} WHERE _website_id={site:UUID} AND _epoch={epoch:UInt64}
         AND _candidate_id={candidate:UUID} LIMIT {limit:UInt32}`,
-        query_params: { site: websiteId, epoch, candidate: candidateId, limit: expectedCount + 1 },
-        format: 'JSONEachRow',
-      })
-      .then(r => r.json<StoredFact>());
-    if (rows.length !== expectedCount || candidateDigest(name, rows) !== expectedDigest)
-      throw new Error('Warehouse candidate verification failed');
-    return {
-      rowCount: String(rows.length),
-      digest: expectedDigest,
-      attempts: [...new Set(rows.map(r => r._attempt_id))],
-      versions: [...new Set(rows.map(r => r._version))],
-    };
+          query_params: {
+            site: websiteId,
+            epoch,
+            candidate: candidateId,
+            limit: expectedCount + 1,
+          },
+          format: 'JSONEachRow',
+        })
+        .then(r => r.json<StoredFact>());
+    const rows = recoveryRows
+      ? await tracePublication(trace, 'recovery.read.' + name, read)
+      : await read();
+    if (recoveryRows && rows.length < expectedCount) {
+      // Compare the entire persisted subset (including metadata) to sealed input.
+      // A short or timed-out response alone never establishes which rows are missing.
+      const present = new Set(rows.map(row => row._ordinal));
+      const expectedSubset = recoveryRows.filter(row => present.has(row._ordinal));
+      verifyRows(name, rows, expectedSubset.length, candidateDigest(name, expectedSubset));
+      const missing = recoveryRows.filter(row => !present.has(row._ordinal));
+      await tracePublication(
+        trace,
+        'recovery.append.' + name,
+        () => this.append(name, missing),
+        missing.length,
+      );
+      return tracePublication(trace, 'recovery.recheck.' + name, async () =>
+        verifyRows(name, await read(), expectedCount, expectedDigest),
+      );
+    }
+    return verifyRows(name, rows, expectedCount, expectedDigest);
   }
 }

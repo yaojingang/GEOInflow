@@ -30,6 +30,7 @@ vi.mock('@/queries/sql', () => ({ getFunnel: vi.fn() }));
 import { parseReportQuery } from './contracts/query';
 import { buildReport } from './report';
 import { reportLogRange } from './report-log-tables';
+import { withDashboardClock } from './upstream/dashboard-clock';
 
 const params = { resource: 'overview', startAt: 0, endAt: 86400000, timezone: 'UTC' };
 const website = { id: '5b4c0de0-6c47-5b51-8f53-11e5e8c79001', name: 'Test', domain: 'example.com' };
@@ -160,6 +161,26 @@ describe('buildReport serialization slicing', () => {
       });
       expect(result.range.endAt).toBe(cutoff);
       expect(result.range.startAt).toBe(parsed.data.startAt);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('uses the current local day for range validation when the offline cutoff is before midnight', async () => {
+    const time = Date.parse('2026-11-03T00:15:00+08:00');
+    const cutoff = time - 30 * 60000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(time);
+    try {
+      const parsed = parseReportQuery({
+        resource: 'overview',
+        chartPeriod: '7d',
+        startAt: Date.parse('2026-10-27T00:00:00+08:00'),
+        endAt: Date.parse('2026-11-03T23:59:59.999+08:00'),
+        timezone: 'Asia/Shanghai',
+      });
+      if (!parsed.success) throw new Error('invalid cutoff fixture');
+      const range = await withDashboardClock(cutoff, async () => reportLogRange(parsed.data));
+      expect(range.readEndAt).toBe(cutoff - 1);
     } finally {
       clock.mockRestore();
     }

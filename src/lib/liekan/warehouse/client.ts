@@ -1,4 +1,9 @@
-import { type ClickHouseClientConfigOptions, ClickHouseLogLevel, createClient } from '@clickhouse/client';
+import {
+  type ClickHouseClientConfigOptions,
+  ClickHouseLogLevel,
+  createClient,
+} from '@clickhouse/client';
+import { publicationQueryOptions } from './publication-timing';
 import { prepareQueryParameters } from './query-parameters';
 
 export const warehouseSettings = {
@@ -25,6 +30,9 @@ export function createWarehouseClient(options: ClickHouseClientConfigOptions) {
     clickhouse_settings: { ...options.clickhouse_settings, ...warehouseSettings },
   });
   const query = client.query.bind(client);
-  client.query = ((input: any) => query(prepareQueryParameters(input))) as typeof client.query;
+  client.query = ((input: any) =>
+    query(publicationQueryOptions(prepareQueryParameters(input)))) as typeof client.query;
+  const insert = client.insert.bind(client);
+  client.insert = (input => insert(publicationQueryOptions(input))) as typeof client.insert;
   return client;
 }

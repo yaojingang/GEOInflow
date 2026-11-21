@@ -184,12 +184,33 @@ export class WarehouseQueue {
       // so already accepted packages can finish and verified GC can reclaim.
       await requireQueueInputSpace(this.options.storagePath);
       const required = new Set(batch.map(r => r.partition));
+      const measure = process.env.LIEKAN_WAREHOUSE_PUBLICATION_TIMING === '1';
+      const started = measure ? performance.now() : 0;
       const acknowledgements = await this.producer.send({
         topic: this.installation.topicName,
         messages: batch.map(({ key, value, partition }) => ({ key, value, partition })),
       });
       for (const ack of acknowledgements) required.delete(ack.partition);
       if (required.size) throw new Error('warehouse-queue-confirmation-unavailable');
+      if (measure) {
+        const acknowledgedAtMs = Date.now();
+        const inputsByPartition = new Map<number, number>();
+        for (const { partition } of batch)
+          inputsByPartition.set(partition, (inputsByPartition.get(partition) ?? 0) + 1);
+        console.info(
+          JSON.stringify({
+            event: 'warehouse-broker-ack-timing',
+            topicId: this.installation.topicId,
+            acknowledgedAtMs,
+            sendMs: Math.round(performance.now() - started),
+            partitions: acknowledgements.map(({ partition, baseOffset }) => ({
+              partition,
+              baseOffset,
+              inputs: inputsByPartition.get(partition),
+            })),
+          }),
+        );
+      }
       batch = [];
       bytes = 0;
     };

@@ -263,6 +263,43 @@ it('keeps bookmarked chart periods out of the main report identity and ignores l
   expect(state.push).not.toHaveBeenCalled();
 });
 
+it.each([
+  ['en-US', '11/01/2026', '11/02/2026'],
+  ['zh-CN', '2026/11/01', '2026/11/02'],
+] as const)('shows the last included date across a DST transition in %s', async (locale, day, nextDay) => {
+  const source = overviewFixture(1, '/previous');
+  // The New York fall-back day has 25 hours.
+  const range = {
+    startAt: Date.parse('2026-11-01T04:00:00Z'),
+    endAt: Date.parse('2026-11-02T05:00:00Z'),
+    timezone: 'America/New_York',
+  };
+  state.get.mockResolvedValue({
+    ...source,
+    range,
+    meta: {
+      ...source.meta,
+      snapshot: {
+        ...source.meta.snapshot,
+        state: 'updating',
+        fallback: { sourceRange: range, requestedRange: source.range, chartPeriod: 'today' },
+      },
+      crawlerMetrics: { timeBoundary: 'half_open' },
+    },
+  });
+  render(
+    <LiekanLocaleContext.Provider value={locale}>
+      <QueryClientProvider client={client}>
+        <LiekanPage resource="overview" />
+      </QueryClientProvider>
+    </LiekanLocaleContext.Provider>,
+  );
+  await screen.findByText('/previous');
+  const notice = screen.getAllByRole('status').find(element => element.textContent?.includes(day));
+  expect(notice).toBeVisible();
+  expect(notice).not.toHaveTextContent(nextDay);
+});
+
 it('shows the actual period of a server-validated previous trend and clears it on permission failure', async () => {
   state.date = '7day';
   const original = overviewFixture(1, '/stable-ranking');
@@ -319,6 +356,32 @@ it('revalidates the parent at most once when a bookmarked trend remains in confl
   expect(state.get.mock.calls.filter(([, p]) => p.chartPeriod === '7d')).toHaveLength(2);
 });
 
+it.each([429, 503])(
+  'removes a cached report when HTTP %i confirms no valid snapshot survives',
+  async status => {
+    state.get.mockResolvedValue(report('prior-result'));
+    render(
+      <QueryClientProvider client={client}>
+        <LiekanPage resource="content" />
+      </QueryClientProvider>,
+    );
+    await screen.findByText('prior-result');
+    state.get.mockRejectedValue({ status, code: 'warehouse-report-no-valid-snapshot' });
+    await act(async () => {
+      await client.refetchQueries({ queryKey: ['liekan', 'site-a'] });
+    });
+    await waitFor(() => {
+      expect(screen.queryByText('prior-result')).toBeNull();
+      const failed = client
+        .getQueryCache()
+        .findAll()
+        .filter(q => q.state.status === 'error');
+      expect(failed.length).toBeGreaterThan(0);
+      expect(failed.every(q => q.state.data === undefined)).toBe(true);
+    });
+  },
+);
+
 it('retains a published trend after a transient refresh failure', async () => {
   state.date = '7day';
   state.get.mockImplementation(() => Promise.resolve(overviewFixture(1, '/stable-ranking')));
@@ -341,6 +404,23 @@ it('retains a published trend after a transient refresh failure', async () => {
   });
   expect(await within(section).findByText('更新失败，当前显示上次读取的数据')).toBeVisible();
   expect(section.querySelector('#d1')).toBeInTheDocument();
+  expect(screen.getByText('/stable-ranking')).toBeVisible();
+  state.get.mockRejectedValue({ status: 503, code: 'warehouse-report-no-valid-snapshot' });
+  fireEvent.click(within(section).getByRole('button', { name: '重试' }));
+  expect(await within(section).findByText(/无法读取此范围的数据/)).toBeVisible();
+  expect(section.querySelector('#d1')).toBeNull();
+  state.get.mockRejectedValue({ status: 503, message: 'Busy' });
+  const attempts = state.get.mock.calls.length;
+  fireEvent.click(within(section).getByRole('button', { name: '重试' }));
+  await waitFor(() => {
+    expect(state.get.mock.calls.length).toBeGreaterThan(attempts);
+    const latest = client.getQueryCache().getAll().find(
+      q => q.queryKey[3] === 'overview' && q.queryKey[7] === '30d',
+    );
+    expect(latest?.state.error?.message).toBe('Busy');
+    expect(latest?.state.data).toBeUndefined();
+  });
+  expect(section.querySelector('#d1')).toBeNull();
   expect(screen.getByText('/stable-ranking')).toBeVisible();
 });
 
@@ -770,7 +850,7 @@ describe('GEO refresh after a successful write', () => {
   );
 });
 
-it.each([401, 403, 404, 503])(
+it.each([401, 403, 404, 429, 503])(
   'masks cached comparison values only for hard read errors (%s)',
   async status => {
     state.compare = true;
@@ -801,7 +881,7 @@ it.each([401, 403, 404, 503])(
           .some(query => (query.state.error as any)?.status === status),
       ).toBe(true);
       expect(screen.getByTestId('comparison-value')).toHaveTextContent(
-        status === 503 ? 'previous' : 'unavailable',
+        [429, 503].includes(status) ? 'previous' : 'unavailable',
       );
     });
   },
@@ -1243,7 +1323,20 @@ it('shows the server-validated last report with its actual dates until the reque
     </QueryClientProvider>,
   );
   await screen.findByText('/retained-ranking');
-  expect(screen.getByText(/当前区间尚未就绪，显示上次统计/)).toBeInTheDocument();
+  const notice = screen.getByText(/当前区间尚未就绪，显示上次统计/);
+  const expectedDay = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: source.range.timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(source.range.startAt);
+  expect(notice).toHaveTextContent(expectedDay);
+  expect(notice.parentElement).toHaveTextContent(
+    new Date(source.meta.snapshot.dataThrough).toLocaleString('zh-CN', {
+      timeZone: source.range.timezone,
+      hour12: false,
+    }),
+  );
   expect(screen.queryByText('数据准备中，请稍后查看')).not.toBeInTheDocument();
   expect(screen.queryByText('pending')).not.toBeInTheDocument();
   const initial = state.get.mock.calls.length;

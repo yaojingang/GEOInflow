@@ -49,11 +49,23 @@ export async function readWebsiteSummary(request: Request, input: unknown) {
     parsed.data,
     async () => {
       const fresh = await checkAuth(request);
-      return !!fresh?.user && fresh.user.id === auth.user.id && fresh.user.role === auth.user.role;
+      if (
+        !fresh?.user ||
+        fresh.user.deletedAt ||
+        ('shareToken' in fresh && fresh.shareToken) ||
+        fresh.user.id !== auth.user.id ||
+        fresh.user.role !== auth.user.role
+      )
+        return false;
+      return (
+        await Promise.all(
+          p.ids.map(id => canViewWebsiteSection(fresh as Auth, id, ['overview', 'compare'])),
+        )
+      ).every(Boolean);
     },
     { allowWarehousePublicationAdvance: true },
   );
-  await prepareAnalyticsVersions(p.ids.map(websiteCacheTag));
+  if (!warehouseEnabled()) await prepareAnalyticsVersions(p.ids.map(websiteCacheTag));
   // Check current ownership and permissions before every cache read.
   const sites = await (
     getRawQueryClient(prisma.client, { write: true }) as typeof prisma.client
@@ -66,6 +78,14 @@ export async function readWebsiteSummary(request: Request, input: unknown) {
     p.ids.map(id => canViewWebsiteSection(auth as Auth, id, ['overview', 'compare'])),
   );
   if (allowed.some(value => !value)) throw new LiekanError('无权访问网站', 403);
+  if (warehouseEnabled()) {
+    const { readPublishedWebsiteSummaries } = await import('./warehouse-overview-snapshots');
+    return readPublishedWebsiteSummaries(p.ids, {
+      startAt: p.startAt,
+      endAt: p.endAt,
+      timezone: p.timezone,
+    });
+  }
   const ttl = Math.min(30000, statisticsCacheTtl(p.endAt, p.timezone));
   if (!p.ids.length) return [];
   const current = { startDate: new Date(p.startAt), endDate: new Date(p.endAt) };
@@ -95,7 +115,6 @@ export async function readWebsiteSummary(request: Request, input: unknown) {
     ttl,
     p.ids.map(websiteCacheTag),
     async () => {
-      if(warehouseEnabled())return (await import('./warehouse-website-summary')).warehouseWebsiteSummaries(sites,p);
       if (process.env.CLICKHOUSE_URL || process.env.CLOUD_MODE) {
         const rows = [];
         // Bound compatibility fallback fan-out; PostgreSQL uses one grouped query.

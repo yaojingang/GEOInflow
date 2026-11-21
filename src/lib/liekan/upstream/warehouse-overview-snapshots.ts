@@ -1,5 +1,10 @@
+import { computeWebsiteSummary } from './warehouse-website-summary';
+import { readBrowserPresence } from './warehouse-browser-presence';
+import type { WebsiteSummary } from '../contracts/website-summary';
+import { traceSummarySnapshot } from './report-read-diagnostics';
 import { WarehouseBackgroundDeferred } from './warehouse-background-budget';
 import { createHash, randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { formatInTimeZone, fromZonedTime } from 'date-fns-tz';
 import { ACCOUNT_DEFAULT_TIMEZONE, validateTimezone } from '../contracts/account-preferences';
 import { calendarDayRange } from '../contracts/calendar';
@@ -13,6 +18,7 @@ import {
 } from '../contracts/query';
 import { isScheduledReport, scheduledReportResources } from '../contracts/scheduled-reports';
 import { getPublishedCatalog } from '../crawlers/published';
+import { warehouseReportNoValidSnapshot } from '../contracts/report-status';
 import { reportLogRange } from '../report-log-tables';
 import { WarehouseConflict } from '../warehouse/control-db';
 import { warehouseReader } from '../warehouse/reader-runtime';
@@ -21,6 +27,7 @@ import type { ReportingMetadata } from '../warehouse/reporting-relations';
 import {
   analysisErrorReason,
   captureReportTimings,
+  noteBackgroundInterval,
   type ReportTimings,
   timeReportQuery,
 } from './analysis-diagnostics';
@@ -50,22 +57,38 @@ import { warehouseLogWindowHasFacts } from './warehouse-log-queries';
 import { prepareWarehouseOverviewLogSegments } from './warehouse-overview-log-segments';
 import {
   acquireReportRound,
+  canJoinReportRound,
+  liveRoundProgress,
   finishReportRound,
+  offlineReportCutoff,
+  offlineReportLagMs,
   type ReportRound,
   reportAnalysisKinds,
   saveRoundPreparation,
   reportRoundMetrics,
+  reportRoundBuild,
+  reportRoundVersion,
 } from './warehouse-report-round';
 import {
+  warehouseBackgroundClaimAfter,
+  warehouseFairClaimDue,
+  withWarehouseReportClaim,
   warehouseControlFingerprint,
+  warehouseReportCheckpoint,
   warehouseReportMetadata,
   withinWarehouseReport,
 } from './warehouse-report-snapshot';
 import { computeWarehouseRetention, type RetentionSnapshot } from './warehouse-retention-result';
 import { withRoundMetrics } from './warehouse-round-metrics';
+import {
+  adaptPreviousRetention,
+  adaptPreviousSnapshot,
+  currentSnapshotFormat,
+  readableSnapshotFormats,
+} from './warehouse-snapshot-compatibility';
 
 // Change when persisted results can no longer be read with the current report semantics.
-const formatVersion = 3;
+const formatVersion = currentSnapshotFormat;
 const intervalMs = 30 * 60 * 1000;
 const minimumPresetRefreshGap = '5 seconds';
 const presetIntervals = {
@@ -88,23 +111,40 @@ const discoveryIntervalMs = 30000;
 const discoveryBatch = 48;
 const claimsBetweenBackfills = 4;
 const controlScanIntervalMs = 10000;
+const presetPriorityWindowMs = 2 * 60 * 1000;
+const presetFailureRetryMs = 5 * 60 * 1000;
 const withoutTablePages = "coalesce(parameters->'tablePages','{}'::jsonb)='{}'::jsonb";
 let nextDiscoveryAt = 0;
 let scheduledCatalog: string | undefined;
 let nextControlScanAt = 0;
 let lastScannedSite: string | null = null;
+// Alternate pressure slots between overdue Today overviews and the normal
+// aged queue. Both groups retain persisted eligibility order across sites.
+let favorToday = true;
 let lastBackfillSnapshot: string | null = null;
 type Access = Awaited<ReturnType<typeof authorize>>;
 type Snapshot = {
+  format_version: number;
   id: string;
   website_id: string;
   query_key: string;
   preset: boolean;
   catalog_version: string;
-  parameters: ReportQuery & { nativeRetention?: Record<string, unknown> };
+  parameters: ReportQuery & {
+    nativeRetention?: Record<string, unknown>;
+    siteSummary?: 'day' | 'range';
+  };
   control_version: string;
   publication: string | null;
-  result: WarehouseOverviewResult | RetentionSnapshot | null;
+  result:
+    | WarehouseOverviewResult
+    | RetentionSnapshot
+    | {
+        kind: 'site-summary';
+        row: Omit<WebsiteSummary[number], 'received' | 'lastAt'>;
+        dataThrough: number;
+      }
+    | null;
   generated_at: Date | null;
   generated_version?: string | null;
   queued_at: Date;
@@ -113,7 +153,7 @@ type Snapshot = {
   lease_until: Date | null;
   error_code: string | null;
 };
-type OverviewClaim = { row: Snapshot; token: string };
+type OverviewClaim = { row: Snapshot & { saved_through: number | null }; token: string };
 function overviewKey(p: ReportQuery, catalogVersion: string) {
   return createHash('sha256')
     .update(JSON.stringify([formatVersion, catalogVersion, p]))
@@ -125,7 +165,7 @@ function presetRefreshPhase(websiteId: string) {
   return createHash('sha256').update(websiteId).digest().readUInt32BE() % presetIntervals.today;
 }
 
-function presetParameters(timezone: string, now: number) {
+function presetParameters(timezone: string, now: number, includeOnDemandRetention = false) {
   const ranges = scheduledReportResources
     .flatMap(resource =>
       dashboardWarmRanges(timezone, now).map((range, i) => {
@@ -144,7 +184,7 @@ function presetParameters(timezone: string, now: number) {
       }),
     )
     .flatMap(parameters =>
-      parameters.resource === 'human/overview'
+      includeOnDemandRetention && parameters.resource === 'human/overview'
         ? [parameters, { ...parameters, nativeRetention: {} }]
         : [parameters],
     );
@@ -163,7 +203,28 @@ function presetParameters(timezone: string, now: number) {
   return [...ranges, { ...monthly.data, nativeRetention: {} }];
 }
 
+type SummaryRange = { startAt: number; endAt: number; timezone: string };
+function summaryParameters({ startAt, endAt, timezone }: SummaryRange): Snapshot['parameters'] {
+  const day = calendarDayRange(startAt, timezone);
+  const parsed = parseReportQuery({
+    resource: 'human/overview',
+    chartPeriod: 'today',
+    startAt,
+    endAt,
+    timezone,
+  });
+  if (!parsed.success) throw new LiekanError('统计参数无效');
+  return {
+    ...parsed.data,
+    siteSummary: day.startAt === startAt && day.endAt === endAt ? 'day' : 'range',
+  };
+}
+function dailySummary(timezone: string, now: number) {
+  return summaryParameters({ timezone, ...calendarDayRange(now, timezone) });
+}
+
 function isCurrentPreset(p: ReportQuery, catalog: string, key: string, now = Date.now()) {
+  if ('siteSummary' in p) return overviewKey(dailySummary(p.timezone, now), catalog) === key;
   return presetParameters(p.timezone, now).some(params => overviewKey(params, catalog) === key);
 }
 
@@ -192,7 +253,7 @@ async function scheduleOverviewPresets(now: number) {
   const presets = [...new Set([ACCOUNT_DEFAULT_TIMEZONE, ...zones.map(zone => zone.timezone)])]
     .filter(validateTimezone)
     .flatMap(timezone =>
-      presetParameters(timezone, now).map(parameters => ({
+      [...presetParameters(timezone, now), dailySummary(timezone, now)].map(parameters => ({
         timezone,
         query_key: overviewKey(parameters, version),
         parameters,
@@ -219,6 +280,22 @@ async function scheduleOverviewPresets(now: number) {
      RETURNING id`,
     [ACCOUNT_DEFAULT_TIMEZONE, JSON.stringify(presets), version, formatVersion, discoveryBatch],
   );
+  // Older schedulers registered all three rolling retention ranges. The native
+  // calendar month also uses chartPeriod=today; distinguish it by its duration.
+  // Leave the result and lease available to readers and in-flight computations.
+  await db.read(
+    `UPDATE liekan_warehouse_overview_snapshot SET preset=false,
+       last_requested_at=CASE WHEN generated_at IS NULL AND lease_token IS NULL
+         THEN least(last_requested_at,now()-interval '1 day') ELSE last_requested_at END
+     WHERE preset AND id IN (
+      SELECT id FROM liekan_warehouse_overview_snapshot
+      WHERE preset AND parameters ? 'nativeRetention' AND format_version=$1
+        AND (parameters->>'chartPeriod' IN ('7d','30d') OR
+          (parameters->>'chartPeriod'='today' AND
+           (parameters->>'endAt')::bigint-(parameters->>'startAt')::bigint < 2*86400000))
+      ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED)`,
+    [formatVersion, discoveryBatch],
+  );
   scheduledCatalog = version;
   nextDiscoveryAt = scheduled.length < discoveryBatch ? now + discoveryIntervalMs : now;
   return version;
@@ -227,51 +304,114 @@ async function scheduleOverviewPresets(now: number) {
 async function readSnapshot(
   websiteId: string,
   selector: { queryKey: string } | { id: string },
-  includeResult: boolean,
+  includeResult: boolean | 'today-card',
+  format = formatVersion,
 ) {
   const [row] = await warehouseReader().db.read<Snapshot>(
-    `SELECT id,website_id,parameters,preset,catalog_version,control_version,publication,generated_at,queued_at,started_at,
+    `SELECT id,website_id,parameters,preset,format_version,catalog_version,control_version,publication,generated_at,queued_at,started_at,
       extract(epoch FROM generated_at)::text AS generated_version,next_attempt_at,lease_until,error_code,
-      CASE WHEN $4 THEN result END AS result
+      CASE WHEN $4 THEN
+        ${
+          includeResult === 'today-card' && format === formatVersion
+            ? "jsonb_build_object('cards',result->'cards','meta',jsonb_build_object('snapshot',result->'meta'->'snapshot'))"
+            : 'result'
+        }
+      END AS result
       FROM liekan_warehouse_overview_snapshot WHERE website_id=$1 AND
       ${'id' in selector ? 'id=$2' : 'query_key=$2'} AND format_version=$3`,
-    [websiteId, 'id' in selector ? selector.id : selector.queryKey, formatVersion, includeResult],
+    [websiteId, 'id' in selector ? selector.id : selector.queryKey, format, !!includeResult],
   );
+  if (row?.result && row.format_version !== formatVersion) {
+    const adapted = row.parameters.nativeRetention
+      ? adaptPreviousRetention(row.format_version, row.result)
+      : adaptPreviousSnapshot(row.format_version, row.result, row.parameters, row.website_id);
+    if (!adapted) return;
+    row.result = adapted;
+  }
   return row;
 }
 
-/** Date changes may reuse the last published report, but never another site's,
- * resource's, filter's, timezone's or control version's result. */
-async function readLastPublished(
+// SQL jsonb numbers compare numerically. A missing or malformed cutoff must
+// never outrank a verified timestamp, even in an archived format.
+function cutoffSql(result: string) {
+  const value = `coalesce(${result}#>'{meta,snapshot,dataThrough}',${result}->'dataThrough')`;
+  return `(CASE WHEN jsonb_typeof(${value})='number' THEN ${value} END)`;
+}
+
+function dataThrough(row: Snapshot) {
+  const result = row.result;
+  if (!result) return;
+  return 'kind' in result ? result.dataThrough : result.meta?.snapshot?.dataThrough;
+}
+
+/** Prefer the exact requested range. During an upgrade, a compatible result
+ * for that range stays visible until its replacement covers at least as much. */
+async function readPublished(
   site: string,
   parameters: Snapshot['parameters'],
   catalog: string,
   control: Awaited<ReturnType<typeof readOverviewControl>>,
+  options: { current?: Snapshot; exact?: boolean; todayCard?: boolean } = {},
 ) {
-  // The native retention response is an array and cannot describe an alternate
-  // range. Keep that protocol strict until its consumer supports range metadata.
-  if (parameters.nativeRetention) return;
-  const [candidate] = await warehouseReader().db.read<{ id: string }>(
-    `SELECT id FROM liekan_warehouse_overview_snapshot
-     WHERE website_id=$1 AND format_version=$2 AND catalog_version=$3
-       AND control_version=$4 AND publication<=$5 AND generated_at IS NOT NULL AND result IS NOT NULL
-       AND ${withoutTablePages}
-       AND parameters - ARRAY['startAt','endAt','chartPeriod','tablePages']::text[] =
-         $6::jsonb - ARRAY['startAt','endAt','chartPeriod','tablePages']::text[]
-     ORDER BY (parameters->>'chartPeriod'=$7) DESC, generated_at DESC, id DESC LIMIT 1`,
-    [
-      site,
-      formatVersion,
-      catalog,
-      control.version,
-      control.publication,
-      JSON.stringify(parameters),
-      parameters.chartPeriod,
-    ],
-  );
-  if (!candidate) return;
-  const row = await readSnapshot(site, candidate, true);
-  return row && hasCurrentResult(row, control) ? row : undefined;
+  const { exact, todayCard } = options;
+  const current =
+    options.current && Number.isFinite(dataThrough(options.current)) ? options.current : undefined;
+  const cutoff = current && dataThrough(current);
+  const sameRange = "parameters - 'tablePages' = $6::jsonb - 'tablePages'";
+  const sameFilters = `parameters - ARRAY['startAt','endAt','chartPeriod','tablePages']::text[] =
+    $6::jsonb - ARRAY['startAt','endAt','chartPeriod','tablePages']::text[]`;
+  const todayOnly = `AND parameters->>'chartPeriod'='today'
+    AND (parameters->>'startAt')::bigint<=($6::jsonb->>'startAt')::bigint`;
+  // Read metadata in small batches. An unreadable archived format entry must
+  // not hide an older valid publication. Only load bodies until one validates.
+  const rejected: string[] = [];
+  for (;;) {
+    const candidates = await warehouseReader().db.read<{ id: string; format_version: number }>(
+      `SELECT id,format_version FROM liekan_warehouse_overview_snapshot
+       WHERE website_id=$1 AND format_version=ANY($2::integer[]) AND catalog_version=$3
+         AND control_version=$4 AND publication<=$5 AND generated_at IS NOT NULL AND result IS NOT NULL
+         AND NOT (id=ANY($7::uuid[])) AND ${withoutTablePages}
+         AND ${current || exact || parameters.nativeRetention ? sameRange : sameFilters}
+         ${todayCard ? todayOnly : ''}
+         ${parameters.siteSummary === 'day' ? "AND (parameters->>'startAt')::bigint<=($6::jsonb->>'startAt')::bigint" : ''}
+         ${current ? `AND ${cutoffSql('result')} > to_jsonb($8::double precision)` : ''}
+       ORDER BY (${sameRange}) DESC,
+         (parameters->>'chartPeriod'=$6::jsonb->>'chartPeriod') DESC,
+         ${cutoffSql('result')} DESC NULLS LAST,format_version DESC,generated_at DESC,id DESC LIMIT 8`,
+      [
+        site,
+        current
+          ? readableSnapshotFormats.filter(format => format !== formatVersion)
+          : readableSnapshotFormats,
+        catalog,
+        control.version,
+        control.publication,
+        JSON.stringify(parameters),
+        rejected,
+        ...(current ? [cutoff] : []),
+      ],
+    );
+    for (const candidate of candidates) {
+      rejected.push(candidate.id);
+      const row = await readSnapshot(
+        site,
+        candidate,
+        todayCard ? 'today-card' : true,
+        candidate.format_version,
+      );
+      if (!row || !hasCurrentResult(row, control)) continue;
+      const through = dataThrough(row);
+      if (!Number.isFinite(through) || (current && through <= cutoff)) continue;
+      if (todayCard) {
+        // A calendar day's published data outlives its scheduling registration.
+        // An arbitrary custom interval can also carry chartPeriod=today.
+        const day = calendarDayRange(through, parameters.timezone);
+        if (day.startAt !== row.parameters.startAt || day.endAt !== row.parameters.endAt) continue;
+      }
+      return row;
+    }
+    if (candidates.length < 8) return current;
+  }
 }
 
 async function readOverviewControl(websiteId: string) {
@@ -404,48 +544,37 @@ function presented(row: Snapshot, access: Access, updating: boolean, requested?:
 /** Today's content-request card is site-wide (getLogToday has no report filters).
  * Keep a single authority in the canonical Today preset, independently of the
  * selected range. Only project this small published part; never aggregate on HTTP. */
-async function attachTodayRequests(value: LiekanPageReport, row: Snapshot) {
+async function attachTodayRequests(
+  value: LiekanPageReport,
+  row: Snapshot,
+  control: Awaited<ReturnType<typeof readOverviewControl>>,
+) {
   if (row.parameters.resource !== 'overview') return;
   const canonical = presetParameters(row.parameters.timezone, Date.now()).find(
     p => p.resource === 'overview' && p.chartPeriod === 'today',
   );
-  const [source] = await warehouseReader().db.read<Snapshot>(
-    `SELECT id,website_id,parameters,preset,catalog_version,control_version,publication,
-       generated_at,next_attempt_at,lease_until,error_code,queued_at,
-       jsonb_build_object('cards',result->'cards','meta',jsonb_build_object('snapshot',result->'meta'->'snapshot')) AS result
-     FROM liekan_warehouse_overview_snapshot
-     WHERE website_id=$1 AND format_version=$2 AND catalog_version=$3 AND control_version=$4
-       AND preset AND generated_at IS NOT NULL AND publication IS NOT NULL AND result IS NOT NULL
-       AND parameters - ARRAY['startAt','endAt']::text[] = $5::jsonb - ARRAY['startAt','endAt']::text[]
-       AND (parameters->>'startAt')::bigint<=$6
-     ORDER BY (parameters->>'startAt')::bigint DESC,generated_at DESC,id DESC LIMIT 1`,
-    [
-      row.website_id,
-      formatVersion,
-      row.catalog_version,
-      row.control_version,
-      JSON.stringify(canonical),
-      Date.now(),
-    ],
+  const pending = await readSnapshot(
+    row.website_id,
+    { queryKey: overviewKey(canonical, row.catalog_version) },
+    'today-card',
   );
+  const source = await readPublished(row.website_id, canonical, row.catalog_version, control, {
+    current: pending?.preset && hasCurrentResult(pending, control) ? pending : undefined,
+    todayCard: true,
+  });
   const saved = source?.result as WarehouseOverviewResult | undefined;
-  const card = saved?.cards.find(card => card.label === '今日总请求');
+  const card = Array.isArray(saved?.cards)
+    ? saved.cards.find(card => card.label === '今日总请求')
+    : undefined;
   const dataThrough = saved?.meta.snapshot?.dataThrough;
   const usable = card && Number.isFinite(dataThrough);
-  const pending =
-    !source || source.parameters.startAt !== canonical.startAt
-      ? await readSnapshot(
-          row.website_id,
-          { queryKey: overviewKey(canonical, row.catalog_version) },
-          false,
-        )
-      : source;
   const updateError = !!(pending?.control_version === row.control_version && pending.error_code);
   const today = calendarDayRange(Date.now(), row.parameters.timezone);
   const range = usable ? calendarDayRange(dataThrough, row.parameters.timezone) : today;
   const outdated =
     usable &&
-    (range.startAt !== today.startAt ||
+    (source.format_version !== formatVersion ||
+      range.startAt !== today.startAt ||
       !!activeLease(source) ||
       source.queued_at > source.generated_at ||
       snapshotExpiry(source) <= Date.now() ||
@@ -481,9 +610,27 @@ async function attachTodayRequests(value: LiekanPageReport, row: Snapshot) {
   return usable ? source : undefined;
 }
 
+async function checkPinnedVersion(
+  row: Snapshot,
+  control: Awaited<ReturnType<typeof readOverviewControl>>,
+  expectedVersion: string,
+  requested?: ReportQuery,
+) {
+  // An exact result or another format can take over while the old row still exists.
+  const winner = await readPublished(
+    row.website_id,
+    requested ?? row.parameters,
+    row.catalog_version,
+    control,
+    { exact: !requested },
+  );
+  if (!winner || overviewVersion(winner) !== expectedVersion) throw invalidOverviewVersion();
+}
+
 async function ready(
   row: Snapshot,
   access: Access,
+  control: Awaited<ReturnType<typeof readOverviewControl>>,
   tablePages: ReportQuery['tablePages'] = {},
   signal?: AbortSignal,
   expectedVersion?: string,
@@ -493,15 +640,7 @@ async function ready(
   if ('kind' in row.result && row.result.kind === 'retention') {
     const control = await readOverviewControl(row.website_id);
     if (!hasCurrentResult(row, control)) throw invalidOverviewVersion();
-    if (expectedVersion) {
-      const latest = await readSnapshot(row.website_id, { id: row.id }, false);
-      if (
-        !latest ||
-        !hasCurrentResult(latest, control) ||
-        overviewVersion(latest) !== expectedVersion
-      )
-        throw invalidOverviewVersion();
-    }
+    if (expectedVersion) await checkPinnedVersion(row, control, expectedVersion, fallbackRequest);
     noteBrowserPopulation(row.website_id, row.result.population);
     return Response.json(row.result.rows, {
       headers: {
@@ -511,7 +650,9 @@ async function ready(
         'X-Liekan-Report-Version': overviewVersion(row),
         'X-Liekan-Generated-At': String(+row.generated_at),
         'X-Liekan-Report-State':
-          activeLease(row) || snapshotExpiry(row) <= Date.now() ? 'updating' : 'ready',
+          fallbackRequest || activeLease(row) || snapshotExpiry(row) <= Date.now()
+            ? 'updating'
+            : 'ready',
       },
     });
   }
@@ -531,44 +672,63 @@ async function ready(
     ([table, page]) => value.meta.tablePages?.[table] && value.meta.tablePages[table].page !== page,
   );
   if (requested.length) {
-    if (!result.rankings) throw invalidOverviewVersion();
-    await withinWarehouseReport(
-      async () => {
-        if (!hasCurrentResult(row, await readOverviewControl(row.website_id)))
+    if (!result.rankings) {
+      for (const [table, page] of requested) {
+        const current = value.meta.tablePages[table],
+          inline = result.overviewRanking;
+        const begin = (page - 2) * current.pageSize;
+        const end = Math.min((page - 1) * current.pageSize, current.total - current.pageSize);
+        if (
+          row.format_version !== 2 ||
+          !inline ||
+          inline.table !== table ||
+          page < 2 ||
+          page > 3 ||
+          inline.rows.length < end
+        )
           throw invalidOverviewVersion();
-        for (const [table, page] of requested) {
-          const current = value.meta.tablePages[table];
-          if (!rankingPageReady(result.rankings, table, page, current.pageSize, current.total)) {
-            rankingPending = true;
-            continue;
+        value.tables = { ...value.tables, [table]: inline.rows.slice(begin, end) };
+        value.meta.tablePages = { ...value.meta.tablePages, [table]: { ...current, page } };
+      }
+    } else {
+      await withinWarehouseReport(
+        async () => {
+          if (!hasCurrentResult(row, await readOverviewControl(row.website_id)))
+            throw invalidOverviewVersion();
+          for (const [table, page] of requested) {
+            const current = value.meta.tablePages[table];
+            if (!rankingPageReady(result.rankings, table, page, current.pageSize, current.total)) {
+              rankingPending = true;
+              continue;
+            }
+            const slice = await readReportRanking(
+              row.website_id,
+              row.id,
+              result.rankings,
+              table,
+              page,
+              current.pageSize,
+              current.total,
+            );
+            value.tables = { ...value.tables, [table]: slice.rows };
+            value.meta.tablePages = { ...value.meta.tablePages, [table]: { ...current, page } };
+            if (value.meta.geography?.tables?.[table])
+              value.meta.geography = {
+                ...value.meta.geography,
+                tables: { ...value.meta.geography.tables, [table]: slice.geography },
+              };
           }
-          const slice = await readReportRanking(
-            row.website_id,
-            row.id,
-            result.rankings,
-            table,
-            page,
-            current.pageSize,
-            current.total,
-          );
-          value.tables = { ...value.tables, [table]: slice.rows };
-          value.meta.tablePages = { ...value.meta.tablePages, [table]: { ...current, page } };
-          if (value.meta.geography?.tables?.[table])
-            value.meta.geography = {
-              ...value.meta.geography,
-              tables: { ...value.meta.geography.tables, [table]: slice.geography },
-            };
-        }
-      },
-      {
-        publication: { websiteId: row.website_id, publication: row.publication },
-        signal,
-        deadline: Date.now() + 5000,
-      },
-    );
+        },
+        {
+          publication: { websiteId: row.website_id, publication: row.publication },
+          signal,
+          deadline: Date.now() + 5000,
+        },
+      );
+    }
     rankingSource = 'snapshot';
   }
-  const todaySource = await attachTodayRequests(value, row);
+  const todaySource = await attachTodayRequests(value, row, control);
   // Revalidate after reading the artifact. No page can silently switch to a
   // freshly published ranking while preserving cards from an older version.
   const currentControl = await readOverviewControl(row.website_id);
@@ -577,15 +737,8 @@ async function ready(
     (todaySource && !hasCurrentResult(todaySource, currentControl))
   )
     throw invalidOverviewVersion();
-  if (expectedVersion) {
-    const latest = await readSnapshot(row.website_id, { id: row.id }, false);
-    if (
-      !latest ||
-      !hasCurrentResult(latest, currentControl) ||
-      overviewVersion(latest) !== expectedVersion
-    )
-      throw invalidOverviewVersion();
-  }
+  if (expectedVersion)
+    await checkPinnedVersion(row, currentControl, expectedVersion, fallbackRequest);
   for (const population of [value.meta.population, value.meta.trendPopulation])
     if (population) noteBrowserPopulation(access.website.id, population);
   if (rankingPending) return accepted(row);
@@ -685,28 +838,31 @@ export async function requestWarehouseOverview(
   const existing = await readSnapshot(site, { queryKey }, true);
   // Read the authoritative control version after loading the candidate response.
   const control = await readOverviewControl(site);
-  const previous = existing && hasCurrentResult(existing, control) ? existing : undefined;
-  const fallback = previous
-    ? undefined
-    : await readLastPublished(site, parameters, catalogVersion, control);
-  const lastPublished = (errorCode?: string) =>
+  const previous =
+    existing && hasCurrentResult(existing, control) && Number.isFinite(dataThrough(existing))
+      ? existing
+      : undefined;
+  const selected = await readPublished(site, parameters, catalogVersion, control, {
+    current: previous,
+  });
+  const respond = (updates?: Partial<Pick<Snapshot, 'error_code' | 'queued_at'>>) =>
     ready(
       {
-        ...fallback,
+        ...selected,
         error_code:
-          errorCode ??
           (existing?.control_version === control.version ? existing.error_code : null) ??
-          fallback.error_code,
+          selected.error_code,
+        ...updates,
       },
       access,
+      control,
       tablePages,
       signal,
       expectedVersion,
-      parameters,
+      selected === previous ? undefined : parameters,
     );
   if (expectedVersion) {
-    if (previous) return ready(previous, access, tablePages, signal, expectedVersion);
-    if (fallback) return lastPublished();
+    if (selected) return respond();
     throw invalidOverviewVersion();
   }
   if (
@@ -719,10 +875,9 @@ export async function requestWarehouseOverview(
         )
       ).length > 0)
   ) {
-    if (previous) return ready(previous, access, tablePages, signal);
-    if (fallback) return lastPublished();
+    if (selected) return respond();
     if (existing?.error_code && existing.control_version === control.version)
-      throw new LiekanError('后台统计计算失败，请稍后重试', 503, existing.error_code);
+      throw new LiekanError('后台统计计算失败，请稍后重试', 503, warehouseReportNoValidSnapshot);
     if ((await loadPublishedRegistry()).version !== catalogVersion)
       throw new LiekanError('统计任务已过期，请重新读取', 410, 'analysis-expired');
     return Response.json(
@@ -741,9 +896,34 @@ export async function requestWarehouseOverview(
        WHERE id=$1 AND last_requested_at < now()-interval '5 minutes'`,
       [previous.id],
     );
-    return ready(previous, access, tablePages, signal);
+    return respond();
   }
-  const pending = await db.transaction(async tx => {
+  const pending = await enqueueSnapshot(
+    site,
+    queryKey,
+    parameters,
+    catalogVersion,
+    control.version,
+    !!selected,
+  );
+  if (!pending) return respond({ error_code: 'analysis-concurrency-limited' });
+  // An old lease retains the global worker slot until its work settles, even after invalidation.
+  if (pending.error_code && !selected)
+    throw new LiekanError('后台统计计算失败，请稍后重试', 503, warehouseReportNoValidSnapshot);
+  if (selected)
+    return respond(previous === selected ? { queued_at: pending.queued_at } : undefined);
+  return accepted(pending);
+}
+
+async function enqueueSnapshot(
+  site: string,
+  queryKey: string,
+  parameters: Snapshot['parameters'],
+  catalogVersion: string,
+  version: string,
+  hasFallback: boolean,
+) {
+  return warehouseReader().db.transaction(async tx => {
     // A short, separate lock serializes admission across app replicas while the
     // worker holds its computation lock. Existing work can be joined at capacity.
     await tx.query('SELECT pg_advisory_xact_lock(12800001, 94)');
@@ -762,12 +942,12 @@ export async function requestWarehouseOverview(
       !count.alreadyQueued &&
       (count.site >= analysisQueryLimits.site || count.total >= analysisQueryLimits.global)
     ) {
-      if (previous || fallback) return null;
+      if (hasFallback) return null;
       throw new AnalyticsUnavailable(
         '后台统计任务已达上限，请等待当前任务完成',
         5,
         429,
-        'analysis-concurrency-limited',
+        warehouseReportNoValidSnapshot,
       );
     }
     const { rows } = await tx.query<Snapshot>(
@@ -790,36 +970,124 @@ export async function requestWarehouseOverview(
         publication=CASE WHEN snapshot.control_version=excluded.control_version THEN snapshot.publication END,
         started_at=CASE WHEN snapshot.control_version=excluded.control_version THEN snapshot.started_at END
       RETURNING id,website_id,queued_at,started_at,generated_at,lease_until,error_code`,
-      [
-        randomUUID(),
-        site,
-        queryKey,
-        parameters,
-        catalogVersion,
-        formatVersion,
-        false,
-        control.version,
-      ],
+      [randomUUID(), site, queryKey, parameters, catalogVersion, formatVersion, false, version],
     );
     return rows[0];
   });
-  if (!pending) {
-    if (previous)
-      return ready(
-        { ...previous, error_code: 'analysis-concurrency-limited' },
-        access,
-        tablePages,
-        signal,
-      );
-    return lastPublished('analysis-concurrency-limited');
+}
+
+export async function readPublishedWebsiteSummaries(sites: string[], range: SummaryRange) {
+  if (!sites.length) return [];
+  const catalog = getPublishedCatalog()?.version;
+  if (!catalog) throw new LiekanError('统计目录暂不可用', 503);
+  const controls = async () => {
+    const [metadata, settings] = await Promise.all([
+      readReportingMetadataForSites(warehouseReader().db, sites),
+      readOverviewSettings(sites),
+    ]);
+    return new Map(
+      metadata.map(m => [
+        m.boundary.websiteId,
+        overviewControl(m, settings.get(m.boundary.websiteId)),
+      ]),
+    );
+  };
+  const initial = await controls();
+  const rows: WebsiteSummary = [];
+  for (const site of sites) {
+    const control = initial.get(site);
+    if (!control) throw new LiekanError('网站不存在', 404);
+    rows.push(await readSiteSummary(site, range, catalog, control));
   }
-  // An old lease retains the global worker slot until its work settles, even after invalidation.
-  if (pending.error_code && !previous && !fallback)
-    throw new LiekanError('后台统计计算失败，请稍后重试', 503, pending.error_code);
-  if (previous)
-    return ready({ ...previous, queued_at: pending.queued_at }, access, tablePages, signal);
-  if (fallback) return lastPublished();
-  return accepted(pending);
+  // Revalidate all sites together, including the first row of a multi-site read.
+  const current = await controls();
+  for (const [site, control] of initial) {
+    const fresh = current.get(site);
+    if (
+      fresh?.version !== control.version ||
+      BigInt(fresh.publication) < BigInt(control.publication)
+    )
+      throw new AnalyticsRestart();
+  }
+  return rows;
+}
+
+async function readSiteSummary(
+  site: string,
+  range: SummaryRange,
+  catalog: string,
+  control: ReturnType<typeof overviewControl>,
+): Promise<WebsiteSummary[number]> {
+  const parameters = summaryParameters(range);
+  const key = overviewKey(parameters, catalog);
+  const row = await traceSummarySnapshot(() => readSnapshot(site, { queryKey: key }, true));
+  const selected =
+    row?.result && hasCurrentResult(row, control)
+      ? row
+      : await traceSummarySnapshot(() =>
+          readPublished(site, parameters, catalog, control, {
+            exact: parameters.siteSummary !== 'day',
+          }),
+        );
+  const now = Date.now();
+  const recurrent =
+    isCurrentPreset(parameters, catalog, key, now) &&
+    (range.timezone === ACCOUNT_DEFAULT_TIMEZONE ||
+      (
+        await warehouseReader().db.read(
+          `SELECT 1 FROM website w WHERE website_id=$2 AND ${presetTimezoneForSite('$3')}`,
+          [ACCOUNT_DEFAULT_TIMEZONE, site, range.timezone],
+        )
+      ).length > 0);
+  const stale = !row || !hasCurrentResult(row, control) || snapshotExpiry(row) <= now;
+  let failure = row?.control_version === control.version ? row.error_code : null;
+  if (stale && !recurrent) {
+    const queued = await enqueueSnapshot(
+      site,
+      key,
+      parameters,
+      catalog,
+      control.version,
+      !!selected,
+    );
+    failure = queued?.error_code;
+  }
+  const presence = await readBrowserPresence(site);
+  if (selected?.result && 'kind' in selected.result && selected.result.kind === 'site-summary') {
+    return {
+      ...selected.result.row,
+      received: presence?.received ?? false,
+      lastAt: presence?.lastAt ?? null,
+      collectionKnown: presence?.known ?? false,
+      snapshot: {
+        state:
+          selected.id !== row?.id || stale || activeLease(row) || !!failure ? 'updating' : 'ready',
+        startAt: selected.parameters.startAt,
+        endAt: selected.parameters.endAt,
+        dataThrough: selected.result.dataThrough,
+      },
+    };
+  }
+  if (failure)
+    throw new LiekanError('后台统计计算失败，请稍后重试', 503, warehouseReportNoValidSnapshot);
+  const empty = {
+    pageviews: null,
+    visitors: null,
+    visits: null,
+    bounces: null,
+    totaltime: null,
+    aiVisits: null,
+  };
+  return {
+    id: site,
+    ...empty,
+    comparison: empty,
+    views: null,
+    received: presence?.received ?? false,
+    lastAt: presence?.lastAt ?? null,
+    collectionKnown: presence?.known ?? false,
+    snapshot: { state: 'preparing', startAt: range.startAt, endAt: range.endAt, dataThrough: null },
+  };
 }
 
 export async function readWarehouseOverviewJob(
@@ -835,6 +1103,7 @@ export async function readWarehouseOverviewJob(
   const row = await readSnapshot(access.website.id, { id }, result);
   if (
     !row ||
+    row.parameters.siteSummary ||
     row.catalog_version !== getPublishedCatalog()?.version ||
     Object.keys(row.parameters.tablePages ?? {}).length
   ) {
@@ -854,8 +1123,14 @@ export async function readWarehouseOverviewJob(
           ? 'failed'
           : 'queued';
   if (!result) return Response.json({ analysisJob: job(row, status) });
-  if (expectedVersion && !hasCurrentResult(row, control)) throw invalidOverviewVersion();
-  if (status === 'ready' || expectedVersion) {
+  const selected =
+    sameControl &&
+    (await readPublished(row.website_id, row.parameters, row.catalog_version, control, {
+      current: readable ? row : undefined,
+      exact: true,
+    }));
+  if (expectedVersion && !selected) throw invalidOverviewVersion();
+  if (selected) {
     const input = parseReportQuery({
       ...row.parameters,
       ...Object.fromEntries(
@@ -863,94 +1138,70 @@ export async function readWarehouseOverviewJob(
       ),
     });
     if (!input.success) throw new LiekanError('统计参数无效');
-    return ready(row, access, input.data.tablePages, signal, expectedVersion);
+    return ready(
+      selected,
+      access,
+      control,
+      input.data.tablePages,
+      signal,
+      expectedVersion,
+      selected === row ? undefined : row.parameters,
+    );
   }
   if (status === 'queued' || status === 'running') return accepted(row);
   throw new LiekanError(
     '统计结果暂不可读取，请重新查询',
     status === 'failed' ? 503 : 410,
-    row.error_code ?? 'analysis-invalidated',
+    status === 'failed' ? warehouseReportNoValidSnapshot : 'analysis-invalidated',
   );
 }
 
 export async function pumpWarehouseOverview(signal?: AbortSignal) {
-  return Boolean(await pumpOverviewBatch(1, 1, signal));
+  if (signal?.aborted || (await warehouseBackgroundClaimAfter(true))) return false;
+  return pumpOverviewTask(signal);
 }
 
 export async function drainWarehouseOverview(signal: AbortSignal) {
   if (signal.aborted) return;
-  const lanes = Math.min(2, warehouseReader().admission.concurrency);
   let nextBackfill = claimsBetweenBackfills;
   for (let processed = 0; processed < discoveryBatch && !signal.aborted; ) {
-    const count = await pumpOverviewBatch(
-      Math.min(nextBackfill - processed, discoveryBatch - processed),
-      lanes,
-      signal,
-    );
-    processed += count;
-    if (!count || processed === nextBackfill) {
-      await pumpOverviewLogBackfill(signal);
+    const claimAfter = await warehouseBackgroundClaimAfter(true);
+    if (claimAfter) {
+      // Check for an idle ingestion queue during a long debt. No report lease
+      // or advisory lock is held while waiting for the next claim.
+      const started = performance.now();
+      try {
+        await delay(Math.min(1000, Math.max(1, claimAfter - Date.now())), undefined, { signal });
+      } finally {
+        noteBackgroundInterval('claim-yield', performance.now() - started);
+      }
+      continue;
+    }
+    const completed = await pumpOverviewTask(signal);
+    if (completed) processed++;
+    if (!completed || processed === nextBackfill) {
+      if (!(await warehouseBackgroundClaimAfter())) await pumpOverviewLogBackfill(signal);
       nextBackfill += claimsBetweenBackfills;
     }
-    if (!count) break;
+    if (!completed) break;
   }
 }
 
-async function pumpOverviewBatch(limit: number, lanes: number, signal?: AbortSignal) {
-  if (signal?.aborted) return 0;
-  // Older workers and the backfill use the same key. Release it only after
-  // every claimed computation has settled, even if its recovery lease expires.
-  return warehouseReader().db.withAdvisoryLock(12800001, 92, lockSignal =>
-    runOverviewBatch(limit, lanes, signal ? AbortSignal.any([signal, lockSignal]) : lockSignal),
+async function pumpOverviewTask(signal?: AbortSignal) {
+  if (signal?.aborted) return false;
+  // This installation lock also fences another analytics worker and backfill.
+  return Boolean(
+    await warehouseReader().db.withAdvisoryLock(12800001, 92, async lockSignal => {
+      const workSignal = signal ? AbortSignal.any([signal, lockSignal]) : lockSignal;
+      const fairSlot = warehouseFairClaimDue();
+      const catalog = await prepareOverviewQueue(workSignal, fairSlot);
+      const claim = await claimOverview(catalog, workSignal, fairSlot && favorToday);
+      if (!claim) return false;
+      if (fairSlot) favorToday = !favorToday;
+      await withWarehouseReportClaim(() => computeOverviewClaim(claim, workSignal));
+      return true;
+    }),
   );
-}
-
-async function runOverviewBatch(limit: number, lanes: number, signal: AbortSignal) {
-  const catalog = await prepareOverviewQueue(signal);
-  const first = await claimOverview(catalog, signal, [], false);
-  if (!first) return 0;
-  if (lanes === 1 || !first.row.preset || first.row.generated_at) {
-    await computeOverviewClaim(first, signal);
-    return 1;
-  }
-
-  type Settlement = { token: string; failure?: { error: unknown } };
-  const running = new Map<string, { claim: OverviewClaim; settled: Promise<Settlement> }>();
-  const start = (claim: OverviewClaim) => {
-    const { token } = claim;
-    running.set(token, {
-      claim,
-      settled: computeOverviewClaim(claim, signal).then(
-        () => ({ token }),
-        error => ({ token, failure: { error } }),
-      ),
-    });
-  };
-  let claimed = 1;
-  start(first);
-  try {
-    while (running.size) {
-      if (!signal.aborted && claimed < limit && running.size < lanes) {
-        const next = await claimOverview(
-          catalog,
-          signal,
-          [...running.values()].map(entry => entry.claim),
-          true,
-        );
-        if (next) {
-          start(next);
-          claimed++;
-          continue;
-        }
-      }
-      const settled = await Promise.race([...running.values()].map(entry => entry.settled));
-      running.delete(settled.token);
-      if (settled.failure) throw settled.failure.error;
-    }
-  } finally {
-    await Promise.all([...running.values()].map(entry => entry.settled));
-  }
-  return claimed;
 }
 
 async function pumpOverviewLogBackfill(signal: AbortSignal) {
@@ -975,14 +1226,14 @@ async function pumpOverviewLogBackfill(signal: AbortSignal) {
       [ACCOUNT_DEFAULT_TIMEZONE, formatVersion, scheduledCatalog, lastBackfillSnapshot],
     );
     lastBackfillSnapshot = row?.id ?? null;
-    const cutoff = Date.now();
-    if (!row || !isCurrentPreset(row.parameters, row.catalog_version, row.query_key, cutoff))
+    const started = Date.now();
+    if (!row || !isCurrentPreset(row.parameters, row.catalog_version, row.query_key, started))
       return;
     try {
       await withinWarehouseReport(
         () =>
           withDashboardClock(
-            cutoff,
+            offlineReportCutoff(started),
             async () => {
               const { start, end, halfOpen } = reportLogRange(row.parameters);
               if (await warehouseLogWindowHasFacts(row.website_id, start, end, halfOpen))
@@ -996,7 +1247,7 @@ async function pumpOverviewLogBackfill(signal: AbortSignal) {
             },
             'refresh',
           ),
-        { signal: workSignal, deadline: cutoff + 40000, background: true },
+        { signal: workSignal, deadline: started + 40000, background: true },
       );
     } catch (error) {
       workSignal.throwIfAborted();
@@ -1009,20 +1260,28 @@ async function pumpOverviewLogBackfill(signal: AbortSignal) {
   });
 }
 
-async function prepareOverviewQueue(signal: AbortSignal) {
+async function prepareOverviewQueue(signal: AbortSignal, fairSlot: boolean) {
   signal.throwIfAborted();
   const db = warehouseReader().db;
   const catalog = await scheduleOverviewPresets(Date.now());
+  // Spend a pressure allowance only on reporting. In particular, artifact
+  // collection can lock the publishing site's PG row while waiting for CH.
+  if (fairSlot) return catalog;
   await db.read(`DELETE FROM liekan_warehouse_overview_snapshot WHERE id IN (
       SELECT id FROM liekan_warehouse_overview_snapshot
       WHERE last_requested_at<now()-interval '1 day'
         AND (NOT preset OR (parameters->>'endAt')::bigint < extract(epoch FROM now()-interval '1 day')*1000)
         AND (lease_until IS NULL OR lease_until<=now())
-        AND (result IS NULL OR generated_at IS NULL OR format_version<>${formatVersion} OR EXISTS (
+        AND (result IS NULL OR generated_at IS NULL OR format_version NOT IN (${readableSnapshotFormats.join(',')}) OR EXISTS (
           SELECT 1 FROM liekan_warehouse_overview_snapshot newer
           WHERE newer.website_id=liekan_warehouse_overview_snapshot.website_id
+            AND newer.control_version=liekan_warehouse_overview_snapshot.control_version
+            AND newer.catalog_version=liekan_warehouse_overview_snapshot.catalog_version
             AND newer.result IS NOT NULL AND newer.generated_at IS NOT NULL
             AND newer.format_version=${formatVersion} AND coalesce(newer.parameters->'tablePages','{}'::jsonb)='{}'::jsonb
+            AND ${cutoffSql('newer.result')} >= ${cutoffSql('liekan_warehouse_overview_snapshot.result')}
+            AND (newer.format_version=liekan_warehouse_overview_snapshot.format_version OR
+              newer.parameters - 'tablePages'=liekan_warehouse_overview_snapshot.parameters - 'tablePages')
             AND (newer.generated_at,newer.id) >
               (liekan_warehouse_overview_snapshot.generated_at,liekan_warehouse_overview_snapshot.id)
             AND newer.parameters - ARRAY['startAt','endAt','tablePages']::text[] =
@@ -1037,24 +1296,19 @@ async function prepareOverviewQueue(signal: AbortSignal) {
   return catalog;
 }
 
-async function claimOverview(
-  catalog: string,
-  signal: AbortSignal,
-  running: OverviewClaim[],
-  coldOnly: boolean,
-) {
+async function claimOverview(catalog: string, signal: AbortSignal, prioritizeToday: boolean) {
   signal.throwIfAborted();
   await reconcileOverviewControls(catalog, signal);
   signal.throwIfAborted();
   const db = warehouseReader().db;
   const token = randomUUID();
-  const longRunning = running.some(claim => claim.row.parameters.chartPeriod === '30d');
-  const [row] = await db.read<Snapshot>(
+  const [row] = await db.read<OverviewClaim['row']>(
     `WITH due AS (
         SELECT job.id FROM liekan_warehouse_overview_snapshot job
         JOIN liekan_warehouse_site s USING (website_id)
         JOIN website w USING (website_id)
         WHERE format_version=$2 AND next_attempt_at<=now() AND ${withoutTablePages}
+          AND (job.parameters->>'startAt')::bigint<$7
           AND s.state='active' AND w.deleted_at IS NULL
           AND (
             (preset AND catalog_version=$4 AND ${presetTimezoneForSite("job.parameters->>'timezone'")}
@@ -1062,33 +1316,34 @@ async function claimOverview(
             OR (NOT preset AND error_code IS NULL AND last_requested_at>=now()-interval '1 day'
               AND (generated_at IS NULL OR queued_at>generated_at))
           )
-          AND NOT (job.website_id=ANY($5::uuid[]))
           AND NOT EXISTS (
             SELECT 1 FROM liekan_warehouse_report_round round
             JOIN liekan_warehouse_reference ref ON ref.reference_id=round.reference_id
-            WHERE round.website_id=job.website_id AND round.control_version=job.control_version
+            WHERE round.website_id=job.website_id
+              AND (round.control_version=job.control_version OR job.control_version='')
               AND round.catalog_version=job.catalog_version AND round.format_version=job.format_version
-              AND ref.expires_at>clock_timestamp() AND cardinality(round.pending)>0
-              AND round.created_at>clock_timestamp()-interval '30 minutes'
-              AND job.id=ANY(round.members) AND NOT job.id=ANY(round.pending)
+              AND round.model_version=$6 AND round.epoch=s.epoch
+              AND round.deletion_revision=s.deletion_revision AND round.publication<=s.publication
+              AND ref.expires_at>clock_timestamp()
+              AND ${liveRoundProgress('round')}
+              AND EXISTS (SELECT 1 FROM liekan_warehouse_overview_snapshot member
+                WHERE member.id=ANY(round.pending))
+              AND (round.next_eligible_at>clock_timestamp() OR
+                (NOT job.id=ANY(round.pending) AND NOT ${canJoinReportRound}))
           )
-          AND NOT ($8::boolean AND job.preset AND job.generated_at IS NULL
-            AND job.parameters->>'resource'='overview' AND job.parameters->>'chartPeriod'='30d')
           AND NOT EXISTS (
-            SELECT 1 FROM liekan_warehouse_overview_snapshot active
-            WHERE active.lease_until>now() AND (
-              active.lease_token IS NULL OR NOT (active.lease_token=ANY($6::uuid[]))
-            )
+            SELECT 1 FROM liekan_warehouse_overview_snapshot active WHERE active.lease_until>now()
           )
-        ORDER BY CASE
-          WHEN preset AND generated_at IS NOT NULL AND queued_at>generated_at THEN 0
-          WHEN preset AND generated_at IS NULL THEN 1
-          WHEN preset THEN 2 ELSE 3 END,
+        ORDER BY CASE WHEN $8 AND preset AND error_code IS NULL AND job.parameters->>'resource'='overview'
+          AND job.parameters->>'chartPeriod'='today' THEN 0 ELSE 1 END, CASE
+          -- Age out of priority classes using persisted eligibility, including after restart.
+          WHEN next_attempt_at<=now()-$5::bigint*interval '1 millisecond' THEN 0
+          WHEN error_code IS NOT NULL THEN 4
+          WHEN NOT preset AND generated_at IS NULL THEN 1
+          WHEN preset AND generated_at IS NOT NULL AND queued_at>generated_at THEN 1
+          WHEN preset AND generated_at IS NULL THEN 2
+          WHEN preset THEN 3 ELSE 4 END,
           next_attempt_at,
-          CASE WHEN $9::boolean AND preset AND generated_at IS NULL
-            AND job.parameters->>'resource'='overview' AND job.parameters->>'chartPeriod'='30d' THEN 0 ELSE 1 END,
-          CASE WHEN $9::boolean AND preset AND generated_at IS NULL
-            AND job.parameters->>'resource'='overview' AND job.parameters->>'chartPeriod'='30d' THEN s.publication END DESC NULLS LAST,
           CASE WHEN preset THEN CASE job.parameters->>'chartPeriod'
             WHEN 'today' THEN 0 WHEN '7d' THEN 1 ELSE 2 END ELSE 0 END,
           job.website_id,
@@ -1097,18 +1352,21 @@ async function claimOverview(
       ) UPDATE liekan_warehouse_overview_snapshot snapshot
       SET started_at=now(),lease_token=$3,lease_until=now()+interval '3 minutes',error_code=NULL
       FROM due WHERE snapshot.id=due.id
-        AND (NOT $7::boolean OR (snapshot.preset AND snapshot.generated_at IS NULL))
-      RETURNING snapshot.*`,
+      RETURNING snapshot.id,snapshot.website_id,snapshot.query_key,snapshot.parameters,
+        snapshot.preset,snapshot.catalog_version,snapshot.format_version,snapshot.control_version,
+        snapshot.publication,snapshot.generated_at,snapshot.queued_at,snapshot.started_at,
+        snapshot.next_attempt_at,snapshot.lease_until,snapshot.error_code,
+        ${cutoffSql('snapshot.result')} AS saved_through,
+        CASE WHEN snapshot.result->'rankings'->'pending'='true'::jsonb THEN snapshot.result END AS result`,
     [
       ACCOUNT_DEFAULT_TIMEZONE,
       formatVersion,
       token,
       catalog,
-      running.map(claim => claim.row.website_id),
-      running.map(claim => claim.token),
-      coldOnly,
-      longRunning,
-      running.length > 0 && !longRunning,
+      presetPriorityWindowMs,
+      reportRoundVersion,
+      offlineReportCutoff(Date.now()),
+      prioritizeToday,
     ],
   );
   return row ? { row, token } : undefined;
@@ -1117,47 +1375,94 @@ async function claimOverview(
 async function computeOverviewClaim({ row, token }: OverviewClaim, signal: AbortSignal) {
   const db = warehouseReader().db;
   const requestStartedAt = Date.now();
-  let cutoff = requestStartedAt;
+  let cutoff = offlineReportCutoff(requestStartedAt);
   let round: ReportRound | undefined;
   const timings: ReportTimings = {};
   const started = performance.now();
   let outcome = 'discarded';
-  const cleanup = async (errorCode: string | null, retire = false, deferred = false) =>
-    db.read(
-      `UPDATE liekan_warehouse_overview_snapshot SET lease_token=NULL,lease_until=NULL,
+  let reason: string | undefined;
+  let committedAtMs: number | undefined;
+  let rankingPending: boolean | undefined;
+  const cleanup = async (
+    errorCode: string | null,
+    {
+      retire = false,
+      retryAt,
+      covered = false,
+    }: {
+      retire?: boolean;
+      retryAt?: number;
+      covered?: boolean;
+    } = {},
+  ) =>
+    db.transaction(async tx => {
+      const {
+        rows: [updated],
+      } = await tx.query<Pick<Snapshot, 'control_version'>>(
+        `UPDATE liekan_warehouse_overview_snapshot SET lease_token=NULL,lease_until=NULL,
         error_code=CASE WHEN control_version=$3 THEN $4 ELSE error_code END,
-        next_attempt_at=CASE WHEN $6 THEN now()+interval '5 seconds' WHEN control_version=$3 AND $4 IS NOT NULL
-          THEN now()+interval '1 minute' ELSE next_attempt_at END,
+        next_attempt_at=CASE WHEN $6 THEN greatest(now(),to_timestamp($7::double precision/1000)) WHEN control_version=$3 AND $4 IS NOT NULL
+          THEN now()+CASE WHEN preset THEN $8::bigint*interval '1 millisecond'
+            ELSE interval '1 minute' END ELSE next_attempt_at END,
         preset=CASE WHEN control_version=$3 AND $5 THEN false ELSE preset END
-        WHERE id=$1 AND lease_token=$2`,
-      [row.id, token, row.control_version, errorCode, retire, deferred],
-    );
+        WHERE id=$1 AND lease_token=$2 RETURNING control_version`,
+        [
+          row.id,
+          token,
+          row.control_version,
+          errorCode,
+          retire,
+          retryAt !== undefined,
+          retryAt ?? null,
+          presetFailureRetryMs,
+        ],
+      );
+      // An unsuccessful report retries in a later round. A deferred report keeps
+      // its current round and checkpoints for normal resource recovery.
+      if (updated?.control_version === row.control_version && round && (errorCode || covered))
+        await finishReportRound(round, row.id, tx);
+    });
   try {
-    const [site] = await db.read<{ id: string; name: string; domain: string }>(
-      'SELECT website_id AS id,name,domain FROM website WHERE website_id=$1 AND deleted_at IS NULL',
+    const [site] = await db.read<{ id: string; name: string; domain: string; createdAt: Date }>(
+      'SELECT website_id AS id,name,domain,created_at AS "createdAt" FROM website WHERE website_id=$1 AND deleted_at IS NULL',
       [row.website_id],
     );
     if (!site) {
-      await cleanup('analysis-invalidated', true);
+      await cleanup('analysis-invalidated', { retire: true });
       return true;
     }
     const scheduled =
-      row.preset && isCurrentPreset(row.parameters, row.catalog_version, row.query_key, cutoff);
+      row.preset &&
+      isCurrentPreset(row.parameters, row.catalog_version, row.query_key, requestStartedAt);
     if (row.preset && !scheduled && row.generated_at && row.queued_at <= row.generated_at) {
-      await cleanup(null, true);
+      await cleanup(null, { retire: true });
       return true;
     }
-    if (scheduled) {
+    {
       const metadata = await warehouseReportMetadata(site.id);
       const settings = await readOverviewSettings([site.id]);
+      const current = overviewControl(metadata, settings.get(site.id));
       round = await acquireReportRound(
         row,
         metadata,
-        overviewControl(metadata, settings.get(site.id)).version,
+        current.version,
         formatVersion,
         requestStartedAt,
       );
-      cutoff = +round.cutoff_at;
+      cutoff = offlineReportCutoff(+round.cutoff_at);
+      // The lease owns this row. A resumed older round or a clock adjustment
+      // must not replace a valid published result with an earlier cutoff.
+      if (
+        row.saved_through !== null &&
+        row.saved_through > cutoff &&
+        hasCurrentResult(row, current)
+      ) {
+        await cleanup(null, {
+          covered: true,
+          retryAt: Math.max(requestStartedAt + 5000, row.saved_through + offlineReportLagMs),
+        });
+        return true;
+      }
     }
     const savedRanking = row.result && 'rankings' in row.result ? row.result.rankings : undefined;
     const resumeRanking = !!(
@@ -1198,14 +1503,17 @@ async function computeOverviewClaim({ row, token }: OverviewClaim, signal: Abort
                   ),
                 );
                 const kinds = reportAnalysisKinds(row.parameters);
+                const store = round ? reportRoundBuild(round, { id: row.id, token }) : undefined;
                 const prepared = await timeReportQuery('analysis-prepare', () =>
                   prepareAnalysisModel(site.id, start, end, {
                     kinds,
+                    completeThrough: cutoff,
                     prepared: round?.prepared ?? undefined,
+                    buildStore: store,
                     onCheckpoint: round ? value => saveRoundPreparation(round, value) : undefined,
                   }),
                 );
-                if (round && prepared) await saveRoundPreparation(round, prepared);
+                await warehouseReportCheckpoint(store);
                 const captured = await withRoundMetrics(
                   round?.id,
                   () =>
@@ -1216,27 +1524,39 @@ async function computeOverviewClaim({ row, token }: OverviewClaim, signal: Abort
                         log: kinds.includes('log') ? prepared.log : [],
                       },
                       async () =>
-                        row.parameters.nativeRetention
-                          ? computeWarehouseRetention(
-                              site.id,
-                              row.parameters,
-                              row.parameters.nativeRetention,
-                              cutoff,
-                            )
-                          : captureReportRankings(
-                              site.id,
-                              row.id,
-                              () =>
-                                withDashboardClock(
-                                  cutoff,
-                                  () => computeWarehouseOverview(site, row.parameters),
-                                  scheduled ? (row.generated_at ? 'refresh' : 'first') : undefined,
-                                ),
-                              {
-                                round: round?.id,
-                                previous: resumeRanking ? savedRanking : undefined,
-                              },
-                            ),
+                        row.parameters.siteSummary
+                          ? computeWebsiteSummary(site, row.parameters, cutoff).then(row => ({
+                              kind: 'site-summary' as const,
+                              row,
+                              dataThrough: Math.min(end.getTime(), cutoff),
+                            }))
+                          : row.parameters.nativeRetention
+                            ? computeWarehouseRetention(
+                                site.id,
+                                row.parameters,
+                                row.parameters.nativeRetention,
+                                cutoff,
+                              )
+                            : captureReportRankings(
+                                site.id,
+                                row.id,
+                                () =>
+                                  withDashboardClock(
+                                    cutoff,
+                                    () => computeWarehouseOverview(site, row.parameters),
+                                    scheduled
+                                      ? row.generated_at
+                                        ? 'refresh'
+                                        : 'first'
+                                      : undefined,
+                                  ),
+                                {
+                                  round: round?.id,
+                                  previous: resumeRanking ? savedRanking : undefined,
+                                  shouldPause: async () =>
+                                    !!(await warehouseBackgroundClaimAfter()),
+                                },
+                              ),
                     ),
                   round ? reportRoundMetrics(round) : undefined,
                 );
@@ -1247,7 +1567,12 @@ async function computeOverviewClaim({ row, token }: OverviewClaim, signal: Abort
                         ...(resumeRanking ? row.result : captured.value),
                         rankings: captured.rankings,
                       };
-                if ('rankings' in value && 'meta' in value && value.rankings)
+                if (
+                  'rankings' in value &&
+                  'meta' in value &&
+                  value.rankings &&
+                  !value.rankings.pending
+                )
                   await prefillReportRankings(
                     site.id,
                     row.id,
@@ -1277,8 +1602,8 @@ async function computeOverviewClaim({ row, token }: OverviewClaim, signal: Abort
       const { rows } = await tx.query(
         `UPDATE liekan_warehouse_overview_snapshot
        SET result=$4,publication=$5,generated_at=CASE WHEN $12 THEN generated_at ELSE greatest(now(),queued_at) END,
-         control_version=$7,preset=$8,
-         next_attempt_at=CASE WHEN $13 THEN now()+interval '5 seconds' ELSE CASE WHEN $8 THEN
+         control_version=$7,preset=preset AND $8,
+         next_attempt_at=CASE WHEN $13 THEN now()+interval '5 seconds' ELSE CASE WHEN preset AND $8 THEN
            date_bin($6::bigint*interval '1 millisecond',
              greatest(now(),queued_at)+$10::interval,to_timestamp($9::double precision/1000))
            ELSE now() END+$6::bigint*interval '1 millisecond' END,
@@ -1312,6 +1637,8 @@ async function computeOverviewClaim({ row, token }: OverviewClaim, signal: Abort
     // The publication fence can reject a result after a concurrent request invalidated it.
     if (!published.length) await cleanup(null);
     if (published.length) {
+      committedAtMs = Date.now();
+      rankingPending = 'rankings' in value && !!value.rankings?.pending;
       outcome = 'ready';
     }
   } catch (error) {
@@ -1320,26 +1647,39 @@ async function computeOverviewClaim({ row, token }: OverviewClaim, signal: Abort
       (error instanceof WarehouseConflict &&
         ['warehouse-control-busy', 'warehouse-control-unavailable'].includes(error.code));
     const invalidated = error instanceof LiekanError && error.code === 'analysis-invalidated';
+    if (!deferred) reason = analysisErrorReason(error);
     await cleanup(
       signal?.aborted || deferred
         ? null
         : invalidated
           ? 'analysis-invalidated'
           : 'warehouse-overview-unavailable',
-      invalidated && !row.preset,
-      deferred,
+      {
+        retire: invalidated && !row.preset,
+        retryAt: deferred
+          ? ((error instanceof WarehouseBackgroundDeferred ? error.retryAt : undefined) ??
+            Date.now() + 5000)
+          : undefined,
+      },
     );
     outcome = deferred ? 'deferred' : invalidated || signal?.aborted ? 'discarded' : 'failed';
   } finally {
-    if (Object.keys(timings).length)
+    if (outcome === 'failed' || outcome === 'deferred' || Object.keys(timings).length)
       console.info(
         JSON.stringify({
           event: 'warehouse-overview-compute',
           taskId: row.id,
           roundId: round?.id,
           dataThrough: cutoff,
+          resource: row.parameters.siteSummary ? 'website-summary' : row.parameters.resource,
           period: row.parameters.chartPeriod,
+          attemptDueAtMs: +row.next_attempt_at,
+          startedAtMs: requestStartedAt,
+          committedAtMs,
+          rankingPending,
           outcome,
+          reason,
+          queuedOverdueMs: Math.max(0, requestStartedAt - +row.next_attempt_at),
           wallMs: Math.round(performance.now() - started),
           queryGroups: timings,
         }),
@@ -1358,7 +1698,10 @@ export function requestWarehouseRetention(
   const conditions = Object.fromEntries(
     Object.entries(raw).filter(([, v]) => v !== undefined && v !== ''),
   );
-  const preset = presetParameters(String(timezone || ACCOUNT_DEFAULT_TIMEZONE), Date.now()).find(
+  const retentionRanges = presetParameters(String(timezone || ACCOUNT_DEFAULT_TIMEZONE), Date.now(), true);
+  // On a month end the rolling range may coincide with the native calendar
+  // month. Prefer the scheduled month when both describe exactly the same data.
+  const preset = retentionRanges.findLast(
     p => 'nativeRetention' in p && p.startAt === Number(startAt) && p.endAt === Number(endAt),
   );
   return requestWarehouseOverview(

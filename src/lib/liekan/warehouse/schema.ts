@@ -225,6 +225,7 @@ export const warehouseAnalysisDDL = [
     ORDER BY (website_id,epoch,control,publication,recorded_at,checkpoint)`,
   `ALTER TABLE warehouse_analysis_coverage_v1 ADD COLUMN IF NOT EXISTS browser_publication UInt64 DEFAULT publication`,
   `ALTER TABLE warehouse_analysis_coverage_v1 ADD COLUMN IF NOT EXISTS log_publication UInt64 DEFAULT publication`,
+  `ALTER TABLE warehouse_analysis_coverage_v1 ADD COLUMN IF NOT EXISTS log_counts String DEFAULT ''`,
 ];
 export const warehouseReportRankDDL = `CREATE TABLE IF NOT EXISTS warehouse_report_rank_v1 (
   website_id UUID,epoch UInt64,snapshot UUID,build UUID,table_name LowCardinality(String),

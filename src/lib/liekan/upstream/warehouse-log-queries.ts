@@ -1,6 +1,12 @@
-import type { AnalysisWindow } from '../warehouse/analysis-context';
+import {
+  analysisReadParameters,
+  analysisWindowRelation,
+  verifiedLogModel,
+  type AnalysisWindow,
+} from '../warehouse/analysis-context';
 import { createHash } from 'node:crypto';
 import { formatInTimeZone, fromZonedTime } from 'date-fns-tz';
+import { calendarDateRange } from '../contracts/calendar';
 import type { CrawlerMetricOptions } from '../contracts/crawler-metrics';
 import { crawlerIdentitySql } from '../crawlers/metric-scope';
 import { CRAWLER_POPULATION_VERSION, crawlerAiSql, unknownCrawlerSql } from '../rules/population';
@@ -14,13 +20,18 @@ import {
 import { dashboardClock } from './dashboard-clock';
 import { LiekanError } from './errors';
 import { logInputConnectedSql } from './log-input';
-import { staticRequestExtensionPattern } from './logs';
+import { countLogWindow, logCountExpressions, logCountPattern } from './warehouse-log-hour-counts';
 import { readLogPageWindows } from './warehouse-log-page';
 import { decodeWarehouseLogCursor } from './warehouse-log-cursor';
-import { type LogTrendRow, readWarehouseLogTrend } from './warehouse-log-trend';
+import {
+  type LogTrendRow,
+  readWarehouseAiHourDistribution,
+  readWarehouseLogTrend,
+} from './warehouse-log-trend';
 import {
   warehouseReportMetadata,
   warehouseReportQuery,
+  warehouseReportStream,
   withinWarehouseReport,
 } from './warehouse-report-snapshot';
 import { memoRoundMetric } from './warehouse-round-metrics';
@@ -60,6 +71,35 @@ function exactCount(value: unknown) {
   if (!Number.isSafeInteger(n)) throw new Error('warehouse-counter-out-of-range');
   return n;
 }
+
+function singleLogDay(start: Date, end: Date, timezone: string, endExclusive: boolean) {
+  const day = formatInTimeZone(start, timezone, 'yyyy-MM-dd');
+  const last = +end - (endExclusive ? 1 : 0);
+  return +end >= +start && last <= calendarDateRange(day, timezone).endAt ? day : undefined;
+}
+
+type SpiderIdentity = { vendor: string | null; botId: string | null };
+function dailyCountsFromBots(
+  day: string,
+  bots: (SpiderIdentity & { name: string | null; requests: number; aiRequests: number })[],
+) {
+  const groups = new Map<
+    string,
+    SpiderIdentity & { day: string; bot: string | null; count: number; aiRequests: number }
+  >();
+  for (const { name: bot, vendor, botId, requests, aiRequests } of bots) {
+    const key = JSON.stringify([bot, vendor, botId]);
+    const group = groups.get(key);
+    if (group) {
+      group.count = exactCount(group.count + requests);
+      group.aiRequests = exactCount(group.aiRequests + aiRequests);
+    } else {
+      groups.set(key, { day, bot, vendor, botId, count: requests, aiRequests });
+    }
+  }
+  return [...groups.values()];
+}
+
 export async function warehouseContentImpact(
   id: string,
   targets: { path: string; humanPath: string; publishedAt: Date | string }[],
@@ -166,12 +206,26 @@ export async function warehouseLogWindowHasFacts(
   endExclusive = false,
 ) {
   // An empty raw window proves that the accepted, filtered report is empty too.
-  const rows = await warehouseReportQuery(
-    site,
-    `SELECT 1 AS present ${rawLogWindow(endExclusive)} LIMIT 1`,
-    range(start, end),
+  return memoRoundMetric(
+    JSON.stringify(['log-window-presence', site, +start, +end, endExclusive]),
+    async () => {
+      const rows = await warehouseReportQuery(
+        site,
+        `SELECT 1 AS present ${rawLogWindow(endExclusive)} LIMIT 1`,
+        range(start, end),
+      );
+      return rows.length > 0;
+    },
   );
-  return rows.length > 0;
+}
+
+// The round pins publication and control. Also bind the actual analysis buckets
+// because another report can complete more of the model within that round.
+function roundLogAggregate<T>(site: string, sql: string, params: Record<string, unknown>) {
+  return memoRoundMetric(
+    JSON.stringify(['log-aggregate', site, sql, params, analysisReadParameters()]),
+    () => warehouseReportQuery<T>(site, sql, params),
+  );
 }
 
 export async function warehouseOverviewLogWindow(
@@ -180,38 +234,79 @@ export async function warehouseOverviewLogWindow(
   end: Date,
   endExclusive: boolean,
 ) {
-  if (+end - +start > 26 * 3600000)
-    return {
-      hasFacts: await warehouseLogWindowHasFacts(site, start, end, endExclusive),
-      restrictEvidenceToWindow: false,
-    };
-  // The raw window bounds the accepted immutable IDs at the pinned
-  // publication. A new publication cannot enlarge this report's key set.
-  const limit = 100000;
-  const [result] = await warehouseReportQuery<{ count: string }>(
-    site,
-    `SELECT count() AS count FROM (SELECT 1 ${rawLogWindow(endExclusive)} LIMIT ${limit + 1})`,
-    range(start, end),
+  return memoRoundMetric(
+    JSON.stringify(['overview-log-window', site, +start, +end, endExclusive]),
+    async () => {
+      if (+end - +start > 26 * 3600000)
+        return {
+          hasFacts: await warehouseLogWindowHasFacts(site, start, end, endExclusive),
+          restrictEvidenceToWindow: false,
+        };
+      // Bound the immutable IDs at the pinned publication.
+      const limit = 100000;
+      const [result] = await warehouseReportQuery<{ count: string }>(
+        site,
+        `SELECT count() AS count FROM (SELECT 1 ${rawLogWindow(endExclusive)} LIMIT ${limit + 1})`,
+        range(start, end),
+      );
+      const count = exactCount(result.count);
+      return { hasFacts: count > 0, restrictEvidenceToWindow: count > 0 && count <= limit };
+    },
   );
-  const count = exactCount(result.count);
-  return { hasFacts: count > 0, restrictEvidenceToWindow: count > 0 && count <= limit };
 }
 export async function warehouseLogToday(id: string, start: Date, end: Date) {
   return withinWarehouseReport(async () => {
-    const [rows, imports] = await Promise.all([
-      warehouseReportQuery<any>(
-        id,
-        `SELECT countIf(NOT match(path,{staticPattern:String})) AS requests,countIf(status>=400) AS abnormal ${scoped(undefined, ['path', 'status'], false, undefined, false, { start: +start, end: +end })}`,
-        { ...range(start, end), staticPattern: `(?i)${staticRequestExtensionPattern}` },
-      ),
+    const [counts, imports] = await Promise.all([
+      countLogWindow(verifiedLogModel(id), +start, +end, async (from, to, endExclusive) => {
+        const window = { start: from, end: to, endExclusive };
+        const [row] = await warehouseReportQuery<{ requests: string; abnormal: string }>(
+          id,
+          `SELECT ${logCountExpressions} ${scoped(undefined, ['path', 'status'], false, window, false, window)}`,
+          { ...range(new Date(from), new Date(to)), staticPattern: logCountPattern },
+        );
+        return { requests: exactCount(row.requests), abnormal: exactCount(row.abnormal) };
+      }),
       warehouseReader().db.read<{ accepted: string }>(
         'SELECT coalesce(sum(accepted),0)::text AS accepted FROM liekan_import WHERE website_id=$1::uuid AND imported_at BETWEEN $2 AND $3',
         [id, start, end],
       ),
     ]);
-    return { ...warehouseNumbers(rows[0]), accepted: exactCount(imports[0].accepted) };
+    return { ...counts, accepted: exactCount(imports[0].accepted) };
   });
 }
+const trendColumns = ['created_at', 'bot', 'bot_type', 'ai_eligible'];
+const trendCounts = `count() AS count,countIf(${crawlerAiSql('l')}) AS aiRequests`;
+
+function trendHourSource(id: string, metrics: CrawlerMetricOptions) {
+  return {
+    coveredHours: (hours: number[]) =>
+      !!analysisWindowRelation('log', trendColumns, {
+        start: hours[0] * 1000,
+        end: (hours.at(-1) + 3600) * 1000,
+        endExclusive: true,
+      }),
+    async hours(logHours: number[]) {
+      const from = new Date(logHours[0] * 1000);
+      const to = new Date((logHours.at(-1) + 3600) * 1000);
+      if (!(await warehouseLogWindowHasFacts(id, from, to, true))) return [];
+      return warehouseNumbers(
+        await warehouseReportQuery<Omit<LogTrendRow, 'day'> & { hour: number }>(
+          id,
+          `SELECT toUnixTimestamp(toStartOfHour(created_at,'UTC')) AS hour,bot,bot_type AS type,
+       ${trendCounts} ${scoped(metrics, trendColumns, true, { endExclusive: true, hours: true }, false, { start: +from, end: +to, endExclusive: true })}
+       GROUP BY hour,bot,type SETTINGS optimize_aggregation_in_order=1`,
+          { ...range(from, to), logHours },
+        ),
+      );
+    },
+  };
+}
+
+const aiHourColumns = ['created_at', 'ai_eligible', 'bot_type'];
+function aiHourSql(source: string) {
+  return `SELECT toHour(toTimeZone(created_at,{timezone:String})) AS hour,count() AS count ${source} AND ${crawlerAiSql('l')} GROUP BY hour ORDER BY hour`;
+}
+
 export async function warehousePlotLogs(
   id: string,
   start: Date,
@@ -221,38 +316,54 @@ export async function warehousePlotLogs(
   metrics: CrawlerMetricOptions = { crawlerIdentityScope: 'all' },
 ) {
   return withinWarehouseReport(async () => {
-    const columns = ['created_at', 'bot', 'bot_type', 'ai_eligible'];
-    const counts = `count() AS count,countIf(${crawlerAiSql('l')}) AS aiRequests`;
     const readChart = async (from: Date, to: Date, endExclusive: boolean) => {
-      if (!(await warehouseLogWindowHasFacts(id, from, to, endExclusive))) return [];
-      return warehouseNumbers(
-        await warehouseReportQuery<LogTrendRow>(
+      return memoRoundMetric(
+        JSON.stringify([
+          'log-trend-edge',
           id,
-          `SELECT formatDateTime(created_at,'${hour ? '%Y-%m-%d %H:00' : '%Y-%m-%d'}',{timezone:String}) AS day,bot,bot_type AS type,
-       ${counts} ${scoped(metrics, columns, false, { endExclusive }, false, { start: +from, end: +to, endExclusive })} GROUP BY day,bot,type ORDER BY day`,
-          range(from, to, timezone),
-        ),
-      );
-    };
-    if (dashboardClock()?.scheduledOverview) {
-      const result = await readWarehouseLogTrend(id, start, end, timezone, hour, metrics, {
-        edge: readChart,
-        async hours(logHours) {
-          const from = new Date(logHours[0] * 1000);
-          const to = new Date((logHours.at(-1) + 3600) * 1000);
-          if (!(await warehouseLogWindowHasFacts(id, from, to, true))) return [];
+          +from,
+          +to,
+          endExclusive,
+          timezone,
+          hour,
+          metrics.crawlerIdentityScope,
+          metrics.crawlerMetricsVersion,
+        ]),
+        async () => {
+          if (!(await warehouseLogWindowHasFacts(id, from, to, endExclusive))) return [];
           return warehouseNumbers(
-            await warehouseReportQuery<Omit<LogTrendRow, 'day'> & { hour: number }>(
+            await warehouseReportQuery<LogTrendRow>(
               id,
-              `SELECT toUnixTimestamp(toStartOfHour(created_at,'UTC')) AS hour,bot,bot_type AS type,
-               ${counts} ${scoped(metrics, columns, true, { endExclusive: true, hours: true }, false, { start: +from, end: +to, endExclusive: true })}
-               GROUP BY hour,bot,type SETTINGS optimize_aggregation_in_order=1`,
-              { ...range(from, to), logHours },
+              `SELECT formatDateTime(created_at,'${hour ? '%Y-%m-%d %H:00' : '%Y-%m-%d'}',{timezone:String}) AS day,bot,bot_type AS type,
+       ${trendCounts} ${scoped(metrics, trendColumns, false, { endExclusive }, false, { start: +from, end: +to, endExclusive })} GROUP BY day,bot,type ORDER BY day`,
+              range(from, to, timezone),
             ),
           );
         },
-      });
-      if (result) return result;
+      );
+    };
+    if (dashboardClock()?.scheduledOverview) {
+      // Both overview charts consume this exact trend. The owning round pins
+      // publication and control even if more analysis buckets become available.
+      return memoRoundMetric(
+        JSON.stringify([
+          'scheduled-log-trend-v1',
+          id,
+          +start,
+          +end,
+          timezone,
+          hour,
+          metrics.crawlerIdentityScope,
+          metrics.crawlerMetricsVersion,
+        ]),
+        async () => {
+          const hourly = await readWarehouseLogTrend(id, start, end, timezone, hour, metrics, {
+            ...trendHourSource(id, metrics),
+            edge: readChart,
+          });
+          return hourly ?? readChart(start, end, metrics.crawlerMetricsVersion === 1);
+        },
+      );
     }
     return readChart(start, end, metrics.crawlerMetricsVersion === 1);
   });
@@ -269,12 +380,24 @@ export async function warehouseMonthlyAiShare(
     `${new Date(Date.UTC(year, month - 6, 1)).toISOString().slice(0, 10)}T00:00:00`,
     timezone,
   );
-  const rows = warehouseNumbers(
-    await warehouseReportQuery<any>(
+  const rows = await memoRoundMetric(
+    JSON.stringify([
+      'monthly-ai',
       id,
-      `SELECT formatDateTime(created_at,'%Y-%m',{timezone:String}) AS month,count() AS total,countIf(${crawlerAiSql('l')}) AS ai ${scoped(metrics, ['created_at', 'bot_type', 'ai_eligible'], false, undefined, false, { start: +start, end: +end })} GROUP BY month ORDER BY month`,
-      range(start, end, timezone),
-    ),
+      +start,
+      +end,
+      timezone,
+      metrics.crawlerIdentityScope,
+      metrics.crawlerMetricsVersion,
+    ]),
+    async () =>
+      warehouseNumbers(
+        await warehouseReportQuery<{ month: string; total: number; ai: number }>(
+          id,
+          `SELECT formatDateTime(created_at,'%Y-%m',{timezone:String}) AS month,count() AS total,countIf(${crawlerAiSql('l')}) AS ai ${scoped(metrics, ['created_at', 'bot_type', 'ai_eligible'], false, undefined, false, { start: +start, end: +end })} GROUP BY month ORDER BY month`,
+          range(start, end, timezone),
+        ),
+      ),
   );
   return Array.from({ length: 6 }, (_, i) => {
     const label = new Date(Date.UTC(year, month - 6 + i, 1)).toISOString().slice(0, 7);
@@ -317,6 +440,7 @@ export async function warehouseLogQuerySpec(
   reuseOverview = false,
   restrictEvidenceToWindow = false,
   detailWindow?: AnalysisWindow,
+  catalogOnlyPages = false,
 ) {
   if (reuseOverview && metrics.resource !== 'overview')
     throw new Error('warehouse-overview-reuse-scope-invalid');
@@ -344,7 +468,7 @@ export async function warehouseLogQuerySpec(
   const forms = ['ai/bots', 'ai/pages'].includes(metrics.resource);
   let form = "'unknown'";
   if (forms) {
-    const used = await warehouseReportQuery<{ version: string }>(
+    const used = await roundLogAggregate<{ version: string }>(
       id,
       `SELECT DISTINCT toString(reporting_catalog_version) AS version ${base} AND isNotNull(reporting_catalog_version)`,
       {
@@ -393,9 +517,10 @@ export async function warehouseLogQuerySpec(
         AND (isNull({botType:Nullable(String)}) OR bot_type={botType:Nullable(String)}) AND (isNull({botId:Nullable(String)}) OR reporting_crawler_id={botId:Nullable(String)})
         AND (isNotNull({botId:Nullable(String)}) OR isNull({botName:Nullable(String)}) OR (isNull(reporting_crawler_id) AND bot={botName:Nullable(String)}))`
         : ''
-    } GROUP BY path,bot,botId ORDER BY requests DESC,path,bot,botId`,
+    }${catalogOnlyPages ? ' AND l.path IN {catalogPaths:Array(String)}' : ''}
+    GROUP BY path,bot,botId ORDER BY requests DESC,path,bot,botId`,
     statuses: `SELECT intDiv(status,100)*100 AS status,count() AS count ${queryFrom(['status', 'ai_eligible', 'bot_type'])} AND ${ai} GROUP BY status ORDER BY status`,
-    hours: `SELECT toHour(toTimeZone(created_at,{timezone:String})) AS hour,count() AS count ${queryFrom(['created_at', 'ai_eligible', 'bot_type'])} AND ${ai} GROUP BY hour ORDER BY hour`,
+    hours: aiHourSql(queryFrom(aiHourColumns)),
   };
   const filterSql =
     filter === 'ai'
@@ -454,6 +579,7 @@ export function warehouseOverviewAggregateStates(
     sql: overviewAggregateRows(metrics, restrictEvidenceToWindow, days ? 'days' : 'states', {
       start: +start,
       end: +end,
+      endExclusive: !!days || metrics.crawlerMetricsVersion === 1,
     }),
     params: { ...range(start, end, timezone), ...(days ? { overviewDays: days } : {}) },
   };
@@ -524,6 +650,21 @@ export async function warehouseLogFacts(...args: Parameters<typeof import('./log
   return withinWarehouseReport(async () => {
     const meta = await warehouseReportMetadata(id),
       needs = (key: string) => !fields || fields.includes(key);
+    const catalog = needs('catalog')
+      ? await warehouseReader().db.read<{ path: string }>(
+          'SELECT path,title,content_type AS type,word_count AS "wordCount",published_at AS "publishedAt",content_updated_at AS "updatedAt",link_depth AS "linkDepth",evidence_source AS source,structured,structure_score AS "structureScore" FROM liekan_catalog WHERE website_id=$1::uuid ORDER BY path',
+          [id],
+        )
+      : [];
+    // The preference page uses per-path log rows only to join the catalog.
+    // Keep summary, bot denominators and the recent crawl path site-wide.
+    const preferencePaths =
+      fields && needs('catalog') && !fullExport && metrics.resource === 'ai/preference'
+        ? new Set(catalog.map(row => row.path))
+        : undefined;
+    const pushCatalogPaths =
+      !!preferencePaths &&
+      catalog.reduce((bytes, row) => bytes + Buffer.byteLength(row.path) + 8, 0) <= 64 * 1024;
     const { params, previousParams, base, ai, forms, botQuery, statements, filterSql, detailBase } =
       await warehouseLogQuerySpec(
         start,
@@ -534,18 +675,80 @@ export async function warehouseLogFacts(...args: Parameters<typeof import('./log
         search,
         needs('previousBots'),
         id,
+        false,
+        false,
+        undefined,
+        pushCatalogPaths,
       );
     const aggregates: Record<string, any[]> = {};
+    // AI overview reads every known spider group with the same filters as daily.
+    // Within one local day only the additional bot_type grouping needs folding.
+    const botDay =
+      metrics.resource === 'ai/overview' && needs('bots') && needs('daily')
+        ? singleLogDay(start, end, timezone, metrics.crawlerMetricsVersion === 1)
+        : undefined;
     // Limit concurrent scans per report independently of the HTTP concurrency gate.
-    for (const [key, sql] of Object.entries(statements))
-      if (needs(key))
+    for (const [key, sql] of Object.entries(statements)) {
+      if (!needs(key) || (key === 'daily' && botDay)) continue;
+      if (key === 'hours' && metrics.resource === 'ai/overview') {
+        const hours = await readWarehouseAiHourDistribution(
+          id,
+          start,
+          end,
+          timezone,
+          metrics,
+          dashboardClock()?.scheduledOverview ? trendHourSource(id, metrics) : undefined,
+          async logHours => {
+            const from = new Date(Math.max(+start, logHours[0] * 1000));
+            const to = new Date(Math.min(+end, (logHours[logHours.length - 1] + 3600) * 1000));
+            const endExclusive = +to < +end || metrics.crawlerMetricsVersion === 1;
+            const source = scoped(
+              metrics,
+              aiHourColumns,
+              true,
+              { endExclusive, hours: true },
+              false,
+              {
+                start: +from,
+                end: +to,
+                endExclusive,
+              },
+            );
+            return warehouseNumbers(
+              await roundLogAggregate<{ hour: number; count: number }>(id, aiHourSql(source), {
+                ...range(from, to, timezone),
+                logHours,
+              }),
+            );
+          },
+        );
+        if (hours !== undefined) {
+          aggregates.hours = hours;
+          continue;
+        }
+      }
+      if (key === 'pages' && preferencePaths) {
+        if (!preferencePaths.size) continue;
+        const pages: any[] = [];
+        await warehouseReportStream<{ path: string }>(
+          id,
+          sql,
+          pushCatalogPaths ? { ...params, catalogPaths: [...preferencePaths] } : params,
+          async batch => {
+            for (const row of batch)
+              if (preferencePaths.has(row.path)) pages.push(warehouseNumbers(row));
+          },
+        );
+        aggregates.pages = pages;
+      } else {
         aggregates[key] = warehouseNumbers(
-          await (key === 'summary'
-            ? memoRoundMetric(JSON.stringify(['log-summary', id, sql, params]), () =>
-                warehouseReportQuery<any>(id, sql, params),
-              )
+          await (key !== 'pages'
+            ? roundLogAggregate<any>(id, sql, params)
             : warehouseReportQuery<any>(id, sql, params)),
         );
+      }
+    }
+    if (botDay) aggregates.daily = dailyCountsFromBots(botDay, aggregates.bots);
     const [classification] =
       !detailRead && metrics.crawlerMetricsVersion === 1 && needs('recent')
         ? await warehouseReportQuery<any>(
@@ -604,6 +807,7 @@ export async function warehouseLogFacts(...args: Parameters<typeof import('./log
          ${cursor ? ` AND (created_at,id) ${seek === 'before' ? '>' : '<'} ({cursorAt:DateTime64(6,'UTC')},{cursorId:String})` : ''}
          ORDER BY created_at ${order},id ${order} LIMIT ${limit}${offset ? ' OFFSET {skip:UInt64}' : ''}`,
         queryParams,
+        { traceStage: 'log-page' },
       );
     let detail: any[] = [];
     if (needs('recent')) {
@@ -619,6 +823,7 @@ export async function warehouseLogFacts(...args: Parameters<typeof import('./log
                   toString(toUnixTimestamp(toStartOfHour(maxOrNull(_record_time)))) AS lastHour
            ${rawLogWindow(metrics.crawlerMetricsVersion === 1)}`,
           params,
+          { traceStage: 'log-extent' },
         );
         detail = await readLogPageWindows(
           { start: +start, end: +end, endExclusive: metrics.crawlerMetricsVersion === 1 },
@@ -661,12 +866,6 @@ export async function warehouseLogFacts(...args: Parameters<typeof import('./log
             .count,
         )
       : 0;
-    const catalog = needs('catalog')
-      ? await warehouseReader().db.read(
-          'SELECT path,title,content_type AS type,word_count AS "wordCount",published_at AS "publishedAt",content_updated_at AS "updatedAt",link_depth AS "linkDepth",evidence_source AS source,structured,structure_score AS "structureScore" FROM liekan_catalog WHERE website_id=$1::uuid ORDER BY path',
-          [id],
-        )
-      : [];
     const [latest] = needs('latest')
       ? await warehouseReader().db.read<{ time: Date | null; connected: boolean }>(
           `SELECT (SELECT imported_at FROM liekan_import WHERE website_id=$1::uuid AND accepted>0 ORDER BY imported_at DESC LIMIT 1) AS time,${logInputConnectedSql} AS connected`,
