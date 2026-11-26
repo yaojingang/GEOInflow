@@ -364,27 +364,7 @@ export async function refreshRangeSources(options: { fetcher?: typeof fetch } = 
   }
 }
 
-let rangeSnapshotsCache: {
-  catalogKey: string;
-  expiresAt: number;
-  value: VerificationSnapshots;
-} | null = null;
-const RANGE_SNAPSHOTS_TTL_MS = 10_000;
-
-export function clearRangeSnapshotsCache() {
-  rangeSnapshotsCache = null;
-}
-
 export async function readRangeSnapshots(): Promise<VerificationSnapshots> {
-  const catalogKey = getPublishedCatalog()?.version || 'bundled';
-  const now = Date.now();
-  if (
-    rangeSnapshotsCache &&
-    rangeSnapshotsCache.catalogKey === catalogKey &&
-    rangeSnapshotsCache.expiresAt > now
-  ) {
-    return rangeSnapshotsCache.value;
-  }
   await initialize();
   // Use the ingestion read boundary and release its connection before content qualification.
   const rows = await query(`SELECT r.*,s.current_observed_at FROM liekan_crawler_range_source s
@@ -410,11 +390,6 @@ export async function readRangeSnapshots(): Promise<VerificationSnapshots> {
         source: content.sourceUrl,
       };
   }
-  rangeSnapshotsCache = {
-    catalogKey,
-    expiresAt: Date.now() + RANGE_SNAPSHOTS_TTL_MS,
-    value: snapshots,
-  };
   return snapshots;
 }
 
@@ -457,7 +432,6 @@ export async function restoreRangeSnapshot(sourceId: string, version: string) {
       observedAt,
     );
     await mirror(tx, content, observedAt);
-    clearRangeSnapshotsCache();
     return { sourceId, version, observedAt };
   });
 }

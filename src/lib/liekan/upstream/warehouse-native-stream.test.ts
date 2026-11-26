@@ -6,21 +6,8 @@ const mocks = vi.hoisted(() => ({
   pin: vi.fn(),
   population: vi.fn(),
   note: vi.fn(),
-  selection: vi.fn(),
+  reportBoundary: undefined as symbol | undefined,
   relations: vi.fn(),
-  analysis: false,
-}));
-vi.mock('./warehouse-analysis-model', () => ({
-  withAvailableAnalysisModel: async (_site: string, work: () => unknown, selection: unknown) => {
-    mocks.selection(selection);
-    const previous = mocks.analysis;
-    mocks.analysis = true;
-    try {
-      return await work();
-    } finally {
-      mocks.analysis = previous;
-    }
-  },
 }));
 vi.mock('../warehouse/reader-runtime', () => ({
   warehouseReader: () => ({
@@ -41,7 +28,15 @@ vi.mock('./warehouse-native-relations', () => ({
   },
 }));
 vi.mock('./warehouse-report-snapshot', () => ({
-  withinWarehouseReport: (work: () => unknown) => work(),
+  withinWarehouseReport: async (work: () => unknown) => {
+    const outer = mocks.reportBoundary;
+    mocks.reportBoundary = outer ?? Symbol('report');
+    try {
+      return await work();
+    } finally {
+      mocks.reportBoundary = outer;
+    }
+  },
   warehouseReportMetadata: mocks.pin,
   frozenCountKey: async () => 'fixture-count',
   readFrozenCount: () => undefined,
@@ -79,7 +74,7 @@ import { warehouseTime } from '../warehouse/fact-input';
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mocks.analysis = false;
+  mocks.reportBoundary = undefined;
   mocks.query.mockResolvedValue({
     json: async () => ({
       meta: [
@@ -96,19 +91,25 @@ beforeEach(() => {
   });
 });
 
-it('keeps pagination population checks inside the same verified analysis context', async () => {
+it('reads the page count, rows and identity population within one report boundary', async () => {
+  const boundaries: symbol[] = [];
   mocks.population.mockImplementation(async () => {
-    expect(mocks.analysis).toBe(true);
+    expect(mocks.reportBoundary).toBeDefined();
+    boundaries.push(mocks.reportBoundary);
     return { identity: { status: 'complete' } };
   });
-  mocks.query.mockResolvedValue({
-    json: async () => ({
-      meta: [
-        { name: '_liekan_page_count', type: 'UInt64' },
-        { name: 'id', type: 'String' },
-      ],
-      data: [{ _liekan_page_count: '1', id: 'one' }],
-    }),
+  mocks.query.mockImplementation(async () => {
+    expect(mocks.reportBoundary).toBeDefined();
+    boundaries.push(mocks.reportBoundary);
+    return {
+      json: async () => ({
+        meta: [
+          { name: '_liekan_page_count', type: 'UInt64' },
+          { name: 'id', type: 'String' },
+        ],
+        data: [{ _liekan_page_count: '1', id: 'one' }],
+      }),
+    };
   });
   const result = await warehouseNativePage(
     'SELECT id FROM website_event',
@@ -121,7 +122,9 @@ it('keeps pagination population checks inside the same verified analysis context
     'getWebsiteSessions',
   );
   expect(result.count).toBe(1);
-  expect(mocks.analysis).toBe(false);
+  expect(result.data).toEqual([{ id: 'one' }]);
+  expect(new Set(boundaries).size).toBe(1);
+  expect(mocks.reportBoundary).toBeUndefined();
   expect(mocks.population).toHaveBeenCalledTimes(2);
 });
 
@@ -169,7 +172,7 @@ it('rejects a streaming query without an explicit website before invoking the re
   expect(mocks.stream).not.toHaveBeenCalled();
 });
 
-it('bounds audited totals and model selection to both report and disjoint cohort windows', async () => {
+it('passes the report and disjoint cohort windows through to the native query', async () => {
   const params = {
     websiteId: 'trusted-site',
     startDate: new Date('2026-11-13T00:00:00Z'),
@@ -180,7 +183,12 @@ it('bounds audited totals and model selection to both report and disjoint cohort
   await warehouseNativeQuery('select count(*) from website_event', params, 'getWebsiteStats');
   const window = { start: +params.cohort_startDate, end: +params.endDate };
   expect(mocks.relations.mock.calls[0][1]).toEqual(window);
-  expect(mocks.selection).toHaveBeenCalledWith({ kinds: ['browser'], ...window });
+  expect(mocks.query.mock.calls[0][0].query_params).toMatchObject({
+    startDate: warehouseTime(params.startDate),
+    endDate: warehouseTime(params.endDate),
+    cohort_startDate: warehouseTime(params.cohort_startDate),
+    cohort_endDate: warehouseTime(params.cohort_endDate),
+  });
   mocks.relations.mockClear();
   await warehouseNativeQuery('select count(*) from website_event', params, 'identity-history');
   expect(mocks.relations.mock.calls[0][1]).toBeUndefined();

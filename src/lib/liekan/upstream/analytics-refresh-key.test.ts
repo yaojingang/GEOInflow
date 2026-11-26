@@ -41,6 +41,18 @@ const mocks = vi.hoisted(() => ({
   sites: vi.fn(),
   sharePermission: vi.fn(),
 }));
+// The catalog pointer is checked independently of the per-site log-state cache.
+vi.mock('./crawler-registry', async () => {
+  const { getBundledPublishedCatalog } = await import('../crawlers/catalog-seed');
+  const catalog = getBundledPublishedCatalog();
+  return {
+    readCrawlerRegistryPointer: async () => ({
+      version: catalog.version,
+      revision: catalog.revision,
+    }),
+    readPublishedRegistry: async () => catalog,
+  };
+});
 vi.mock('../report', () => ({ buildReport: mocks.build }));
 vi.mock('@/lib/auth', () => ({
   checkAuth: async () => ({ user: { id: '20000000-0000-4000-8000-000000000001', role: 'admin' } }),

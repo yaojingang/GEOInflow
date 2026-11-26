@@ -80,6 +80,16 @@ beforeEach(() => {
   h.query.mockImplementation(async (sql: string) => {
     if (sql.includes('SELECT s.robots'))
       return [{ crawlerRules: structuredClone(h.configuration) }];
+    if (sql.includes('w.domain AS website_domain'))
+      return [
+        {
+          ...h.source,
+          website_domain: h.source.domain,
+          website_user_id: null,
+          website_team_id: null,
+          website_deleted_at: null,
+        },
+      ];
     if (sql.includes('FROM liekan_log_source')) return [{ ...h.source }];
     if (sql.includes('FROM liekan_log_state')) return [{ epoch: 1, policy_revision: 1 }];
     if (sql.includes('FROM liekan_log_interval')) return [{ id: sourceId }];

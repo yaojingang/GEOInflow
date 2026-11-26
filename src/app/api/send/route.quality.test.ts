@@ -11,23 +11,19 @@ const mocks = vi.hoisted(() => ({
   token: vi.fn(),
   warehouse: false,
   enqueue: vi.fn(),
-  completion: vi.fn(),
+  readReceipt: vi.fn(),
+  pgQuery: vi.fn(),
 }));
-vi.mock('@/lib/liekan/warehouse/runtime', () => ({
+vi.mock('@/lib/liekan/warehouse/runtime', async importOriginal => ({
+  ...(await importOriginal<typeof import('@/lib/liekan/warehouse/runtime')>()),
   warehouseIntakeEnabled: () => mocks.warehouse,
-  warehouseRuntime: async () => ({
-    resource: async () => ({ epoch: '0', policy_revision: '0' }),
-    envelope: (_site: any, args: any) => ({
-      ...args,
-      version: 1,
-      routingVersion: 1,
-      topicId: '1'.repeat(32),
-      inputId: '55555555-5555-4555-8555-555555555555',
-      epoch: '0',
-      policyRevision: '0',
-    }),
-    queue: { enqueue: mocks.enqueue },
-    completion: { wait: mocks.completion },
+}));
+vi.mock('@/lib/liekan/warehouse-v2/runtime', () => ({
+  warehouseV2Runtime: () => ({
+    ensureReady: async () => {},
+    pg: { connect: async () => ({ query: mocks.pgQuery, release: vi.fn() }) },
+    ch: { query: async () => ({ json: mocks.readReceipt }) },
+    browserBatcher: { enqueue: mocks.enqueue },
   }),
 }));
 vi.mock('@/lib/liekan/upstream/collection-admission', () => ({
@@ -145,12 +141,16 @@ describe('compatible collection quality intake', () => {
     }));
     delete process.env.DISABLE_BOT_CHECK;
     mocks.warehouse = false;
-    mocks.enqueue.mockResolvedValue({});
-    mocks.completion.mockImplementation(async (e: any) => ({
-      status: 'new',
-      sessionId: e.sessionId,
-      visitId: e.visitId,
-    }));
+    mocks.enqueue.mockResolvedValue(undefined);
+    mocks.readReceipt.mockResolvedValue([]);
+    mocks.pgQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes(' AS active,'))
+        return { rows: [{ active: true, epoch: '1', policy_revision: 0 }] };
+      if (sql.includes('FOR SHARE')) return { rowCount: 1 };
+      if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(sql) || sql.includes('pg_advisory_xact_lock'))
+        return { rows: [] };
+      throw new Error('unexpected collection statement');
+    });
   });
   it('old scripts collect without an ID and preserve the exact Umami response shape', async () => {
     const response = await call();
@@ -243,32 +243,39 @@ describe('compatible collection quality intake', () => {
     expect(mocks.write).not.toHaveBeenCalled();
     expect(mocks.saveEvent).not.toHaveBeenCalled();
     expect(mocks.createSession).not.toHaveBeenCalled();
-    const envelope = mocks.enqueue.mock.calls[0][0];
-    expect(envelope.clientEventId).toBe(eventId);
-    expect(envelope.data.facts.map((f: any) => f.family)).toEqual(
-      expect.arrayContaining([
-        'website_event',
-        'event_data',
-        'revenue',
-        'liekan_event_quality',
-        'liekan_event_environment',
-        'liekan_collection_receipt',
+    expect(mocks.enqueue).toHaveBeenCalledOnce();
+    const [rows, writeKey] = mocks.enqueue.mock.calls[0];
+    expect(writeKey).toBe(`${website}:${eventId}`);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      client_event_id: eventId,
+      website_id: website,
+      event_name: 'purchase',
+      receipt_hash: expect.any(String),
+      classification: 'browser',
+      rule_version: 'traffic-quality-v1',
+      identity_scope: 'browser_unresolved',
+      identity_available: false,
+      event_revenue: [[expect.any(String), 'CNY', '2.1235']],
+      event_properties: expect.arrayContaining([
+        expect.arrayContaining(['revenue']),
+        expect.arrayContaining(['currency']),
       ]),
-    );
-    expect(JSON.stringify(envelope)).not.toContain('192.0.2.1');
-    expect(JSON.stringify(envelope)).not.toContain('Mozilla/5.0');
+    });
+    expect(JSON.stringify(rows)).not.toContain('192.0.2.1');
+    expect(JSON.stringify(rows)).not.toContain('Mozilla/5.0');
   });
-  it('returns a retryable unknown result when the durable queue cannot confirm', async () => {
+  it('returns a retryable unknown result when v2 cannot confirm the write', async () => {
     mocks.warehouse = true;
     mocks.enqueue.mockRejectedValue(new Error('isolated transport outage'));
     const response = await call({ eventId });
     expect(response.status).toBe(503);
     expect(response.headers.get('Retry-After')).toBe('2');
-    expect(mocks.completion).not.toHaveBeenCalled();
+    expect(mocks.pgQuery).toHaveBeenCalledWith('ROLLBACK');
     expect(mocks.token).not.toHaveBeenCalled();
     expect(mocks.write).not.toHaveBeenCalled();
   });
-  it('redacts direct-submitted URL and referrer secrets before queueing warehouse facts', async () => {
+  it('redacts direct-submitted URL and referrer secrets before writing the v2 row', async () => {
     mocks.warehouse = true;
     const response = await call({
       eventId,
@@ -276,8 +283,7 @@ describe('compatible collection quality intake', () => {
       referrer: 'https://referrer.test/from?email=visitor%40example.com&utm_medium=email',
     });
     expect(response.status).toBe(200);
-    const envelope = mocks.enqueue.mock.calls[0][0];
-    const serialized = JSON.stringify(envelope);
+    const serialized = JSON.stringify(mocks.enqueue.mock.calls[0][0]);
     expect(serialized).not.toContain('private-token');
     expect(serialized).not.toContain('private-fragment');
     expect(serialized).not.toContain('visitor%40example.com');
@@ -288,17 +294,16 @@ describe('compatible collection quality intake', () => {
   });
   it('keeps the original session/visit response for warehouse duplicates and 409 for conflicts', async () => {
     mocks.warehouse = true;
-    mocks.completion.mockResolvedValue({
-      status: 'duplicate',
-      sessionId: website,
-      visitId: eventId,
-    });
-    expect(await (await call({ eventId })).json()).toEqual({
+    const payload = { eventId, url: '/original' };
+    expect((await call(payload)).status).toBe(200);
+    const [[stored]] = mocks.enqueue.mock.calls[0];
+    mocks.readReceipt.mockResolvedValue([{ ...stored, session_id: website, visit_id: eventId }]);
+    expect(await (await call(payload)).json()).toEqual({
       cache: 'fixture-cache',
       sessionId: website,
       visitId: eventId,
     });
-    mocks.completion.mockResolvedValue({ status: 'conflict', sessionId: null, visitId: null });
-    expect((await call({ eventId })).status).toBe(409);
+    expect((await call({ ...payload, url: '/different' })).status).toBe(409);
+    expect(mocks.enqueue).toHaveBeenCalledOnce();
   });
 });

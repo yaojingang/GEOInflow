@@ -474,13 +474,11 @@ it('does not build a wide string search predicate for an empty search', async ()
 
 it('shares a finished hourly trend only inside the frozen round and exact chart scope', async () => {
   const { withDashboardClock } = await import('./dashboard-clock');
-  const hour = +start / 1000;
-  const row = { bot: 'Fixture', type: '搜索', count: 2, aiRequests: 1 };
-  const builds = Array.from({ length: 24 }, (_, i) => [hour + i * 3600, 'build']);
+  vi.stubEnv('LIEKAN_WAREHOUSE_V2', '1');
+  const row = { day: '2026-11-01', bot: 'Fixture', type: '搜索', count: 2, aiRequests: 1 };
   mocks.query.mockImplementation(async (_site, sql) => {
-    if (sql.includes('AND hour=0')) return [{ publication: '5', payload: JSON.stringify(builds) }];
-    if (sql.includes('(hour,build) IN'))
-      return builds.map(([hour], i) => ({ hour, payload: JSON.stringify(i ? [] : [row]) }));
+    if (sql.includes('SELECT 1 AS present')) return [{ present: 1 }];
+    if (sql.includes('GROUP BY day,bot,type')) return [row];
     throw Error('unexpected source query');
   });
   const persisted = {
@@ -503,9 +501,9 @@ it('shares a finished hourly trend only inside the frozen round and exact chart 
       round === 'trend-round' ? persisted : undefined,
     );
   try {
-    const expected = [{ ...row, day: '2026-11-01' }];
-    mocks.query.mockRejectedValueOnce(new Error('manifest read failed'));
-    await expect(run('trend-round')).rejects.toThrow('manifest read failed');
+    const expected = [{ ...row }];
+    mocks.query.mockRejectedValueOnce(new Error('trend read failed'));
+    await expect(run('trend-round')).rejects.toThrow('trend read failed');
     expect(Object.keys(persisted.values)).toHaveLength(0);
     mocks.query.mockClear();
     const first = await run('trend-round');
@@ -518,9 +516,12 @@ it('shares a finished hourly trend only inside the frozen round and exact chart 
     await run('trend-round', 'Asia/Shanghai');
     await run('trend-round', 'UTC', 'verified_identity');
     await run('trend-next');
-    expect(mocks.query).toHaveBeenCalledTimes(8);
+    const queries = mocks.query.mock.calls.map(([, sql]) => sql);
+    expect(queries.filter(sql => sql.includes('GROUP BY day,bot,type'))).toHaveLength(4);
+    expect(queries.filter(sql => sql.includes('SELECT 1 AS present'))).toHaveLength(2);
   } finally {
     releaseRoundMetrics('trend-round');
     releaseRoundMetrics('trend-next');
+    vi.unstubAllEnvs();
   }
 });

@@ -1,4 +1,3 @@
-import { closeWarehouseV2Runtime } from '../warehouse-v2/index';
 export {
   warehouseEnabled,
   warehouseIntakeEnabled,
@@ -18,5 +17,6 @@ export class WarehouseUnavailable extends Error {
 export type WarehouseRuntime = never;
 
 export async function closeWarehouseRuntime() {
+  const { closeWarehouseV2Runtime } = await import('../warehouse-v2/runtime');
   await closeWarehouseV2Runtime();
 }

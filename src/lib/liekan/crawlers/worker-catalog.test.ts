@@ -25,10 +25,7 @@ vi.mock('../upstream/crawler-registry', async importOriginal => ({
   readCrawlerRegistryPointer: mocks.pointer,
   readPublishedRegistry: mocks.catalog,
 }));
-vi.mock('../upstream/query-cache', () => ({
-  analyticsCache: { invalidate: mocks.invalidate },
-  websiteCacheTag: (id: string) => id,
-}));
+vi.mock('../upstream/server', () => ({ query: vi.fn() }));
 vi.mock('./analysis', () => ({
   crawlerBase: 'FROM liekan_effective_log l WHERE l.website_id=$1::uuid',
   crawlerCountColumns: 'count(*) AS requests',
@@ -36,6 +33,7 @@ vi.mock('./analysis', () => ({
 }));
 vi.mock('./workflow-lifecycle', () => ({ reconcileFindingWorkflow: mocks.reconcile }));
 
+import { analyticsCache, websiteCacheTag } from '../upstream/query-cache';
 import { processCrawlerAnalysis, recomputeCrawlerRisks } from './worker';
 import { getBundledPublishedCatalog } from './catalog-seed';
 import { getPublishedCatalog } from './published';
@@ -57,6 +55,7 @@ let authority: { authority: string; revision: string; installation_id: string };
 afterEach(() => vi.unstubAllEnvs());
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.spyOn(analyticsCache, 'invalidate').mockImplementation(mocks.invalidate);
   vi.stubEnv('LIEKAN_WAREHOUSE_TRANSITION', 'false');
   vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', '');
   const seed = getBundledPublishedCatalog();
@@ -116,7 +115,7 @@ it('persists the captured version in finding facts and state quality under the c
       ([sql]) => sql === 'SELECT version FROM liekan_crawler_registry_current WHERE id=1 FOR SHARE',
     ),
   ).toBe(true);
-  expect(mocks.invalidate).toHaveBeenCalledWith(websiteId);
+  expect(mocks.invalidate).toHaveBeenCalledWith(websiteCacheTag(websiteId));
 });
 
 it('discards an older computation after a newer publication has committed its analysis', async () => {
