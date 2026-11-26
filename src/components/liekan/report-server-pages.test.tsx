@@ -1,6 +1,8 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import { ReportRows } from './ReportComponents';
+import { ReportList, ReportRows } from './ReportComponents';
+import { LiekanLocaleContext } from '@/lib/liekan/i18n/client';
+import { translateText } from '@/lib/liekan/i18n/text';
 import { ReportContext, type ReportActions } from './ReportContext';
 import type { LiekanReport, Row } from './types';
 
@@ -57,6 +59,68 @@ const click = async (button: HTMLElement) => {
 };
 
 describe('server-paged detail tables', () => {
+  for (const locale of ['zh-CN', 'en-US'] as const) {
+    it(`renders and requests the blind-spot server page without slicing it twice in ${locale}`, async () => {
+      const onTablePage = vi.fn();
+      const data = report();
+      data.tables.blindList = rows(21, 40);
+      data.meta.tablePages = {
+        blindList: { page: 2, pageSize: 20, total: 100005 },
+        apBody: { page: 7, pageSize: 20, total: 200 },
+      };
+      const list = () => (
+        <LiekanLocaleContext.Provider value={locale}>
+          <ReportContext.Provider value={{ ...baseActions, onTablePage }}>
+            <ReportList
+              id="blindList"
+              className="divide-y divide-line/60 text-[12px]"
+              report={data}
+              pageSize={20}
+            />
+          </ReportContext.Provider>
+        </LiekanLocaleContext.Provider>
+      );
+      const view = render(list());
+      expect(screen.getByText('https://example.test/page-21')).toBeInTheDocument();
+      expect(screen.getByText('https://example.test/page-40')).toBeInTheDocument();
+      expect(document.getElementById('blindList')?.children).toHaveLength(20);
+      await click(screen.getByRole('button', { name: translateText('下一页', locale) }));
+      expect(onTablePage).toHaveBeenLastCalledWith('blindList', 3);
+      await click(screen.getByRole('button', { name: translateText('上一页', locale) }));
+      expect(onTablePage).toHaveBeenLastCalledWith('blindList', 1);
+      expect(data.meta.tablePages.apBody.page).toBe(7);
+      data.tables.blindList = rows(100001, 100005);
+      data.meta.tablePages.blindList.page = 5001;
+      view.rerender(list());
+      expect(screen.getByText('https://example.test/page-100005')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: translateText('下一页', locale) })).toBeDisabled();
+      data.tables.blindList = rows(1, 20);
+      data.meta.tablePages.blindList.page = 1;
+      view.rerender(list());
+      expect(screen.getByText('https://example.test/page-1')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: translateText('上一页', locale) })).toBeDisabled();
+    });
+
+    it(`keeps legacy blind-spot arrays on client pagination in ${locale}`, async () => {
+      const onTablePage = vi.fn();
+      const data = report();
+      data.tables.blindList = rows(1, 45);
+      // Another server-paged table does not switch the legacy list into server mode.
+      data.meta.tablePages = { apBody: { page: 2, pageSize: 20, total: 45 } };
+      render(
+        <LiekanLocaleContext.Provider value={locale}>
+          <ReportContext.Provider value={{ ...baseActions, onTablePage }}>
+            <ReportList id="blindList" className="" report={data} pageSize={20} />
+          </ReportContext.Provider>
+        </LiekanLocaleContext.Provider>,
+      );
+      await click(screen.getByRole('button', { name: translateText('下一页', locale) }));
+      expect(screen.getByText('https://example.test/page-21')).toBeInTheDocument();
+      expect(screen.queryByText('https://example.test/page-20')).not.toBeInTheDocument();
+      expect(onTablePage).not.toHaveBeenCalled();
+    });
+  }
+
   it('renders the server slice with pager state from meta and routes page turns', async () => {
     const onTablePage = vi.fn();
     const data = report();

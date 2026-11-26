@@ -1,13 +1,16 @@
-import type { AiTx } from '../upstream/ai-db';
-import { performanceQuerySchema, type EvidenceQuery } from '../contracts/traffic-evidence';
 import { evidenceValue } from '../contracts/crawler-metrics';
+import { type EvidenceQuery, performanceQuerySchema } from '../contracts/traffic-evidence';
+import type { AiTx } from '../upstream/ai-db';
+import { LiekanError } from '../upstream/errors';
+import { warehousePerformanceFacts } from '../upstream/warehouse-evidence-queries';
+import { warehouseEvidenceSections } from '../upstream/warehouse-evidence-table';
+import { warehouseEnabled } from '../warehouse/authority-routing';
 import {
-  evidenceScope,
-  evidenceMeta,
   type EvidenceInputs,
+  evidenceMeta,
+  evidenceScope,
   parseEvidenceQuery,
 } from './evidence-read';
-import { LiekanError } from '../upstream/errors';
 
 export function parsePerformanceQuery(value: unknown) {
   const parsed = performanceQuerySchema.safeParse(value);
@@ -40,8 +43,13 @@ export async function readPerformance(
     CASE WHEN e.edge_observation->'fields'->'OriginResponseDurationMs'->>'state'='present'
       AND (e.edge_observation->'fields'->'OriginResponseStatus'->>'value')::int BETWEEN 100 AND 599
       THEN (e.edge_observation->'fields'->'OriginResponseDurationMs'->>'value')::float8 END AS origin_ms ${scope.sql}`;
-  const [totals] = await tx.query(
-    `WITH selected AS (${projection}) SELECT count(*)::float8 AS requests,
+  const warehouseFacts = warehouseEnabled()
+    ? await warehousePerformanceFacts(websiteId, p, knownCache)
+    : null;
+  const [totals] = warehouseFacts
+    ? [warehouseFacts.totals]
+    : await tx.query(
+        `WITH selected AS (${projection}) SELECT count(*)::float8 AS requests,
     count(edge_ms)::float8 AS "edgeSamples",percentile_cont(0.5) WITHIN GROUP(ORDER BY edge_ms) AS "edgeP50",percentile_cont(0.95) WITHIN GROUP(ORDER BY edge_ms) AS "edgeP95",
     count(origin_ms)::float8 AS "originSamples",percentile_cont(0.5) WITHIN GROUP(ORDER BY origin_ms) AS "originP50",percentile_cont(0.95) WITHIN GROUP(ORDER BY origin_ms) AS "originP95",
     count(*) FILTER(WHERE edge_observation->'fields'->'edgeDurationMs'->>'reason'='over_limit')::float8 AS "edgeOverLimit",
@@ -50,11 +58,13 @@ export async function readPerformance(
     count(*) FILTER(WHERE cache=ANY($${scope.args.length + 1}::text[]))::float8 AS "cacheSamples",
     count(*) FILTER(WHERE cache IN('hit','stream_hit'))::float8 AS hits
     FROM selected`,
-    ...scope.args,
-    knownCache,
-  );
-  const rows = await tx.query(
-    `WITH selected AS (${projection}), bytes AS (
+        ...scope.args,
+        knownCache,
+      );
+  const rows = warehouseFacts
+    ? warehouseFacts.rows
+    : await tx.query(
+        `WITH selected AS (${projection}), bytes AS (
     SELECT coalesce(measurement->>'bytesUnit','unknown') AS unit,
       count(*)::float8 AS requests,count(*) FILTER(WHERE measurement->>'bytesAvailability'='present')::float8 AS samples,
       sum(bytes::numeric) FILTER(WHERE measurement->>'bytesAvailability'='present')::text AS "observedBytes"
@@ -65,25 +75,31 @@ export async function readPerformance(
     SELECT b.*,max(m.bytes) FILTER(WHERE m.minute>=$2 AND m.minute+interval '60 seconds'<=$3)::text AS "peakMinuteBytes",
       (max(m.bytes) FILTER(WHERE m.minute>=$2 AND m.minute+interval '60 seconds'<=$3)/60)::text AS "observedPeakBytesPerSecond"
     FROM bytes b LEFT JOIN minutes m USING(unit) GROUP BY b.unit,b.requests,b.samples,b."observedBytes" ORDER BY b.unit`,
-    ...scope.args,
-  );
-  const [peak] = await tx.query(
-    `WITH minutes AS (SELECT date_bin(interval '60 seconds',l.created_at,'2000-01-01Z'::timestamptz) AS minute,count(*)::float8 AS requests ${scope.sql} GROUP BY 1)
+        ...scope.args,
+      );
+  const [peak] = warehouseFacts
+    ? [warehouseFacts.peak]
+    : await tx.query(
+        `WITH minutes AS (SELECT date_bin(interval '60 seconds',l.created_at,'2000-01-01Z'::timestamptz) AS minute,count(*)::float8 AS requests ${scope.sql} GROUP BY 1)
     SELECT max(requests) FILTER(WHERE minute>=$2 AND minute+interval '60 seconds'<=$3) AS rpm,
       coalesce(sum(requests) FILTER(WHERE minute<$2 OR minute+interval '60 seconds'>$3),0)::float8 AS "incompleteMinuteRequests" FROM minutes`,
-    ...scope.args,
-  );
-  const cache = await tx.query(
-    `SELECT coalesce(lower(e.cache_status),'missing') AS status,count(*)::float8 AS requests ${scope.sql} GROUP BY 1 ORDER BY 1`,
-    ...scope.args,
-  );
-  const fieldCoverage = await tx.query(
-    `WITH selected AS (${projection}) SELECT field,
+        ...scope.args,
+      );
+  const cache = warehouseFacts
+    ? warehouseFacts.cache
+    : await tx.query(
+        `SELECT coalesce(lower(e.cache_status),'missing') AS status,count(*)::float8 AS requests ${scope.sql} GROUP BY 1 ORDER BY 1`,
+        ...scope.args,
+      );
+  const fieldCoverage = warehouseFacts
+    ? warehouseFacts.fieldCoverage
+    : await tx.query(
+        `WITH selected AS (${projection}) SELECT field,
     coalesce(edge_observation->'fields'->field->>'state','unknown') AS state,CASE WHEN field IN('OriginResponseDurationMs','edgeDurationMs') THEN NULL ELSE edge_observation->'fields'->field->'value' END AS value,count(*)::float8 AS requests
     FROM selected CROSS JOIN unnest(ARRAY['BotScore','BotScoreSrc','VerifiedBotCategory','EdgeResponseContentType','OriginResponseDurationMs','OriginResponseStatus','edgeDurationMs']) field
     GROUP BY 1,2,3 ORDER BY 1,2,3 LIMIT 100001`,
-    ...scope.args,
-  );
+        ...scope.args,
+      );
   const metric = (value: number | null, samples: number) =>
     evidenceValue(
       value,
@@ -102,6 +118,14 @@ export async function readPerformance(
       byteUnits: 'separate',
     },
     fieldCoverage,
+    ...(warehouseFacts
+      ? {
+          [warehouseEvidenceSections]: {
+            reasons: warehouseFacts.cacheTable,
+            fieldCoverage: warehouseFacts.fieldCoverageTable,
+          },
+        }
+      : {}),
     rows: rows.map(row => ({
       ...row,
       bytes: evidenceValue(

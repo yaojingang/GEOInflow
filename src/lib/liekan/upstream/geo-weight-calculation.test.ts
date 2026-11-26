@@ -13,7 +13,11 @@ const h = vi.hoisted(() => ({
   epoch: 1,
   policyRevision: '1',
   feature: true,
+  warehouse: false,
+  report: vi.fn(),
 }));
+vi.mock('../warehouse/runtime', () => ({ warehouseEnabled: () => h.warehouse }));
+vi.mock('./warehouse-report-snapshot', () => ({ withinWarehouseReport: h.report }));
 vi.mock('@/lib/auth', () => ({ checkAuth: h.auth }));
 vi.mock('@/lib/db', () => ({ isRelationalOnly: () => true }));
 vi.mock('./ai-access', () => ({ authorizeAiWebsite: h.access }));
@@ -65,6 +69,7 @@ beforeEach(() => {
   h.epoch = 1;
   h.policyRevision = '1';
   h.feature = true;
+  h.warehouse = false;
   h.catalog = getBundledPublishedCatalog();
   h.auth.mockResolvedValue({ authType: 'session', user: actor });
   h.access.mockResolvedValue({ domain: 'www.example.com', role: 'admin', canUse: true });
@@ -122,4 +127,18 @@ describe('GEO background calculator boundaries', () => {
     expect(csv).not.toContain('\r\n@evil');
     expect(csv).not.toMatch(/ip_masked|user_agent/);
   });
+});
+
+it('bounds the CH report by the same GEO deadline and forwards lease cancellation', async () => {
+  h.warehouse = true;
+  h.report.mockResolvedValueOnce({ isolated: true });
+  const abort = new AbortController(), deadline = Date.now() + 1000;
+  await readGeoWeight(actor, site, input, { deadline, signal: abort.signal, fresh: true });
+  expect(h.report.mock.calls[0][1]).toEqual({ deadline, signal: abort.signal });
+  const started = Date.now();
+  h.report.mockResolvedValueOnce({ isolated: true });
+  await readGeoWeight(actor, site, input);
+  const defaultDeadline = h.report.mock.calls[1][1].deadline;
+  expect(defaultDeadline).toBeGreaterThanOrEqual(started + 60000);
+  expect(defaultDeadline).toBeLessThanOrEqual(Date.now() + 60000);
 });

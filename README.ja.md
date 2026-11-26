@@ -99,6 +99,22 @@ flowchart LR
 
 ## クイックデプロイ
 
+ClickHouse 版を新規インストールするには、リポジトリのルートで `env.example` を `.env` にコピーし、4 つの異なるランダムなシークレットを設定してから実行します。
+
+```sh
+docker compose up -d
+```
+
+更新も同じディレクトリで実行します。
+
+```sh
+git pull --ff-only && docker compose up -d
+```
+
+サービスの状態は `docker compose ps` で確認できます。既存の PostgreSQL 版から移行する場合は、[ClickHouse の導入・移行ガイド](docs/warehouse.md)を参照してください。
+
+### PostgreSQL 版
+
 Docker Engine / Docker Desktop と Docker Compose V2 を起動し、イメージと依存関係のダウンロード元にアクセスできることを確認してください。ソースコードを取得したら、プロジェクトのルートで次のコマンドを実行します：
 
 ```sh

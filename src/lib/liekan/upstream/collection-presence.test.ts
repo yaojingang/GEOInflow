@@ -1,14 +1,34 @@
 import { beforeEach, expect, it, vi } from 'vitest';
-const mocks = vi.hoisted(() => ({ query: vi.fn(), stats: vi.fn(), dates: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  query: vi.fn(),
+  stats: vi.fn(),
+  dates: vi.fn(),
+  warehouse: vi.fn(),
+}));
 vi.mock('./server', () => ({ query: mocks.query }));
 vi.mock('@/queries/sql', () => ({
   getWebsiteStats: mocks.stats,
   getWebsiteDateRange: mocks.dates,
 }));
+vi.mock('./warehouse-presence', () => ({ warehouseCollectionPresence: mocks.warehouse }));
 import { collectionPresence } from './collection-presence';
 beforeEach(() => {
   vi.resetAllMocks();
   vi.stubEnv('CLICKHOUSE_URL', '');
+  vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'postgresql');
+});
+it('verifies raw collection in the installed warehouse without reading stale PG facts', async () => {
+  vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+  const presence = {
+    pageviews: 7,
+    firstAt: '2026-11-03T00:00:00.000Z',
+    lastAt: '2026-11-03T01:00:00.000Z',
+  };
+  mocks.warehouse.mockResolvedValue(presence);
+  expect(await collectionPresence('fixture')).toEqual(presence);
+  expect(mocks.warehouse).toHaveBeenCalledWith('fixture');
+  expect(mocks.query).not.toHaveBeenCalled();
+  expect(mocks.stats).not.toHaveBeenCalled();
 });
 it('reads raw PostgreSQL collection presence independently of the active policy', async () => {
   mocks.query.mockResolvedValue([

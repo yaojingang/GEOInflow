@@ -1,4 +1,5 @@
 import prisma from '@/lib/prisma';
+
 export async function recordGeographyIngress(
   websiteId: string,
   reason: 'blocked_ip' | 'invalid_ip',

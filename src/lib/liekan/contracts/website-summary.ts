@@ -34,6 +34,15 @@ export const websiteSummarySchema = z.array(
     received: z.boolean(),
     lastAt: z.string().nullable(),
     comparison: totals,
+    snapshot: z
+      .object({
+        state: z.enum(['ready', 'updating', 'preparing']),
+        startAt: z.number(),
+        endAt: z.number(),
+        dataThrough: z.number().nullable(),
+      })
+      .optional(),
+    collectionKnown: z.boolean().optional(),
   }),
 );
 export type WebsiteSummary = z.infer<typeof websiteSummarySchema>;

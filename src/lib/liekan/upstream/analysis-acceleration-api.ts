@@ -1,3 +1,4 @@
+import { warehouseEnabled } from '../warehouse/runtime';
 import { z } from 'zod';
 import { formatInTimeZone, fromZonedTime } from 'date-fns-tz';
 import { analysisBuildInputSchema, analysisActionSchema } from '../contracts/analysis-acceleration';
@@ -42,7 +43,8 @@ export async function listAnalysisWebsites(request: Request) {
       cursor || null,
     );
     return {
-      supported: true,
+      supported: !warehouseEnabled(),
+      backend: warehouseEnabled() ? 'clickhouse' : 'postgresql',
       websites: rows.slice(0, 50),
       nextCursor: rows.length > 50 ? rows[49].id : null,
     };
@@ -68,12 +70,14 @@ export function analysisCommonRange(timezone: string, now = Date.now()) {
 }
 export async function analysisManagementState(request: Request, handle: string) {
   const { websiteId, identity } = await authorizeAnalysisManagement(request, handle);
+  if (warehouseEnabled()) return { websiteId, supported: false, backend: 'clickhouse' };
   return getAnalysisStatus(websiteId, identity);
 }
 export async function analysisManagementBuild(request: Request, handle: string, input: unknown) {
   const parsed = analysisBuildInputSchema.safeParse(input);
   if (!parsed.success) throw new LiekanError('构建参数无效', 400);
   const { websiteId, identity } = await authorizeAnalysisManagement(request, handle);
+  if (warehouseEnabled()) throw new LiekanError('ClickHouse 已直接提供统计，无需构建旧汇总', 410);
   const p = parsed.data;
   let range = analysisCommonRange(p.timezone);
   if (p.preset === 'custom') range = { startDate: new Date(p.startAt), endDate: new Date(p.endAt) };
@@ -100,5 +104,6 @@ export async function analysisManagementAction(request: Request, handle: string,
   const parsed = analysisActionSchema.safeParse(input);
   if (!parsed.success) throw new LiekanError('操作参数无效', 400);
   const { websiteId, identity } = await authorizeAnalysisManagement(request, handle);
+  if (warehouseEnabled()) throw new LiekanError('ClickHouse 已直接提供统计，无需构建旧汇总', 410);
   return actionAnalysisBuild(websiteId, identity, parsed.data);
 }

@@ -1,3 +1,4 @@
+import { warehouseEnabled } from '@/lib/liekan/warehouse/authority-routing';
 import {
   GEO_CONTENT_TYPES,
   GEO_METADATA_PATH,
@@ -6,7 +7,7 @@ import {
 } from '../geo-weight/policy';
 import type { AiTx } from './ai-db';
 
-// All path/day distinct operations stay in PostgreSQL. No row or Top-N limit feeds a score.
+// Path/day distinct operations stay in the active analytical backend. No Top-N feeds a score.
 export async function geoWeightAggregate(
   tx: AiTx,
   websiteId: string,
@@ -14,6 +15,14 @@ export async function geoWeightAggregate(
   timezone: string,
   windows: Array<{ asOf: string; startAt: number; endAt: number }>,
 ) {
+  if (warehouseEnabled())
+    return (await import('./warehouse-geo-weight')).warehouseGeoWeightAggregate(
+      tx,
+      websiteId,
+      hostname,
+      timezone,
+      windows,
+    );
   return tx.query(
     `WITH windows AS (
       SELECT * FROM jsonb_to_recordset($2::jsonb) AS w("asOf" text,"startAt" timestamptz,"endAt" timestamptz)
@@ -172,6 +181,14 @@ export async function geoWeightFirstEvidence(
   timezone: string,
   endAt: number,
 ) {
+  if (warehouseEnabled())
+    return (await import('./warehouse-geo-weight')).warehouseGeoWeightFirstEvidence(
+      tx,
+      websiteId,
+      hostname,
+      timezone,
+      endAt,
+    );
   const [earliest] = await tx.query(
     `SELECT (l.created_at AT TIME ZONE $3)::date::text AS day
           FROM liekan_effective_log l JOIN liekan_crawler_evidence e ON e.website_id=l.website_id AND e.log_id=l.id

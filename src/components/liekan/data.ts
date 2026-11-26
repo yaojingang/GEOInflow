@@ -375,54 +375,57 @@ export function formatCellValue(
     }).format(new Date(value));
   return formatValue(value, locale);
 }
-export function selectRows(
-  rows: Row[],
+export function rowMatchesSelection(
+  row: Row,
   filter: string,
-  sort: { label: string; direction: number },
   table: string,
   query = '',
   displayPath?: (value: unknown) => string | null,
 ) {
-  const filtered = rows.filter(row => {
-    const category = String(row.type ?? row.classification ?? '');
-    const matches =
-      filter === '全部' ||
-      !filter ||
-      filter.startsWith('按') ||
-      (filter === 'AI 训练' && category === '训练') ||
-      (filter === 'AI 搜索' && category === '搜索') ||
-      (['其他爬虫', '其他已知'].includes(filter) && isOtherCrawler(row)) ||
-      (filter === 'AI 工作台' &&
-        String(row.productForm ?? '')
-          .split(',')
-          .includes('workbench')) ||
-      (filter === '个人 Agent' &&
-        String(row.productForm ?? '')
-          .split(',')
-          .includes('personal_agent')) ||
-      (filter === '仅 AI 蜘蛛' &&
-        table === 'logBody' &&
-        (typeof row.aiEligible === 'boolean'
-          ? row.aiEligible
-          : ['训练', '搜索', '用户触发'].includes(String(row.botType ?? '')))) ||
-      (filter === '未知／未分类' &&
-        isUnknownCrawler({
-          bot: row.bot as string | undefined,
-          recognitionState: row.recognitionState as string | null | undefined,
-        })) ||
-      (filter === '仅异常' &&
-        (/risk|异常|风险|unknown/i.test(category) || Number(row.status) >= 400)) ||
-      category.replace(/\s/g, '').includes(filter.replace(/\s/g, ''));
-    return (
-      matches &&
-      (!query ||
-        [...Object.values(row), displayPath?.(row.path)].some(value =>
-          String(value ?? '')
-            .toLowerCase()
-            .includes(query.toLowerCase()),
-        ))
-    );
-  });
+  const category = String(row.type ?? row.classification ?? '');
+  const matches =
+    filter === '全部' ||
+    !filter ||
+    filter.startsWith('按') ||
+    (filter === 'AI 训练' && category === '训练') ||
+    (filter === 'AI 搜索' && category === '搜索') ||
+    (['其他爬虫', '其他已知'].includes(filter) && isOtherCrawler(row)) ||
+    (filter === 'AI 工作台' &&
+      String(row.productForm ?? '')
+        .split(',')
+        .includes('workbench')) ||
+    (filter === '个人 Agent' &&
+      String(row.productForm ?? '')
+        .split(',')
+        .includes('personal_agent')) ||
+    (filter === '仅 AI 蜘蛛' &&
+      table === 'logBody' &&
+      (typeof row.aiEligible === 'boolean'
+        ? row.aiEligible
+        : ['训练', '搜索', '用户触发'].includes(String(row.botType ?? '')))) ||
+    (filter === '未知／未分类' &&
+      isUnknownCrawler({
+        bot: row.bot as string | undefined,
+        recognitionState: row.recognitionState as string | null | undefined,
+      })) ||
+    (filter === '仅异常' &&
+      (/risk|异常|风险|unknown/i.test(category) || Number(row.status) >= 400)) ||
+    category.replace(/\s/g, '').includes(filter.replace(/\s/g, ''));
+  return (
+    matches &&
+    (!query ||
+      [...Object.values(row), displayPath?.(row.path)].some(value =>
+        String(value ?? '')
+          .toLowerCase()
+          .includes(query.toLowerCase()),
+      ))
+  );
+}
+export function rowSelectionComparator(
+  filter: string,
+  sort: { label: string; direction: number },
+  table: string,
+) {
   const byFilter: Record<string, string> = {
     按抓取量: 'requests',
     按重复率: 'repeatRate',
@@ -432,8 +435,9 @@ export function selectRows(
     按时长: 'duration',
   };
   const key = byFilter[filter] || columns[table]?.find(([, label]) => label === sort.label)?.[0];
-  if (!key) return filtered;
-  return [...filtered].sort((a, b) => {
+  if (!key) return (_a: Row, _b: Row) => 0;
+  const compareText = new Intl.Collator('zh-CN', { numeric: true }).compare;
+  return (a: Row, b: Row) => {
     const av = a[key],
       bv = b[key];
     if (av == null && bv == null) return 0;
@@ -442,10 +446,22 @@ export function selectRows(
     return (
       (typeof av === 'number' && typeof bv === 'number'
         ? av - bv
-        : String(av).localeCompare(String(bv), 'zh-CN', { numeric: true })) *
-      (byFilter[filter] ? -1 : sort.direction)
+        : compareText(String(av), String(bv))) * (byFilter[filter] ? -1 : sort.direction)
     );
-  });
+  };
+}
+
+export function selectRows(
+  rows: Row[],
+  filter: string,
+  sort: { label: string; direction: number },
+  table: string,
+  query = '',
+  displayPath?: (value: unknown) => string | null,
+) {
+  return rows
+    .filter(row => rowMatchesSelection(row, filter, table, query, displayPath))
+    .sort(rowSelectionComparator(filter, sort, table));
 }
 export function csvMatrix(headers: string[], rows: string[][]) {
   const cell = (value: unknown) => {

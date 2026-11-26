@@ -31,6 +31,7 @@ it.each(['', '/private-api'])(
       '/liekan/websites/site/analytics-jobs/job',
       '/liekan/websites/site/analytics-jobs/job/result',
       '/liekan/websites/site/page-report',
+      '/liekan/websites/site/log-entries',
       '/liekan/websites/site/analytics',
       '/liekan/websites/site/journeys',
     ]) {

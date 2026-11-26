@@ -1,6 +1,6 @@
+import { ReportTrend } from '../ReportTrend';
 import { useLiekanI18n } from '@/lib/liekan/i18n/client';
 import {
-  FilterChip,
   InsightRows,
   MetricCard,
   ReferenceChart,
@@ -16,6 +16,7 @@ export function Overview({
   trendLabel,
   aiCrawlerEnabled,
   geoWeight,
+  trend,
 }: ReportViewProps) {
   const i18n = useLiekanI18n();
   if (aiCrawlerEnabled === false || report?.meta.aiCrawlerEnabled === false)
@@ -24,6 +25,7 @@ export function Overview({
         report={report}
         rangeLabel={i18n.system(rangeLabel)}
         trendLabel={i18n.system(trendLabel)}
+        trend={trend}
       />
     );
   return (
@@ -49,25 +51,17 @@ export function Overview({
         />
         {geoWeight ?? <GeoWeightPlaceholder />}
       </section>
-      <section className="card fade-in d2">
-        <div className="px-6 pt-5 pb-2 flex items-center justify-between">
-          <div>
-            <h2 className="text-[14px] font-bold tracking-tight">
-              {i18n.text('AI 蜘蛛与浏览访问趋势')}
-            </h2>
-            <p className="text-[11.5px] text-faint mt-0.5">
-              {trendLabel || rangeLabel}
-              {i18n.fragment(' · 浏览器 PV / 日志 AI 请求', true, false)}
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <FilterChip label="30 天" />
-            <FilterChip label="7 天" />
-            <FilterChip label="今天" />
-          </div>
-        </div>
-        <ReferenceChart id="d1" height={280} report={report} />
-      </section>
+      <ReportTrend
+        key={trend?.key}
+        report={report}
+        rangeLabel={rangeLabel}
+        trendLabel={trendLabel}
+        trend={trend}
+        title="AI 蜘蛛与浏览访问趋势"
+        suffix=" · 浏览器 PV / 日志 AI 请求"
+        id="d1"
+        height={280}
+      />
       <section className="grid grid-cols-3 gap-4">
         <div className="card fade-in d2">
           <div className="px-6 pt-5 pb-2">
@@ -127,7 +121,7 @@ export function Overview({
   );
 }
 
-function VisitorOverview({ report, rangeLabel, trendLabel }: ReportViewProps) {
+function VisitorOverview({ report, rangeLabel, trendLabel, trend }: ReportViewProps) {
   const i18n = useLiekanI18n();
   return (
     <main className="max-w-[1200px] mx-auto px-8 py-6 space-y-4" data-visitor-overview>
@@ -142,23 +136,18 @@ function VisitorOverview({ report, rangeLabel, trendLabel }: ReportViewProps) {
           />
         ))}
       </section>
-      <section className="card fade-in d2">
-        <div className="px-6 pt-5 pb-2 flex flex-wrap gap-3 items-center justify-between">
-          <div>
-            <h2 className="text-[14px] font-bold tracking-tight">{i18n.text('访客浏览趋势')}</h2>
-            <p className="text-[11.5px] text-faint mt-0.5">
-              {trendLabel || rangeLabel}
-              {i18n.fragment(' · 浏览器 PV', true, false)}
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <FilterChip label="30 天" />
-            <FilterChip label="7 天" />
-            <FilterChip label="今天" />
-          </div>
-        </div>
-        <ReferenceChart id="d1" height={280} report={report} />
-      </section>
+      <ReportTrend
+        key={trend?.key}
+        report={report}
+        rangeLabel={rangeLabel}
+        trendLabel={trendLabel}
+        trend={trend}
+        title="访客浏览趋势"
+        suffix=" · 浏览器 PV"
+        id="d1"
+        height={280}
+        wrap
+      />
       <section className="grid grid-cols-2 gap-4">
         <div className="card fade-in d2">
           <div className="px-6 pt-5 pb-2">

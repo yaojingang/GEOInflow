@@ -1,3 +1,4 @@
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { populationFromRow } from '@/lib/liekan/upstream/browser-population';
 import { identityUnavailableReason } from '@/lib/liekan/contracts/population-results';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -15,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   navigate: vi.fn(),
   updateQuery: vi.fn(),
   actionBusy: false,
+  refetch: vi.fn(),
 }));
 vi.mock('next/link', () => ({
   default: ({ children, href }: any) => <a href={href}>{children}</a>,
@@ -26,6 +28,7 @@ vi.mock('./context', () => ({
       typeof mocks.query[key[0]] === 'function' ? mocks.query[key[0]](key) : mocks.query[key[0]],
     error: mocks.errors[key[0]] || null,
     isPending: mocks.pending[key[0]] || false,
+    refetch: mocks.refetch,
   }),
   useAction: () => ({
     run: async (action: () => Promise<any>) => action(),
@@ -228,9 +231,7 @@ it.each(['未提供', 'Not provided'])(
         <AnalyticsPages page="breakdown" />
       </LiekanLocaleContext.Provider>,
     );
-    expect(screen.getByRole('searchbox', { name: 'Search this page' })).toHaveValue(
-      term,
-    );
+    expect(screen.getByRole('searchbox', { name: 'Search this page' })).toHaveValue(term);
     expect(screen.getAllByRole('cell').map(cell => cell.textContent)).toContain('/missing');
     expect(screen.queryByRole('cell', { name: '/known' })).not.toBeInTheDocument();
   },
@@ -632,3 +633,68 @@ it('keeps a measured empty comparison period at zero and marks a new source', ()
   const chart = JSON.parse(screen.getByRole('img', { name: '同期访问趋势' }).textContent);
   expect(chart.series[1].values).toEqual([0]);
 });
+
+it.each(['zh-CN', 'en-US'] as const)(
+  'ends retention loading on preparing and preserves the month selectors (%s)',
+  locale => {
+    mocks.context.range = {
+      startAt: Date.UTC(2026, 10, 1),
+      endAt: Date.UTC(2026, 10, 14),
+      timezone: 'UTC',
+    };
+    mocks.query.retention = { status: 'preparing', analysisJob: { status: 'queued' } };
+    const view = render(
+      <LiekanLocaleContext.Provider value={locale}>
+        <AnalyticsPages page="retention" />
+      </LiekanLocaleContext.Provider>,
+    );
+    expect(
+      screen.getByText(
+        locale === 'zh-CN'
+          ? '数据准备中，请稍后查看'
+          : 'Data is being prepared. Please check again later.',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('pending')).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole('button', { name: locale === 'zh-CN' ? '重新查看' : 'Check again' }),
+    );
+    expect(mocks.refetch).toHaveBeenCalled();
+    expect(screen.getAllByRole('combobox').length).toBeGreaterThanOrEqual(2);
+    // React Query retains the previous 202 payload when a manual reread fails.
+    mocks.errors.retention = new Error('Controlled report failure');
+    view.rerender(
+      <LiekanLocaleContext.Provider value={locale}>
+        <AnalyticsPages page="retention" />
+      </LiekanLocaleContext.Provider>,
+    );
+    expect(
+      screen.queryByText(
+        locale === 'zh-CN'
+          ? '数据准备中，请稍后查看'
+          : 'Data is being prepared. Please check again later.',
+      ),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText('Controlled report failure')).toBeInTheDocument();
+    delete mocks.errors.retention;
+    if (process.env.LIEKAN_REPORT_UI_ARTIFACTS === '1') {
+      let css = readFileSync('src/styles/liekan/Features.module.css', 'utf8');
+      for (let at = css.indexOf(':global('); at >= 0; at = css.indexOf(':global(', at)) {
+        let end = at + 8,
+          depth = 1;
+        for (; end < css.length && depth; end++) {
+          if (css[end] === '(') depth++;
+          else if (css[end] === ')') depth--;
+        }
+        css = css.slice(0, at) + css.slice(at + 8, end - 1) + css.slice(end);
+      }
+      mkdirSync('.local/report-plan-validation/ui', { recursive: true });
+      writeFileSync(
+        `.local/report-plan-validation/ui/retention-${locale}.html`,
+        `<!doctype html><html lang="${locale}"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style><body data-liekan-features><main style="padding:24px">${view.container.innerHTML}</main></body></html>`,
+      );
+    }
+
+    view.unmount();
+  },
+);

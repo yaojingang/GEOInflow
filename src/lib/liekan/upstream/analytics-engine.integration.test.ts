@@ -671,6 +671,87 @@ describe.skipIf(!enabled)('optional ClickHouse analytics on owned databases', ()
     await exec('DELETE FROM liekan_analytics_engine_site WHERE website_id=$1::uuid', other);
     await worker.runEngineBatch();
   });
+  it('continues registered legacy deletions after warehouse intake without copying new facts', async () => {
+    const [state] = await q('SELECT installation_id FROM liekan_analytics_engine WHERE id=1');
+    const target = ch.engineConnection().key,
+      foreignTarget = 'f'.repeat(64),
+      cleanupSite = randomUUID();
+    const foreignInstallation = randomUUID();
+    await ch.initializeEngineTable();
+    const row = (id: string, epoch = 1, installation = state.installation_id) => ({
+      installation_id: installation,
+      source_epoch: epoch,
+      website_id: cleanupSite,
+      generation: randomUUID(),
+      bucket: '2026-01-01 00:00:00',
+      chunk: 0,
+      id,
+      created_at: '2026-01-01 00:01:00',
+      path: '/cleanup',
+      status: 200,
+      self_check: 0,
+      bot: null,
+      vendor: null,
+      bot_type: null,
+      verification: null,
+      ai_eligible: null,
+      recognition_state: null,
+      crawler_id: null,
+      catalog_version: null,
+      classification_version: null,
+      product_form: null,
+    });
+    const write = (rows: any[]) =>
+      ch.engineClient().insert({ table: ch.ENGINE_TABLE, format: 'JSONEachRow', values: rows });
+    await write([
+      row('old'),
+      row('new-epoch', 2),
+      row('foreign-installation', 1, foreignInstallation),
+    ]);
+    await exec(
+      `INSERT INTO liekan_analytics_engine_site(website_id,epoch,purge_through,purge_pending,pending_targets,sweep_targets)
+      VALUES($1::uuid,2,2,true,ARRAY[$2,$3],ARRAY[$2])`,
+      cleanupSite,
+      target,
+      foreignTarget,
+    );
+    await exec(
+      "UPDATE liekan_analytics_engine SET capture=false,syncing=true,connection_hash=repeat('c',64) WHERE id=1",
+    );
+    vi.stubEnv('LIEKAN_WAREHOUSE_TRANSITION', 'true');
+    try {
+      expect(await reader.readClickHouseLogRollup(input())).toBeNull();
+      await worker.discoverEngineWork(true);
+      expect(await worker.runEngineBatch()).toBe(true);
+      const remaining = () =>
+        ch.engineQuery(
+          `SELECT id FROM ${ch.ENGINE_TABLE} WHERE website_id={site:UUID} ORDER BY id`,
+          { site: cleanupSite },
+        );
+      expect((await remaining()).map(row => row.id)).toEqual(['foreign-installation', 'new-epoch']);
+      const [pending] = await q(
+        'SELECT pending_targets,purge_pending FROM liekan_analytics_engine_site WHERE website_id=$1::uuid',
+        cleanupSite,
+      );
+      expect(pending.pending_targets).toEqual([foreignTarget]);
+      expect(pending.purge_pending).toBe(true);
+      expect(
+        await q(
+          'SELECT 1 FROM liekan_analytics_engine_unit WHERE website_id=$1::uuid',
+          cleanupSite,
+        ),
+      ).toEqual([]);
+      await write([row('late-old')]);
+      await exec(
+        'UPDATE liekan_analytics_engine_site SET purge_checked_at=NULL WHERE website_id=$1::uuid',
+        cleanupSite,
+      );
+      expect(await worker.runEngineBatch()).toBe(true);
+      expect((await remaining()).map(row => row.id)).toEqual(['foreign-installation', 'new-epoch']);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
   it.skipIf(process.env.LIEKAN_ENGINE_VISUAL !== '1')(
     'prepares real fixture coverage for isolated browser verification',
     async () => {

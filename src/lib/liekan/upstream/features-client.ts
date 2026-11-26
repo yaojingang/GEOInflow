@@ -10,12 +10,14 @@ import { browserPopulationSchema } from '../contracts/browser-population';
 import type { ExportFrame, ExportRequest } from '../contracts/exports';
 import { isReportOwnedBy } from '../contracts/query';
 import type { WebsiteSummary } from '../contracts/website-summary';
+import { reportPreparingSchema } from '../contracts/report-status';
 import { defaultLiekanLocale, isLiekanLocale, readLocaleCookie } from '../i18n/locale';
 import {
   analysisAsyncPath,
   followAnalysisJob,
   waitForAnalysisAdmission,
   waitForAnalysisVisibility,
+  waitForScheduledOverview,
 } from './analysis-query-client';
 import { aggregateRequestResources, isAggregateRequest } from './cache-policy';
 import { clientCatalogVersion } from './catalog-client';
@@ -31,6 +33,7 @@ import { RequestPool, browserReads as reads } from './request-pool';
 
 // Keep initial task submissions within the server's per-consumer active quota.
 const analysisReads = new RequestPool(2);
+const websiteSummaryReads = new RequestPool(3);
 export async function streamFeatureExport(
   websiteId: string,
   body: ExportRequest,
@@ -75,6 +78,15 @@ export async function streamFeatureExport(
         if (!line) continue;
         const frame: ExportFrame = JSON.parse(line);
         if (frame.type === 'error') throw new FeatureApiError(frame.message, frame.status);
+        if (frame.type === 'file' && frame.downloadUrl) {
+          if (
+            !/^\/api\/liekan\/websites\/[a-f0-9-]{36}\/exports\/[a-f0-9-]{36}$/.test(
+              frame.downloadUrl,
+            )
+          )
+            throw new FeatureApiError('导出下载地址无效', 500);
+          frame.downloadUrl = getApiUrl(frame.downloadUrl.slice('/api'.length));
+        }
         if (frame.type === 'complete') complete = true;
         onFrame(frame);
       }
@@ -141,7 +153,11 @@ export async function featureRequest<T = any>(
   signal?: AbortSignal,
   shareToken?: string,
   tokenOverride?: string,
-  options?: { priority?: 'foreground' | 'prefetch'; onPrevious?: (value: unknown) => void },
+  options?: {
+    priority?: 'foreground' | 'prefetch';
+    onPrevious?: (value: unknown) => void;
+    waitForResult?: boolean;
+  },
 ): Promise<T> {
   const url = new URL(getApiUrl(path), window.location.origin);
   const aggregate = method === 'GET' && isAggregateRequest(path, params);
@@ -199,10 +215,30 @@ export async function featureRequest<T = any>(
       });
     };
     let response = await send();
+    if (response.status === 202 && options?.waitForResult === false) {
+      const accepted = await response.json();
+      // The server validates ownership and the control version of a previous result.
+      if (accepted.previousResult) return accepted.previousResult;
+      return reportPreparingSchema.parse({
+        status: 'preparing',
+        analysisJob: accepted.analysisJob,
+      });
+    }
+    if (
+      attemptHeaders.Prefer === 'respond-async' &&
+      params?.resource === 'overview' &&
+      response.status === 202 &&
+      response.headers.get('X-Liekan-Read-Path') === 'scheduled'
+    ) {
+      response = await waitForScheduledOverview(response, send, retryAfter, requestSignal);
+      if (!response)
+        throw new FeatureApiError('数据仍在读取，请稍后重试', 503, 'warehouse-overview-pending');
+    }
     let data = await response.json().catch(() => null);
     if (
       attemptHeaders.Prefer === 'respond-async' &&
       response.status === 429 &&
+      options?.waitForResult !== false &&
       data?.error?.code === 'analysis-concurrency-limited'
     ) {
       const websiteId = /\/websites\/([^/]+)\//.exec(path)?.[1];
@@ -249,14 +285,24 @@ export async function featureRequest<T = any>(
                   }),
               }
             : {}),
-          fetchJob: taskPath =>
-            fetch(new URL(getApiUrl(taskPath), window.location.origin), {
+          fetchJob: taskPath => {
+            const taskUrl = new URL(getApiUrl(taskPath), window.location.origin);
+            if (
+              params?.resource === 'overview' &&
+              /\/overview-jobs\/[^/]+\/result$/.test(taskPath)
+            ) {
+              for (const key of ['tp_topBody', 'tp_visitorTopBody', 'overviewVersion']) {
+                if (params[key] != null) taskUrl.searchParams.set(key, String(params[key]));
+              }
+            }
+            return fetch(taskUrl, {
               headers: Object.fromEntries(
                 Object.entries(attemptHeaders).filter(([key]) => key !== 'Prefer'),
               ),
               signal: requestSignal,
               cache: 'no-store',
-            }),
+            });
+          },
         });
         response = result.response;
         data = result.data;
@@ -283,9 +329,15 @@ export async function featureRequest<T = any>(
       );
     return data;
   };
+  const readPool =
+    headers.Prefer === 'respond-async'
+      ? analysisReads
+      : path === '/liekan/websites/summary'
+        ? websiteSummaryReads
+        : reads;
   try {
     const data = await (method === 'GET'
-      ? (headers.Prefer === 'respond-async' ? analysisReads : reads).read(
+      ? readPool.read(
           JSON.stringify([
             url.href,
             Object.fromEntries(Object.entries(headers).filter(([key]) => key !== 'X-Liekan-View')),
@@ -308,7 +360,11 @@ export const featureApi = {
     path: string,
     params?: Record<string, any>,
     signal?: AbortSignal,
-    options?: { priority?: 'foreground' | 'prefetch'; onPrevious?: (value: unknown) => void },
+    options?: {
+      priority?: 'foreground' | 'prefetch';
+      onPrevious?: (value: unknown) => void;
+      waitForResult?: boolean;
+    },
   ) => featureRequest<T>('GET', path, params, signal, undefined, undefined, options),
   post: <T = any>(path: string, body?: Record<string, any>, signal?: AbortSignal) =>
     featureRequest<T>('POST', path, body, signal),

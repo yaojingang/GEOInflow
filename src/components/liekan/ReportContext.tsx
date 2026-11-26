@@ -21,8 +21,9 @@ export type ReportActions = {
   onSort: (label: string) => void;
   onAction: (label: string) => void;
   onLogsPage?: (page: number) => void;
-  // 服务端分页明细表翻页：table 在 meta.tablePages 白名单内时由 ReportRows 调用。
+  // 服务端分页明细表翻页：meta.tablePages 内的 ReportRows / ReportList 共用同一协议。
   onTablePage?: (table: string, page: number) => void;
+  tablePageRead?: { table: string; page: number; loading: boolean; retry?: () => void };
 };
 export const ReportContext = createContext<ReportActions>({
   filter: '',

@@ -83,8 +83,13 @@ vi.mock('./context', () => ({
     const name = Array.isArray(key) ? key[0] : key;
     mocks.queries.push(key);
     mocks.loaders[name] = load;
+    const data =
+      typeof mocks.query[name] === 'function' ? mocks.query[name](key) : mocks.query[name];
     return {
-      data: typeof mocks.query[name] === 'function' ? mocks.query[name](key) : mocks.query[name],
+      data:
+        /^website-management-(stats|today)$/.test(name) && Array.isArray(data)
+          ? data.filter(row => key[1].includes(row.id))
+          : data,
       isPending: false,
       isFetching: false,
       error: null,
@@ -1219,9 +1224,7 @@ describe('core form flows', () => {
     };
     mocks.context.query = { section: 'install' };
     render(<CorePages page="website-settings" />);
-    expect(
-      screen.getByRole('heading', { name: '接入设置已保存', level: 3 }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '接入设置已保存', level: 3 })).toBeInTheDocument();
     expect(screen.getAllByText('检查已延后')).toHaveLength(2);
     expect(screen.getByRole('link', { name: '服务器安装页面' })).toHaveAttribute(
       'href',

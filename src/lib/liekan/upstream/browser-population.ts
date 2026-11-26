@@ -7,6 +7,7 @@ import {
 } from '../contracts/browser-population';
 import { getQuerySnapshot } from './query-snapshot';
 import { TRAFFIC_POLICY_VERSION } from './traffic-query';
+import { warehouseEnabled } from '../warehouse/runtime';
 
 export const browserPopulationMetadataSql = `CASE WHEN EXISTS(SELECT 1 FROM website WHERE website_id=$1::uuid AND deleted_at IS NULL) THEN 'website'
         WHEN EXISTS(SELECT 1 FROM link WHERE link_id=$1::uuid AND deleted_at IS NULL) THEN 'link'
@@ -141,6 +142,7 @@ export async function readBrowserPopulation(
   executor?: Executor,
   options: { halfOpen?: boolean } = {},
 ): Promise<BrowserPopulation> {
+  if(warehouseEnabled())return (await import('./warehouse-browser-population')).warehouseBrowserPopulation(websiteId,startDate,endDate,timezone,options.halfOpen);
   const range = {
     startAt: +startDate,
     endAt: +endDate,

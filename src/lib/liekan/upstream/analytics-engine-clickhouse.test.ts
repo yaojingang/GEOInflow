@@ -70,3 +70,12 @@ it('returns unsupported aggregate fields to the PostgreSQL reader', () => {
   expect(supportedLogInput({ fields: ['classificationSet'] })).toBe(false);
   expect(supportedLogInput({ fields: ['summary', 'classificationSet'] })).toBe(false);
 });
+
+it.each([
+  ['LIEKAN_ANALYTICS_BACKEND', 'clickhouse'],
+  ['LIEKAN_WAREHOUSE_TRANSITION', 'true'],
+])('retains the independent cleanup connection while %s owns intake', (key, value) => {
+  vi.stubEnv(key, value);
+  vi.stubEnv('LIEKAN_ANALYTICS_CLICKHOUSE_URL', 'http://replica.invalid/legacy');
+  expect(engineConnection()?.label).toBe('http://replica.invalid/legacy');
+});

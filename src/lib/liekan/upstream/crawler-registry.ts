@@ -3,6 +3,7 @@ import { ROLES } from '@/lib/constants';
 import { aiTransaction, type AiTx } from './ai-db';
 import { crawlerTransaction, type CrawlerActor } from './crawler-access';
 import { LiekanError } from './errors';
+import { query } from './server';
 import { getBundledPublishedCatalog } from '../crawlers/catalog-seed';
 import {
   catalogHash,
@@ -141,16 +142,11 @@ export async function registryVersionIsCurrent(tx: AiTx, version: string): Promi
   return pointer?.version === version;
 }
 export async function readCrawlerRegistryPointer(): Promise<{ version: string; revision: string }> {
-  return aiTransaction(
-    async tx => {
-      const [row] = await tx.query(
-        'SELECT version,revision FROM liekan_crawler_registry_current WHERE id=1',
-      );
-      if (!row) throw new LiekanError('目录版本不存在', 404);
-      return { version: row.version, revision: String(row.revision) };
-    },
-    { readOnly: true },
+  const [row] = await query(
+    'SELECT version,revision FROM liekan_crawler_registry_current WHERE id=1',
   );
+  if (!row) throw new LiekanError('目录版本不存在', 404);
+  return { version: row.version, revision: String(row.revision) };
 }
 export async function readPublishedRegistry(version?: string): Promise<PublishedCatalog> {
   return aiTransaction(

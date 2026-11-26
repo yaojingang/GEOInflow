@@ -3,6 +3,8 @@ import clickhouse from '@/lib/clickhouse';
 import { uuid } from '@/lib/crypto';
 import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
 import kafka from '@/lib/kafka';
+import { saveWarehouseRecording } from '@/lib/liekan/upstream/warehouse-recorder';
+import { warehouseIntakeEnabled } from '@/lib/liekan/warehouse/runtime';
 import prisma from '@/lib/prisma';
 
 export interface SaveRecordingArgs {
@@ -17,6 +19,7 @@ export interface SaveRecordingArgs {
 }
 
 export async function saveRecording(args: SaveRecordingArgs) {
+  if (warehouseIntakeEnabled()) return saveWarehouseRecording(args);
   return runQuery({
     [PRISMA]: () => relationalQuery(args),
     [CLICKHOUSE]: () => clickhouseQuery(args),

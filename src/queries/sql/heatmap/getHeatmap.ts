@@ -1,10 +1,13 @@
-import { identityUsable, type BrowserPopulation } from '@/lib/liekan/contracts/browser-population';
-import { readBrowserPopulation } from '@/lib/liekan/upstream/browser-population';
-import { nativeSnapshot } from '@/lib/liekan/upstream/native-snapshot';
-import { nativeAggregate } from '@/lib/liekan/upstream/native-aggregate';
 import clickhouse from '@/lib/clickhouse';
 import { HEATMAP_EVENT_TYPE, OPERATORS } from '@/lib/constants';
 import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
+import { type BrowserPopulation, identityUsable } from '@/lib/liekan/contracts/browser-population';
+import { readBrowserPopulation } from '@/lib/liekan/upstream/browser-population';
+import { nativeAggregate } from '@/lib/liekan/upstream/native-aggregate';
+import { nativeSnapshot } from '@/lib/liekan/upstream/native-snapshot';
+import { warehouseNativeQuery } from '@/lib/liekan/upstream/warehouse-native-query';
+import { withinWarehouseReport } from '@/lib/liekan/upstream/warehouse-report-snapshot';
+import { warehouseEnabled } from '@/lib/liekan/warehouse/runtime';
 import { filtersObjectToArray } from '@/lib/params';
 import prisma from '@/lib/prisma';
 import type { QueryFilters } from '@/lib/types';
@@ -82,6 +85,26 @@ export async function getHeatmap(
   websiteId: string,
   parameters: HeatmapParameters,
 ): Promise<HeatmapResult> {
+  if (warehouseEnabled())
+    return withinWarehouseReport(async () => {
+      const result = await clickhouseQuery(websiteId, parameters);
+      result.population = await readBrowserPopulation(
+        websiteId,
+        parameters.startDate,
+        parameters.endDate,
+        parameters.timezone,
+      );
+      if (!identityUsable(result.population)) {
+        result.pages.forEach(page => {
+          page.sessions = null;
+        });
+        result.scroll.buckets.forEach(bucket => {
+          bucket.sessions = null;
+        });
+        result.scroll.totalSessions = null;
+      }
+      return result;
+    });
   return runQuery({
     [PRISMA]: () =>
       nativeAggregate(FUNCTION_NAME, websiteId, parameters, parameters, () =>
@@ -313,7 +336,7 @@ async function clickhouseQuery(
   websiteId: string,
   parameters: HeatmapParameters,
 ): Promise<HeatmapResult> {
-  const { rawQuery } = clickhouse;
+  const rawQuery = warehouseEnabled() ? warehouseNativeQuery : clickhouse.rawQuery;
   const { startDate, endDate, urlPath, mode = 'click' } = parameters;
   const eventType = mode === 'scroll' ? HEATMAP_EVENT_TYPE.scroll : HEATMAP_EVENT_TYPE.click;
   const filterContext = getClickhouseHeatmapFilterContext(websiteId, parameters);
@@ -950,7 +973,7 @@ function getClickhouseHeatmapFilterContext(
     websiteId,
   });
 
-  if (!(filterQuery || cohortQuery || excludeBounceQuery)) {
+  if (!warehouseEnabled() && !(filterQuery || cohortQuery || excludeBounceQuery)) {
     return {
       joinQuery: '',
       filterQuery: pathFilterContext.filterQuery,

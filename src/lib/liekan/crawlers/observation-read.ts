@@ -1,3 +1,6 @@
+import { warehouseEvidenceRows } from '../upstream/warehouse-evidence-table';
+import { warehouseEnabled } from '../warehouse/authority-routing';
+import { warehouseObservationFacts } from '../upstream/warehouse-evidence-queries';
 import { evidenceValue } from '../contracts/crawler-metrics';
 import { BROWSER_RISK_VERSION } from '../traffic-quality/behavior';
 import { OBSERVATION_VERSION } from '../upstream/collection-observation';
@@ -27,15 +30,22 @@ export async function readObservations(
     WHERE e.website_id=$1::uuid AND e.event_type=1 AND q.source IN('browser','legacy_override')
       AND coalesce(o.received_at,q.created_at)>=$2 AND coalesce(o.received_at,q.created_at)<$3
       ${p.subset === 'eligible' ? 'AND EXISTS(SELECT 1 FROM website_event eligible WHERE eligible.event_id=e.event_id AND eligible.website_id=e.website_id)' : ''}`;
-  const rows = await tx.query(
-    `SELECT coalesce(s.browser,'unknown') AS browser,q.source,q.classification,coalesce(o.version,'not_collected') AS version,
+  const warehouseFacts = warehouseEnabled()
+    ? await warehouseObservationFacts(websiteId, p, input, args[1] as Date)
+    : null;
+  const rows = warehouseFacts
+    ? warehouseFacts.rows
+    : await tx.query(
+        `SELECT coalesce(s.browser,'unknown') AS browser,q.source,q.classification,coalesce(o.version,'not_collected') AS version,
     o.features,count(*)::float8 AS pv,count(distinct e.session_id)::float8 AS uv,
     count(*)<20 AS "smallSample",min(e.created_at) AS "firstEventAt",max(e.created_at) AS "lastEventAt"
     ${population} GROUP BY 1,2,3,4,5 ORDER BY 1,2,3,4,o.features::text LIMIT 100001`,
-    ...args,
-  );
-  const [behavior] = await tx.query(
-    `SELECT count(*) FILTER(WHERE EXISTS(
+        ...args,
+      );
+  const [behavior] = warehouseFacts
+    ? [warehouseFacts.behavior]
+    : await tx.query(
+        `SELECT count(*) FILTER(WHERE EXISTS(
       SELECT 1 FROM liekan_browser_risk r JOIN liekan_browser_risk_window w USING(website_id,window_end)
       WHERE r.website_id=e.website_id AND r.session_id=e.session_id AND r.visit_id=e.visit_id
         AND w.epoch=$4 AND w.rule_version=$5 AND w.coverage='observed'
@@ -47,21 +57,23 @@ export async function readObservations(
         AND w.epoch=$4 AND w.rule_version=$5 AND w.coverage='observed'
         AND q.created_at<=r.window_end AND q.created_at>r.window_end-interval '5 minutes'
     ))::float8 AS "flaggedUv" ${population}`,
-    ...args,
-    input.baseline.epoch,
-    BROWSER_RISK_VERSION,
-  );
-  const [totals] = await tx.query(
-    `SELECT count(*)::float8 AS pv,count(distinct e.session_id)::float8 AS uv,
+        ...args,
+        input.baseline.epoch,
+        BROWSER_RISK_VERSION,
+      );
+  const [totals] = warehouseFacts
+    ? [warehouseFacts.totals]
+    : await tx.query(
+        `SELECT count(*)::float8 AS pv,count(distinct e.session_id)::float8 AS uv,
     count(distinct(e.visit_id,e.session_id))::float8 AS visits,count(o.event_id)::float8 AS observed,
     count(*) FILTER(WHERE env.scope='browser' AND env.identity_available)::float8 AS "identityQualifiedPv",
     count(distinct e.session_id) FILTER(WHERE env.scope='browser' AND env.identity_available)::float8 AS "identityQualifiedVisitors",
     array_remove(array_agg(distinct env.identity_version ORDER BY env.identity_version),NULL) AS "identityVersions",
     count(*) FILTER(WHERE o.event_id IS NULL)::float8 AS "notCollected",count(*) FILTER(WHERE o.version=$4)::float8 AS "currentVersion"
     ${population}`,
-    ...args,
-    OBSERVATION_VERSION,
-  );
+        ...args,
+        OBSERVATION_VERSION,
+      );
   const observationIdentity = {
     version: 'received-browser-identity-v1' as const,
     timeBasis: 'received_at' as const,
@@ -89,10 +101,9 @@ export async function readObservations(
   );
   const fields = Object.fromEntries(
     ['accept', 'language', 'site', 'mode', 'dest'].map(field => {
-      const samples = rows.reduce(
-        (n, row) => n + (row.features?.[field]?.state === 'present' ? row.pv : 0),
-        0,
-      );
+      const samples = warehouseFacts
+        ? Number(warehouseFacts.fieldSamples[field])
+        : rows.reduce((n, row) => n + (row.features?.[field]?.state === 'present' ? row.pv : 0), 0);
       return [
         field,
         evidenceValue(
@@ -117,6 +128,7 @@ export async function readObservations(
       historicalReception: 'unknown',
     },
     rows: rows.map(row => ({ ...row, uv: identityReady ? row.uv : null })),
+    ...(warehouseFacts ? { [warehouseEvidenceRows]: warehouseFacts.table } : {}),
     totals: {
       ...counts,
       ...behavior,

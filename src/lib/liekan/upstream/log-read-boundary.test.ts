@@ -1,6 +1,20 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 
 const versions = vi.hoisted(() => vi.fn());
+const warehouse = vi.hoisted(() => ({
+  enabled: false,
+  publication: '12',
+  logRevision: '1',
+  control: 'initial',
+}));
+vi.mock('../warehouse/authority-routing', () => ({ warehouseEnabled: () => warehouse.enabled }));
+vi.mock('./warehouse-report-snapshot', () => ({
+  warehouseReportMetadata: async () => ({
+    boundary: { publication: warehouse.publication },
+    logRevision: warehouse.logRevision,
+  }),
+  warehouseControlFingerprint: () => warehouse.control,
+}));
 vi.mock('./analytics-revision', () => ({ readAnalyticsVersions: versions }));
 
 import { logReadBoundary, parseLogRead } from './log-read-boundary';
@@ -10,6 +24,12 @@ const input = { startAt: 1000, endAt: 2000, timezone: 'UTC', crawlerMetricsVersi
 let row: any;
 const tx = { $queryRawUnsafe: vi.fn(async () => [row]) };
 beforeEach(() => {
+  Object.assign(warehouse, {
+    enabled: false,
+    publication: '12',
+    logRevision: '1',
+    control: 'initial',
+  });
   row = { mode: 'live', epoch: '1', log_epoch: '1', coarse: 'history', fine: 'tail' };
   versions.mockResolvedValue({ strong: 'policy-1', data: 'data-1' });
 });
@@ -68,4 +88,12 @@ it('keeps a source revision fence when incremental capture is disabled', async (
   await expect(
     logReadBoundary(tx, id, parseLogRead({ ...input, readBoundary: a })),
   ).rejects.toMatchObject({ status: 409 });
+});
+
+it('requires the protected warehouse log context rather than reconstructing an unpinned token', async () => {
+  warehouse.enabled = true;
+  await expect(logReadBoundary(undefined, id, parseLogRead(input))).rejects.toMatchObject({
+    status: 409,
+    code: 'log-read-boundary-conflict',
+  });
 });

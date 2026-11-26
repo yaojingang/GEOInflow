@@ -10,6 +10,14 @@ export const analyticsEngineActionSchema = z
   .strict();
 export type AnalyticsEngineAction = z.infer<typeof analyticsEngineActionSchema>;
 export const analyticsEngineStatusSchema = z.object({
+  warehouse: z
+    .object({
+      legacyCleanupPending: z.boolean().optional(),
+      legacyCleanupConfigured: z.boolean().optional(),
+      authority: z.enum(['postgres', 'clickhouse', 'frozen']).nullable(),
+      transition: z.enum(['none', 'shadow', 'rollback', 'draining', 'exited']).nullable(),
+    })
+    .optional(),
   nextCursor: z.uuid().nullable().optional(),
   configured: z.boolean(),
   supported: z.boolean(),
@@ -38,6 +46,12 @@ export const analyticsEngineStatusSchema = z.object({
   ),
 });
 export interface AnalyticsEngineStatus {
+  warehouse?: {
+    legacyCleanupPending?: boolean;
+    legacyCleanupConfigured?: boolean;
+    authority: 'postgres' | 'clickhouse' | 'frozen' | null;
+    transition: 'none' | 'shadow' | 'rollback' | 'draining' | 'exited' | null;
+  };
   nextCursor?: string | null;
   configured: boolean;
   supported: boolean;

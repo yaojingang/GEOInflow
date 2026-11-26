@@ -1,3 +1,8 @@
+import {
+  withReadDiagnostics,
+  noteReadRetry,
+  traceReadAuthorization,
+} from './report-read-diagnostics';
 import type { BrowserPopulation } from '../contracts/browser-population';
 import { withPublishedRegistry } from './crawler-registry-context';
 import { getPublishedCatalog } from '../crawlers/published';
@@ -7,6 +12,9 @@ import { randomUUID } from 'node:crypto';
 import type { CachedResult } from './query-cache';
 import { AnalyticsRestart, AnalyticsUnavailable } from './analytics-budget';
 import { processSingleton } from './process-singleton';
+import { withinWarehouseAuthority, warehouseEnabled } from '../warehouse/authority-routing';
+import { warehouseTransient } from '../warehouse/control-db';
+import { isWarehouseReportRequest } from './warehouse-report-scope';
 
 interface CacheContext {
   populations?: Map<string, BrowserPopulation>;
@@ -18,9 +26,12 @@ interface CacheContext {
   actor?: string;
   scope?: unknown;
   request?: Request;
+  computationSignal?: AbortSignal;
   parameters?: Record<string, unknown>;
+  allowWarehousePublicationAdvance?: boolean;
   versions?: Map<string, Promise<unknown>>;
   reauthorize?: (deadline?: number) => Promise<boolean>;
+  reportDeletion?: { key: [string, string, string]; verify: () => Promise<void> };
   prepared?: boolean;
   background?: boolean;
   workKind?: 'interactive' | 'preheat';
@@ -40,9 +51,9 @@ export function installAuthorizationRunner(runner: CacheState['authorizationRunn
   state.authorizationRunner = runner;
 }
 export function runCacheAuthorization<T>(work: () => Promise<T>) {
-  return cacheHeadersEnabled() && state.authorizationRunner
-    ? state.authorizationRunner(work)
-    : work();
+  return traceReadAuthorization(() =>
+    cacheHeadersEnabled() && state.authorizationRunner ? state.authorizationRunner(work) : work(),
+  );
 }
 export function installVersionReader(reader: CacheState['versionReader']) {
   state.versionReader = reader;
@@ -56,11 +67,23 @@ const contexts = state.contexts;
 export const bypassQueryCache = () => contexts.getStore()?.bypass;
 export const cacheHeadersEnabled = () => !!contexts.getStore() && !contexts.getStore()?.bypass;
 export const currentCacheContext = () => contexts.getStore();
+export const currentAnalyticsSignal = () =>
+  contexts.getStore()?.computationSignal ?? contexts.getStore()?.request?.signal;
+/** Coalesced work belongs to all its live viewers, not the initiating request. */
+export function withAnalyticsComputationSignal<T>(signal: AbortSignal, work: () => Promise<T>) {
+  const parent = contexts.getStore();
+  return contexts.run(
+    { ...parent, results: parent?.results ?? [], computationSignal: signal },
+    work,
+  );
+}
+
 export function bindCacheRequest(
   request: Request,
   auth: any,
   parameters?: Record<string, unknown>,
   reauthorize?: (deadline?: number) => Promise<boolean>,
+  options?: { allowWarehousePublicationAdvance?: boolean },
 ) {
   const context = contexts.getStore();
   if (!context) return;
@@ -80,6 +103,8 @@ export function bindCacheRequest(
     : { private: true };
   context.parameters = parameters;
   context.reauthorize = reauthorize;
+  if (options?.allowWarehousePublicationAdvance !== undefined)
+    context.allowWarehousePublicationAdvance = options.allowWarehousePublicationAdvance;
 }
 export function noteBrowserPopulation(resourceId: string, population: BrowserPopulation) {
   const context = contexts.getStore();
@@ -108,6 +133,22 @@ export function noteCacheResult({ generatedAt, expiresAt, status, tier }: Cached
 }
 export const withoutQueryCache = <T>(work: () => Promise<T>) =>
   contexts.run({ bypass: true, results: [] }, work);
+/** File generation outlives the HTTP response headers. Retain the submitting
+ * identity and reauthorization callback, without the interactive cache deadline. */
+export function exportReadContext<T>(work: () => Promise<T>) {
+  const parent = contexts.getStore();
+  return contexts.run(
+    {
+      ...parent,
+      bypass: true,
+      deadline: undefined,
+      results: [],
+      versions: new Map(),
+      populations: new Map(),
+    },
+    work,
+  );
+}
 export const CacheProbeMiss = processSingleton(
   'analytics-cache-probe-miss',
   () => class CacheProbeMiss extends Error {},
@@ -163,13 +204,17 @@ export function analyticsWorkerContext<T>(
 export async function withQueryCacheHeaders(
   work: () => Promise<Response>,
   request?: Request,
+  catalogPinned = false,
+  diagnostics = false,
 ): Promise<Response> {
-  if (request && !process.env.CLICKHOUSE_URL) {
+  if (request && isWarehouseReportRequest(request) && !diagnostics)
+    return withReadDiagnostics(() => withQueryCacheHeaders(work, request, catalogPinned, true));
+  if (request && !process.env.CLICKHOUSE_URL && !catalogPinned) {
     const version = request.headers.get('x-liekan-catalog-version');
     if (version && !z.uuid().safeParse(version).success)
       return Response.json({ error: { message: '目录版本无效', status: 400 } }, { status: 400 });
     return withPublishedRegistry(async () => {
-      const response = await withQueryCacheHeaders(work);
+      const response = await withQueryCacheHeaders(work, request, true, true);
       response.headers.set('X-Liekan-Catalog-Version', getPublishedCatalog()?.version || '');
       return response;
     }, version || undefined);
@@ -186,17 +231,31 @@ export async function withQueryCacheHeaders(
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        response = await contexts.run(context, work);
+        response = await withinWarehouseAuthority(() =>
+          contexts.run(context, async () => {
+            if (warehouseEnabled() && isWarehouseReportRequest(request)) {
+              context.allowWarehousePublicationAdvance = true;
+              const { withinWarehouseReport } = await import('./warehouse-report-snapshot');
+              return withinWarehouseReport(work, {
+                signal: request.signal,
+                deadline: context.deadline,
+              });
+            }
+            return work();
+          }),
+        );
         break;
       } catch (error) {
         if (!(error instanceof AnalyticsRestart) || attempt > 0)
           throw error instanceof AnalyticsRestart
             ? new AnalyticsUnavailable('统计配置已变更，请稍后重试')
             : error;
+        noteReadRetry();
         context.versions.clear();
         context.results = [];
         context.populations?.clear();
         context.prepared = false;
+        context.reportDeletion = undefined;
       }
     }
     if (
@@ -209,7 +268,19 @@ export async function withQueryCacheHeaders(
         { error: { message: '访问权限已变更，请重新打开页面', status: 403 } },
         { status: 403, headers: { 'Cache-Control': 'private, no-store' } },
       );
+    if (response.ok && context.reportDeletion) await context.reportDeletion.verify();
   } catch (error) {
+    if (warehouseTransient(error))
+      return Response.json(
+        {
+          error: {
+            message: '统计服务暂时繁忙或正在切换，请稍后重试',
+            status: 503,
+            code: error.code,
+          },
+        },
+        { status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '2' } },
+      );
     if (!(error instanceof AnalyticsUnavailable)) throw error;
     return Response.json(
       { error: { message: error.message, status: error.status } },
@@ -230,7 +301,9 @@ export async function withQueryCacheHeaders(
         identity: {
           ...identity,
           versions: identity.versions.slice(0, 4),
-          ...(identity.qualifiedVersions ? { qualifiedVersions: identity.qualifiedVersions.slice(0, 4) } : {}),
+          ...(identity.qualifiedVersions
+            ? { qualifiedVersions: identity.qualifiedVersions.slice(0, 4) }
+            : {}),
         },
         ruleVersions: ruleVersions.slice(0, 4),
         catalogVersions: catalogVersions.slice(0, 4),

@@ -7,6 +7,7 @@ import {
   type AnalysisTx,
 } from './analysis-rollups-model';
 import { getQuerySnapshot } from './query-snapshot';
+import { warehouseEnabled } from '../warehouse/runtime';
 import { boundedBrowserEventsSql } from './bounded-browser-events';
 
 export const BROWSER_DETAIL_FORMAT = 'browser-detail-v1';
@@ -150,6 +151,7 @@ export async function readBrowserDetailFacts(
     geographyReadLimit?: { rows: number; bytes: number };
   } = {},
 ) {
+  if(warehouseEnabled())return (await import('./warehouse-browser-queries')).warehouseBrowserFacts(id,start,end,timezone,fields,options);
   if (
     process.env.CLICKHOUSE_URL ||
     !Number.isFinite(+start) ||

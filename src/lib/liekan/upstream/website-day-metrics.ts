@@ -3,10 +3,10 @@ import { calendarDayRange } from '../contracts/calendar';
 // 预计今日按已流逝进度折算；凌晨至少按 10 分钟进度，避免刚开日时数值爆炸。
 const MIN_PROJECTED_MS = 600000;
 
-/** Exact [today 00:00, tomorrow 00:00) window in the site timezone. */
+/** Match the calendar range sent by the date picker. */
 export function websiteDayWindow(timezone: string, now = Date.now()) {
   const day = calendarDayRange(now, timezone);
-  return { startAt: day.startAt, endAt: day.endAt + 1, timezone };
+  return { ...day, timezone };
 }
 
 /** End-of-day projection: measured value divided by elapsed day progress. */
@@ -17,7 +17,7 @@ export function projectToday(
 ): number | null {
   if (value == null || !Number.isFinite(value)) return null;
   const { startAt, endAt } = websiteDayWindow(timezone, now);
-  const duration = endAt - startAt;
+  const duration = endAt + 1 - startAt;
   const progress = Math.min(duration, Math.max(MIN_PROJECTED_MS, now - startAt)) / duration;
   return Math.round(value / progress);
 }

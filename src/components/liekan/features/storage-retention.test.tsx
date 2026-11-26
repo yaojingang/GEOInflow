@@ -82,6 +82,7 @@ function mount(
     userId?: string;
     locale?: 'zh-CN' | 'en-US';
     authorized?: boolean;
+    warehouseMode?: boolean;
   } = {},
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -100,7 +101,10 @@ function mount(
             }
           >
             <ManualAuthorizationBoundary authorized={values.authorized !== false}>
-              <StorageRetentionPanel websiteId={values.websiteId} />
+              <StorageRetentionPanel
+                websiteId={values.websiteId}
+                warehouseMode={values.warehouseMode}
+              />
             </ManualAuthorizationBoundary>
             <Controls />
           </FeatureProvider>
@@ -552,3 +556,29 @@ it('renders the policy and explicit confirmation in English', async () => {
   ).toBeVisible();
   expect(screen.queryByText('存储与清理')).toBeNull();
 });
+
+it.each(['zh-CN', 'en-US'] as const)(
+  'describes legacy PostgreSQL cleanup without a ClickHouse quota in %s',
+  async locale => {
+    const get = vi.fn(async () => state());
+    mount(get, vi.fn(), { websiteId: site, warehouseMode: true, locale });
+    await advance();
+    await advance();
+    expect(
+      screen.getByText(
+        locale === 'zh-CN'
+          ? '清理 PostgreSQL 中无引用的旧统计副本和已完成任务，不删除 ClickHouse 明细。'
+          : 'Clean up unreferenced legacy analytics copies and completed jobs in PostgreSQL. ClickHouse detail records are retained.',
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText('1.0 MiB / 10.0 MiB')).toBeNull();
+    expect(screen.queryByLabelText('容量达到 80% 时提前回收')).toBeNull();
+    expect(screen.queryByText('预计可回收额度')).toBeNull();
+    expect(
+      screen.getByText(locale === 'zh-CN' ? '预计可回收数据量' : 'Estimated reclaimable data'),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: locale === 'zh-CN' ? '预览清理' : 'Preview cleanup' }),
+    ).toBeEnabled();
+  },
+);

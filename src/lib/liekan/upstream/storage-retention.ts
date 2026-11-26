@@ -9,6 +9,7 @@ import {
   type StorageSettings,
   type StorageState,
 } from '../contracts/storage-retention';
+import { warehouseIntakeEnabled } from '../warehouse/authority-routing';
 import { aiExecutor } from './ai-db';
 import { analysisCapacity, analysisTransaction } from './analysis-rollups-db';
 import { analysisHash } from './analysis-rollups-model';
@@ -163,7 +164,10 @@ export async function readStorageState(scope: StorageScope): Promise<StorageStat
       websiteId: scope.websiteId || null,
       canManageQueues: !scope.websiteId,
       policy: { ...p.settings, revision: number(p.revision) },
-      capacity: scope.websiteId ? await analysisCapacity(tx, scope.websiteId) : null,
+      capacity:
+        scope.websiteId && !warehouseIntakeEnabled()
+          ? await analysisCapacity(tx, scope.websiteId)
+          : null,
       preview: { ...preview, completedJobs },
       runs: rows.map(dto),
     };

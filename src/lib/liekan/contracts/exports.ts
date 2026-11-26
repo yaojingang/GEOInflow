@@ -57,7 +57,14 @@ export const EXPORT_MAX_BYTES = 50 * 1024 * 1024;
 export { sanitizeExportValue, safeCsvCell } from './export-privacy';
 export type ExportFrame =
   | { type: 'progress'; stage: string; percent: number }
-  | { type: 'file'; name: string; mime: string; size: number; manifest: unknown }
+  | {
+      type: 'file';
+      name: string;
+      mime: string;
+      size: number;
+      manifest: unknown;
+      downloadUrl?: string;
+    }
   | { type: 'chunk'; data: string }
   | { type: 'complete' }
   | { type: 'error'; status: number; message: string };

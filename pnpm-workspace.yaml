@@ -5,7 +5,9 @@ packages:
   - '!tmp/**'
   - '!outputs/**'
   - '!test-results/**'
+  - '!experiments/ch-prototype'
 allowBuilds:
+  '@confluentinc/kafka-javascript': true
   '@parcel/watcher': false
   '@prisma/engines': true
   '@swc/core': false

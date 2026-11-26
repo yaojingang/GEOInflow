@@ -1,7 +1,10 @@
 import { query } from './server';
 import { LiekanError } from './errors';
+import { warehouseEnabled } from '../warehouse/authority-routing';
 
 export async function collectionPresence(websiteId: string) {
+  if (warehouseEnabled())
+    return (await import('./warehouse-presence')).warehouseCollectionPresence(websiteId);
   if (process.env.CLICKHOUSE_URL) {
     const { getWebsiteStats, getWebsiteDateRange } = await import('@/queries/sql');
     const [website] = await query(

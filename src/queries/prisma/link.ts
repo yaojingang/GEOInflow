@@ -1,3 +1,4 @@
+import { prepareWarehouseCascade } from '@/lib/liekan/upstream/warehouse-cascade';
 import { bumpAnalyticsRevision } from '@/lib/liekan/upstream/analytics-revision';
 import { analyticsCache, invalidateWebsiteAnalytics } from '@/lib/liekan/upstream/query-cache';
 import type { Link, Prisma } from '@/generated/prisma/client';
@@ -86,6 +87,7 @@ export async function updateLink(linkId: string, data: any) {
 
 export async function deleteLink(linkId: string) {
   const result = await prisma.transaction(async tx => {
+    await prepareWarehouseCascade(tx, [{ id: linkId, kind: 'link' }]);
     const result = await tx.link.delete({ where: { id: linkId } });
     await bumpAnalyticsRevision(tx, 'link', result.id);
     return result;

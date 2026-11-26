@@ -22,6 +22,10 @@ export const operations = [
           description: 'Website totals and installation state',
           content: { 'application/json': { schema: websiteSummarySchema } },
         },
+        '202': {
+          description: 'A site summary is preparing. Available rows retain their published cutoff.',
+          content: { 'application/json': { schema: websiteSummarySchema } },
+        },
         '400': badRequestResponse,
         '401': unauthorizedResponse,
         '404': notFoundResponse,

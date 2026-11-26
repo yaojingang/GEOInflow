@@ -1,3 +1,5 @@
+import { warehouseEnabled } from '../warehouse/authority-routing';
+import { readV2BrowserPresence, warehouseV2Enabled, warehouseV2Runtime } from '../warehouse-v2/index';
 import { readBrowserPopulation } from './browser-population';
 import {
   type BrowserPopulation,
@@ -42,11 +44,29 @@ export async function readWebsiteSummary(request: Request, input: unknown) {
   const auth = await checkAuth(request);
   if (!auth?.user || auth.user.deletedAt || ('shareToken' in auth && auth.shareToken))
     throw new LiekanError('需要完整登录', 401);
-  bindCacheRequest(request, auth, parsed.data, async () => {
-    const fresh = await checkAuth(request);
-    return !!fresh?.user && fresh.user.id === auth.user.id && fresh.user.role === auth.user.role;
-  });
-  await prepareAnalyticsVersions(p.ids.map(websiteCacheTag));
+  bindCacheRequest(
+    request,
+    auth,
+    parsed.data,
+    async () => {
+      const fresh = await checkAuth(request);
+      if (
+        !fresh?.user ||
+        fresh.user.deletedAt ||
+        ('shareToken' in fresh && fresh.shareToken) ||
+        fresh.user.id !== auth.user.id ||
+        fresh.user.role !== auth.user.role
+      )
+        return false;
+      return (
+        await Promise.all(
+          p.ids.map(id => canViewWebsiteSection(fresh as Auth, id, ['overview', 'compare'])),
+        )
+      ).every(Boolean);
+    },
+    { allowWarehousePublicationAdvance: true },
+  );
+  if (!warehouseEnabled()) await prepareAnalyticsVersions(p.ids.map(websiteCacheTag));
   // Check current ownership and permissions before every cache read.
   const sites = await (
     getRawQueryClient(prisma.client, { write: true }) as typeof prisma.client
@@ -59,6 +79,35 @@ export async function readWebsiteSummary(request: Request, input: unknown) {
     p.ids.map(id => canViewWebsiteSection(auth as Auth, id, ['overview', 'compare'])),
   );
   if (allowed.some(value => !value)) throw new LiekanError('无权访问网站', 403);
+  if (warehouseEnabled()) {
+    const { computeWebsiteSummary } = await import('./warehouse-website-summary');
+    const rt = warehouseV2Runtime();
+    await rt.ensureReady();
+    const rows = await Promise.all(
+      sites.map(async site => {
+        const [summary, stateRows] = await Promise.all([
+          computeWebsiteSummary(site, {
+            startAt: p.startAt,
+            endAt: p.endAt,
+            timezone: p.timezone,
+          }),
+          rt.pg.query<{ epoch: string }>(
+            'SELECT epoch::text FROM liekan_log_state WHERE website_id=$1::uuid',
+            [site.id],
+          ),
+        ]);
+        const epoch = stateRows.rows[0]?.epoch ?? '1';
+        const presence = await readV2BrowserPresence(rt.ch, site.id, epoch, site.createdAt);
+        return websiteSummarySchema.element.parse({
+          ...summary,
+          received: presence.received,
+          collectionKnown: presence.known,
+          lastAt: presence.lastAt,
+        });
+      }),
+    );
+    return rows;
+  }
   const ttl = Math.min(30000, statisticsCacheTtl(p.endAt, p.timezone));
   if (!p.ids.length) return [];
   const current = { startDate: new Date(p.startAt), endDate: new Date(p.endAt) };

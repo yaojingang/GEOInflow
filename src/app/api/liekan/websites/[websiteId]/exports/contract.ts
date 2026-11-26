@@ -17,7 +17,7 @@ export const operations = [
       operationId: 'createLiekanExport',
       summary: '导出当前网站真实统计文件',
       description:
-        '返回 NDJSON：progress 为实际文件生成/传输进度，file 为文件元数据与字段清单，chunk 为顺序 Base64 数据，complete 为完成。普通 CSV/JSON 使用 summary；ZIP 使用勾选范围；kind=source-keywords 的 CSV 导出全部筛选关键词及搜索引擎，包含读取时间与条件。取消请求终止传输。查询阶段超过 100000 明细行或 50 MiB 返回 413；传输阶段错误为 error 帧。',
+        '返回 NDJSON：progress 为文件生成进度，file 为文件元数据与字段清单，complete 为完成，error 为生成失败。ClickHouse 导出按块生成完整文件，file.downloadUrl 提供受权限保护的下载地址，不设总行数或总文件字节数的业务上限；取消请求会停止生成。兼容迁移期间旧 PG 引擎的 chunk Base64 传输。普通 CSV/JSON 使用 summary；ZIP 使用勾选范围；kind=source-keywords 的 CSV 包含全部筛选关键词、搜索引擎、读取时间与条件。',
       tags: ['Liekan'],
       requestParams: { path: z.object({ websiteId: z.uuid() }) },
       requestBody: {
@@ -26,7 +26,7 @@ export const operations = [
       },
       responses: {
         200: {
-          description: '有界真实文件生成与下载流',
+          description: '使用有界内存生成真实文件，返回进度与下载信息',
           content: { 'application/x-ndjson': { schema: z.string() } },
         },
         400: badRequestResponse,
@@ -41,7 +41,11 @@ export const operations = [
           content: { 'application/json': { schema: apiErrorSchema } },
         },
         413: {
-          description: '导出超过上限，缩小范围后重试',
+          description: '旧 PG 引擎兼容响应：超过其旧导出上限；ClickHouse 导出不使用此上限',
+          content: { 'application/json': { schema: apiErrorSchema } },
+        },
+        503: {
+          description: '存储或控制服务暂时不可用',
           content: { 'application/json': { schema: apiErrorSchema } },
         },
       },

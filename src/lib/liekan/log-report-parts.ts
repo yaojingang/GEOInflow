@@ -1,21 +1,4 @@
-import { isbot } from 'isbot';
-import type { DataState, LiekanReport } from './contracts/report';
-import { isUnknownCrawler } from './rules/population';
-
-export function logEntryRows(recent: any[]): LiekanReport['tables']['logBody'] {
-  return recent.map(row => ({
-    ...row,
-    ...(row.identityEvidence != null && typeof row.identityEvidence === 'object'
-      ? { identityEvidence: JSON.stringify(row.identityEvidence) }
-      : {}),
-    time: row.time,
-    classification: isUnknownCrawler(row)
-      ? isbot(row.userAgent || '')
-        ? '自动化特征 · 身份未核验'
-        : '未知／未分类'
-      : `${row.bot} · ${row.verification === 'verified_range' ? '官方 IP 范围匹配' : row.verification === 'verified_dns' ? '官方 DNS 双向核验' : row.verification === 'verified_edge' ? '可信边缘身份核验' : row.verification === 'range_mismatch' ? '官方范围未匹配' : '身份未核验'}`,
-  }));
-}
+import type { DataState } from './contracts/report';
 
 export function logSummaryView(input: {
   latest: unknown;

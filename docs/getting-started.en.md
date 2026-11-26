@@ -8,10 +8,10 @@ Other linked reference guides are currently in Simplified Chinese.
 
 ## 1. Start the instance and sign in
 
-Run this command from the source root:
+Prepare `.env` in the repository root using the [installation guide](warehouse.md#新安装与应用升级), then start the ClickHouse stack.
 
 ```sh
-sh scripts/liekan-deploy.sh
+docker compose up -d
 ```
 
 Once the services are healthy, open `http://127.0.0.1:3002` in a browser. A fresh installation uses `admin` with the initial password `liekan`. Change the password in account settings. Existing instances continue to use their saved accounts and passwords.

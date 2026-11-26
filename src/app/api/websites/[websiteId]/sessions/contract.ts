@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { defineOperation } from '@/openapi/operation';
 import { badRequestResponse, jsonResponse, unauthorizedResponse } from '@/openapi/schemas';
 import { websiteIdPathSchema } from '../../response-schema';
@@ -16,10 +17,23 @@ const getWebsiteSessionsOperation = defineOperation({
     tags: ['Websites'],
     requestParams: {
       path: websiteIdPathSchema,
-      query: pagedAnalyticsQuerySchema,
+      query: pagedAnalyticsQuerySchema.extend({
+        readBoundary: z
+          .string()
+          .regex(/^[a-f0-9]{64}$/)
+          .optional(),
+      }),
     },
     responses: {
-      '200': jsonResponse(websiteSessionPageSchema, 'A page of sessions.'),
+      '200': jsonResponse(
+        websiteSessionPageSchema.extend({
+          readBoundary: z
+            .string()
+            .regex(/^[a-f0-9]{64}$/)
+            .optional(),
+        }),
+        'A page of sessions.',
+      ),
       '400': badRequestResponse,
       '401': unauthorizedResponse,
     },

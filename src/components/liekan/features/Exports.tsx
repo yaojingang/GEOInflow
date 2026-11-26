@@ -112,7 +112,8 @@ export function Exports() {
                     if (frame.type === 'progress')
                       setProgress({ stage: frame.stage, percent: frame.percent });
                     if (frame.type === 'file') {
-                      if (frame.size > EXPORT_MAX_BYTES) throw new Error('下载文件超过 50 MiB');
+                      if (!frame.downloadUrl && frame.size > EXPORT_MAX_BYTES)
+                        throw new Error('下载文件超过 50 MiB');
                       meta = frame;
                     }
                     if (frame.type === 'chunk') {
@@ -126,11 +127,13 @@ export function Exports() {
                 );
                 if (run !== generation.current) return;
                 const result = meta as Extract<ExportFrame, { type: 'file' }> | null;
-                if (!complete || !result || result.size !== received)
+                if (!complete || !result || (!result.downloadUrl && result.size !== received))
                   throw new Error('文件传输未完成，请重新生成');
-                const blob = new Blob(chunks as BlobPart[], { type: result.mime });
+                const blob = result.downloadUrl
+                  ? null
+                  : new Blob(chunks as BlobPart[], { type: result.mime });
                 setFile({
-                  url: URL.createObjectURL(blob),
+                  url: result.downloadUrl || URL.createObjectURL(blob),
                   name: result.name,
                   manifest: result.manifest,
                 });
@@ -199,7 +202,7 @@ export function Exports() {
             />
             <Notice tone="amber">
               {i18n.text(
-                'CSV 与 JSON 使用汇总范围；ZIP 按勾选项导出。明细上限 100,000 行，未压缩内容上限 50 MiB。超出范围时明确报错。文件不包含原始 IP 或账户凭据。',
+                'CSV 与 JSON 使用汇总范围；ZIP 按勾选项导出。文件生成后开始下载，不包含原始 IP 或账户凭据。',
               )}
             </Notice>
           </Form>

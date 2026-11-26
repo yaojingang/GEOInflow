@@ -1,27 +1,27 @@
-import { collectionRepairScope } from './upstream/history-repair-boundary';
-import { getPublishedCatalog } from './crawlers/published';
-import { withPublishedRegistry } from './upstream/crawler-registry-context';
-import { parseLogInputWithGeography, persistLogGeography } from './upstream/log-geography';
-import { invalidateWebsiteAnalytics } from './upstream/query-cache';
-import { bumpAnalyticsRevision } from './upstream/analytics-revision';
 import { syncLegacyRobotsDraft } from './upstream/robots-draft';
 import { randomUUID } from 'node:crypto';
 import ipaddr from 'ipaddr.js';
-import { parseCatalog, parseLogInput } from './ingest';
-import { verificationSnapshots } from './log-ingestion/ranges';
+import { getPublishedCatalog } from './crawlers/published';
+import { parseCatalog, type parseLogInput } from './ingest';
 import {
+  archiveCrawlerRules,
   crawlerClassificationVersion,
   crawlerIdentityId,
-  archiveCrawlerRules,
   persistCrawlerEvidence,
 } from './log-ingestion/crawler-evidence';
+import { verificationSnapshots } from './log-ingestion/ranges';
 import { BOT_TYPES, type BotRule } from './rules/bots';
 import {
-  resolveCrawlerRules,
-  preserveHistoricalRules,
-  validateCrawlerConfiguration,
   type CrawlerRuleConfiguration,
+  preserveHistoricalRules,
+  resolveCrawlerRules,
+  validateCrawlerConfiguration,
 } from './rules/configuration';
+import { bumpAnalyticsRevision } from './upstream/analytics-revision';
+import { withPublishedRegistry } from './upstream/crawler-registry-context';
+import { collectionRepairScope } from './upstream/history-repair-boundary';
+import { parseLogInputWithGeography, persistLogGeography } from './upstream/log-geography';
+import { invalidateWebsiteAnalytics } from './upstream/query-cache';
 import {
   LiekanError,
   lockWritableWebsite,
@@ -29,13 +29,39 @@ import {
   transaction,
   type WriteIdentity,
 } from './upstream/server';
+import { prepareWarehouseUpload, sendWarehouseUpload } from './upstream/warehouse-log-ingestion';
+import { warehouseEnabled } from './warehouse/runtime';
 
 const settingsQuery = `SELECT s.robots,s.allowlist,s.rules,s.crawler_rules AS "crawlerRules",s.rules_revision AS "rulesRevision",s.is_demo AS "isDemo",s.ai_crawler_enabled AS "aiCrawlerEnabled",
     (EXISTS (SELECT 1 FROM liekan_log_source WHERE website_id=$1::uuid AND state='active')
       OR EXISTS (SELECT 1 FROM liekan_import WHERE website_id=$1::uuid AND accepted>0
         AND (kind='automatic' OR NOT COALESCE(s.is_demo,false)))) AS "logsConfigured"
     FROM (SELECT $1::uuid AS website_id) w LEFT JOIN liekan_setting s USING (website_id)`;
-function settingsFromRow(row?: {
+const resolvedRulesCache = new Map<
+  string,
+  { rules: BotRule[]; configuration: CrawlerRuleConfiguration; classificationVersion: string }
+>();
+
+function cachedResolvedRules(row?: { rules?: BotRule[]; crawlerRules?: CrawlerRuleConfiguration }) {
+  const catalogVersion = getPublishedCatalog()?.version ?? 'bundled';
+  const key =
+    !row?.rules && !row?.crawlerRules
+      ? `${catalogVersion}:default`
+      : `${catalogVersion}:${JSON.stringify(row?.rules ?? null)}:${JSON.stringify(row?.crawlerRules ?? null)}`;
+  const hit = resolvedRulesCache.get(key);
+  if (hit) return hit;
+  const resolved = resolveCrawlerRules(row);
+  const entry = {
+    rules: resolved.rules,
+    configuration: resolved.configuration,
+    classificationVersion: crawlerClassificationVersion(resolved.rules, resolved.configuration),
+  };
+  if (resolvedRulesCache.size > 256) resolvedRulesCache.clear();
+  resolvedRulesCache.set(key, entry);
+  return entry;
+}
+
+export function settingsFromRow(row?: {
   robots?: string;
   allowlist?: string[];
   rules?: BotRule[];
@@ -45,14 +71,14 @@ function settingsFromRow(row?: {
   aiCrawlerEnabled?: boolean;
   logsConfigured?: boolean;
 }) {
-  const resolved = resolveCrawlerRules(row);
+  const resolved = cachedResolvedRules(row);
   return {
     robots: row?.robots ?? '',
     allowlist: row?.allowlist ?? [],
     rules: resolved.rules,
     crawlerRules: resolved.configuration,
     rulesRevision: Number(row?.rulesRevision ?? 0),
-    classificationVersion: crawlerClassificationVersion(resolved.rules, resolved.configuration),
+    classificationVersion: resolved.classificationVersion,
     isDemo: row?.isDemo ?? false,
     aiCrawlerEnabled: row?.aiCrawlerEnabled ?? true,
     logsConfigured: row?.logsConfigured ?? false,
@@ -222,6 +248,7 @@ async function importPinnedLogs(id: string, domain: string, input: any, identity
   }
   if (!parsed.records.length)
     throw new LiekanError('没有有效日志；请检查时间、IP、路径、状态和 User-Agent');
+  const warehouse = warehouseEnabled();
   const result = await transaction(async tx => {
     // One importing transaction per website, including across replicas/processes.
     const lock = await tx.$queryRawUnsafe(
@@ -238,12 +265,24 @@ async function importPinnedLogs(id: string, domain: string, input: any, identity
       id,
       parsed.digest,
     );
-    if (old.length) return { ...old[0], duplicate: true, inserted: 0, errors: parsed.errors };
+    const oldUpload =
+      old.length && warehouse
+        ? (
+            await tx.$queryRawUnsafe(
+              'SELECT queued,status FROM liekan_warehouse_upload WHERE batch_id=$1::uuid',
+              old[0].id,
+            )
+          )[0]
+        : undefined;
+    if (oldUpload && ['cancelled', 'failed'].includes(oldUpload.status))
+      throw new LiekanError('采集批次已取消或存在冲突', 409);
+    if (old.length && !(oldUpload && !oldUpload.queued))
+      return { ...old[0], duplicate: true, inserted: 0, errors: parsed.errors };
     const rate = await tx.$queryRawUnsafe(
       "SELECT count(*)::int AS count FROM liekan_import WHERE website_id=$1::uuid AND kind='manual' AND imported_at>now()-interval '1 minute'",
       id,
     );
-    if (rate[0].count >= 5) throw new LiekanError('每站点每分钟上限 5 次导入', 429);
+    if (!old.length && rate[0].count >= 5) throw new LiekanError('每站点每分钟上限 5 次导入', 429);
     const intervals = await tx.$queryRawUnsafe(
       'SELECT starts_at,ends_at FROM liekan_log_interval WHERE website_id=$1::uuid',
       id,
@@ -265,7 +304,54 @@ async function importPinnedLogs(id: string, domain: string, input: any, identity
     parsed.records = allowed;
     parsed.accepted = allowed.length;
     if (!allowed.length) throw new LiekanError('日志时间范围与自动来源重叠，请导入其他时间段', 409);
-    const importId = randomUUID();
+    const importId = old[0]?.id ?? randomUUID();
+    if (warehouse) {
+      const [state] = await tx.$queryRawUnsafe(
+        'SELECT epoch FROM liekan_log_state WHERE website_id=$1::uuid',
+        id,
+      );
+      await prepareWarehouseUpload(tx, {
+        batchId: importId,
+        websiteId: id,
+        sourceId: null,
+        sourceEpoch: state?.epoch ?? 1,
+        kind: 'manual',
+        digest: parsed.digest,
+        count: allowed.length,
+        actorId: identity?.userId,
+      });
+      await tx.$executeRawUnsafe(
+        `INSERT INTO liekan_import(id,website_id,digest,accepted,rejected,inserted,repair_scope_id)
+        VALUES($1::uuid,$2::uuid,$3,0,$4,0,$5::uuid) ON CONFLICT(id) DO NOTHING`,
+        importId,
+        id,
+        parsed.digest,
+        parsed.rejected,
+        await collectionRepairScope(tx, id),
+      );
+      return {
+        id: importId,
+        accepted: allowed.length,
+        rejected: parsed.rejected,
+        inserted: 0,
+        duplicate: !!old.length,
+        errors: parsed.errors,
+        queued: true,
+        warehouseDispatch: {
+          batchId: importId,
+          websiteId: id,
+          sourceId: null,
+          epoch: state?.epoch ?? 1,
+          isRetry: !!old.length,
+          records: allowed.map(row => ({
+            ...row,
+            classificationVersion,
+            catalogVersion: getPublishedCatalog()?.version ?? null,
+            crawlerId: crawlerIdentityId(row.userAgent, settings.rules),
+          })),
+        },
+      };
+    }
     await tx.$executeRawUnsafe(
       'INSERT INTO liekan_import (id,website_id,digest,accepted,rejected,repair_scope_id) VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6::uuid)',
       importId,
@@ -273,7 +359,7 @@ async function importPinnedLogs(id: string, domain: string, input: any, identity
       parsed.digest,
       parsed.accepted,
       parsed.rejected,
-      await collectionRepairScope(tx,id),
+      await collectionRepairScope(tx, id),
     );
     let inserted = 0;
     for (let offset = 0; offset < parsed.records.length; offset += 500) {
@@ -313,6 +399,16 @@ async function importPinnedLogs(id: string, domain: string, input: any, identity
       errors: parsed.errors,
     };
   });
+  if ('warehouseDispatch' in result) {
+    const { warehouseDispatch, ...response } = result;
+    await sendWarehouseUpload(warehouseDispatch);
+    invalidateWebsiteAnalytics(id);
+    return {
+      ...response,
+      inserted: warehouseDispatch.records.length,
+      queued: false,
+    };
+  }
   invalidateWebsiteAnalytics(id);
   return result;
 }

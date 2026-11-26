@@ -2,7 +2,7 @@
 import { type AnalysisJob, analysisAcceptedSchema } from '../contracts/analysis-acceleration';
 
 const privateTaskPath =
-  /^\/liekan\/websites\/[a-f0-9-]{36}\/analytics-jobs\/[a-f0-9-]{36}(\/result)?$/i;
+  /^\/liekan\/websites\/[a-f0-9-]{36}\/(?:analytics-jobs|overview-jobs)\/[a-f0-9-]{36}(\/result)?$/i;
 
 type Pending = { job?: AnalysisJob; websiteId: string; paused: boolean; resume?: () => void };
 const pending = new Map<string, Pending>();
@@ -114,6 +114,28 @@ function foregroundBudget() {
     close: () => document?.removeEventListener('visibilitychange', tick),
   };
 }
+
+export async function waitForScheduledOverview(
+  initial: Response,
+  send: () => Promise<Response>,
+  retryAfter: (response: Response) => number | undefined,
+  signal?: AbortSignal,
+) {
+  const budget = foregroundBudget();
+  let response = initial;
+  try {
+    while (response.status === 202 && response.headers.get('X-Liekan-Read-Path') === 'scheduled') {
+      await waitForAnalysisVisibility(signal);
+      if (budget.elapsed() >= 120000) return;
+      await wait(Math.min(10000, Math.max(3000, retryAfter(response) || 5000)), signal);
+      if (document.visibilityState !== 'hidden') response = await send();
+    }
+    return response;
+  } finally {
+    budget.close();
+  }
+}
+
 async function resumePolling(entry: Pending, signal?: AbortSignal) {
   entry.paused = true;
   publish();
@@ -277,7 +299,11 @@ export async function followAnalysisJob(
     pending.delete(job.id);
     publish();
     const releasePath = job.resultUrl.replace(/\/result$/, '');
-    if (options.releaseJob && privateTaskPath.test(releasePath))
+    if (
+      options.releaseJob &&
+      privateTaskPath.test(releasePath) &&
+      releasePath.includes('/analytics-jobs/')
+    )
       void options.releaseJob(releasePath).catch(() => {});
   }
 }

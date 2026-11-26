@@ -1,4 +1,9 @@
-import { crawlerFilterLabels, pagableTables } from '@/lib/liekan/contracts/query';
+import {
+  crawlerFilterLabels,
+  pagableTables,
+  tablePageMax,
+  reportPageMax,
+} from '@/lib/liekan/contracts/query';
 import { columns, primaryTables } from './data';
 import type { Resource } from './types';
 import { calendarDayRange, shiftCalendarRange } from '@/lib/liekan/contracts/calendar';
@@ -30,13 +35,17 @@ export function readTablePages(params: Record<string, string>) {
     if (!key.startsWith('tp_')) continue;
     const table = key.slice(3);
     const page = Number(value);
-    if (pagableSet.has(table) && Number.isSafeInteger(page) && page > 1 && page <= 100000)
+    if (pagableSet.has(table) && Number.isSafeInteger(page) && page > 1 && page <= tablePageMax)
       tablePages[table] = page;
   }
   return tablePages;
 }
 export const clearTablePages = (tablePages: Record<string, number>) =>
   Object.fromEntries(Object.keys(tablePages).map(table => [`tp_${table}`, undefined]));
+export function readReportPage(value: unknown) {
+  const page = Number(value);
+  return Number.isSafeInteger(page) && page > 0 && page <= reportPageMax ? page : 1;
+}
 const filters: Partial<Record<Resource, string[]>> = {
   'human/search-engines': ['全部', '传统搜索', 'AI 搜索引荐'],
   'ai/bots': crawlerFilterLabels,
@@ -55,7 +64,6 @@ export function readViewState(params: Record<string, string>, resource: Resource
       : resource === 'overview' && params.sort === 'AI/人 比值'
         ? 'AI/浏览 比值'
         : params.sort;
-  const page = Number(params.page);
   const cursor =
     resource === 'logs' && params.cursor?.length <= 512 && ['after', 'before'].includes(params.seek)
       ? params.cursor
@@ -63,8 +71,7 @@ export function readViewState(params: Record<string, string>, resource: Resource
   return {
     filter: filters[resource]?.includes(filter) ? filter : '',
     search: ['logs', 'human/geo'].includes(resource) ? (params.search || '').slice(0, 200) : '',
-    logPage:
-      resource === 'logs' && Number.isSafeInteger(page) && page > 0 && page <= 100000 ? page : 1,
+    logPage: resource === 'logs' ? readReportPage(params.page) : 1,
     cursor,
     seek: cursor ? params.seek : '',
     chartPeriod: (['overview', 'human/overview'].includes(resource) &&

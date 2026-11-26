@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { randomUUID } from 'node:crypto';
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   query: vi.fn(),
@@ -10,6 +10,13 @@ const mocks = vi.hoisted(() => ({
   catalog: vi.fn(),
   invalidate: vi.fn(),
   reconcile: vi.fn(),
+  authorityRead: vi.fn(),
+}));
+vi.mock('../warehouse/control-db', async importOriginal => ({
+  ...(await importOriginal<typeof import('../warehouse/control-db')>()),
+  ControlDatabase: class {
+    read = mocks.authorityRead;
+  },
 }));
 vi.mock('../upstream/ai-db', () => ({ aiTransaction: (work: any) => work(mocks) }));
 vi.mock('../upstream/crawler-access', () => ({ crawlerTransaction: (work: any) => work(mocks) }));
@@ -46,8 +53,12 @@ const quality = {
 let published: ReturnType<typeof getBundledPublishedCatalog>;
 let live: { epoch: number; data_revision: number };
 let leased: boolean;
+let authority: { authority: string; revision: string; installation_id: string };
+afterEach(() => vi.unstubAllEnvs());
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.stubEnv('LIEKAN_WAREHOUSE_TRANSITION', 'false');
+  vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', '');
   const seed = getBundledPublishedCatalog();
   published = {
     ...seed,
@@ -59,11 +70,15 @@ beforeEach(() => {
   };
   live = { epoch: 1, data_revision: 4 };
   leased = true;
+  authority = { authority: 'postgres', revision: '1', installation_id: randomUUID() };
+  mocks.authorityRead.mockReset().mockImplementation(async () => [{ ...authority }]);
   mocks.pointer.mockReset().mockImplementation(async () => published);
   mocks.catalog.mockReset().mockImplementation(async () => published);
   mocks.quality.mockReset().mockResolvedValue(quality);
   mocks.execute.mockReset().mockResolvedValue(1);
   mocks.query.mockReset().mockImplementation(async (sql: string, ...args: unknown[]) => {
+    if (sql.startsWith('SELECT authority,revision::text,installation_id::text'))
+      return [{ ...authority }];
     if (sql.includes('FROM liekan_crawler_registry_current'))
       return [{ version: published.version }];
     if (sql.startsWith('SELECT epoch,data_revision')) return [{ ...live }];
@@ -201,4 +216,74 @@ it('does not persist an old failure after publication', async () => {
   expect(mocks.query.mock.calls.some(([, name]) => name === `analysis-failure:${websiteId}`)).toBe(
     false,
   );
+});
+
+it.each(['direct', 'queued'])(
+  'routes %s analysis to PG while the installed authority is PG',
+  async entry => {
+    vi.stubEnv('DATABASE_URL', 'postgresql://fixture.invalid/warehouse');
+    vi.stubEnv('LIEKAN_WAREHOUSE_TRANSITION', 'true');
+    vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+    await (entry === 'direct'
+      ? recomputeCrawlerRisks(websiteId, now)
+      : processCrawlerAnalysis(workerId));
+    expect(stateWrites()).toHaveLength(1);
+    expect(mocks.query.mock.calls.some(([sql]) => sql.includes('FROM liekan_effective_log'))).toBe(
+      true,
+    );
+    const lock = mocks.query.mock.calls.findIndex(
+      ([sql]) =>
+        sql ===
+        'SELECT authority,revision::text,installation_id::text FROM liekan_warehouse_installation WHERE id=1 FOR SHARE',
+    );
+    const write = mocks.query.mock.calls.findIndex(([sql]) => sql.startsWith('WITH incoming AS'));
+    expect(lock).toBeGreaterThan(-1);
+    expect(lock).toBeLessThan(write);
+  },
+);
+
+it.each(['authority', 'revision', 'installation_id'] as const)(
+  'discards completed analysis before writing when installation %s changes',
+  async field => {
+    vi.stubEnv('DATABASE_URL', 'postgresql://fixture.invalid/warehouse');
+    vi.stubEnv('LIEKAN_WAREHOUSE_TRANSITION', 'true');
+    vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+    mocks.quality.mockImplementationOnce(async () => {
+      authority[field] =
+        field === 'authority' ? 'clickhouse' : field === 'revision' ? '2' : randomUUID();
+      return quality;
+    });
+    await expect(recomputeCrawlerRisks(websiteId, now)).rejects.toThrow(
+      'warehouse-authority-changed',
+    );
+    expect(stateWrites()).toHaveLength(0);
+    expect(findingWrites()).toHaveLength(0);
+    expect(mocks.invalidate).not.toHaveBeenCalled();
+  },
+);
+
+it('does not persist a failure or cooldown across an authority transition', async () => {
+  vi.stubEnv('DATABASE_URL', 'postgresql://fixture.invalid/warehouse');
+  vi.stubEnv('LIEKAN_WAREHOUSE_TRANSITION', 'true');
+  vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+  mocks.quality.mockImplementationOnce(async () => {
+    authority.revision = '2';
+    throw new Error('old authority computation failed');
+  });
+  await expect(processCrawlerAnalysis(workerId)).rejects.toThrow('warehouse-authority-changed');
+  expect(stateWrites()).toHaveLength(0);
+  expect(findingWrites()).toHaveLength(0);
+  expect(mocks.query.mock.calls.some(([, name]) => name === `analysis-failure:${websiteId}`)).toBe(
+    false,
+  );
+});
+
+it('does not start a crawler job while the installation authority is frozen', async () => {
+  vi.stubEnv('DATABASE_URL', 'postgresql://fixture.invalid/warehouse');
+  vi.stubEnv('LIEKAN_WAREHOUSE_TRANSITION', 'true');
+  vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+  authority.authority = 'frozen';
+  await expect(processCrawlerAnalysis(workerId)).rejects.toThrow('warehouse-authority-frozen');
+  expect(mocks.query).not.toHaveBeenCalled();
+  expect(mocks.execute).not.toHaveBeenCalled();
 });

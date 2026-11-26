@@ -1,16 +1,21 @@
+import { warehouseEnabled } from '@/lib/liekan/warehouse/authority-routing';
+import { assertTransitionMaintenance } from './warehouse-maintenance';
 import {
+  assessBrowserBehavior,
   BROWSER_RISK_VERSION,
   BROWSER_RISK_WINDOW_LIMIT,
-  assessBrowserBehavior,
 } from '../traffic-quality/behavior';
 import { transaction } from './server';
 import { parseQualityRange, qualityReadTransaction, qualityTotals } from './traffic-quality';
 
 /** Bounded jobs hold website before progress locks, matching reset/delete lock order. */
 export async function processBrowserRisk() {
+  if (warehouseEnabled())
+    return (await import('./warehouse-browser-risk')).processWarehouseBrowserRisk();
   if (process.env.CLICKHOUSE_URL) return;
   // Lock a bounded set of live websites before FK writes; resets never stall other sites.
   await transaction(async tx => {
+    await assertTransitionMaintenance(tx, 'risk');
     await tx.$executeRawUnsafe("SET LOCAL statement_timeout='2s'");
     await tx.$executeRawUnsafe(
       `WITH candidates AS MATERIALIZED (
@@ -31,6 +36,7 @@ export async function processBrowserRisk() {
     let selectedWindow: Date | undefined;
     try {
       const processed = await transaction(async tx => {
+        await assertTransitionMaintenance(tx, 'risk');
         await tx.$executeRawUnsafe("SET LOCAL statement_timeout='15s'");
         const [candidate] = await tx.$queryRawUnsafe(
           `SELECT s.website_id FROM liekan_browser_risk_state s JOIN website w ON w.website_id=s.website_id
@@ -177,6 +183,11 @@ export async function processBrowserRisk() {
   });
 }
 export async function browserRiskReport(websiteId: string, parameters: URLSearchParams) {
+  if (warehouseEnabled())
+    return (await import('./warehouse-browser-risk')).warehouseBrowserRiskReport(
+      websiteId,
+      parameters,
+    );
   if (process.env.CLICKHOUSE_URL)
     return { available: false, reason: '行为风险观察当前支持 PostgreSQL' };
   // Observations retain whole visit windows; audit paths must not narrow their totals.

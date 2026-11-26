@@ -218,7 +218,10 @@ export function invalidateWebsiteAnalytics(...ids: string[]) {
 }
 export function analyticsCacheKey(namespace: string, value: unknown) {
   namespace = `${namespace}:${ANALYTICS_READ_VERSION}:${getPublishedCatalog()?.version || 'bundled'}:${geographyVersion}:${GEOGRAPHY_ANCHOR_VERSION}`;
-  return analyticsInfrastructureKey(namespace, value);
+  const deletionKey = currentCacheContext()?.reportDeletion?.key;
+  return deletionKey
+    ? analyticsInfrastructureKey(namespace + ':deletion', [deletionKey, value])
+    : analyticsInfrastructureKey(namespace, value);
 }
 /** Infrastructure and permission identities stay stable across request catalog snapshots. */
 export function analyticsInfrastructureKey(namespace: string, value: unknown) {

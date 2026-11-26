@@ -1136,9 +1136,16 @@ function getClient() {
 
   const schema = getSchema();
 
+  const parsedConnectionLimit = Number(new URL(url).searchParams.get('connection_limit'));
+  const poolMax = isAnalyticsWorker()
+    ? 4
+    : Number.isSafeInteger(parsedConnectionLimit) && parsedConnectionLimit > 0
+      ? parsedConnectionLimit
+      : Number(process.env.LIEKAN_PG_POOL_MAX ?? 24);
+
   const baseAdapter = new PrismaPg(
     // Two foreground computations and one background computation retain one control connection.
-    { connectionString: url, ...(isAnalyticsWorker() ? { max: 4 } : {}) },
+    { connectionString: url, max: poolMax },
     { schema },
   );
 
