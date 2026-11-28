@@ -123,5 +123,6 @@
   "100_warehouse_browser_presence.sql": "61c5279b1411f904cd4ea80472fafaf2da556e0c32cdca0789df6bfafb388e3c",
   "101_geo_coverage_revision.sql": "d3e763473203ce8e4c5c7d12fe9116f9e939b11bcfed9dc3bdb0862dd97671d3",
   "102_warehouse_v2_upload_fk.sql": "6ab36cac883707edee7d734feb1265d4c20bcb2ef374eb1ced01780e36ffe25f",
-  "103_warehouse_v2_evidence_deletion.sql": "4ffd88cf6b8f6eb56e4c75377913df84c289a80980b6defd02450cd930e03c9a"
+  "103_warehouse_v2_evidence_deletion.sql": "4ffd88cf6b8f6eb56e4c75377913df84c289a80980b6defd02450cd930e03c9a",
+  "104_ingest_batch_event_time.sql": "452a9da14d7b24cf59e6d7696283e756f0d7ec47e512e61aac8c5ac1b2a1cf28"
 }

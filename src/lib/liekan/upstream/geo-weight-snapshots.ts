@@ -16,7 +16,7 @@ import {
   geoWeightResponseSchema,
 } from '../contracts/geo-weight';
 import { GEO_ALGORITHM } from '../geo-weight/policy';
-import { canonicalGeoTimezone, geoDateOffset, geoWindow } from '../geo-weight/window';
+import { canonicalGeoTimezone, geoDateOffset, geoScoreWindows, geoWindow } from '../geo-weight/window';
 import { getQueue } from '../log-ingestion/queue';
 import { aiExecutor, type AiTx } from './ai-db';
 import { authorizeCrawler, type CrawlerActor } from './crawler-access';
@@ -27,7 +27,7 @@ import {
   parseGeoWeightQuery,
 } from './geo-weight';
 import { LiekanError } from './errors';
-import { geoControlHistory, geoLogHistory } from './warehouse-geo-history';
+import { geoControlHistory, geoLogHistory, geoPendingWindowsSql } from './warehouse-geo-history';
 import { QueryCache } from './query-cache';
 import { processSingleton } from './process-singleton';
 import { withPublishedRegistry } from './crawler-registry-context';
@@ -104,6 +104,7 @@ export async function geoSnapshotAccess(
   websiteId: string,
   timezone: string,
   asOf: string,
+  pendingCutoffs?: string[],
 ) {
   const website = await authorizeCrawler(tx, actor, websiteId);
   const [setting] = await tx.query(
@@ -114,9 +115,11 @@ export async function geoSnapshotAccess(
   const [state] = warehouseV2Enabled()
     ? await tx.query(
         `SELECT s.epoch,s.data_revision::text,coalesce(d.revision,0)::text AS deletion_revision,d.pending_kind
+          ${pendingCutoffs ? `, ${geoPendingWindowsSql} AS pending_windows` : ''}
          FROM (SELECT $1::uuid AS website_id) w LEFT JOIN liekan_log_state s USING(website_id)
          LEFT JOIN liekan_v2_evidence_deletion d USING(website_id)`,
         websiteId,
+        ...(pendingCutoffs ? [pendingCutoffs] : []),
       )
     : await tx.query(
         'SELECT epoch,data_revision::text FROM liekan_log_state WHERE website_id=$1::uuid',
@@ -155,6 +158,7 @@ export async function geoSnapshotAccess(
   return {
     ...boundary,
     strongVersion: digest(boundary),
+    pendingWindows: state?.pending_windows as boolean[] | undefined,
     ownership: digest([website.ownerUserId, website.teamId]),
     dataRevision: state?.data_revision || '0',
     canRecalculate: website.canControl,
@@ -643,21 +647,28 @@ export async function readGeoWeightSnapshot(
   const p = parseGeoSnapshotQuery(input);
   if (warehouseV2Enabled() && !p.snapshotId && !p.taskId) {
     const view = options.legacyExportDigest ? 'detail' : p.view;
-    const end = geoWindow(p.asOf, p.timezone).endAt;
-    const start = geoWindow(
-      view === 'detail' ? geoDateOffset(p.asOf, -30) : p.asOf,
-      p.timezone,
-    ).startAt;
+    const windows = geoScoreWindows(p.asOf, p.timezone, view);
+    const end = windows[0].endAt;
+    const start = windows[windows.length - 1].startAt;
+    const cutoffs = windows.map(window => new Date(window.endAt).toISOString());
+    const readAccess = (tx: Tx) => geoSnapshotAccess(tx, actor, websiteId, p.timezone, p.asOf, cutoffs);
+    const accessKey = (access: Awaited<ReturnType<typeof readAccess>>) =>
+      digest([access.strongVersion, access.ownership, access.pendingWindows]);
     const boundary = () =>
       transaction(async tx => {
-        const access = await geoSnapshotAccess(tx, actor, websiteId, p.timezone, p.asOf);
         const controls = await geoControlHistory(tx, websiteId, start, end);
-        return { access, key: [access.strongVersion, access.ownership, controls] };
+        const access = await readAccess(tx);
+        return { access, accessKey: accessKey(access), controls };
       });
     return withPublishedRegistry(async catalog => {
-      const before = await boundary();
+      // Authorize before the CH read. Check permission, deletion and pending work again
+      // after it, then look up the score with the current historical controls.
+      const initial = await transaction(readAccess);
       const history = () => geoLogHistory(websiteId, end, options.signal);
       const logs = await history();
+      const before = await boundary();
+      if (accessKey(initial) !== before.accessKey)
+        throw new LiekanError('统计基准已变化，请重新读取', 409);
       const key = digest([
         websiteId,
         p.timezone,
@@ -666,7 +677,8 @@ export async function readGeoWeightSnapshot(
         catalog.version,
         catalog.state,
         catalog.contentHash,
-        before.key,
+        before.accessKey,
+        before.controls,
         logs,
       ]);
       const context = currentCacheContext();
@@ -684,8 +696,8 @@ export async function readGeoWeightSnapshot(
         ));
       if (!cached && digest(logs) !== digest(await history()))
         throw new LiekanError('统计基准已变化，请重新读取', 409);
-      const after = await boundary();
-      if (digest(before.key) !== digest(after.key))
+      const after = cached ? before : await boundary();
+      if (before.accessKey !== after.accessKey || before.controls !== after.controls)
         throw new LiekanError('统计基准已变化，请重新读取', 409);
       if (options.signal?.aborted) throw new LiekanError('统计读取已取消', 499);
       const generatedAt = Date.parse(result.calculatedAt);

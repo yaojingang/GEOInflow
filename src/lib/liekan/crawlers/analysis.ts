@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { pendingBeforeSql } from '../log-ingestion/pending';
 import { type BrowserPopulation, identityUsable } from '../contracts/browser-population';
 import type { CrawlerAnalyzedBot, CrawlerAnalyzedPage } from '../contracts/crawler-analysis';
 import type { CrawlerIdentityScope } from '../contracts/crawler-metrics';
@@ -124,8 +125,9 @@ export async function crawlerWindowQuality(
     ...args,
   );
   const [backlog] = await tx.query(
-    `SELECT count(*)::int AS count FROM liekan_ingest_batch WHERE website_id=$1::uuid AND state='pending'${sourceId ? ' AND source_id=$2::uuid' : ''}`,
+    `SELECT count(*)::int AS count FROM liekan_ingest_batch WHERE website_id=$1::uuid AND ${pendingBeforeSql('$2')}${sourceId ? ' AND source_id=$3::uuid' : ''}`,
     websiteId,
+    new Date(endAt),
     ...(sourceId ? [sourceId] : []),
   );
   const declarations = await tx.query(

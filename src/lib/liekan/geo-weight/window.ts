@@ -27,3 +27,9 @@ export function geoWindow(asOf: string, timezone: string) {
     endAt: +fromZonedTime(geoDateOffset(asOf, 1) + 'T00:00:00', timezone),
   };
 }
+
+export function geoScoreWindows(asOf: string, timezone: string, view: 'summary' | 'detail') {
+  return (view === 'detail' ? [0, 7, 14, 21, 28, 30] : [0]).map(days =>
+    geoWindow(geoDateOffset(asOf, -days), timezone),
+  );
+}

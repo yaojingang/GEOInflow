@@ -110,7 +110,8 @@ import {
   readLegacyGeoWeight,
 } from './geo-weight-snapshots';
 import { geoWeightSnapshotResponseSchema } from '../contracts/geo-weight';
-import { geoDateOffset } from '../geo-weight/window';
+import { aiTransaction } from './ai-db';
+import { geoDateOffset, geoWindow } from '../geo-weight/window';
 import { GEO_ALGORITHM } from '../geo-weight/policy';
 import { GEO_SCOPE_HASH } from './geo-weight';
 const enabled = !!process.env.LIEKAN_GEO_SNAPSHOT_TEST_URL;
@@ -147,7 +148,7 @@ describe.skipIf(!enabled)('durable GEO snapshots in an owned PostgreSQL database
       CREATE TABLE liekan_setting(website_id uuid PRIMARY KEY,ai_crawler_enabled boolean);
       CREATE TABLE liekan_log_state(website_id uuid PRIMARY KEY,epoch int,data_revision bigint DEFAULT 0,policy_revision bigint DEFAULT 0);
       CREATE TABLE liekan_v2_evidence_deletion(website_id uuid PRIMARY KEY, revision bigint, pending_kind text);
-      CREATE TABLE liekan_ingest_batch(website_id uuid,state text);
+      CREATE TABLE liekan_ingest_batch(website_id uuid,state text,valid int NOT NULL);
       CREATE TABLE liekan_crawler_registry_current(id int,version uuid);
       CREATE TABLE liekan_crawler_state(website_id uuid PRIMARY KEY,deleted_at timestamptz);
       CREATE TABLE liekan_crawler_quality(website_id uuid,source_id uuid,starts_at timestamptz,ends_at timestamptz,state text,evidence jsonb,recorded_at timestamptz);
@@ -163,6 +164,7 @@ describe.skipIf(!enabled)('durable GEO snapshots in an owned PostgreSQL database
       '036_geo_weight_snapshots.sql',
       '071_warehouse_geo_publication.sql',
       '101_geo_coverage_revision.sql',
+      '104_ingest_batch_event_time.sql',
     ]) {
       await q(await readFile(`db/liekan/migrations/${migration}`, 'utf8'));
     }
@@ -246,7 +248,7 @@ describe.skipIf(!enabled)('durable GEO snapshots in an owned PostgreSQL database
     try {
       const request = input();
       const first = await readGeoWeightSnapshot(actor, site, request);
-      await q("INSERT INTO liekan_ingest_batch(website_id,state) VALUES($1,'pending')", site);
+      await q("INSERT INTO liekan_ingest_batch(website_id,state,valid) VALUES($1,'pending',1)", site);
       await readGeoWeightSnapshot(actor, site, request);
       expect(h.aggregate).toHaveBeenCalledTimes(2);
       await q("DELETE FROM liekan_ingest_batch WHERE website_id=$1", site);
@@ -257,6 +259,90 @@ describe.skipIf(!enabled)('durable GEO snapshots in an owned PostgreSQL database
       );
       await readGeoWeightSnapshot(actor, site, request);
       expect(h.aggregate).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+  it('serves the same summary across receipt and completion of contemporary or empty batches', async () => {
+    vi.stubEnv('LIEKAN_WAREHOUSE_V2', '1');
+    try {
+      const request = { mode: 'current', timezone: 'Asia/Shanghai', view: 'summary' };
+      const baseline = await readGeoWeightSnapshot(actor, site, request);
+      const end = new Date(geoWindow(baseline.servedAsOf, request.timezone).endAt);
+      h.history.mockImplementationOnce(async () => {
+        await q(`INSERT INTO liekan_ingest_batch(website_id,state,valid,min_event_at)
+          VALUES ($1,'pending',1,$2),($1,'pending',0,NULL)`, site, end);
+        return h.history.getMockImplementation()();
+      });
+      h.queries = [];
+      const hit = await readGeoWeightSnapshot(actor, site, request);
+      expect(hit.result.snapshot).toBe(baseline.result.snapshot);
+      expect(h.aggregate).toHaveBeenCalledTimes(1);
+      expect(h.queries.filter(sql => sql.includes('FROM liekan_crawler_range_snapshot'))).toHaveLength(1);
+
+      h.aggregate.mockImplementationOnce(async () => {
+        await q("UPDATE liekan_ingest_batch SET state='processed' WHERE website_id=$1", site);
+        return [];
+      });
+      const fresh = await readGeoWeightSnapshot(actor, site, request, { fresh: true });
+      expect(fresh.result.snapshot).toBe(baseline.result.snapshot);
+      expect(h.aggregate).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+  it('marks crawler quality unknown only while an eligible batch may contribute before the cutoff', async () => {
+    vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+    try {
+      const { crawlerWindowQuality } = await vi.importActual<typeof import('../crawlers/analysis')>('../crawlers/analysis');
+      const { startAt, endAt } = geoWindow('2026-11-27', 'Asia/Shanghai');
+      const versions = { classes: 0, classification: null, sources: 0, source: null, legacy: 0 };
+      const readState = async () => (await aiTransaction(tx =>
+        crawlerWindowQuality(tx, site, startAt, endAt, 'Asia/Shanghai', undefined, versions),
+      )).state;
+      await q(`INSERT INTO liekan_ingest_batch(website_id,state,valid,min_event_at)
+        VALUES ($1,'pending',1,$2),($1,'pending',0,NULL)`, site, new Date(endAt));
+      expect(await readState()).toBe('missing');
+      for (const earliest of [new Date(endAt - 1), null]) {
+        await q(`INSERT INTO liekan_ingest_batch(website_id,state,valid,min_event_at)
+          VALUES ($1,'pending',1,$2)`, site, earliest);
+        expect(await readState()).toBe('unknown');
+        await q("UPDATE liekan_ingest_batch SET state='processed' WHERE website_id=$1", site);
+        expect(await readState()).toBe('missing');
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+  it.each(['before-cutoff', 'unknown'] as const)('rejects a pending %s batch arriving during a score', async kind => {
+    vi.stubEnv('LIEKAN_WAREHOUSE_V2', '1');
+    try {
+      const request = { mode: 'current', timezone: 'Asia/Shanghai', view: 'summary' };
+      const first = await readGeoWeightSnapshot(actor, site, request);
+      const cutoff = geoWindow(first.servedAsOf, request.timezone).endAt;
+      h.aggregate.mockImplementationOnce(async () => {
+        await q(`INSERT INTO liekan_ingest_batch(website_id,state,valid,min_event_at)
+          VALUES ($1,'pending',1,$2)`, site, kind === 'unknown' ? null : new Date(cutoff - 1));
+        return [];
+      });
+      await expect(readGeoWeightSnapshot(actor, site, request, { fresh: true })).rejects.toMatchObject({
+        status: 409,
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+  it('invalidates older detail windows independently while a recent backfill is still pending', async () => {
+    vi.stubEnv('LIEKAN_WAREHOUSE_V2', '1');
+    try {
+      const end = geoWindow(parseGeoSnapshotQuery(input()).asOf, 'UTC').endAt;
+      const add = (time: number) => q(`INSERT INTO liekan_ingest_batch(website_id,state,valid,min_event_at)
+        VALUES ($1,'pending',1,$2)`, site, new Date(time));
+      await add(end - 1);
+      await readGeoWeightSnapshot(actor, site, input());
+      await add(end - 60 * 86400000);
+      await readGeoWeightSnapshot(actor, site, input());
+      expect(h.aggregate).toHaveBeenCalledTimes(2);
     } finally {
       vi.unstubAllEnvs();
     }

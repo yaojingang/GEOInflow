@@ -1,4 +1,5 @@
 // The first eligible observation can precede every scoring window.
+import { pendingBeforeSql } from '../log-ingestion/pending';
 import { warehouseTime } from '../warehouse/fact-input';
 import { geoLogFingerprint, v2Tables } from '../warehouse-v2/schema';
 import { warehouseReportQuery } from './warehouse-report-snapshot';
@@ -25,6 +26,11 @@ export async function geoLogHistory(site: string, end: number, signal?: AbortSig
   return rows.sort((a, b) => a.segment.localeCompare(b.segment));
 }
 
+// Keep one flag per scoring window: a newer pending batch cannot mask an older backfill.
+export const geoPendingWindowsSql = `ARRAY(SELECT EXISTS(
+    SELECT 1 FROM liekan_ingest_batch WHERE website_id=$1 AND ${pendingBeforeSql('cutoff')}
+  ) FROM unnest($2::timestamptz[]) AS windows(cutoff) ORDER BY cutoff)`;
+
 // Interval bounds are clipped at the historical cutoff. Progress after that cutoff
 // cannot affect this score. Archived rule/registry/range payloads are immutable;
 // include their PG row versions to also detect replacement or removal.
@@ -32,7 +38,6 @@ export async function geoControlHistory(tx: AiTx, site: string, start: number, e
   const [row] = await tx.query<{ revision: string }>(
     `SELECT md5(jsonb_build_array(
         (SELECT policy_revision FROM liekan_log_state WHERE website_id=$1),
-        EXISTS(SELECT 1 FROM liekan_ingest_batch WHERE website_id=$1 AND state='pending'),
         ARRAY(SELECT jsonb_build_array(source_id, greatest(starts_at,$2),least(ends_at,$3),state,
             evidence->>'basis',evidence->>'classificationVersion',evidence->>'sourceVersion') AS q
           FROM liekan_crawler_quality WHERE website_id=$1 AND starts_at<$3 AND ends_at>$2 ORDER BY q),

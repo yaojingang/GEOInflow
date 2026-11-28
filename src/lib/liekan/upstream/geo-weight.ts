@@ -15,7 +15,7 @@ import {
   GEO_SCOPE,
   GEO_VERIFICATION,
 } from '../geo-weight/policy';
-import { geoDateOffset, geoWindow } from '../geo-weight/window';
+import { geoScoreWindows, geoWindow } from '../geo-weight/window';
 import type { AiTx } from './ai-db';
 import { AnalyticsUnavailable, analyticsGate } from './analytics-budget';
 import { currentCacheContext, noteCacheResult } from './cache-context';
@@ -159,9 +159,7 @@ async function calculateGeoWeightAtBoundary(
         throw new LiekanError('当前环境缺少 GEO 权重所需的目录与日志证据能力', 503);
       throw error;
     }
-    const windows = (p.view === 'detail' ? [0, 7, 14, 21, 28, 30] : [0]).map(days =>
-      geoWindow(geoDateOffset(p.asOf, -days), p.timezone),
-    );
+    const windows = geoScoreWindows(p.asOf, p.timezone, p.view);
     let computedHere = false;
     const compute = (signal?: AbortSignal) =>
       analyticsGate.run(

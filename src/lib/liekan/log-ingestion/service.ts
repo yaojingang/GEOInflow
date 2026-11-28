@@ -42,6 +42,11 @@ import { enqueue, LOG_QUEUE, PROVIDER_QUEUE } from './queue';
 import { verificationSnapshots } from './ranges';
 import { newToken, tokenHash } from './secrets';
 
+// Automatic records already carry normalized event times and batches are capped at 1,000.
+function earliestEventAt(records: AutomaticRecord[]) {
+  return records.length ? new Date(Math.min(...records.map(record => Date.parse(record.time)))) : null;
+}
+
 export interface LogSource {
   id: string;
   website_id: string;
@@ -505,8 +510,8 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
            ON CONFLICT(id) DO NOTHING
          ),
          b_ins AS (
-           INSERT INTO liekan_ingest_batch(id,website_id,source_id,epoch,digest,payload,received,valid,rejected,errors,catalog_version,repair_scope_id)
-           VALUES($1::uuid,$2::uuid,$3::uuid,$4::integer,$5::text,NULL,$10::integer,$6::integer,$8::integer,$11::jsonb,$12::uuid,$9::uuid)
+           INSERT INTO liekan_ingest_batch(id,website_id,source_id,epoch,digest,payload,received,valid,rejected,errors,catalog_version,repair_scope_id,min_event_at)
+           VALUES($1::uuid,$2::uuid,$3::uuid,$4::integer,$5::text,NULL,$10::integer,$6::integer,$8::integer,$11::jsonb,$12::uuid,$9::uuid,$13::timestamptz)
            ON CONFLICT(id) DO NOTHING
          )
          SELECT batch_id FROM u_ins`,
@@ -522,6 +527,7 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
         parsed.received,
         JSON.stringify(parsed.errors),
         getPublishedCatalog()?.version ?? null,
+        earliestEventAt(valid),
       );
       if (!insertedUpload) {
         // Rare concurrent/retry path: validate existing upload registration compatibly.
@@ -692,8 +698,8 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
         repairScope,
       );
       await tx.$executeRawUnsafe(
-        `INSERT INTO liekan_ingest_batch(id,website_id,source_id,epoch,digest,payload,received,valid,rejected,errors,catalog_version,repair_scope_id)
-        VALUES($1::uuid,$2::uuid,$3::uuid,$4,$5,NULL,$6,$7,$8,$9::jsonb,$10::uuid,$11::uuid) ON CONFLICT(id) DO NOTHING`,
+        `INSERT INTO liekan_ingest_batch(id,website_id,source_id,epoch,digest,payload,received,valid,rejected,errors,catalog_version,repair_scope_id,min_event_at)
+        VALUES($1::uuid,$2::uuid,$3::uuid,$4,$5,NULL,$6,$7,$8,$9::jsonb,$10::uuid,$11::uuid,$12::timestamptz) ON CONFLICT(id) DO NOTHING`,
         batchId,
         live.source.website_id,
         sourceId,
@@ -705,6 +711,7 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
         JSON.stringify(parsed.errors),
         getPublishedCatalog()?.version ?? null,
         repairScope,
+        earliestEventAt(valid),
       );
       // Note: do NOT run UPDATE liekan_log_source inside this FOR SHARE transaction —
       // upgrading FOR SHARE -> FOR NO KEY UPDATE across concurrent batches causes PG deadlocks.
@@ -729,7 +736,7 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
       };
     }
     await tx.$executeRawUnsafe(
-      'INSERT INTO liekan_ingest_batch(id,website_id,source_id,epoch,digest,payload,received,valid,rejected,errors,catalog_version,repair_scope_id) VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6::jsonb,$7,$8,$9,$10::jsonb,$11::uuid,$12::uuid)',
+      'INSERT INTO liekan_ingest_batch(id,website_id,source_id,epoch,digest,payload,received,valid,rejected,errors,catalog_version,repair_scope_id,min_event_at) VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6::jsonb,$7,$8,$9,$10::jsonb,$11::uuid,$12::uuid,$13::timestamptz)',
       batchId,
       live.source.website_id,
       sourceId,
@@ -742,6 +749,7 @@ async function receivePinnedBatch(request: Request, sourceId: string) {
       JSON.stringify(parsed.errors),
       getPublishedCatalog()?.version ?? null,
       await collectionRepairScope(tx, live.source.website_id),
+      earliestEventAt(valid),
     );
     await enqueue(tx, LOG_QUEUE, { batchId }, batchId);
     if (valid.length)
