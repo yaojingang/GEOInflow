@@ -133,7 +133,7 @@ describe('private durable GEO snapshot API', () => {
       actor,
       site,
       { mode: 'historical', asOf: '2026-10-20', timezone: 'UTC', snapshotId },
-      { signal: expect.any(AbortSignal) },
+      { signal: expect.any(AbortSignal), fresh: true },
     );
   });
   it('returns server-clock freshness through the next local day for saved results', async () => {
@@ -165,7 +165,7 @@ describe('private durable GEO snapshot API', () => {
       actor,
       site,
       { mode: 'current', asOf: '2026-10-20', timezone: 'UTC', taskId },
-      { signal: expect.any(AbortSignal) },
+      { signal: expect.any(AbortSignal), fresh: false },
     );
     expect(
       geoWeightSnapshotQuerySchema.safeParse({ timezone: 'UTC', taskId, snapshotId }).success,
