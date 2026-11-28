@@ -1,4 +1,5 @@
 import { LiekanError } from '@/lib/liekan/upstream/server';
+import { api } from '@/lib/liekan/http';
 import { parseRequest } from '@/lib/request';
 import { forbidden, notFound, ok, unauthorized } from '@/lib/response';
 import { canUpdateWebsite } from '@/permissions';
@@ -20,16 +21,18 @@ export async function POST(
     return unauthorized();
   }
 
-  try {
-    await resetWebsite(websiteId, { userId: auth.user.id });
-  } catch (error) {
-    if (error instanceof LiekanError) {
-      if (error.status === 403) return forbidden();
-      if (error.status === 401) return unauthorized();
-      if (error.status === 404) return notFound();
+  return api(async () => {
+    try {
+      await resetWebsite(websiteId, { userId: auth.user.id });
+    } catch (error) {
+      if (error instanceof LiekanError) {
+        if (error.status === 403) return forbidden();
+        if (error.status === 401) return unauthorized();
+        if (error.status === 404) return notFound();
+      }
+      throw error;
     }
-    throw error;
-  }
 
-  return ok();
+    return ok();
+  });
 }

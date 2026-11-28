@@ -1,3 +1,4 @@
+import { warehouseEnabled } from '../warehouse/authority-routing';
 import { readBrowserPopulation } from './browser-population';
 import { identityUsable, unavailableFields } from '../contracts/browser-population';
 import { getPublishedCatalog } from '../crawlers/published';
@@ -77,7 +78,7 @@ const englishExportLabels: Record<string, string> = {
   '360 搜索': '360 Search',
   神马: 'Shenma',
 };
-const exportLabel = (source: string, locale?: LiekanLocale) =>
+export const exportLabel = (source: string, locale?: LiekanLocale) =>
   locale === 'en-US' && Object.hasOwn(englishExportLabels, source)
     ? englishExportLabels[source]
     : source;
@@ -102,7 +103,7 @@ const englishFieldLabels: Record<string, string> = {
   type: 'Type',
   value: 'Value',
 };
-function csvFieldLabel(file: string, field: string, locale?: LiekanLocale) {
+export function csvFieldLabel(file: string, field: string, locale?: LiekanLocale) {
   if (locale !== 'en-US') return field;
   if (field === 'name')
     return (
@@ -117,7 +118,12 @@ function csvFieldLabel(file: string, field: string, locale?: LiekanLocale) {
     );
   return Object.hasOwn(englishFieldLabels, field) ? englishFieldLabels[field] : field;
 }
-function csvDisplayValue(file: string, field: string, value: unknown, locale?: LiekanLocale) {
+export function csvDisplayValue(
+  file: string,
+  field: string,
+  value: unknown,
+  locale?: LiekanLocale,
+) {
   if (locale !== 'en-US') return value;
   if (
     typeof value === 'string' &&
@@ -146,6 +152,8 @@ export async function prepareFeatureExport(
   const parsed = exportRequestSchema.safeParse(input);
   if (!parsed.success) throw new LiekanError('导出参数无效');
   const p = parsed.data;
+  if (warehouseEnabled() && p.kind)
+    return (await import('./warehouse-special-exports')).warehouseSpecialExport(website, p, signal);
   if (p.kind === 'geography') {
     if (process.env.CLICKHOUSE_URL) throw new LiekanError('地域完整导出当前支持 PostgreSQL', 501);
     return analyticsGate.run(() =>
@@ -165,6 +173,8 @@ export async function prepareFeatureExport(
       deadline,
     );
   }
+  if (warehouseEnabled())
+    return (await import('./warehouse-feature-exports')).warehouseFeatureExport(website, p, signal);
   if (process.env.CLICKHOUSE_URL)
     throw new LiekanError('完整导出当前支持 PostgreSQL，可使用兼容导出功能。', 501);
   const primary = getRawQueryClient(prisma.client, { write: true }) as PrismaClient;

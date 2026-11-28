@@ -193,6 +193,38 @@ test('verified publication metadata supports incremental source publication', t 
   assert.equal(git(f.target, ['show', `${second.commit}:feature.txt`]), 'second');
 });
 
+test('a merged sibling publication does not replace the feature baseline', t => {
+  const f = fixture(t);
+  const base = git(f.source, ['rev-parse', 'HEAD']);
+  f.commit(f.source, 'feature version one', { 'feature.txt': 'one\n' });
+  f.prepare();
+  git(f.source, ['switch', '-c', 'build-resources', base]);
+  f.commit(f.source, 'build resources', { 'resources.txt': 'bounded\n' });
+  const resources = f.prepare({ branch: 'feature/build-resources' });
+  git(f.target, ['merge', '--ff-only', resources.commit]);
+  git(f.target, ['update-ref', 'refs/remotes/origin/main', resources.commit]);
+  git(f.target, ['switch', 'feature/publication']);
+  git(f.target, ['merge', '--no-edit', 'main']);
+  git(f.target, ['switch', 'main']);
+  git(f.source, ['switch', 'main']);
+  git(f.source, ['merge', '--no-edit', 'build-resources']);
+  f.commit(f.source, 'feature version two', { 'feature.txt': 'two\n' });
+  const result = f.prepare();
+  assert.equal(git(f.target, ['show', result.commit + ':feature.txt']), 'two');
+  assert.equal(git(f.target, ['show', result.commit + ':resources.txt']), 'bounded');
+  assert.equal(
+    git(f.target, ['rev-parse', result.commit + '^{tree}']),
+    git(f.source, ['rev-parse', 'HEAD^{tree}']),
+  );
+  // The same baseline still rejects community changes missing from development.
+  f.commit(f.target, 'community contribution', { 'community.txt': 'keep\n' });
+  git(f.target, ['switch', 'feature/publication']);
+  git(f.target, ['merge', '--no-edit', 'main']);
+  git(f.target, ['switch', 'main']);
+  f.commit(f.source, 'feature version three', { 'feature.txt': 'three\n' });
+  assert.throws(() => f.prepare(), /Public changes are absent/);
+});
+
 test('publication preserves another worktree and its pending user changes', t => {
   const f = fixture(t);
   const other = join(f.root, 'other-worktree');
@@ -242,6 +274,9 @@ test('CI requires the public history gate without path filters', () => {
 
 test('dual publication uses identical commits and preserves candidates on partial failure', t => {
   const f = fixture(t);
+  // Fail closed if the local Git shim is unavailable; tests never contact a host.
+  git(f.target, ['config', 'protocol.https.allow', 'never']);
+  git(f.target, ['config', 'protocol.ssh.allow', 'never']);
   f.commit(f.source, 'new source', { 'app.txt': 'new feature\n' });
   git(f.target, ['remote', 'add', 'gitee', f.policy.mirrorRepository]);
   const servers = ['github.git', 'gitee.git'].map(name => join(f.root, name));
@@ -253,7 +288,7 @@ test('dual publication uses identical commits and preserves candidates on partia
   const shim = join(f.root, 'git');
   writeFileSync(
     shim,
-    `#!${process.execPath}
+    `#!/usr/bin/env node
 import {spawnSync} from 'node:child_process';
 const args=process.argv.slice(2);
 const command=args.indexOf('push')>=0?'push':args.indexOf('ls-remote')>=0?'ls-remote':null;

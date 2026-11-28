@@ -1,3 +1,4 @@
+import { reportPreparingSchema } from '@/lib/liekan/contracts/report-status';
 import { analysisAcceptedSchema } from '@/lib/liekan/contracts/analysis-acceleration';
 import { z } from 'zod';
 import { retentionQuerySchema } from '@/lib/analytics-schema';
@@ -16,7 +17,15 @@ export const operations = [
       tags: ['Websites'],
       requestParams: { path: z.object({ websiteId: z.uuid() }), query: retentionQuerySchema },
       responses: {
-        '202': {description:'Opt-in Prefer: respond-async accepted a durable private task',content:{'application/json':{schema:analysisAcceptedSchema}}},
+        '202': {
+          description:
+            'The warehouse report is being prepared; this response completes the read. Legacy async requests may return a task receipt.',
+          content: {
+            'application/json': {
+              schema: z.union([reportPreparingSchema, analysisAcceptedSchema]),
+            },
+          },
+        },
         '200': {
           description: 'The operation completed successfully.',
           content: {

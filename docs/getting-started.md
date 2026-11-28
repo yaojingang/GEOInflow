@@ -6,10 +6,10 @@
 
 ## 1. 启动实例并登录
 
-在源码根目录运行：
+按[安装说明](warehouse.md#新安装与应用升级)在仓库根目录准备 `.env` 后，启动 ClickHouse 版。
 
 ```sh
-sh scripts/liekan-deploy.sh
+docker compose up -d
 ```
 
 等待服务健康后，用浏览器打开 `http://127.0.0.1:3002`。首次安装账号为 `admin`，初始密码为 `liekan`。进入账户设置修改密码；已有实例继续使用已保存的账号和密码。

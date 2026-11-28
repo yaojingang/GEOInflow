@@ -47,6 +47,13 @@ regexTarget = "secret"
 regexes = ['''^preserved-private-2fa-key$''']
 
 [[rules.allowlists]]
+description = "Literal dummy environment entry in the same-host deployment unit fixture"
+condition = "AND"
+paths = ['''^tests/liekan/warehouse-test\.test\.py$''']
+regexTarget = "secret"
+regexes = ['''^TWO_FACTOR_ENCRYPTION_KEY=key$''']
+
+[[rules.allowlists]]
 description = "Deliberately invalid MCP token fixture"
 condition = "AND"
 paths = ['''^src/lib/mcp/auth\.test\.ts$''']

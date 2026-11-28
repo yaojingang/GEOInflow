@@ -1,3 +1,4 @@
+import { warehouseEnabled, withinWarehouseAuthority } from './liekan/warehouse/authority-routing';
 export const PRISMA = 'prisma';
 export const POSTGRESQL = 'postgresql';
 export const CLICKHOUSE = 'clickhouse';
@@ -24,6 +25,16 @@ export function isRelationalOnly() {
 }
 
 export async function runQuery(queries: any) {
+  return withinWarehouseAuthority(() => runSelectedQuery(queries));
+}
+async function runSelectedQuery(queries: any) {
+  if (warehouseEnabled()) {
+    if (process.env.CLICKHOUSE_URL) throw new Error('warehouse-upstream-configuration-conflict');
+    if (!queries[CLICKHOUSE]) throw new Error('warehouse-query-adapter-missing');
+    return (await import('./liekan/upstream/warehouse-report-snapshot')).withinWarehouseReport(() =>
+      queries[CLICKHOUSE](),
+    );
+  }
   if (process.env.CLICKHOUSE_URL) {
     if (queries[KAFKA]) {
       return queries[KAFKA]();

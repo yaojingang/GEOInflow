@@ -1,0 +1,13 @@
+<clickhouse>
+  <query_log>
+    <!-- Keep failures, queries taking at least one second and a stable 1% of
+         fast successes. Short-lived rows expire during normal TTL merges. -->
+    <ttl>if(type IN ('ExceptionBeforeStart', 'ExceptionWhileProcessing') OR (type = 'QueryFinish' AND (query_duration_ms &gt;= 1000 OR cityHash64(query_id) % 100 = 0)), event_time + INTERVAL 7 DAY, event_time + INTERVAL 5 MINUTE)</ttl>
+    <settings>index_granularity = 8192, merge_with_ttl_timeout = 1800</settings>
+  </query_log>
+  <trace_log><ttl>event_time + INTERVAL 14 DAY</ttl></trace_log>
+  <metric_log><ttl>event_time + INTERVAL 14 DAY</ttl></metric_log>
+  <asynchronous_metric_log><ttl>event_time + INTERVAL 14 DAY</ttl></asynchronous_metric_log>
+  <query_metric_log><ttl>event_time + INTERVAL 14 DAY</ttl></query_metric_log>
+  <part_log><ttl>event_time + INTERVAL 30 DAY</ttl></part_log>
+</clickhouse>

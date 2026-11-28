@@ -1,3 +1,4 @@
+import { publishedReport } from '../contracts/report-status';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { useState } from 'react';
@@ -1068,7 +1069,7 @@ it('shows a 202 previous report on the authorized resolved key while the current
         </QueryClientProvider>
       ),
     });
-    await waitFor(() => expect(hook.result.current.data?.cards[0].value).toBe(17));
+    await waitFor(() => expect(publishedReport(hook.result.current.data)?.cards[0].value).toBe(17));
     expect(hook.result.current.fetchStatus).toBe('fetching');
     const resolved = (hook.result.current as any).resolvedQueryKey;
     expect(resolved).not.toEqual(options.queryKey);
@@ -1076,7 +1077,7 @@ it('shows a 202 previous report on the authorized resolved key while the current
     await act(async () => {
       finish({ ...previous, cards: [{ ...previous.cards[0], value: 18 }] });
     });
-    await waitFor(() => expect(hook.result.current.data?.cards[0].value).toBe(18));
+    await waitFor(() => expect(publishedReport(hook.result.current.data)?.cards[0].value).toBe(18));
   } finally {
     get.mockRestore();
     cleanup();

@@ -11,12 +11,19 @@ import {
   supportedLogInput,
 } from './analytics-engine-clickhouse';
 import { getQuerySnapshot } from './query-snapshot';
+import { warehouseIntakeEnabled } from '../warehouse/authority-routing';
 
 async function readEngine<T>(
   input: AnalysisLogInput,
   load: (scope: string, params: Record<string, any>, units: number) => Promise<T>,
 ): Promise<T | null> {
-  if (process.env.CLICKHOUSE_URL || input.allowRawOnly || !supportedLogInput(input)) return null;
+  if (
+    warehouseIntakeEnabled() ||
+    process.env.CLICKHOUSE_URL ||
+    input.allowRawOnly ||
+    !supportedLogInput(input)
+  )
+    return null;
   const window = engineWindow(input);
   if (!window) return null;
   let config: ReturnType<typeof engineConnection>;

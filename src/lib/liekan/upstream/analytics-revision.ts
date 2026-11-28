@@ -1,3 +1,5 @@
+import { warehouseTransitionEnabled, warehouseEnabled } from '../warehouse/authority-routing';
+import { AnalyticsUnavailable } from './analytics-budget';
 import { HISTORY_REPAIR_CAMPAIGN, HISTORY_REPAIR_ENGINE } from '../contracts/history-repair';
 import { getPublishedCatalog } from '../crawlers/published';
 import { CALENDAR_POLICY_VERSION } from '../contracts/calendar';
@@ -31,12 +33,33 @@ export interface AnalyticsVersions {
   strong: string;
   data: string;
 }
-export async function readAnalyticsVersions(tx: any, tags: string[]): Promise<AnalyticsVersions> {
+export async function readAnalyticsVersions(
+  tx: any,
+  tags: string[],
+  allowWarehousePublicationAdvance = false,
+): Promise<AnalyticsVersions> {
   const ids = [...new Set(tags.map(tag => tag.split(':')[1]).filter(Boolean))].sort();
   if (!ids.length) return { strong: '[]', data: '[]' };
-  // Read all resource types for these identifiers; native link/pixel statistics share the website API.
+  if (warehouseTransitionEnabled() && !warehouseEnabled()) {
+    const pending = await tx.$queryRawUnsafe(
+      `SELECT 1 FROM liekan_warehouse_deletion WHERE website_id=ANY($1::uuid[]) AND status NOT IN('active','reclaimed') LIMIT 1`,
+      ids,
+    );
+    if (pending.length) throw new AnalyticsUnavailable('网站数据操作正在完成，请稍后重试');
+  }
+  // Warehouse publication increments both counters in the same transaction.
+  // A pinned report may finish at that publication. Control writes still
+  // invalidate it, including reset/deletion recorded in the warehouse head.
   const revisions = await tx.$queryRawUnsafe(
-    `SELECT resource_type AS type,resource_id::text AS id,revision::text AS revision
+    allowWarehousePublicationAdvance && warehouseEnabled()
+      ? `SELECT 'website' AS type, requested.id::text AS id,
+          (coalesce(r.revision,0)-coalesce(s.publication,0))::text AS revision,
+          s.epoch::text AS epoch,s.deletion_revision::text AS deletion,s.state
+         FROM unnest($1::uuid[]) AS requested(id)
+         LEFT JOIN liekan_warehouse_site s ON s.website_id=requested.id AND s.resource_type='website'
+         LEFT JOIN liekan_analytics_revision r ON r.resource_type='website' AND r.resource_id=requested.id
+         ORDER BY requested.id`
+      : `SELECT resource_type AS type,resource_id::text AS id,revision::text AS revision
      FROM liekan_analytics_revision WHERE resource_id=ANY($1::uuid[]) ORDER BY resource_type,resource_id`,
     ids,
   );

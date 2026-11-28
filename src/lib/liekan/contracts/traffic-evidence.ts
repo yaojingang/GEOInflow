@@ -1,7 +1,7 @@
-import { browserPopulationSchema } from './browser-population';
 import { z } from 'zod';
-import { crawlerPathSchema } from './crawlers';
+import { browserPopulationSchema } from './browser-population';
 import { crawlerIdentityScopeSchema, evidenceStateSchema } from './crawler-metrics';
+import { crawlerPathSchema } from './crawlers';
 
 const reportDisplaySchema = z.object({
   filter: z.string().max(100),
@@ -47,7 +47,24 @@ export const evidenceQuerySchema = z.strictObject({
   path: crawlerPathSchema.shape.value.optional(),
   crawlerIdentityScope: crawlerIdentityScopeSchema.default('all'),
   crawlerMetricsVersion: z.coerce.number().pipe(z.literal(1)).default(1),
-  page: z.coerce.number().int().min(1).max(5000).default(1),
+  page: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(Math.floor(Number.MAX_SAFE_INTEGER / 20))
+    .default(1),
+  reasonsPage: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(Math.floor(Number.MAX_SAFE_INTEGER / 20))
+    .optional(),
+  fieldCoveragePage: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(Math.floor(Number.MAX_SAFE_INTEGER / 20))
+    .optional(),
   sort: z.enum(['requests', 'visits', 'path']).default('requests'),
   direction: z.enum(['asc', 'desc']).default('desc'),
   snapshot: z

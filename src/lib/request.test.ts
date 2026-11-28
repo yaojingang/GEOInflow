@@ -1,7 +1,8 @@
 import { beforeEach, expect, test, vi } from 'vitest';
 import { fetchWebsite } from '@/lib/load';
 import { getWebsiteSegment } from '@/queries/prisma';
-import { getQueryFilters } from './request';
+import { getQueryFilters, parseRequest } from './request';
+import { z } from 'zod';
 
 vi.hoisted(() => {
   process.env.DATABASE_URL ??= 'postgresql://user:pass@localhost:5432/umami?schema=public';
@@ -20,19 +21,34 @@ vi.mock('@/queries/prisma', () => ({
 const fetchWebsiteMock = vi.mocked(fetchWebsite);
 const getWebsiteSegmentMock = vi.mocked(getWebsiteSegment);
 
+test('validates the bounded parsed body without cloning or reading the request again', async () => {
+  const request = new Request('http://localhost/api/record', {
+    method: 'POST',
+    body: 'already consumed',
+  });
+  await request.text();
+  const clone = vi.spyOn(request, 'clone');
+  const schema = z.object({ value: z.string() });
+  expect(
+    (await parseRequest(request, schema, { skipAuth: true, body: { value: 'valid' } })).body,
+  ).toEqual({ value: 'valid' });
+  expect(
+    (await parseRequest(request, schema, { skipAuth: true, body: undefined })).error().status,
+  ).toBe(400);
+  expect(clone).not.toHaveBeenCalled();
+});
+
 beforeEach(() => {
   fetchWebsiteMock.mockReset();
   getWebsiteSegmentMock.mockReset();
   fetchWebsiteMock.mockResolvedValue({ id: 'website-1' } as any);
 });
 
-test('combines a saved segment\'s session property filters with active filters', async () => {
+test("combines a saved segment's session property filters with active filters", async () => {
   getWebsiteSegmentMock.mockResolvedValue({
     parameters: {
       filters: [],
-      sessionPropertyFilters: [
-        { propertyName: 'plan', dataType: 1, operator: 'eq', value: 'pro' },
-      ],
+      sessionPropertyFilters: [{ propertyName: 'plan', dataType: 1, operator: 'eq', value: 'pro' }],
     },
   } as any);
 

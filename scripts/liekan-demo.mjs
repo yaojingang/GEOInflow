@@ -70,7 +70,7 @@ export async function* readDemoRecords() {
   }
 }
 
-async function bindDemoCatalog(client, manifest) {
+export async function bindDemoCatalog(client, manifest) {
   const catalog = JSON.parse(await readFile(new URL('catalog.json', directory), 'utf8'));
   let current = (
     await client.query('SELECT version FROM liekan_crawler_registry_current WHERE id=1')

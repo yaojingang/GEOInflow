@@ -16,6 +16,7 @@ import {
   projectionDigest,
 } from './analytics-engine-clickhouse';
 import { LiekanError } from './errors';
+import { warehouseIntakeEnabled } from '../warehouse/authority-routing';
 
 const owner = randomUUID();
 const columns = projectionColumns.join(',');
@@ -39,15 +40,20 @@ function normalizeProjection(row: any): Projection {
   );
   return result;
 }
-async function stateForWork(tx: AnalysisTx, lock = 'FOR UPDATE SKIP LOCKED') {
+async function stateForWork(tx: AnalysisTx, lock = 'FOR UPDATE SKIP LOCKED', cleanup = false) {
+  if (warehouseIntakeEnabled() && !cleanup) return null;
   const [state] = await tx.$queryRawUnsafe<any[]>(
     `SELECT * FROM liekan_analytics_engine WHERE id=1 ${lock}`,
   );
   const config = engineConnection();
+  // Cleanup can revisit an older configured target recorded in pending/sweep
+  // metadata, even after capture stopped or the last checked connection changed.
+  if (cleanup && warehouseIntakeEnabled()) return state && config ? state : null;
   return state?.capture && config?.key === state.connection_hash ? state : null;
 }
 let discoveredAt = 0;
 export async function discoverEngineWork(force = false) {
+  if (warehouseIntakeEnabled()) return;
   if (!force && Date.now() - discoveredAt < 5000) return;
   await analysisTransaction(async tx => {
     const state = await stateForWork(tx);
@@ -159,16 +165,17 @@ export async function discoverEngineWork(force = false) {
 }
 async function claim() {
   return analysisTransaction(async tx => {
-    const state = await stateForWork(tx);
+    const state = await stateForWork(tx, 'FOR UPDATE SKIP LOCKED', true);
     if (!state) return null;
+    const target = engineConnection().key;
     await tx.$executeRawUnsafe(
       'UPDATE liekan_analytics_engine SET maintenance_turn=(maintenance_turn+1)%8 WHERE id=1',
     );
     const [purge] = await tx.$queryRawUnsafe<any[]>(
       `SELECT * FROM liekan_analytics_engine_site WHERE ((purge_pending AND $1=ANY(pending_targets)) OR ($2::boolean AND purge_through>0 AND $1=ANY(sweep_targets) AND (purge_checked_at IS NULL OR purge_checked_at<clock_timestamp()-interval '30 seconds')))
    AND (purge_until IS NULL OR purge_until<clock_timestamp()) ORDER BY purge_pending DESC,purge_checked_at NULLS FIRST,website_id LIMIT 1 FOR UPDATE SKIP LOCKED`,
-      state.connection_hash,
-      !state.syncing || Number(state.maintenance_turn) === 0,
+      target,
+      warehouseIntakeEnabled() || !state.syncing || Number(state.maintenance_turn) === 0,
     );
     if (purge) {
       const token = randomUUID();
@@ -177,9 +184,9 @@ async function claim() {
         purge.website_id,
         token,
       );
-      return { kind: 'purge' as const, state, site: purge, token };
+      return { kind: 'purge' as const, state, site: purge, token, target };
     }
-    if (!state.syncing || !state.actor_id) return null;
+    if (warehouseIntakeEnabled() || !state.syncing || !state.actor_id) return null;
     await engineAdmin(tx, state.actor_id);
     const closed = new Date(Math.floor((Date.now() - 30000) / HOUR) * HOUR);
     const [unit] = await tx.$queryRawUnsafe<any[]>(
@@ -292,8 +299,13 @@ export async function runEngineBatch(): Promise<boolean> {
         clickhouse_settings: { mutations_sync: '1' },
       });
       await analysisTransaction(async tx => {
-        const state = await stateForWork(tx);
-        if (!state || state.connection_hash !== work.state.connection_hash) return;
+        const state = await stateForWork(tx, 'FOR UPDATE SKIP LOCKED', true);
+        if (
+          !state ||
+          state.installation_id !== work.state.installation_id ||
+          engineConnection()?.key !== work.target
+        )
+          return;
         const [site] = await tx.$queryRawUnsafe<any[]>(
           'SELECT * FROM liekan_analytics_engine_site WHERE website_id=$1::uuid AND purge_until>clock_timestamp() FOR UPDATE',
           work.site.website_id,
@@ -325,12 +337,16 @@ export async function runEngineBatch(): Promise<boolean> {
         );
         await tx.$executeRawUnsafe(
           `UPDATE liekan_analytics_engine_site SET pending_targets=array_remove(pending_targets,$2),targets=array_remove(targets,$2),purge_pending=cardinality(array_remove(pending_targets,$2))>0,purge_checked_at=clock_timestamp(),purge_token=NULL,purge_until=NULL,
-     history_cursor=(SELECT ${utcHour('min(created_at)')} FROM liekan_log WHERE website_id=$1::uuid),
+     ${
+       warehouseIntakeEnabled()
+         ? 'history_cursor=NULL,history_start=NULL,history_end=NULL'
+         : `history_cursor=(SELECT ${utcHour('min(created_at)')} FROM liekan_log WHERE website_id=$1::uuid),
      history_start=(SELECT ${utcHour('min(created_at)')} FROM liekan_log WHERE website_id=$1::uuid),
-     history_end=(SELECT ${utcHour('max(created_at)')}+interval '1 hour' FROM liekan_log WHERE website_id=$1::uuid)
+     history_end=(SELECT ${utcHour('max(created_at)')}+interval '1 hour' FROM liekan_log WHERE website_id=$1::uuid)`
+}
      WHERE website_id=$1::uuid`,
           site.website_id,
-          work.state.connection_hash,
+          work.target,
         );
       });
       return true;
@@ -514,6 +530,7 @@ async function checkHealth() {
   healthAt = Date.now();
 }
 export async function collectEngineGarbage() {
+  if (warehouseIntakeEnabled()) return;
   const state = await analysisTransaction(tx => stateForWork(tx, ''));
   if (!state) return;
   // Query parameters use multipart. Mutations have a bounded list and stay below URL limits.
@@ -562,6 +579,13 @@ export async function pumpAnalyticsEngine() {
   if (running || !engineConnection() || process.env.CLICKHOUSE_URL) return;
   running = true;
   try {
+    if (warehouseIntakeEnabled()) {
+      // Each purge has its own durable site lease. Retired PG build queues must
+      // not starve deletion propagation after the warehouse owns intake.
+      const until = Date.now() + 2000;
+      for (let i = 0; i < 64 && Date.now() < until; i++) if (!(await runEngineBatch())) break;
+      return;
+    }
     await checkHealth();
     await withAnalysisPermit('history', async owned => {
       if (Date.now() - collectedAt > 300000) {

@@ -227,19 +227,102 @@ it('distinguishes collector connection, reception, processing and no AI matches'
         primary: true,
         lastHeartbeatAt: new Date().toISOString(),
         lastReceivedAt: new Date().toISOString(),
-        lastProcessedAt: null,
+        lastProcessedAt: new Date().toISOString(),
+        latestBatch: {
+          receivedAt: new Date().toISOString(),
+          state: 'processing',
+          expected: 20,
+          processed: 5,
+          inserted: 5,
+          conflicts: 0,
+        },
         backlog: 1,
         health: { errorCode: 'format-error' },
       },
     ],
   });
   expect(screen.getByText(/采集服务：已连接/)).toHaveTextContent(
-    '真实日志：已接收 · 处理：等待处理',
+    '真实日志：已接收 · 最新批次：处理中（5/20 条）',
   );
   expect(screen.getByText(/本站 AI 蜘蛛匹配/)).toHaveTextContent(
     '日志已收到，暂未匹配到 AI 蜘蛛请求。',
   );
   expect(screen.getByText(/存在无法识别的日志行/)).toBeVisible();
+});
+
+it.each([
+  ['registered', 0, 0, '已登记，等待入队'],
+  ['queued', 0, 0, '已入队'],
+  ['published', 20, 0, '已发布，可查询'],
+  ['failed', 18, 2, '处理失败 · 冲突 2 条'],
+] as const)(
+  'shows the latest batch state %s independently of source history',
+  (state, inserted, conflicts, expected) => {
+    const receivedAt = new Date().toISOString();
+    mount('server', {
+      ...status,
+      sources: [
+        {
+          id: 'source',
+          kind: 'server',
+          domain: 'example.com',
+          state: 'active',
+          lastReceivedAt: receivedAt,
+          lastProcessedAt: receivedAt,
+          backlog: 0,
+          health: {},
+          latestBatch: {
+            receivedAt,
+            state,
+            expected: 20,
+            processed: inserted + conflicts,
+            inserted,
+            conflicts,
+          },
+        },
+      ],
+    });
+    expect(screen.getByText(/最新批次/)).toHaveTextContent(expected);
+  },
+);
+it('follows an in-flight batch until it is published', async () => {
+  vi.useFakeTimers();
+  try {
+    const receivedAt = new Date().toISOString();
+    const source = {
+      id: 'source',
+      kind: 'server',
+      domain: 'example.com',
+      state: 'active',
+      backlog: 1,
+      health: {},
+      latestBatch: {
+        receivedAt,
+        state: 'queued',
+        expected: 20,
+        processed: 0,
+        inserted: 0,
+        conflicts: 0,
+      },
+    };
+    mocks.api.get.mockResolvedValue({
+      sources: [
+        {
+          ...source,
+          backlog: 0,
+          latestBatch: { ...source.latestBatch, state: 'published', processed: 20, inserted: 20 },
+        },
+      ],
+    });
+    mount('server', { ...status, sources: [source] });
+    expect(screen.getByText('已入队')).toBeVisible();
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(screen.getByText('已发布，可查询')).toBeVisible();
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(mocks.api.get).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 it('requires domain and fee confirmation before completing Cloudflare authorization', async () => {
   mocks.query = { flow: 'a-flow' };

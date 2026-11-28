@@ -69,6 +69,8 @@ export function crawlerClassificationVersion(
     )
     .digest('hex');
 }
+const archivedRuleVersions = new Set<string>();
+
 export async function archiveCrawlerRules(
   tx: any,
   websiteId: string,
@@ -76,6 +78,8 @@ export async function archiveCrawlerRules(
   configuration?: CrawlerRuleConfiguration,
 ) {
   const version = crawlerClassificationVersion(rules, configuration);
+  const cacheKey = `${websiteId}:${version}`;
+  if (archivedRuleVersions.has(cacheKey)) return version;
   await tx.$executeRawUnsafe(
     `INSERT INTO liekan_crawler_rule_version(website_id,version,matcher_version,rules,catalog_version,crawler_configuration)
      VALUES($1::uuid,$2,$3,$4::jsonb,$5::uuid,$6::jsonb) ON CONFLICT(website_id,version) DO NOTHING`,
@@ -86,6 +90,8 @@ export async function archiveCrawlerRules(
     getPublishedCatalog()?.version ?? null,
     configuration ? JSON.stringify(configuration) : null,
   );
+  if (archivedRuleVersions.size > 2000) archivedRuleVersions.clear();
+  archivedRuleVersions.add(cacheKey);
   return version;
 }
 export function crawlerIdentityId(userAgent: string, rules: BotRule[]) {

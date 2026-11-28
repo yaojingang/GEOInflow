@@ -1,4 +1,6 @@
 'use client';
+import { featureDateRange } from '../contracts/analysis';
+import { readFeatureDateRange } from './date-range';
 import { type KeywordConditions, keywordStatusVersion } from '../contracts/keywords';
 import { logReadQuery } from '../contracts/log-read';
 import {
@@ -16,6 +18,37 @@ import {
   withClientFreshness,
 } from './client-freshness';
 import { featureApi } from './features-client';
+import { stableBusinessKey } from './cache-policy';
+import { isReportPreparing, type ReportPreparing } from '../contracts/report-status';
+
+/** The first fifteen fields retain the shared report cache and ownership layout. */
+const reportKeyFields = {
+  resource: 3,
+  page: 10,
+  cursor: 11,
+  seek: 12,
+  tablePages: 13,
+  logBoundary: 16,
+};
+
+export function canReuseReportPlaceholder(
+  current: readonly unknown[],
+  previous: readonly unknown[],
+  returnedLogBoundary: string | undefined,
+  requestedLogBoundary: string | undefined,
+) {
+  const previousKey = stableBusinessKey(previous);
+  if (current.length !== previousKey.length) return false;
+  const isLog = current[reportKeyFields.resource] === 'logs';
+  // Table pagination changes only its page map. Log pagination also changes its
+  // page, cursor and seek, and the first request learns its boundary from the response.
+  const { page, cursor, seek, tablePages, logBoundary } = reportKeyFields;
+  const pages = isLog ? [page, cursor, seek, tablePages, logBoundary] : [tablePages];
+  return (
+    current.every((field, index) => pages.includes(index) || field === previousKey[index]) &&
+    (!isLog || (!!requestedLogBoundary && requestedLogBoundary === returnedLogBoundary))
+  );
+}
 
 export function pageReportQuery(
   userId: string,
@@ -34,6 +67,8 @@ export function pageReportQuery(
       page?: number;
       cursor?: string;
       readBoundary?: string;
+      reportVersion?: string;
+      overviewVersion?: string;
       keywordSnapshot?: string;
       seek?: string;
       tablePages?: Record<string, number>;
@@ -76,7 +111,7 @@ export function pageReportQuery(
     JSON.stringify(tpParams),
     userId,
   ];
-  if (p.crawlerIdentityScope || p.crawlerMetricsVersion)
+  if (p.resource === 'logs' || p.crawlerIdentityScope || p.crawlerMetricsVersion)
     queryKey.push(
       JSON.stringify([
         p.crawlerIdentityScope || 'all',
@@ -84,6 +119,8 @@ export function pageReportQuery(
         'calendar-v2',
       ]),
     );
+  if (p.resource === 'logs') queryKey.push(p.readBoundary ?? '');
+  if (p.reportVersion || p.overviewVersion) queryKey.push(p.reportVersion ?? p.overviewVersion);
   if (p.resource === 'human/geo')
     queryKey.push(JSON.stringify([p.geoSort || 'sessions', p.direction || 'desc']));
   if (p.resource === 'ai/pages' || p.resource === 'ai/bots')
@@ -108,7 +145,6 @@ export function pageReportQuery(
         keywordStatusVersion,
       ]),
     );
-  if (p.resource === 'logs' && p.readBoundary) queryKey.push(p.readBoundary);
   return {
     queryKey,
     queryFn: ({
@@ -123,10 +159,14 @@ export function pageReportQuery(
       withClientFreshness(
         signal,
         () =>
-          featureApi.get<LiekanPageReport>(
+          featureApi.get<LiekanPageReport | ReportPreparing>(
             `/liekan/websites/${websiteId}/${p.resource === 'logs' ? 'log-entries' : 'page-report'}`,
             p.resource === 'logs'
-              ? logReadQuery.parse({ ...p, seek: p.seek || 'after' })
+              ? logReadQuery.parse({
+                  ...p,
+                  seek: p.seek || 'after',
+                  ...(fresh?.() ? { refresh: '1' } : {}),
+                })
               : {
                   ...p,
                   tablePages: undefined,
@@ -137,6 +177,7 @@ export function pageReportQuery(
             signal,
             {
               priority,
+              waitForResult: false,
               onPrevious: previous => {
                 if (signal.aborted || !client) return;
                 const parsed = pageReportSchema.safeParse(previous);
@@ -149,16 +190,40 @@ export function pageReportQuery(
           ),
         { priority, queryKey },
       ),
-    staleTime: (query: any) => (p.resource === 'logs' ? 0 : freshnessStaleTime(query)),
+    staleTime: (query: any) =>
+      isReportPreparing(query.state.data)
+        ? Infinity
+        : p.resource === 'logs'
+          ? 0
+          : freshnessStaleTime(query),
+    // A composite report contains a separately refreshed published Today part.
+    // Revalidate that part once per visit; the manual-read boundary still owns retries.
+    meta: { revalidatePublishedParts: p.resource === 'overview' },
     gcTime: 600000,
     structuralSharing: shareWithFreshness,
     refetchOnMount: (query: any) =>
-      hasClientFreshness(query.state.data) &&
-      remainingFreshness(query.state.data, query.state.dataUpdatedAt) <= 0
-        ? 'always'
-        : true,
+      isReportPreparing(query.state.data)
+        ? false
+        : p.resource === 'overview' && query.state.data?.meta?.todayRequests
+          ? 'always'
+          : hasClientFreshness(query.state.data) &&
+              remainingFreshness(query.state.data, query.state.dataUpdatedAt) <= 0
+            ? 'always'
+            : true,
     refetchOnWindowFocus: false as const,
     refetchOnReconnect: false as const,
     retry: false as const,
   };
+}
+
+/** Match scheduled preset range semantics, including local calendar/DST boundaries. */
+export function trendReportInput(
+  resource: 'overview' | 'human/overview',
+  chartPeriod: 'today' | '7d' | '30d' | '24h',
+  endAt: number,
+  timezone: string,
+) {
+  const token = { today: '0day', '7d': '7day', '30d': '30day', '24h': '24hour' }[chartPeriod];
+  const { dateRange } = readFeatureDateRange(token, '', 0, timezone, 'zh-CN', endAt);
+  return { resource, ...featureDateRange(dateRange, timezone), chartPeriod, timezone };
 }

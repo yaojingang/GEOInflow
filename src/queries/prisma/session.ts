@@ -4,11 +4,22 @@ import {
   setAnalyticsSchema,
 } from '@/lib/liekan/upstream/analytics-revision';
 import prisma from '@/lib/prisma';
+import { warehouseIntakeEnabled } from '@/lib/liekan/warehouse/runtime';
 
 export async function deleteSession(
   websiteId: string,
   sessionId: string,
+  identity?: { userId: string },
 ): Promise<{ id: string } | null> {
+  if (warehouseIntakeEnabled()) {
+    await (await import('@/lib/liekan/upstream/warehouse-lifecycle')).deleteWarehouseStatistics(
+      websiteId,
+      'session',
+      identity,
+      sessionId,
+    );
+    return { id: sessionId };
+  }
   const transaction = prisma.transaction as <T>(input: (tx: any) => Promise<T>) => Promise<T>;
 
   const result = await transaction(async tx => {

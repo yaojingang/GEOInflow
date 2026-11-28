@@ -1765,9 +1765,29 @@ export interface paths {
     put?: never;
     /**
      * 导出当前网站真实统计文件
-     * @description 返回 NDJSON：progress 为实际文件生成/传输进度，file 为文件元数据与字段清单，chunk 为顺序 Base64 数据，complete 为完成。普通 CSV/JSON 使用 summary；ZIP 使用勾选范围；kind=source-keywords 的 CSV 导出全部筛选关键词及搜索引擎，包含读取时间与条件。取消请求终止传输。查询阶段超过 100000 明细行或 50 MiB 返回 413；传输阶段错误为 error 帧。
+     * @description 返回 NDJSON：progress 为文件生成进度，file 为文件元数据与字段清单，complete 为完成，error 为生成失败。ClickHouse 导出按块生成完整文件，file.downloadUrl 提供受权限保护的下载地址，不设总行数或总文件字节数的业务上限；取消请求会停止生成。兼容迁移期间旧 PG 引擎的 chunk Base64 传输。普通 CSV/JSON 使用 summary；ZIP 使用勾选范围；kind=source-keywords 的 CSV 包含全部筛选关键词、搜索引擎、读取时间与条件。
      */
     post: operations['createLiekanExport'];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/liekan/websites/{websiteId}/exports/{exportId}': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * 下载已生成的网站统计文件
+     * @description 使用创建导出时返回的 downloadUrl 流式下载 CSV、JSON 或 ZIP。仅创建者在仍有网站权限时可下载；支持完整登录或 API key，拒绝公开分享身份。浏览器可使用创建接口设置的路径专用 HttpOnly 凭据 cookie。传输期间继续复核权限和数据规则；权限或规则变化会中止传输。过期文件需要重新生成。
+     */
+    get: operations['downloadLiekanExport'];
+    put?: never;
+    post?: never;
     delete?: never;
     options?: never;
     head?: never;
@@ -2212,6 +2232,40 @@ export interface paths {
     put?: never;
     /** post Liekan logs/import */
     post: operations['postLiekanLogsImport'];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/liekan/websites/{websiteId}/overview-jobs/{jobId}': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read the background report state without waiting for computation */
+    get: operations['getLiekanOverviewJob'];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/liekan/websites/{websiteId}/overview-jobs/{jobId}/result': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Read a published report or a completed preparing response */
+    get: operations['getLiekanWebsitesWebsiteIdOverviewJobsJobIdResult'];
+    put?: never;
+    post?: never;
     delete?: never;
     options?: never;
     head?: never;
@@ -5083,66 +5137,6 @@ export interface components {
       websiteId: string;
     } & {
       [key: string]: unknown;
-    };
-    WebsiteSessionPage: {
-      /** @description Number of matching records. */
-      count: number | null;
-      /** @description Data returned by the operation. */
-      data: components['schemas']['WebsiteSession'][];
-      /** @description Whether the results were truncated by the maximum result limit. */
-      isCapped?: boolean;
-      /** @description Page number, starting at 1. */
-      page: number;
-      /** @description Number of results per page. */
-      pageSize: number;
-      population?: {
-        /** @enum {string} */
-        capability: 'supported' | 'unsupported';
-        catalogVersions: string[];
-        epoch: string | null;
-        governanceProcessing?: {
-          computedAt: string | null;
-          errorCode: string | null;
-          nextWindow: string | null;
-          /** @enum {string} */
-          state: 'observed' | 'unknown';
-        };
-        governanceRevision: string | null;
-        governanceWatermark: string | null;
-        historyActiveGeneration: string | null;
-        historyRevision: string | null;
-        identity: {
-          coverage: number | null;
-          eligibleEvents: number | null;
-          eligiblePV: number | null;
-          qualifiedPV: number | null;
-          qualifiedVersions?: string[];
-          qualifiedVisitors: number | null;
-          /** @enum {string} */
-          status: 'complete' | 'partial' | 'unavailable' | 'empty' | 'unsupported';
-          versions: string[];
-        };
-        /** @constant */
-        metricScope?: 'qualified-browser';
-        policyRevision: string | null;
-        populationVersion: string;
-        range: {
-          /** @description End of the date range as a Unix timestamp in milliseconds. */
-          endAt: number;
-          endExclusive?: boolean;
-          /** @description Start of the date range as a Unix timestamp in milliseconds. */
-          startAt: number;
-          /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
-          timezone: string;
-        };
-        resourceId?: string;
-        /** @enum {string} */
-        resourceKind: 'website' | 'link' | 'pixel' | 'unknown';
-        ruleVersions: string[];
-        /** @constant */
-        scope: 'resource-window';
-        versionSetsTruncated: boolean;
-      };
     };
     WebsiteStats: {
       /** @description Number of visits with only one pageview. */
@@ -8711,6 +8705,12 @@ export interface operations {
             supported: boolean;
             syncing: boolean;
             version: string | null;
+            warehouse?: {
+              authority: ('postgres' | 'clickhouse' | 'frozen') | null;
+              legacyCleanupConfigured?: boolean;
+              legacyCleanupPending?: boolean;
+              transition: ('none' | 'shadow' | 'rollback' | 'draining' | 'exited') | null;
+            };
             workerAt: string | null;
           };
         };
@@ -8853,6 +8853,12 @@ export interface operations {
             supported: boolean;
             syncing: boolean;
             version: string | null;
+            warehouse?: {
+              authority: ('postgres' | 'clickhouse' | 'frozen') | null;
+              legacyCleanupConfigured?: boolean;
+              legacyCleanupPending?: boolean;
+              transition: ('none' | 'shadow' | 'rollback' | 'draining' | 'exited') | null;
+            };
             workerAt: string | null;
           };
         };
@@ -13514,6 +13520,8 @@ export interface operations {
         };
         content: {
           'application/json': {
+            /** @enum {string} */
+            backend?: 'postgresql' | 'clickhouse';
             nextCursor: string | null;
             supported: boolean;
             websites: {
@@ -16798,6 +16806,7 @@ export interface operations {
         page?: number;
         /** @description Name of the custom event or session property. */
         propertyName?: string;
+        readBoundary?: string;
         refresh?: '1';
         retentionDate?: string;
         retentionDay?: number;
@@ -17096,6 +17105,7 @@ export interface operations {
                   scope: 'resource-window';
                   versionSetsTruncated: boolean;
                 };
+                readBoundary?: string;
                 rows: ({
                   /** @description Browser used by the visitor. */
                   browser: string | null;
@@ -20063,12 +20073,14 @@ export interface operations {
         direction?: 'asc' | 'desc';
         /** @description End of the date range as a Unix timestamp in milliseconds. */
         endAt: number;
+        fieldCoveragePage?: number;
         logFilter?: 'ai' | 'abnormal' | 'other';
         /** @description Page number, starting at 1. */
         page?: number;
         /** @description Filter by page URL path. */
         path?: string;
         population?: 'recognized_crawlers' | 'ai_crawlers' | 'all_logs';
+        reasonsPage?: number;
         recognitionGroup?: 'ambiguous';
         reportDisplay?: {
           filter: string;
@@ -20964,12 +20976,14 @@ export interface operations {
         direction?: 'asc' | 'desc';
         /** @description End of the date range as a Unix timestamp in milliseconds. */
         endAt: number;
+        fieldCoveragePage?: number;
         logFilter?: 'ai' | 'abnormal' | 'other';
         /** @description Page number, starting at 1. */
         page?: number;
         /** @description Filter by page URL path. */
         path?: string;
         population?: 'recognized_crawlers' | 'ai_crawlers' | 'all_logs';
+        reasonsPage?: number;
         /** @description Search text used to filter results. */
         search?: string;
         snapshot?: string;
@@ -21299,12 +21313,14 @@ export interface operations {
         direction?: 'asc' | 'desc';
         /** @description End of the date range as a Unix timestamp in milliseconds. */
         endAt: number;
+        fieldCoveragePage?: number;
         logFilter?: 'ai' | 'abnormal' | 'other';
         /** @description Page number, starting at 1. */
         page?: number;
         /** @description Filter by page URL path. */
         path?: string;
         population?: 'recognized_crawlers' | 'ai_crawlers' | 'all_logs';
+        reasonsPage?: number;
         /** @description Search text used to filter results. */
         search?: string;
         snapshot?: string;
@@ -26055,7 +26071,7 @@ export interface operations {
       };
     };
     responses: {
-      /** @description 有界真实文件生成与下载流 */
+      /** @description 使用有界内存生成真实文件，返回进度与下载信息 */
       200: {
         headers: {
           [name: string]: unknown;
@@ -26127,7 +26143,7 @@ export interface operations {
           'application/json': components['schemas']['ApiError'];
         };
       };
-      /** @description 导出超过上限，缩小范围后重试 */
+      /** @description 旧 PG 引擎兼容响应：超过其旧导出上限；ClickHouse 导出不使用此上限 */
       413: {
         headers: {
           [name: string]: unknown;
@@ -26138,6 +26154,115 @@ export interface operations {
       };
       /** @description 当前数据引擎暂不支持 */
       501: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description 存储或控制服务暂时不可用 */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+    };
+  };
+  downloadLiekanExport: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        exportId: string;
+        /** @description ID of the website. */
+        websiteId: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description 按块传输完整文件；文件名和字节数由响应头提供 */
+      200: {
+        headers: {
+          'Content-Disposition'?: string;
+          'Content-Length'?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': string;
+          'application/zip': string;
+          'text/csv': string;
+        };
+      };
+      /** @description Unauthorized. */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "unauthorized",
+           *         "message": "Unauthorized.",
+           *         "status": 401
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description 当前账户无网站访问权限 */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Not found. */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          /**
+           * @example {
+           *       "error": {
+           *         "code": "not-found",
+           *         "message": "Not found.",
+           *         "status": 404
+           *       }
+           *     }
+           */
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description 数据规则已变更，需要重新生成文件 */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description 导出文件已过期 */
+      410: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description 存储或控制状态暂时不可用 */
+      503: {
         headers: {
           [name: string]: unknown;
         };
@@ -28034,6 +28159,7 @@ export interface operations {
         page?: number;
         /** @description Name of the custom event or session property. */
         propertyName?: string;
+        readBoundary?: string;
         refresh?: '1';
         retentionDate?: string;
         retentionDay?: number;
@@ -31074,10 +31200,31 @@ export interface operations {
               ruleCount: number;
               snapshot?: {
                 dataThrough: number;
+                fallback?: {
+                  /** @enum {string} */
+                  chartPeriod: 'today' | '7d' | '30d' | '24h';
+                  requestedRange: {
+                    /** @description End of the date range as a Unix timestamp in milliseconds. */
+                    endAt: number;
+                    /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                    startAt: number;
+                    /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                    timezone: string;
+                  };
+                  sourceRange: {
+                    /** @description End of the date range as a Unix timestamp in milliseconds. */
+                    endAt: number;
+                    /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                    startAt: number;
+                    /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                    timezone: string;
+                  };
+                };
                 intervalMs: number;
                 /** @enum {string} */
                 state: 'ready' | 'updating';
                 updateError?: boolean;
+                version?: string;
               };
               tablePages?: {
                 [key: string]: {
@@ -31087,6 +31234,22 @@ export interface operations {
                   pageSize: number;
                   total: number;
                 };
+              };
+              todayRequests?: {
+                dataThrough?: number;
+                generatedAt?: number;
+                intervalMs: number;
+                range: {
+                  /** @description End of the date range as a Unix timestamp in milliseconds. */
+                  endAt: number;
+                  /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                  startAt: number;
+                  /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                  timezone: string;
+                };
+                /** @enum {string} */
+                state: 'ready' | 'updating' | 'preparing' | 'failed';
+                updateError?: boolean;
               };
               totalLogs?: number;
               trendPopulation?: {
@@ -32419,6 +32582,696 @@ export interface operations {
       };
     };
   };
+  getLiekanOverviewJob: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        jobId: string;
+        /** @description ID of the website. */
+        websiteId: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Current job state */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': {
+            analysisJob: {
+              completedAt: string | null;
+              errorCode: string | null;
+              /** @description Date and time the credential expires. */
+              expiresAt: number | null;
+              generatedAt: number | null;
+              /**
+               * Format: uuid
+               * @description Unique identifier of the resource.
+               */
+              id: string;
+              queuedAt: string;
+              resultUrl: string;
+              retryAfterMs: number;
+              /** @description Date and time the recording started. */
+              startedAt: string | null;
+              /** @enum {string} */
+              status: 'queued' | 'running' | 'ready' | 'failed' | 'invalidated' | 'expired';
+              /**
+               * Format: uuid
+               * @description ID of the website.
+               */
+              websiteId: string;
+            };
+          };
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      410: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+    };
+  };
+  getLiekanWebsitesWebsiteIdOverviewJobsJobIdResult: {
+    parameters: {
+      query?: {
+        botCategory?: 'other';
+        botId?: string;
+        botName?: string;
+        botProductForm?: 'workbench' | 'personal_agent';
+        botType?: '训练' | '搜索' | '用户触发' | '传统搜索' | '其他';
+        chartPeriod?: 'today' | '30d' | '7d' | '24h';
+        crawlerIdentityScope?: 'all' | 'verified_range' | 'verified_identity';
+        crawlerMetricsVersion?: number;
+        cursor?: string;
+        direction?: 'asc' | 'desc';
+        /** @description End of the date range as a Unix timestamp in milliseconds. */
+        endAt?: number;
+        engine?: '360' | '' | 'Google' | 'Bing' | '百度' | '搜狗' | 'DuckDuckGo' | 'Yahoo';
+        evidence?: '' | 'referrer' | 'utm' | 'none';
+        filter?: '' | 'ai' | 'abnormal' | 'other';
+        geoSort?: 'city' | 'sessions' | 'share' | 'duration' | 'bounceRate' | 'conversionRate';
+        keywordSnapshot?: string;
+        keywordStatusVersion?: '2';
+        overviewVersion?: string;
+        /** @description Page number, starting at 1. */
+        page?: number;
+        refresh?: '1';
+        reportVersion?: string;
+        resource?:
+          | 'overview'
+          | 'ai/overview'
+          | 'ai/bots'
+          | 'ai/pages'
+          | 'ai/preference'
+          | 'human/overview'
+          | 'human/geo'
+          | 'human/sources'
+          | 'human/search-engines'
+          | 'human/keywords'
+          | 'content'
+          | 'conversions'
+          | 'logs';
+        /** @description Search text used to filter results. */
+        search?: string;
+        seek?: 'after' | 'before';
+        sort?:
+          | 'sessions'
+          | 'keyword'
+          | 'engine'
+          | 'evidence'
+          | 'status'
+          | 'share'
+          | 'bounceRate'
+          | 'conversionRate';
+        /** @description Start of the date range as a Unix timestamp in milliseconds. */
+        startAt?: number;
+        status?:
+          | ''
+          | 'available'
+          | 'missing'
+          | 'redirect'
+          | 'invalid'
+          | 'unsupported'
+          | 'conflict'
+          | 'incomplete'
+          | 'redacted';
+        tablePages?: {
+          [key: string]: number;
+        };
+        /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+        timezone?: string;
+      };
+      header?: never;
+      path: {
+        jobId: string;
+        /** @description ID of the website. */
+        websiteId: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Published page or retention result at its stated data boundary */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json':
+            | {
+                cards: {
+                  detail?: string;
+                  key: string;
+                  label: string;
+                  /** @enum {string} */
+                  state:
+                    | 'available'
+                    | 'empty'
+                    | 'not_connected'
+                    | 'unsupported'
+                    | 'estimated'
+                    | 'unavailable';
+                  /** @description Time interval used to group results: minute, hour, day, month, or year. */
+                  unit?: string;
+                  value: number | string | null;
+                }[];
+                charts: {
+                  [key: string]: {
+                    labels: string[];
+                    rows?: {
+                      [key: string]: unknown;
+                    }[];
+                    series: {
+                      /** @description Display name of the resource. */
+                      name: string;
+                      values: (number | null)[];
+                    }[];
+                    /** @enum {string} */
+                    state?:
+                      | 'available'
+                      | 'empty'
+                      | 'not_connected'
+                      | 'unsupported'
+                      | 'estimated'
+                      | 'unavailable';
+                  };
+                };
+                /** @constant */
+                contractVersion: 2;
+                insights: string[];
+                meta: {
+                  aiCrawlerEnabled?: boolean;
+                  canManage: boolean;
+                  /** Format: uuid */
+                  catalogVersion?: string;
+                  crawlerClassification?: {
+                    legacyRequests: number;
+                    /** @enum {string} */
+                    mode: 'current' | 'legacy' | 'mixed';
+                    unclassifiedRequests: number;
+                    versions: number;
+                  };
+                  crawlerEvidenceView?: {
+                    policySnapshot: string;
+                    query: {
+                      [key: string]: unknown;
+                    };
+                    snapshot: string;
+                  };
+                  crawlerMetrics?: {
+                    population: string;
+                    /** @enum {string} */
+                    scope: 'all' | 'verified_range' | 'verified_identity';
+                    /** @enum {string} */
+                    timeBoundary: 'half_open' | 'legacy_inclusive';
+                    version: 1 | null;
+                  };
+                  crawlerPageBots?: {
+                    botId: string | null;
+                    /** @description Display name of the resource. */
+                    name: string;
+                    productForm?: string;
+                    type: string;
+                  }[];
+                  demo: boolean;
+                  /** @description Date and time the credential expires. */
+                  expiresAt: number;
+                  generatedAt: number;
+                  geography?: {
+                    cards?: {
+                      [key: string]: {
+                        /** @description City of the visitor. */
+                        city: string | null;
+                        cityId: number | null;
+                        /** @description Country code of the visitor. */
+                        country: string | null;
+                        /** @description Region or subdivision of the visitor. */
+                        region: string | null;
+                      };
+                    };
+                    charts?: {
+                      [key: string]: {
+                        /** @description City of the visitor. */
+                        city: string | null;
+                        cityId: number | null;
+                        /** @description Country code of the visitor. */
+                        country: string | null;
+                        /** @description Region or subdivision of the visitor. */
+                        region: string | null;
+                      }[];
+                    };
+                    tables?: {
+                      [key: string]: {
+                        /** @description City of the visitor. */
+                        city: string | null;
+                        cityId: number | null;
+                        /** @description Country code of the visitor. */
+                        country: string | null;
+                        /** @description Region or subdivision of the visitor. */
+                        region: string | null;
+                      }[];
+                    };
+                  };
+                  geographyCoverage?: {
+                    chinaProvinceCoverage: number | null;
+                    chinaProvinceKnownVisits: number;
+                    chinaProvinceUnknownVisits: number;
+                    chinaVisits: number;
+                    cityCoverage: number | null;
+                    /** @enum {string} */
+                    cityDisplayState: 'empty' | 'unidentified' | 'available';
+                    cityKnownVisits: number;
+                    cityUnknownVisits: number;
+                    displayRuleVersion: string;
+                    /** @enum {string} */
+                    provinceDisplayState: 'empty' | 'unidentified' | 'available';
+                    totalVisits: number;
+                  };
+                  keywordEngines?: string[];
+                  keywordHasGoals?: boolean;
+                  keywordReadAt?: number;
+                  keywordReset?: boolean;
+                  keywordSnapshot?: string;
+                  latestImportAt: string | null;
+                  logHasMore?: boolean;
+                  logParts?: {
+                    /**
+                     * @description Number of matching records.
+                     * @enum {string}
+                     */
+                    count: 'pending' | 'ready' | 'failed';
+                    /** @enum {string} */
+                    summary: 'pending' | 'ready' | 'failed';
+                  };
+                  logReadBoundary?: string;
+                  logsConfigured?: boolean;
+                  nextCursor?: string;
+                  /** @description Page number, starting at 1. */
+                  page?: number;
+                  /** @description Number of results per page. */
+                  pageSize?: number;
+                  population?: {
+                    /** @enum {string} */
+                    capability: 'supported' | 'unsupported';
+                    catalogVersions: string[];
+                    epoch: string | null;
+                    governanceProcessing?: {
+                      computedAt: string | null;
+                      errorCode: string | null;
+                      nextWindow: string | null;
+                      /** @enum {string} */
+                      state: 'observed' | 'unknown';
+                    };
+                    governanceRevision: string | null;
+                    governanceWatermark: string | null;
+                    historyActiveGeneration: string | null;
+                    historyRevision: string | null;
+                    identity: {
+                      coverage: number | null;
+                      eligibleEvents: number | null;
+                      eligiblePV: number | null;
+                      qualifiedPV: number | null;
+                      qualifiedVersions?: string[];
+                      qualifiedVisitors: number | null;
+                      /** @enum {string} */
+                      status: 'complete' | 'partial' | 'unavailable' | 'empty' | 'unsupported';
+                      versions: string[];
+                    };
+                    /** @constant */
+                    metricScope?: 'qualified-browser';
+                    policyRevision: string | null;
+                    populationVersion: string;
+                    range: {
+                      /** @description End of the date range as a Unix timestamp in milliseconds. */
+                      endAt: number;
+                      endExclusive?: boolean;
+                      /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                      startAt: number;
+                      /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                      timezone: string;
+                    };
+                    resourceId?: string;
+                    /** @enum {string} */
+                    resourceKind: 'website' | 'link' | 'pixel' | 'unknown';
+                    ruleVersions: string[];
+                    /** @constant */
+                    scope: 'resource-window';
+                    versionSetsTruncated: boolean;
+                  };
+                  previousCursor?: string;
+                  ruleCount: number;
+                  snapshot?: {
+                    dataThrough: number;
+                    fallback?: {
+                      /** @enum {string} */
+                      chartPeriod: 'today' | '7d' | '30d' | '24h';
+                      requestedRange: {
+                        /** @description End of the date range as a Unix timestamp in milliseconds. */
+                        endAt: number;
+                        /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                        startAt: number;
+                        /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                        timezone: string;
+                      };
+                      sourceRange: {
+                        /** @description End of the date range as a Unix timestamp in milliseconds. */
+                        endAt: number;
+                        /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                        startAt: number;
+                        /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                        timezone: string;
+                      };
+                    };
+                    intervalMs: number;
+                    /** @enum {string} */
+                    state: 'ready' | 'updating';
+                    updateError?: boolean;
+                    version?: string;
+                  };
+                  tablePages?: {
+                    [key: string]: {
+                      /** @description Page number, starting at 1. */
+                      page: number;
+                      /** @description Number of results per page. */
+                      pageSize: number;
+                      total: number;
+                    };
+                  };
+                  todayRequests?: {
+                    dataThrough?: number;
+                    generatedAt?: number;
+                    intervalMs: number;
+                    range: {
+                      /** @description End of the date range as a Unix timestamp in milliseconds. */
+                      endAt: number;
+                      /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                      startAt: number;
+                      /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                      timezone: string;
+                    };
+                    /** @enum {string} */
+                    state: 'ready' | 'updating' | 'preparing' | 'failed';
+                    updateError?: boolean;
+                  };
+                  totalLogs?: number;
+                  trendPopulation?: {
+                    /** @enum {string} */
+                    capability: 'supported' | 'unsupported';
+                    catalogVersions: string[];
+                    epoch: string | null;
+                    governanceProcessing?: {
+                      computedAt: string | null;
+                      errorCode: string | null;
+                      nextWindow: string | null;
+                      /** @enum {string} */
+                      state: 'observed' | 'unknown';
+                    };
+                    governanceRevision: string | null;
+                    governanceWatermark: string | null;
+                    historyActiveGeneration: string | null;
+                    historyRevision: string | null;
+                    identity: {
+                      coverage: number | null;
+                      eligibleEvents: number | null;
+                      eligiblePV: number | null;
+                      qualifiedPV: number | null;
+                      qualifiedVersions?: string[];
+                      qualifiedVisitors: number | null;
+                      /** @enum {string} */
+                      status: 'complete' | 'partial' | 'unavailable' | 'empty' | 'unsupported';
+                      versions: string[];
+                    };
+                    /** @constant */
+                    metricScope?: 'qualified-browser';
+                    policyRevision: string | null;
+                    populationVersion: string;
+                    range: {
+                      /** @description End of the date range as a Unix timestamp in milliseconds. */
+                      endAt: number;
+                      endExclusive?: boolean;
+                      /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                      startAt: number;
+                      /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                      timezone: string;
+                    };
+                    resourceId?: string;
+                    /** @enum {string} */
+                    resourceKind: 'website' | 'link' | 'pixel' | 'unknown';
+                    ruleVersions: string[];
+                    /** @constant */
+                    scope: 'resource-window';
+                    versionSetsTruncated: boolean;
+                  };
+                };
+                range: {
+                  /** @description End of the date range as a Unix timestamp in milliseconds. */
+                  endAt: number;
+                  /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                  startAt: number;
+                  /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                  timezone: string;
+                };
+                /** @enum {string} */
+                resource:
+                  | 'overview'
+                  | 'ai/overview'
+                  | 'ai/bots'
+                  | 'ai/pages'
+                  | 'ai/preference'
+                  | 'human/overview'
+                  | 'human/geo'
+                  | 'human/sources'
+                  | 'human/search-engines'
+                  | 'human/keywords'
+                  | 'content'
+                  | 'conversions'
+                  | 'logs';
+                states: {
+                  /** @enum {string} */
+                  catalog:
+                    | 'available'
+                    | 'empty'
+                    | 'not_connected'
+                    | 'unsupported'
+                    | 'estimated'
+                    | 'unavailable';
+                  /** @enum {string} */
+                  goals:
+                    | 'available'
+                    | 'empty'
+                    | 'not_connected'
+                    | 'unsupported'
+                    | 'estimated'
+                    | 'unavailable';
+                  /** @enum {string} */
+                  human:
+                    | 'available'
+                    | 'empty'
+                    | 'not_connected'
+                    | 'unsupported'
+                    | 'estimated'
+                    | 'unavailable';
+                  /** @enum {string} */
+                  logs:
+                    | 'available'
+                    | 'empty'
+                    | 'not_connected'
+                    | 'unsupported'
+                    | 'estimated'
+                    | 'unavailable';
+                };
+                tables: {
+                  [key: string]: {
+                    [key: string]: string | number | boolean | null;
+                  }[];
+                };
+                website: {
+                  /** @description Domain name associated with the resource. */
+                  domain: string;
+                  /**
+                   * Format: uuid
+                   * @description Unique identifier of the resource.
+                   */
+                  id: string;
+                  /** @description Display name of the resource. */
+                  name: string;
+                  siteNumber?: number | null;
+                };
+              }
+            | {
+                date: string;
+                day: number;
+                percentage: number | null;
+                returnVisitors: number | null;
+                /** @description Unique visitor counts for the selected period. */
+                visitors: number | null;
+              }[];
+        };
+      };
+      /** @description No published result yet; stop loading and offer a manual status read */
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': {
+            analysisJob?: {
+              completedAt: string | null;
+              errorCode: string | null;
+              /** @description Date and time the credential expires. */
+              expiresAt: number | null;
+              generatedAt: number | null;
+              /**
+               * Format: uuid
+               * @description Unique identifier of the resource.
+               */
+              id: string;
+              queuedAt: string;
+              resultUrl: string;
+              retryAfterMs: number;
+              /** @description Date and time the recording started. */
+              startedAt: string | null;
+              /** @enum {string} */
+              status: 'queued' | 'running' | 'ready' | 'failed' | 'invalidated' | 'expired';
+              /**
+               * Format: uuid
+               * @description ID of the website.
+               */
+              websiteId: string;
+            };
+            /** @constant */
+            status: 'preparing';
+          };
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      410: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Permission, report-version or background computation failure */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+    };
+  };
   getLiekanPageReport: {
     parameters: {
       query: {
@@ -32440,9 +33293,11 @@ export interface operations {
         geoSort?: 'city' | 'sessions' | 'share' | 'duration' | 'bounceRate' | 'conversionRate';
         keywordSnapshot?: string;
         keywordStatusVersion?: '2';
+        overviewVersion?: string;
         /** @description Page number, starting at 1. */
         page?: number;
         refresh?: '0' | '1';
+        reportVersion?: string;
         resource:
           | 'overview'
           | 'ai/overview'
@@ -32706,10 +33561,31 @@ export interface operations {
               ruleCount: number;
               snapshot?: {
                 dataThrough: number;
+                fallback?: {
+                  /** @enum {string} */
+                  chartPeriod: 'today' | '7d' | '30d' | '24h';
+                  requestedRange: {
+                    /** @description End of the date range as a Unix timestamp in milliseconds. */
+                    endAt: number;
+                    /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                    startAt: number;
+                    /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                    timezone: string;
+                  };
+                  sourceRange: {
+                    /** @description End of the date range as a Unix timestamp in milliseconds. */
+                    endAt: number;
+                    /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                    startAt: number;
+                    /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                    timezone: string;
+                  };
+                };
                 intervalMs: number;
                 /** @enum {string} */
                 state: 'ready' | 'updating';
                 updateError?: boolean;
+                version?: string;
               };
               tablePages?: {
                 [key: string]: {
@@ -32719,6 +33595,22 @@ export interface operations {
                   pageSize: number;
                   total: number;
                 };
+              };
+              todayRequests?: {
+                dataThrough?: number;
+                generatedAt?: number;
+                intervalMs: number;
+                range: {
+                  /** @description End of the date range as a Unix timestamp in milliseconds. */
+                  endAt: number;
+                  /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                  startAt: number;
+                  /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                  timezone: string;
+                };
+                /** @enum {string} */
+                state: 'ready' | 'updating' | 'preparing' | 'failed';
+                updateError?: boolean;
               };
               totalLogs?: number;
               trendPopulation?: {
@@ -32847,39 +33739,68 @@ export interface operations {
           };
         };
       };
-      /** @description Opt-in Prefer: respond-async accepted a durable private task */
+      /** @description The report is being prepared in the background; this read is complete */
       202: {
         headers: {
           [name: string]: unknown;
         };
         content: {
-          'application/json': {
-            analysisJob: {
-              completedAt: string | null;
-              errorCode: string | null;
-              /** @description Date and time the credential expires. */
-              expiresAt: number | null;
-              generatedAt: number | null;
-              /**
-               * Format: uuid
-               * @description Unique identifier of the resource.
-               */
-              id: string;
-              queuedAt: string;
-              resultUrl: string;
-              retryAfterMs: number;
-              /** @description Date and time the recording started. */
-              startedAt: string | null;
-              /** @enum {string} */
-              status: 'queued' | 'running' | 'ready' | 'failed' | 'invalidated' | 'expired';
-              /**
-               * Format: uuid
-               * @description ID of the website.
-               */
-              websiteId: string;
-            };
-            previousResult?: unknown;
-          };
+          'application/json':
+            | {
+                analysisJob?: {
+                  completedAt: string | null;
+                  errorCode: string | null;
+                  /** @description Date and time the credential expires. */
+                  expiresAt: number | null;
+                  generatedAt: number | null;
+                  /**
+                   * Format: uuid
+                   * @description Unique identifier of the resource.
+                   */
+                  id: string;
+                  queuedAt: string;
+                  resultUrl: string;
+                  retryAfterMs: number;
+                  /** @description Date and time the recording started. */
+                  startedAt: string | null;
+                  /** @enum {string} */
+                  status: 'queued' | 'running' | 'ready' | 'failed' | 'invalidated' | 'expired';
+                  /**
+                   * Format: uuid
+                   * @description ID of the website.
+                   */
+                  websiteId: string;
+                };
+                /** @constant */
+                status: 'preparing';
+              }
+            | {
+                analysisJob: {
+                  completedAt: string | null;
+                  errorCode: string | null;
+                  /** @description Date and time the credential expires. */
+                  expiresAt: number | null;
+                  generatedAt: number | null;
+                  /**
+                   * Format: uuid
+                   * @description Unique identifier of the resource.
+                   */
+                  id: string;
+                  queuedAt: string;
+                  resultUrl: string;
+                  retryAfterMs: number;
+                  /** @description Date and time the recording started. */
+                  startedAt: string | null;
+                  /** @enum {string} */
+                  status: 'queued' | 'running' | 'ready' | 'failed' | 'invalidated' | 'expired';
+                  /**
+                   * Format: uuid
+                   * @description ID of the website.
+                   */
+                  websiteId: string;
+                };
+                previousResult?: unknown;
+              };
         };
       };
       /** @description Bad request. */
@@ -32938,6 +33859,15 @@ export interface operations {
       };
       /** @description The reporting revision or cursor scope changed; reload the report */
       409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['ApiError'];
+        };
+      };
+      /** @description Background computation failed and no valid result is available */
+      503: {
         headers: {
           [name: string]: unknown;
         };
@@ -33667,10 +34597,31 @@ export interface operations {
               ruleCount: number;
               snapshot?: {
                 dataThrough: number;
+                fallback?: {
+                  /** @enum {string} */
+                  chartPeriod: 'today' | '7d' | '30d' | '24h';
+                  requestedRange: {
+                    /** @description End of the date range as a Unix timestamp in milliseconds. */
+                    endAt: number;
+                    /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                    startAt: number;
+                    /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                    timezone: string;
+                  };
+                  sourceRange: {
+                    /** @description End of the date range as a Unix timestamp in milliseconds. */
+                    endAt: number;
+                    /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                    startAt: number;
+                    /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                    timezone: string;
+                  };
+                };
                 intervalMs: number;
                 /** @enum {string} */
                 state: 'ready' | 'updating';
                 updateError?: boolean;
+                version?: string;
               };
               tablePages?: {
                 [key: string]: {
@@ -33680,6 +34631,22 @@ export interface operations {
                   pageSize: number;
                   total: number;
                 };
+              };
+              todayRequests?: {
+                dataThrough?: number;
+                generatedAt?: number;
+                intervalMs: number;
+                range: {
+                  /** @description End of the date range as a Unix timestamp in milliseconds. */
+                  endAt: number;
+                  /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                  startAt: number;
+                  /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                  timezone: string;
+                };
+                /** @enum {string} */
+                state: 'ready' | 'updating' | 'preparing' | 'failed';
+                updateError?: boolean;
               };
               totalLogs?: number;
               trendPopulation?: {
@@ -34903,10 +35870,31 @@ export interface operations {
               ruleCount: number;
               snapshot?: {
                 dataThrough: number;
+                fallback?: {
+                  /** @enum {string} */
+                  chartPeriod: 'today' | '7d' | '30d' | '24h';
+                  requestedRange: {
+                    /** @description End of the date range as a Unix timestamp in milliseconds. */
+                    endAt: number;
+                    /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                    startAt: number;
+                    /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                    timezone: string;
+                  };
+                  sourceRange: {
+                    /** @description End of the date range as a Unix timestamp in milliseconds. */
+                    endAt: number;
+                    /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                    startAt: number;
+                    /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                    timezone: string;
+                  };
+                };
                 intervalMs: number;
                 /** @enum {string} */
                 state: 'ready' | 'updating';
                 updateError?: boolean;
+                version?: string;
               };
               tablePages?: {
                 [key: string]: {
@@ -34916,6 +35904,22 @@ export interface operations {
                   pageSize: number;
                   total: number;
                 };
+              };
+              todayRequests?: {
+                dataThrough?: number;
+                generatedAt?: number;
+                intervalMs: number;
+                range: {
+                  /** @description End of the date range as a Unix timestamp in milliseconds. */
+                  endAt: number;
+                  /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                  startAt: number;
+                  /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                  timezone: string;
+                };
+                /** @enum {string} */
+                state: 'ready' | 'updating' | 'preparing' | 'failed';
+                updateError?: boolean;
               };
               totalLogs?: number;
               trendPopulation?: {
@@ -36844,12 +37848,14 @@ export interface operations {
         direction?: 'asc' | 'desc';
         /** @description End of the date range as a Unix timestamp in milliseconds. */
         endAt: number;
+        fieldCoveragePage?: number;
         /** @description Hostname on which the activity occurred. */
         hostname: string;
         /** @description Page number, starting at 1. */
         page?: number;
         /** @description Filter by page URL path. */
         path?: string;
+        reasonsPage?: number;
         snapshot?: string;
         sort?: 'requests' | 'visits' | 'path';
         sourceId: string | 'manual';
@@ -37388,6 +38394,7 @@ export interface operations {
             aiVisits: number | null;
             /** @description Number of visits with only one pageview. */
             bounces: number | null;
+            collectionKnown?: boolean;
             /** @description Analytics for the comparison period. */
             comparison: {
               aiVisits: number | null;
@@ -37508,6 +38515,166 @@ export interface operations {
               versionSetsTruncated: boolean;
             };
             received: boolean;
+            snapshot?: {
+              dataThrough: number | null;
+              /** @description End of the date range as a Unix timestamp in milliseconds. */
+              endAt: number;
+              /** @description Start of the date range as a Unix timestamp in milliseconds. */
+              startAt: number;
+              /** @enum {string} */
+              state: 'ready' | 'updating' | 'preparing';
+            };
+            /** @description Total visit duration in seconds. */
+            totaltime: number | null;
+            /** @description Pageview counts for the selected period. */
+            views: number | null;
+            /** @description Unique visitor counts for the selected period. */
+            visitors: number | null;
+            /** @description Visit counts for the selected period. */
+            visits: number | null;
+          }[];
+        };
+      };
+      /** @description A site summary is preparing. Available rows retain their published cutoff. */
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': {
+            aiVisits: number | null;
+            /** @description Number of visits with only one pageview. */
+            bounces: number | null;
+            collectionKnown?: boolean;
+            /** @description Analytics for the comparison period. */
+            comparison: {
+              aiVisits: number | null;
+              /** @description Number of visits with only one pageview. */
+              bounces: number | null;
+              /** @description Pageview counts for the selected period. */
+              pageviews: number | null;
+              population?: {
+                /** @enum {string} */
+                capability: 'supported' | 'unsupported';
+                catalogVersions: string[];
+                epoch: string | null;
+                governanceProcessing?: {
+                  computedAt: string | null;
+                  errorCode: string | null;
+                  nextWindow: string | null;
+                  /** @enum {string} */
+                  state: 'observed' | 'unknown';
+                };
+                governanceRevision: string | null;
+                governanceWatermark: string | null;
+                historyActiveGeneration: string | null;
+                historyRevision: string | null;
+                identity: {
+                  coverage: number | null;
+                  eligibleEvents: number | null;
+                  eligiblePV: number | null;
+                  qualifiedPV: number | null;
+                  qualifiedVersions?: string[];
+                  qualifiedVisitors: number | null;
+                  /** @enum {string} */
+                  status: 'complete' | 'partial' | 'unavailable' | 'empty' | 'unsupported';
+                  versions: string[];
+                };
+                /** @constant */
+                metricScope?: 'qualified-browser';
+                policyRevision: string | null;
+                populationVersion: string;
+                range: {
+                  /** @description End of the date range as a Unix timestamp in milliseconds. */
+                  endAt: number;
+                  endExclusive?: boolean;
+                  /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                  startAt: number;
+                  /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                  timezone: string;
+                };
+                resourceId?: string;
+                /** @enum {string} */
+                resourceKind: 'website' | 'link' | 'pixel' | 'unknown';
+                ruleVersions: string[];
+                /** @constant */
+                scope: 'resource-window';
+                versionSetsTruncated: boolean;
+              };
+              /** @description Total visit duration in seconds. */
+              totaltime: number | null;
+              /** @description Unique visitor counts for the selected period. */
+              visitors: number | null;
+              /** @description Visit counts for the selected period. */
+              visits: number | null;
+            };
+            /**
+             * Format: uuid
+             * @description Unique identifier of the resource.
+             */
+            id: string;
+            /** @description Date and time of the most recent recorded activity. */
+            lastAt: string | null;
+            /** @description Pageview counts for the selected period. */
+            pageviews: number | null;
+            population?: {
+              /** @enum {string} */
+              capability: 'supported' | 'unsupported';
+              catalogVersions: string[];
+              epoch: string | null;
+              governanceProcessing?: {
+                computedAt: string | null;
+                errorCode: string | null;
+                nextWindow: string | null;
+                /** @enum {string} */
+                state: 'observed' | 'unknown';
+              };
+              governanceRevision: string | null;
+              governanceWatermark: string | null;
+              historyActiveGeneration: string | null;
+              historyRevision: string | null;
+              identity: {
+                coverage: number | null;
+                eligibleEvents: number | null;
+                eligiblePV: number | null;
+                qualifiedPV: number | null;
+                qualifiedVersions?: string[];
+                qualifiedVisitors: number | null;
+                /** @enum {string} */
+                status: 'complete' | 'partial' | 'unavailable' | 'empty' | 'unsupported';
+                versions: string[];
+              };
+              /** @constant */
+              metricScope?: 'qualified-browser';
+              policyRevision: string | null;
+              populationVersion: string;
+              range: {
+                /** @description End of the date range as a Unix timestamp in milliseconds. */
+                endAt: number;
+                endExclusive?: boolean;
+                /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                startAt: number;
+                /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                timezone: string;
+              };
+              resourceId?: string;
+              /** @enum {string} */
+              resourceKind: 'website' | 'link' | 'pixel' | 'unknown';
+              ruleVersions: string[];
+              /** @constant */
+              scope: 'resource-window';
+              versionSetsTruncated: boolean;
+            };
+            received: boolean;
+            snapshot?: {
+              dataThrough: number | null;
+              /** @description End of the date range as a Unix timestamp in milliseconds. */
+              endAt: number;
+              /** @description Start of the date range as a Unix timestamp in milliseconds. */
+              startAt: number;
+              /** @enum {string} */
+              state: 'ready' | 'updating' | 'preparing';
+            };
             /** @description Total visit duration in seconds. */
             totaltime: number | null;
             /** @description Pageview counts for the selected period. */
@@ -51063,39 +52230,68 @@ export interface operations {
           }[];
         };
       };
-      /** @description Opt-in Prefer: respond-async accepted a durable private task */
+      /** @description The warehouse report is being prepared; this response completes the read. Legacy async requests may return a task receipt. */
       202: {
         headers: {
           [name: string]: unknown;
         };
         content: {
-          'application/json': {
-            analysisJob: {
-              completedAt: string | null;
-              errorCode: string | null;
-              /** @description Date and time the credential expires. */
-              expiresAt: number | null;
-              generatedAt: number | null;
-              /**
-               * Format: uuid
-               * @description Unique identifier of the resource.
-               */
-              id: string;
-              queuedAt: string;
-              resultUrl: string;
-              retryAfterMs: number;
-              /** @description Date and time the recording started. */
-              startedAt: string | null;
-              /** @enum {string} */
-              status: 'queued' | 'running' | 'ready' | 'failed' | 'invalidated' | 'expired';
-              /**
-               * Format: uuid
-               * @description ID of the website.
-               */
-              websiteId: string;
-            };
-            previousResult?: unknown;
-          };
+          'application/json':
+            | {
+                analysisJob?: {
+                  completedAt: string | null;
+                  errorCode: string | null;
+                  /** @description Date and time the credential expires. */
+                  expiresAt: number | null;
+                  generatedAt: number | null;
+                  /**
+                   * Format: uuid
+                   * @description Unique identifier of the resource.
+                   */
+                  id: string;
+                  queuedAt: string;
+                  resultUrl: string;
+                  retryAfterMs: number;
+                  /** @description Date and time the recording started. */
+                  startedAt: string | null;
+                  /** @enum {string} */
+                  status: 'queued' | 'running' | 'ready' | 'failed' | 'invalidated' | 'expired';
+                  /**
+                   * Format: uuid
+                   * @description ID of the website.
+                   */
+                  websiteId: string;
+                };
+                /** @constant */
+                status: 'preparing';
+              }
+            | {
+                analysisJob: {
+                  completedAt: string | null;
+                  errorCode: string | null;
+                  /** @description Date and time the credential expires. */
+                  expiresAt: number | null;
+                  generatedAt: number | null;
+                  /**
+                   * Format: uuid
+                   * @description Unique identifier of the resource.
+                   */
+                  id: string;
+                  queuedAt: string;
+                  resultUrl: string;
+                  retryAfterMs: number;
+                  /** @description Date and time the recording started. */
+                  startedAt: string | null;
+                  /** @enum {string} */
+                  status: 'queued' | 'running' | 'ready' | 'failed' | 'invalidated' | 'expired';
+                  /**
+                   * Format: uuid
+                   * @description ID of the website.
+                   */
+                  websiteId: string;
+                };
+                previousResult?: unknown;
+              };
         };
       };
       /** @description Bad request. */
@@ -53616,6 +54812,7 @@ export interface operations {
         path?: string;
         /** @description Filter by page URL query string. */
         query?: string;
+        readBoundary?: string;
         /** @description Filter by referring URL. */
         referrer?: string;
         refresh?: '1';
@@ -53665,7 +54862,67 @@ export interface operations {
           [name: string]: unknown;
         };
         content: {
-          'application/json': components['schemas']['WebsiteSessionPage'];
+          'application/json': {
+            /** @description Number of matching records. */
+            count: number | null;
+            /** @description Data returned by the operation. */
+            data: components['schemas']['WebsiteSession'][];
+            /** @description Whether the results were truncated by the maximum result limit. */
+            isCapped?: boolean;
+            /** @description Page number, starting at 1. */
+            page: number;
+            /** @description Number of results per page. */
+            pageSize: number;
+            population?: {
+              /** @enum {string} */
+              capability: 'supported' | 'unsupported';
+              catalogVersions: string[];
+              epoch: string | null;
+              governanceProcessing?: {
+                computedAt: string | null;
+                errorCode: string | null;
+                nextWindow: string | null;
+                /** @enum {string} */
+                state: 'observed' | 'unknown';
+              };
+              governanceRevision: string | null;
+              governanceWatermark: string | null;
+              historyActiveGeneration: string | null;
+              historyRevision: string | null;
+              identity: {
+                coverage: number | null;
+                eligibleEvents: number | null;
+                eligiblePV: number | null;
+                qualifiedPV: number | null;
+                qualifiedVersions?: string[];
+                qualifiedVisitors: number | null;
+                /** @enum {string} */
+                status: 'complete' | 'partial' | 'unavailable' | 'empty' | 'unsupported';
+                versions: string[];
+              };
+              /** @constant */
+              metricScope?: 'qualified-browser';
+              policyRevision: string | null;
+              populationVersion: string;
+              range: {
+                /** @description End of the date range as a Unix timestamp in milliseconds. */
+                endAt: number;
+                endExclusive?: boolean;
+                /** @description Start of the date range as a Unix timestamp in milliseconds. */
+                startAt: number;
+                /** @description IANA time zone used to interpret dates and group results, for example America/New_York. */
+                timezone: string;
+              };
+              resourceId?: string;
+              /** @enum {string} */
+              resourceKind: 'website' | 'link' | 'pixel' | 'unknown';
+              ruleVersions: string[];
+              /** @constant */
+              scope: 'resource-window';
+              versionSetsTruncated: boolean;
+            };
+            readBoundary?: string;
+          };
         };
       };
       /** @description Bad request. */

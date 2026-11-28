@@ -73,7 +73,7 @@ export const pageReportParts = {
     charts: ['s1', 's2'],
     tables: ['srcBody'],
     human: ['daily', 'sources', 'dailySources', 'previousSources'],
-    logs: ['summary', 'catalog', 'latest', 'daily'],
+    logs: ['summary', 'catalog', 'latest'],
     today: false,
     insights: false,
   },

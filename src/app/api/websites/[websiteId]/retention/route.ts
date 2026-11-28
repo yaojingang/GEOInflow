@@ -1,3 +1,4 @@
+import { warehouseEnabled } from '@/lib/liekan/warehouse/authority-routing';
 import { requestApi } from '@/lib/liekan/http';
 import {
   analysisAsyncRequested,
@@ -29,5 +30,6 @@ export async function GET(...args: Parameters<typeof getResponse>) {
       asyncAnalysisResponse(args[0], (await args[1].params).websiteId, 'native:retention'),
     );
 
+  if (warehouseEnabled()) return requestApi(args[0], () => getResponse(...args));
   return withQueryCacheHeaders(() => getResponse(...args), args[0]);
 }

@@ -214,3 +214,44 @@ it('retires retained website maintenance controls when a running status poll bec
   expect(screen.getByLabelText('高频已完成任务保留期')).toBeVisible();
   expect(get.mock.calls.some(([path]) => path === '/liekan/storage')).toBe(true);
 });
+
+it.each([id, ''])(
+  'keeps legacy cleanup available after identifying the ClickHouse backend for website %s',
+  async websiteId => {
+    vi.useFakeTimers();
+    let resolveList: (value: any) => void;
+    const pending = new Promise(resolve => {
+      resolveList = resolve;
+    });
+    const get = vi.fn(async (path: string) => {
+      if (path === '/liekan/analytics-acceleration') return pending;
+      if (path === '/liekan/storage') return instanceStorage;
+      if (path.endsWith('/storage'))
+        return { ...instanceStorage, scope: 'website', websiteId: id, canManageQueues: false };
+      return { ...detail, supported: false, backend: 'clickhouse' };
+    });
+    mount(get, vi.fn(), { role: 'admin', websiteId });
+    await advance();
+    expect(get.mock.calls.some(([path]) => path.endsWith('/storage'))).toBe(false);
+    resolveList({
+      supported: false,
+      backend: 'clickhouse',
+      websites: [{ id, name: 'Fixture' }],
+      nextCursor: null,
+    });
+    await advance();
+    await advance();
+    expect(screen.getByText('ClickHouse 已直接提供统计，无需构建旧汇总')).toBeVisible();
+    expect(screen.queryByText('正在读取加速状态')).toBeNull();
+    expect(screen.queryByRole('button', { name: '开始构建' })).toBeNull();
+    expect(screen.getByRole('heading', { name: '存储与清理' })).toBeVisible();
+    expect(
+      screen.getByText(
+        '清理 PostgreSQL 中无引用的旧统计副本和已完成任务，不删除 ClickHouse 明细。',
+      ),
+    ).toBeVisible();
+    expect(get.mock.calls.some(([path]) => path.endsWith('/storage'))).toBe(true);
+    expect(screen.queryByText('网站派生空间估算')).toBeNull();
+    expect(screen.queryByLabelText('容量达到 80% 时提前回收')).toBeNull();
+  },
+);

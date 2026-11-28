@@ -108,3 +108,33 @@ it('captures the submission locale and keeps an active export when the display l
   expect(stream.mock.calls[1][1]).toMatchObject({ locale: 'zh-CN' });
   await act(async () => next.reject(new Error('fixture failure')));
 });
+
+it('downloads a large prepared file without buffering it into a browser Blob', async () => {
+  const current = pendingExport();
+  const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+  const previous = URL.createObjectURL,
+    create = vi.fn();
+  URL.createObjectURL = create;
+  try {
+    render(<KeywordExport report={report} conditions={google} disabled={false} />);
+    fireEvent.click(screen.getByRole('button', { name: '导出全部筛选结果' }));
+    await act(async () => {
+      current.frame({
+        type: 'file',
+        name: 'keywords.csv',
+        size: 75 * 1024 * 1024,
+        mime: 'text/csv',
+        manifest: {},
+        downloadUrl: '/api/liekan/websites/test/exports/prepared',
+      });
+      current.frame({ type: 'complete' });
+      current.resolve();
+    });
+    expect(click).toHaveBeenCalledOnce();
+    expect(create).not.toHaveBeenCalled();
+    expect(screen.getByRole('status')).toHaveTextContent('已导出全部筛选结果');
+  } finally {
+    URL.createObjectURL = previous;
+    click.mockRestore();
+  }
+});

@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { withSessionReadBoundary } from '@/lib/liekan/upstream/warehouse-session-boundary';
 import { withQueryCacheHeaders } from '@/lib/liekan/upstream/cache-context';
 import { getQueryFilters, parseRequest } from '@/lib/request';
 import { json, unauthorized } from '@/lib/response';
@@ -10,6 +12,10 @@ async function getResponse(
   { params }: { params: Promise<{ websiteId: string }> },
 ) {
   const schema = withDateRange({
+    readBoundary: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
     ...filterParams,
     ...pagingParams,
     ...searchParams,
@@ -29,7 +35,9 @@ async function getResponse(
 
   const filters = await getQueryFilters(query, websiteId);
 
-  const data = await getWebsiteSessions(websiteId, filters);
+  const data = await withSessionReadBoundary(websiteId, query, () =>
+    getWebsiteSessions(websiteId, filters),
+  );
 
   return json(data);
 }

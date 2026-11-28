@@ -14,6 +14,7 @@ import {
   readAnalysisLogToday,
 } from './analysis-rollups';
 import { analysisSafeNumber } from './analysis-rollups-model';
+import { warehouseEnabled } from '../warehouse/runtime';
 import { readClickHouseLogRollup, readClickHouseLogSeries } from './analytics-engine-read';
 import { staticRequestExtensionPattern } from './log-content-boundary';
 import { logInputConnectedSql } from './log-input';
@@ -96,7 +97,11 @@ async function readPreferredLogSeries(input: Parameters<typeof readAnalysisLogSe
       (a.type || '').localeCompare(b.type || ''),
   );
 }
-export async function getLogFacts(...args: Parameters<typeof readLogFacts>) {
+export async function getLogFacts(
+  ...args: Parameters<typeof readLogFacts>
+): Promise<Awaited<ReturnType<typeof readLogFacts>>> {
+  if (warehouseEnabled())
+    return (await import('./warehouse-log-queries')).warehouseLogFacts(...args);
   return withLogStatisticsRead(() => readLogFacts(...args));
 }
 async function readLogFacts(
@@ -114,7 +119,7 @@ async function readLogFacts(
     crawlerIdentityScope: 'all',
   },
   fullExport = false,
-  comparisonBoundary?: [Date, string],
+  comparisonBoundary?: [Date | string, string],
   detailRead?: { cursorScope: string; limit: 101 },
 ) {
   const read = <T = any>(sql: string, ...params: any[]) =>
@@ -237,7 +242,9 @@ async function readLogFacts(
     try {
       // Export comparison has already checked the page's policy/catalog/epoch baseline.
       // Its original keyset boundary survives a late record introducing a classification version.
-      boundary = comparisonBoundary ?? decodeCursor(cursor, cursorScope);
+      boundary = comparisonBoundary
+        ? [new Date(comparisonBoundary[0]), comparisonBoundary[1]]
+        : decodeCursor(cursor, cursorScope);
     } catch {
       throw new LiekanError('日志游标已失效，请重新读取', 409, 'history-repair-cursor-conflict');
     }
@@ -408,6 +415,7 @@ async function readLogFacts(
   };
 }
 export async function getLogToday(id: string, start: Date, end: Date) {
+  if(warehouseEnabled())return (await import('./warehouse-log-queries')).warehouseLogToday(id,start,end);
   const [rows, imports] = await Promise.all([
     readAnalysisLogToday({ websiteId: id, startDate: start, endDate: end }).then(
       covered =>
@@ -441,6 +449,8 @@ export async function getContentImpact(
     end,
   );
   if (!targets.length) return [];
+  if (warehouseEnabled()) return (await import('./warehouse-log-queries')).warehouseContentImpact(id,
+    targets.map(target=>({...target,humanPath:humanPathFromEncoded(target.path)})),metrics);
   return query(
     `WITH targets AS (SELECT * FROM jsonb_to_recordset($2::jsonb) AS c(path text,"humanPath" text,"publishedAt" timestamptz))
     SELECT c.path,
@@ -460,6 +470,7 @@ export async function getMonthlyAiShare(
   timezone: string,
   metrics: CrawlerMetricOptions = { crawlerIdentityScope: 'all' },
 ) {
+  if(warehouseEnabled())return (await import('./warehouse-log-queries')).warehouseMonthlyAiShare(id,end,timezone,metrics);
   const monthEnd = metrics.crawlerMetricsVersion === 1 ? new Date(+end - 1) : end;
   if (/^[a-f0-9-]{36}$/i.test(id)) {
     const [y, m] = formatInTimeZone(monthEnd, timezone, 'yyyy-MM').split('-').map(Number);
@@ -509,6 +520,7 @@ export async function getPlotLogs(
   hour = false,
   metrics: CrawlerMetricOptions = { crawlerIdentityScope: 'all' },
 ) {
+  if(warehouseEnabled())return (await import('./warehouse-log-queries')).warehousePlotLogs(id,start,end,timezone,hour,metrics);
   if (/^[a-f0-9-]{36}$/i.test(id)) {
     const series = await readPreferredLogSeries({
       websiteId: id,

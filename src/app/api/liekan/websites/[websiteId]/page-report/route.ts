@@ -4,6 +4,7 @@ import {
 } from '@/lib/liekan/upstream/analysis-query-api';
 import { requestApi } from '@/lib/liekan/http';
 import { readPageReport } from '@/lib/liekan/upstream/page-report';
+import { bindReportDeletion } from '@/lib/liekan/upstream/warehouse-report-deletion';
 import { authorize } from '@/lib/liekan/upstream/server';
 import { noteCacheResult } from '@/lib/liekan/upstream/cache-context';
 import {
@@ -25,17 +26,18 @@ export async function GET(
     request,
     async () => {
       const { websiteId } = await params;
+      const query = new URL(request.url).searchParams;
       if (
         analysisAsyncRequested(request, 'feature:page-report') &&
-        !['logs', 'human/keywords'].includes(new URL(request.url).searchParams.get('resource'))
+        !['logs', 'human/keywords'].includes(query.get('resource'))
       )
         return asyncAnalysisResponse(request, websiteId, 'feature:page-report');
       const authStart = performance.now();
       const access = await authorize(request, websiteId).finally(() => {
         authMs = performance.now() - authStart;
       });
-      const query = new URL(request.url).searchParams;
       const reportStart = performance.now();
+      await bindReportDeletion(access.website.id);
       const result = await captureReportTimings(
         () =>
           readPageReport(access.website, Object.fromEntries(query), query.get('refresh') === '1'),

@@ -1,0 +1,11 @@
+<clickhouse>
+  <profiles>
+    <default>
+      <log_processors_profiles>0</log_processors_profiles>
+      <log_queries>1</log_queries>
+      <log_queries_min_type>QUERY_FINISH</log_queries_min_type>
+      <log_queries_min_query_duration_ms>0</log_queries_min_query_duration_ms>
+      <log_queries_probability>1</log_queries_probability>
+    </default>
+  </profiles>
+</clickhouse>

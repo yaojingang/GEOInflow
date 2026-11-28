@@ -2,6 +2,8 @@ import clickhouse from '@/lib/clickhouse';
 import { uuid } from '@/lib/crypto';
 import { CLICKHOUSE, PRISMA, runQuery } from '@/lib/db';
 import kafka from '@/lib/kafka';
+import { saveWarehouseHeatmap } from '@/lib/liekan/upstream/warehouse-recorder';
+import { warehouseIntakeEnabled } from '@/lib/liekan/warehouse/runtime';
 import prisma from '@/lib/prisma';
 
 export interface HeatmapEventRow {
@@ -38,6 +40,7 @@ export async function saveHeatmapEvents(rows: HeatmapEventRow[]) {
     scrollPct: toScrollPct(r.scrollPct),
   }));
 
+  if (warehouseIntakeEnabled()) return saveWarehouseHeatmap(normalizedRows);
   return runQuery({
     [PRISMA]: () => relationalQuery(normalizedRows),
     [CLICKHOUSE]: () => clickhouseQuery(normalizedRows),

@@ -264,9 +264,9 @@ export function materializeDemoRow(kind, row, index, anchor, secret, owner) {
   return result;
 }
 
-export async function insertDemoBatch(client, kind, rows) {
+export async function insertDemoBatch(client, kind, rows, { resume = false } = {}) {
   const { table, fields, global } = demoSpecs[kind];
-  const sql = `INSERT INTO ${table}(${fields.join(',')}) SELECT ${fields.map(field => `r.${field}`).join(',')} FROM jsonb_populate_recordset(NULL::${table},$1::jsonb) r`;
+  const sql = `INSERT INTO ${table}(${fields.join(',')}) SELECT ${fields.map(field => `r.${field}`).join(',')} FROM jsonb_populate_recordset(NULL::${table},$1::jsonb) r${resume ? ' WHERE true ON CONFLICT DO NOTHING' : ''}`;
   if (global) {
     for (const row of rows) {
       const old = (

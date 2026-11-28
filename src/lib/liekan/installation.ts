@@ -18,6 +18,7 @@ import {
 import { getLogCapabilities } from './log-ingestion/capabilities';
 import { listSources } from './log-ingestion/service';
 import { collectionPresence } from './upstream/collection-presence';
+import { warehouseEnabled } from './warehouse/authority-routing';
 const progressQuery = `SELECT method,last_step AS "lastStep",browser_check_deferred AS "browserCheckDeferred",
   log_check_deferred AS "logCheckDeferred",completed_at AS "completedAt"
   FROM liekan_installation WHERE website_id=$1::uuid`;
@@ -37,15 +38,19 @@ export async function getInstallation(
 ): Promise<InstallationStatus> {
   const [rows, logs, browser, availability, sources, observation] = await Promise.all([
     query<InstallationProgress>(progressQuery, id),
-    query<InstallationStatus['logs']>(
-      `SELECT
+    warehouseEnabled()
+      ? (await import('./upstream/warehouse-presence'))
+          .warehouseInstallationLogs(id)
+          .then(value => [value])
+      : query<InstallationStatus['logs']>(
+          `SELECT
       (SELECT count(*)::int FROM liekan_reporting_log WHERE website_id=$1::uuid) AS total,
       (SELECT count(*)::int FROM liekan_reporting_log WHERE website_id=$1::uuid AND ${crawlerAiSql()}) AS ai,
       (SELECT max(created_at) FROM liekan_reporting_log WHERE website_id=$1::uuid) AS "latestAt",
       (SELECT max(imported_at) FROM liekan_import WHERE website_id=$1::uuid) AS "latestImportAt",
       COALESCE((SELECT is_demo FROM liekan_setting WHERE website_id=$1::uuid),false) AS demo`,
-      id,
-    ),
+          id,
+        ),
     collectionPresence(id),
     getLogCapabilities(),
     listSources(id),

@@ -1,0 +1,6 @@
+name: liekan
+
+include:
+  - path:
+      - docker-compose.liekan.yml
+      - docker-compose.warehouse.yml

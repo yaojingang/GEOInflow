@@ -40,29 +40,32 @@ export async function readSharedReport(request: Request, websiteId: string): Pro
     const authorized = (await authorize(request, websiteId)).website;
     website = { id: authorized.id, name: authorized.name, domain: authorized.domain };
   }
-  bindCacheRequest(
-    request,
-    auth,
-    Object.fromEntries(new URL(request.url).searchParams),
-    async () => {
-      const fresh = await checkAuth(request);
-      return (
-        !!fresh &&
-        JSON.stringify(
-          ('shareToken' in fresh && fresh.shareToken) || {
-            id: fresh.user?.id,
-            role: fresh.user?.role,
-          },
-        ) ===
+  // authorize() retains the site ownership/membership check for signed-in
+  // readers. Only public shares replace it with a share-credential check.
+  if ('shareToken' in auth && auth.shareToken)
+    bindCacheRequest(
+      request,
+      auth,
+      Object.fromEntries(new URL(request.url).searchParams),
+      async () => {
+        const fresh = await checkAuth(request);
+        return (
+          !!fresh &&
           JSON.stringify(
-            ('shareToken' in auth && auth.shareToken) || {
-              id: auth.user?.id,
-              role: auth.user?.role,
+            ('shareToken' in fresh && fresh.shareToken) || {
+              id: fresh.user?.id,
+              role: fresh.user?.role,
             },
-          )
-      );
-    },
-  );
+          ) ===
+            JSON.stringify(
+              ('shareToken' in auth && auth.shareToken) || {
+                id: auth.user?.id,
+                role: auth.user?.role,
+              },
+            )
+        );
+      },
+    );
   const input = sharedReportQuery.safeParse(Object.fromEntries(new URL(request.url).searchParams));
   if (!input.success) throw new LiekanError('分享统计参数无效');
   return warmSharedReport(website, input.data, auth);

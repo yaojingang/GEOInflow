@@ -2,6 +2,11 @@ import type { CrawlerCoverage } from '../contracts/crawler-quality';
 import { crawlerClassificationVersion } from './crawler-evidence';
 import type { BotRule } from '../rules/bots';
 import type { CrawlerRuleConfiguration } from '../rules/configuration';
+import { warehouseEnabled } from '../warehouse/authority-routing';
+import {
+  acceptWarehouseCrawlerCoverage,
+  type WarehouseCrawlerCoverage,
+} from '../upstream/warehouse-crawler-coverage';
 
 // This attests to the collector's observed file range and processed batches.
 // It cannot establish that the upstream web server logged every request.
@@ -13,6 +18,7 @@ export async function recordCrawlerCoverage(
   rules: BotRule[],
   now = Date.now(),
   configuration?: CrawlerRuleConfiguration,
+  warehouseProof?: WarehouseCrawlerCoverage,
 ) {
   const proof = health.coverage;
   if (source.kind !== 'server' || source.state !== 'active') return;
@@ -48,14 +54,40 @@ export async function recordCrawlerCoverage(
     proof.cursors.some(cursor => cursor.confirmed !== cursor.read)
   )
     return;
+  const classificationVersion = crawlerClassificationVersion(rules, configuration);
+  const warehouse = warehouseEnabled();
+  if (
+    warehouse &&
+    (!warehouseProof ||
+      !(await acceptWarehouseCrawlerCoverage(
+        tx,
+        warehouseProof,
+        source.website_id,
+        source.id,
+        epoch,
+        proof,
+        classificationVersion,
+      )))
+  )
+    return;
   await tx.$executeRawUnsafe("SET LOCAL statement_timeout TO '5000ms'");
-  const batches = await tx.$queryRawUnsafe(
-    `SELECT b.id,b.epoch,b.state,b.rejected,b.received_at,min(l.created_at) AS first_event,max(l.created_at) AS last_event
+  const batchRows = await tx.$queryRawUnsafe(
+    warehouse
+      ? `SELECT b.id,b.epoch,b.state,b.rejected,b.received_at FROM liekan_ingest_batch b
+         WHERE b.website_id=$3::uuid AND b.source_id=$1::uuid AND b.id=ANY($2::uuid[])`
+      : `SELECT b.id,b.epoch,b.state,b.rejected,b.received_at,min(l.created_at) AS first_event,max(l.created_at) AS last_event
     FROM liekan_ingest_batch b LEFT JOIN liekan_log l ON l.import_id=b.id AND l.website_id=b.website_id
     WHERE b.source_id=$1::uuid AND b.id=ANY($2::uuid[]) GROUP BY b.id`,
     source.id,
     [proof.fromBatchId, proof.toBatchId],
+    ...(warehouse ? [source.website_id] : []),
   );
+  const batches = warehouse
+    ? batchRows.map((row: any) => ({
+        ...row,
+        ...warehouseProof.batches.find(b => b.id === row.id),
+      }))
+    : batchRows;
   const first = batches.find((row: any) => row.id === proof.fromBatchId),
     last = batches.find((row: any) => row.id === proof.toBatchId);
   if (
@@ -83,28 +115,33 @@ export async function recordCrawlerCoverage(
     new Date(proof.endsAt),
   );
   if (pending.count || !interval?.id) return;
-  const classificationVersion = crawlerClassificationVersion(rules, configuration);
-  const [previous] = await tx.$queryRawUnsafe(
-    "SELECT ends_at,recorded_at FROM liekan_crawler_quality WHERE website_id=$1::uuid AND source_id=$2::uuid AND starts_at=$3 AND state='complete' AND evidence->>'classificationVersion'=$4 AND evidence->>'epoch'=$5",
-    source.website_id,
-    source.id,
-    new Date(proof.startsAt),
-    classificationVersion,
-    String(epoch),
-  );
+  const [previous] = warehouse
+    ? []
+    : await tx.$queryRawUnsafe(
+        "SELECT ends_at,recorded_at FROM liekan_crawler_quality WHERE website_id=$1::uuid AND source_id=$2::uuid AND starts_at=$3 AND state='complete' AND evidence->>'classificationVersion'=$4 AND evidence->>'epoch'=$5",
+        source.website_id,
+        source.id,
+        new Date(proof.startsAt),
+        classificationVersion,
+        String(epoch),
+      );
   // Source locking serializes this proof with ingestion. Recheck new imports for late events.
   const candidates = previous
     ? `SELECT l.* FROM liekan_effective_log l WHERE l.source_id=$1::uuid AND l.created_at>=$2 AND l.created_at<=$3
     UNION ALL SELECT l.* FROM liekan_import i JOIN liekan_effective_log l ON l.import_id=i.id WHERE i.source_id=$1::uuid AND i.imported_at>=$5 AND l.created_at>=$6 AND l.created_at<=$3`
     : 'SELECT l.* FROM liekan_effective_log l WHERE l.source_id=$1::uuid AND l.created_at>=$2 AND l.created_at<=$3';
-  const changed = await tx.$queryRawUnsafe(
-    `SELECT 1 FROM (${candidates}) l LEFT JOIN liekan_crawler_evidence e ON e.website_id=l.website_id AND e.log_id=l.id WHERE e.classification_version IS DISTINCT FROM $4 LIMIT 1`,
-    source.id,
-    new Date(previous ? Math.max(proof.startsAt, +new Date(previous.ends_at)) : proof.startsAt),
-    new Date(proof.endsAt),
-    classificationVersion,
-    ...(previous ? [previous.recorded_at, new Date(proof.startsAt)] : []),
-  );
+  const changed = warehouse
+    ? warehouseProof.changed
+      ? [1]
+      : []
+    : await tx.$queryRawUnsafe(
+        `SELECT 1 FROM (${candidates}) l LEFT JOIN liekan_crawler_evidence e ON e.website_id=l.website_id AND e.log_id=l.id WHERE e.classification_version IS DISTINCT FROM $4 LIMIT 1`,
+        source.id,
+        new Date(previous ? Math.max(proof.startsAt, +new Date(previous.ends_at)) : proof.startsAt),
+        new Date(proof.endsAt),
+        classificationVersion,
+        ...(previous ? [previous.recorded_at, new Date(proof.startsAt)] : []),
+      );
   if (changed.length) return;
   const evidence = {
     basis: 'event_time',

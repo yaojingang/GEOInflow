@@ -10,10 +10,15 @@ import { json, serviceUnavailable, unauthorized } from '@/lib/response';
 import { getTwoFactorConfigurationError, isTwoFactorConfigured } from '@/lib/two-factor/crypto';
 import { getAllUserTeams, getUserByUsername } from '@/queries/prisma';
 import { loginRequestSchema } from './schema';
+import { clearWarehouseExportCookie } from '@/lib/liekan/upstream/warehouse-export-cookie';
 import { acquireLoginAttempt } from '@/lib/liekan/upstream/login-attempts';
 import { ShareAttemptError } from '@/lib/liekan/upstream/share-attempts';
 
 export async function POST(request: Request) {
+  return clearWarehouseExportCookie(request, await login(request));
+}
+
+async function login(request: Request) {
   const { body, error } = await parseRequest(request, loginRequestSchema, { skipAuth: true });
 
   if (error) {

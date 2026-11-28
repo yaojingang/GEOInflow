@@ -94,6 +94,9 @@ export function useFreshQuery<T = any>(
       });
     },
     retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    refetchInterval: false,
     meta: {
       ...options.meta,
       localeInvariant: true,

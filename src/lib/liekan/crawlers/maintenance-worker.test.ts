@@ -7,6 +7,9 @@ const h = vi.hoisted(() => ({
   handlers: new Map<string, () => Promise<void>>(),
   ranges: vi.fn(),
   documents: vi.fn(),
+  execute: vi.fn(async (_sql: string, ..._args: unknown[]) => 1),
+  closeWarehouse: vi.fn(async () => {}),
+  startup: vi.fn(async () => {}),
 }));
 vi.mock('pg-boss', () => ({
   PgBoss: class {
@@ -23,9 +26,19 @@ vi.mock('../upstream/server', () => ({
   LiekanError: class extends Error {},
   query: vi.fn(async () => []),
   transaction: vi.fn(async work =>
-    work({ $executeRawUnsafe: vi.fn(async () => 1), $queryRawUnsafe: vi.fn(async () => []) }),
+    work({ $executeRawUnsafe: h.execute, $queryRawUnsafe: vi.fn(async () => []) }),
   ),
 }));
+vi.mock('../warehouse/process-resources', () => ({ closeWarehouseProcessResources: h.closeWarehouse }));
+// This suite isolates scheduling. Startup/authority have real-DB integration suites.
+vi.mock('../warehouse/startup', () => ({ assertWarehouseStartup: h.startup }));
+vi.mock('../warehouse/authority-routing', async importOriginal => ({
+  ...await importOriginal<typeof import('../warehouse/authority-routing')>(),
+  withinWarehouseAuthority: (work: () => unknown) => work(),
+}));
+vi.mock('../upstream/history-repair', () => ({ reconcileHistoryRepairs: vi.fn(async () => {}), processHistoryRepairJob: vi.fn() }));
+vi.mock('../upstream/robots-management', () => ({ processRobotsManagement: vi.fn(async () => {}) }));
+vi.mock('../upstream/observation-retention', () => ({ pruneTrafficObservations: vi.fn(async () => {}) }));
 vi.mock('../upstream/crawler-registry-context', () => ({ initializeCrawlerRegistry: vi.fn(), withPublishedRegistry: (work: () => unknown) => work() }));
 vi.mock('../geography/update', () => ({ maintainGeography: vi.fn() }));
 vi.mock('../upstream/browser-risk', () => ({ processBrowserRisk: vi.fn() }));
@@ -52,14 +65,17 @@ afterEach(() => {
   process.argv = [...argv];
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   h.handlers.clear();
 });
 
 describe('existing log worker document maintenance scheduling', () => {
-  it.each([true, false])('honors the maintenance pause switch: %s', async paused => {
+  it.each([[true, false], [false, false], [true, true], [false, true]])('honors pause=%s and warehouse=%s', async (paused, warehouse) => {
     vi.resetModules();
     vi.clearAllMocks();
     vi.useFakeTimers();
+    vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', warehouse ? 'clickhouse' : '');
+    vi.stubEnv('LIEKAN_WAREHOUSE_TRANSITION', 'false');
     h.send.mockResolvedValue(null);
     h.stop.mockResolvedValue(undefined);
     process.argv = [...argv, ...(paused ? ['--pause-crawler-maintenance'] : [])];
@@ -70,6 +86,7 @@ describe('existing log worker document maintenance scheduling', () => {
     await import('../../../liekan-worker/main');
     for (let n = 0; n < 100 && !h.handlers.has('SIGINT'); n++) await Promise.resolve();
     expect(listener).toHaveBeenCalledWith('SIGINT', expect.any(Function));
+    expect(h.startup).toHaveBeenCalledOnce();
     const queues = h.work.mock.calls.map(call => call[0]);
     for (const queue of [
       'liekan-range-refresh',
@@ -114,7 +131,12 @@ describe('existing log worker document maintenance scheduling', () => {
       );
     }
     h.handlers.get('SIGINT')();
-    for (let n = 0; n < 10; n++) await Promise.resolve();
+    for (let n = 0; n < 100 && !h.closeWarehouse.mock.calls.length; n++) await Promise.resolve();
     expect(h.stop).toHaveBeenCalledWith({ graceful: true, timeout: 30000 });
+    expect(h.closeWarehouse).toHaveBeenCalledOnce();
+    expect(h.closeWarehouse.mock.invocationCallOrder[0]).toBeGreaterThan(h.stop.mock.invocationCallOrder[0]);
+    const sql = h.execute.mock.calls.map(call => String(call[0]));
+    expect(sql.some(text => text.includes('DELETE FROM liekan_geography_ingress'))).toBe(!warehouse);
+    expect(sql.some(text => text.includes('DELETE FROM liekan_log_grant'))).toBe(true);
   });
 });

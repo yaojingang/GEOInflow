@@ -105,6 +105,11 @@ export function useLogReportParts<
   const restricted = [count.error, summary.error].find(error =>
     [401, 403, 404].includes((error as any)?.status),
   );
+  const logPartsBoundaryConflict =
+    active &&
+    [count.error, summary.error].some(
+      error => (error as any)?.code === 'log-read-boundary-conflict',
+    );
   const data = useMemo(
     () =>
       enabled && boundary && entries.data
@@ -118,6 +123,15 @@ export function useLogReportParts<
   return {
     ...entries,
     data,
+    logPartsBoundaryConflict,
+    logPartsReady:
+      active &&
+      count.isSuccess &&
+      !count.isPlaceholderData &&
+      count.data?.readBoundary === boundary &&
+      summary.isSuccess &&
+      !summary.isPlaceholderData &&
+      summary.data?.readBoundary === boundary,
     error: restricted || entries.error,
     ...(restricted ? { isError: true, isSuccess: false, status: 'error' as const } : {}),
     isFetching:

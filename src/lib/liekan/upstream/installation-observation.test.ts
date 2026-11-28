@@ -1,9 +1,23 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LiekanError } from './errors';
 
-const mocks = vi.hoisted(() => ({ query: vi.fn(), transaction: vi.fn(), supported: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  query: vi.fn(),
+  transaction: vi.fn(),
+  supported: vi.fn(),
+  warehouse: vi.fn(),
+  authority: vi.fn(),
+  warehouseQuery: vi.fn(),
+}));
 vi.mock('./ai-db', () => ({ aiTransaction: mocks.transaction }));
 vi.mock('@/lib/db', () => ({ isRelationalOnly: mocks.supported }));
+vi.mock('../warehouse/authority-routing', () => ({
+  warehouseEnabled: mocks.warehouse,
+  withinWarehouseAuthority: mocks.authority,
+}));
+vi.mock('./warehouse-installation-observation', () => ({
+  warehouseInstallationObservation: mocks.warehouseQuery,
+}));
 vi.mock('@/lib/auth', () => ({ hasPermission: async (role: string) => role === 'admin' }));
 import {
   installationObservationSql,
@@ -26,11 +40,15 @@ beforeEach(() => {
     lastReceivedAt: new Date(endAt - 1),
   };
   mocks.supported.mockReturnValue(true);
+  mocks.warehouse.mockReturnValue(false);
+  mocks.authority.mockImplementation(work => work());
+  mocks.warehouseQuery.mockImplementation(async () => row);
   mocks.query.mockImplementation(sql =>
     Promise.resolve([sql.includes('WITH received') ? row : access]),
   );
   mocks.transaction.mockImplementation(work => work({ query: mocks.query }));
 });
+afterEach(() => vi.useRealTimers());
 
 describe('installation receipt observation', () => {
   it('uses the complete half-open receipt window and a separate two-second read-only budget', async () => {
@@ -198,5 +216,80 @@ describe('installation receipt observation', () => {
       sampleCount: null,
       coverage: null,
     });
+  });
+  it('uses CH authority even though its PostgreSQL control database is relational', async () => {
+    mocks.warehouse.mockReturnValue(true);
+    row = { ...row, samples: 3, available: 1, unknown: 1, fallback: 1 };
+    expect(await readInstallationObservation(websiteId, userId, endAt)).toMatchObject({
+      status: 'unknown',
+      sampleCount: 3,
+      availableIdentityCount: 1,
+      unknownIdentityCount: 1,
+      coverage: null,
+      reasons: ['small_sample', 'identity_evidence_missing', 'reception_fallback'],
+    });
+    expect(mocks.warehouseQuery).toHaveBeenCalledWith(
+      websiteId,
+      endAt - 1800000,
+      endAt,
+      expect.any(AbortSignal),
+    );
+    expect(mocks.query.mock.calls).toHaveLength(2);
+    expect(mocks.query.mock.calls.every(([sql]) => sql.includes('FROM website w'))).toBe(true);
+  });
+  it('rechecks CH caller authority before releasing an observed aggregate', async () => {
+    mocks.warehouse.mockReturnValue(true);
+    mocks.query
+      .mockResolvedValueOnce([access])
+      .mockResolvedValueOnce([{ ...access, userId: null }]);
+    await expect(readInstallationObservation(websiteId, userId, endAt)).rejects.toMatchObject({
+      status: 401,
+    });
+  });
+  it('does not begin a warehouse read for an unauthorized caller or demo website', async () => {
+    mocks.warehouse.mockReturnValue(true);
+    mocks.query.mockResolvedValueOnce([{ ...access, ownerId: 'another-owner' }]);
+    await expect(readInstallationObservation(websiteId, userId, endAt)).rejects.toMatchObject({
+      status: 403,
+    });
+    mocks.query.mockResolvedValueOnce([{ ...access, demo: true }]);
+    expect((await readInstallationObservation(websiteId, userId, endAt)).status).toBe('demo');
+    expect(mocks.warehouseQuery).not.toHaveBeenCalled();
+  });
+  it.each(['warehouse-read-boundary-changed', 'warehouse-authority-changed'])(
+    'withholds counts if a deletion or migration fence fails (%s)',
+    async message => {
+      mocks.warehouse.mockReturnValue(true);
+      if (message.includes('authority')) {
+        mocks.authority.mockImplementation(async work => {
+          await work();
+          throw new Error(message);
+        });
+      } else mocks.warehouseQuery.mockRejectedValueOnce(new Error(message));
+      expect(await readInstallationObservation(websiteId, userId, endAt)).toMatchObject({
+        status: 'temporarily_unavailable',
+        sampleCount: null,
+        coverage: null,
+        reasons: ['diagnostic_unavailable'],
+      });
+    },
+  );
+  it('cancels a stalled warehouse diagnostic at its total budget without publishing zeros', async () => {
+    vi.useFakeTimers();
+    mocks.warehouse.mockReturnValue(true);
+    mocks.warehouseQuery.mockImplementationOnce(
+      (_site, _start, _end, signal: AbortSignal) =>
+        new Promise((_resolve, reject) =>
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+        ),
+    );
+    const pending = readInstallationObservation(websiteId, userId, endAt);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(await pending).toMatchObject({
+      status: 'temporarily_unavailable',
+      sampleCount: null,
+      reasons: ['diagnostic_timeout'],
+    });
+    expect(mocks.warehouseQuery.mock.calls[0][3].aborted).toBe(true);
   });
 });

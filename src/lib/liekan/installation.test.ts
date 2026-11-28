@@ -12,6 +12,12 @@ const mocks = vi.hoisted(() => ({
   execute: vi.fn(),
   read: vi.fn(),
   observation: vi.fn(),
+  warehouseLogs: vi.fn(),
+  warehouseBrowser: vi.fn(),
+}));
+vi.mock('./upstream/warehouse-presence', () => ({
+  warehouseInstallationLogs: mocks.warehouseLogs,
+  warehouseCollectionPresence: mocks.warehouseBrowser,
 }));
 vi.mock('./upstream/installation-observation', () => ({
   readInstallationObservation: mocks.observation,
@@ -28,6 +34,7 @@ const identity = { userId: '5b4c0de0-6c47-5b51-8f53-11e5e8c79002' };
 const params = { params: Promise.resolve({ websiteId: id }) };
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'postgresql');
   mocks.read.mockResolvedValue([]);
   mocks.observation.mockResolvedValue({ status: 'empty', sampleCount: 0, coverage: null });
   mocks.execute.mockResolvedValue(1);
@@ -50,6 +57,21 @@ beforeEach(() => {
 });
 
 describe('website installation progress', () => {
+  it('verifies both warehouse inputs while setup metadata remains in PG', async () => {
+    vi.stubEnv('LIEKAN_ANALYTICS_BACKEND', 'clickhouse');
+    const logs = { total: 8, ai: 3, demo: false, latestAt: null, latestImportAt: null };
+    const browser = { pageviews: 4, firstAt: null, lastAt: null };
+    mocks.warehouseLogs.mockResolvedValue(logs);
+    mocks.warehouseBrowser.mockResolvedValue(browser);
+    const status = await getInstallation(id, false);
+    expect(status.logs).toEqual(logs);
+    expect(status.browser).toEqual(browser);
+    expect(
+      mocks.query.mock.calls.some(([sql]) =>
+        /liekan_reporting_log|liekan_raw_website_event/.test(sql),
+      ),
+    ).toBe(false);
+  });
   it.each(['api-key', 'partial', 'share', undefined])(
     'preserves old fields and omits new private observation for identity %s',
     async authType => {

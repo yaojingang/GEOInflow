@@ -1,0 +1,68 @@
+name: liekan_ch_proto_20261027
+services:
+  pg:
+    image: postgres@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    platform: linux/arm64
+    environment:
+      POSTGRES_USER: liekan_ch_proto
+      POSTGRES_DB: liekan_ch_proto
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports: ["127.0.0.1:25439:5432"]
+    volumes: ["pg:/var/lib/postgresql/data"]
+    mem_limit: 384m
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U liekan_ch_proto -d liekan_ch_proto"]
+      interval: 2s
+      timeout: 2s
+      retries: 40
+  ch:
+    image: clickhouse/clickhouse-server@sha256:61dee53a0b34659b6b16048fa7f937dcd7b19696e0331a5b24e8f60760bf1fa6
+    platform: linux/arm64
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    ports: ["127.0.0.1:28129:8123"]
+    volumes:
+      - ch:/var/lib/clickhouse
+      - ./clickhouse.xml:/etc/clickhouse-server/config.d/prototype.xml:ro
+    mem_limit: 1536m
+    healthcheck:
+      test: [CMD, clickhouse-client, --query, "SELECT 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda@sha256:2de12f55ca48ce20f140b94c0efa2870f4f3627c4793d6a87c4afac63f994fcf
+    platform: linux/arm64
+    entrypoint: [/bin/sh, -c]
+    command:
+      - >-
+        cp /prototype/redpanda.yaml /etc/redpanda/redpanda.yaml &&
+        exec /usr/bin/rpk redpanda start --config /etc/redpanda/redpanda.yaml
+        --smp=1 --memory=768M --reserve-memory=0M --overprovisioned
+        --check=false --unsafe-bypass-fsync=false
+    ports: ["127.0.0.1:29099:29099"]
+    volumes:
+      - redpanda:/var/lib/redpanda/data
+      - ./redpanda.yaml:/prototype/redpanda.yaml:ro
+    mem_limit: 1280m
+    healthcheck:
+      test: [CMD, rpk, cluster, info, -X, brokers=127.0.0.1:9092]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+  actor:
+    profiles: [fault]
+    image: node@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402
+    platform: linux/arm64
+    working_dir: /workspace
+    environment:
+      PROTO_IN_CONTAINER: "1"
+    volumes:
+      - .:/workspace/experiments/ch-prototype:ro
+      - ../../.local/ch-prototype:/workspace/.local/ch-prototype
+    command: [node, --experimental-transform-types, experiments/ch-prototype/actor.ts]
+    mem_limit: 384m
+volumes:
+  pg:
+  ch:
+  redpanda:

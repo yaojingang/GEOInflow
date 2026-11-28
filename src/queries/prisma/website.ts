@@ -7,6 +7,7 @@ import prisma, { getSchema } from '@/lib/prisma';
 import redis from '@/lib/redis';
 import { sanitizeSortFilters } from '@/lib/sort';
 import type { PageResult, QueryFilters } from '@/lib/types';
+import { warehouseIntakeEnabled } from '@/lib/liekan/warehouse/runtime';
 
 const WEBSITE_SORT_FIELDS = ['name', 'domain', 'createdAt'] as const;
 
@@ -413,6 +414,17 @@ export async function updateWebsite(
 
 export async function resetWebsite(websiteId: string, identity?: { userId: string }) {
   const cloudMode = !!process.env.CLOUD_MODE;
+  if (warehouseIntakeEnabled()) {
+    await (await import('@/lib/liekan/upstream/warehouse-lifecycle')).deleteWarehouseStatistics(
+      websiteId,
+      'reset',
+      identity,
+    );
+    const data = await prisma.client.website.findUnique({ where: { id: websiteId } });
+    if (cloudMode) await redis.client.set(`website:${websiteId}`, data);
+    return data;
+  }
+
   const data = await withWebsiteMutation(async tx => {
     // Keep website, actor and team locks through every batch and the final state change.
     await (await import('@/lib/liekan/upstream/server')).lockWritableWebsite(
@@ -441,6 +453,17 @@ export async function resetWebsite(websiteId: string, identity?: { userId: strin
 
 export async function deleteWebsite(websiteId: string, identity?: { userId: string }) {
   const cloudMode = !!process.env.CLOUD_MODE;
+  if (warehouseIntakeEnabled()) {
+    const data = await prisma.client.website.findUnique({ where: { id: websiteId } });
+    await (await import('@/lib/liekan/upstream/warehouse-lifecycle')).deleteWarehouseStatistics(
+      websiteId,
+      'website',
+      identity,
+    );
+    if (cloudMode) await redis.client.del(`website:${websiteId}`);
+    return data;
+  }
+
   const data = await withWebsiteMutation(async tx => {
     await (await import('@/lib/liekan/upstream/server')).lockWritableWebsite(
       tx,

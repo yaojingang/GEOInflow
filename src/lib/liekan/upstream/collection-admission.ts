@@ -35,25 +35,26 @@ export function conflictsWithCollectionHosts(
       (originHostname !== null && !policy.allowedHostnames.includes(originHostname)))
   );
 }
+const ADMISSION_TTL_MS = 2000;
+const admissionCache = new Map<string, { value: CollectionAdmission; expiresAt: number }>();
+
 export async function collectionAdmission(websiteId: string): Promise<CollectionAdmission> {
-  const { default: prisma, getRawQueryClient, getSchema } = await import('@/lib/prisma');
-  const schema = getSchema() || 'public';
-  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(schema))
-    throw new Error('Invalid collection database schema');
+  const now = Date.now();
+  const hit = admissionCache.get(websiteId);
+  if (hit && hit.expiresAt > now) return hit.value;
+
+  const { default: prisma, getRawQueryClient } = await import('@/lib/prisma');
   const primary = getRawQueryClient(prisma.client, { write: true }) as any;
-  return primary.$transaction(
-    async (tx: any) => {
-      await tx.$executeRawUnsafe(`SET LOCAL search_path TO "${schema}"`);
-      const [row] = await tx.$queryRawUnsafe(
-        'SELECT revision::text,mode,allowed_hostnames FROM liekan_collection_policy WHERE website_id=$1::uuid',
-        websiteId,
-      );
-      return {
-        revision: row?.revision ?? '0',
-        mode: row?.mode ?? 'standard',
-        allowedHostnames: row?.allowed_hostnames ?? [],
-      };
-    },
-    { timeout: 10000, maxWait: 5000 },
+  const [row] = await primary.$queryRawUnsafe(
+    'SELECT revision::text,mode,allowed_hostnames FROM liekan_collection_policy WHERE website_id=$1::uuid',
+    websiteId,
   );
+  const value: CollectionAdmission = {
+    revision: row?.revision ?? '0',
+    mode: row?.mode ?? 'standard',
+    allowedHostnames: row?.allowed_hostnames ?? [],
+  };
+  if (admissionCache.size >= 512) admissionCache.clear();
+  admissionCache.set(websiteId, { value, expiresAt: now + ADMISSION_TTL_MS });
+  return value;
 }

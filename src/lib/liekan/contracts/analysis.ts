@@ -115,6 +115,10 @@ export const analysisQuery = z
     eventName: z.string().max(200).optional(),
     propertyName: z.string().max(200).optional(),
     sessionId: z.uuid().optional(),
+    readBoundary: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
     page: z.coerce.number().int().min(1).max(100000).default(1),
   })
   .catchall(z.string().max(2000))

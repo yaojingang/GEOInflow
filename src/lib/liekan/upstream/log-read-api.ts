@@ -13,6 +13,7 @@ import { getQuerySnapshot } from './query-snapshot';
 import { authorize, reportSnapshot } from './server';
 import { ReportFragmentMiss, withReportFragments } from './report-fragments';
 import { currentCacheContext } from './cache-context';
+import { bindReportDeletion } from './warehouse-report-deletion';
 import { analyticsGate } from './analytics-budget';
 import { analyticsQueryFailure } from './analytics-deadline';
 
@@ -30,7 +31,10 @@ export async function logReadResponse(
     authMs = performance.now() - began;
     const input = Object.fromEntries(new URL(request.url).searchParams);
     const parsed = parseLogRead(input);
-    if (part === 'entries') return readLogEntries(access.website, parsed, access.canManage);
+    if (part === 'entries') {
+      await bindReportDeletion(access.website.id);
+      return readLogEntries(access.website, parsed, access.canManage);
+    }
     if (!logCountQuery.safeParse(input).success) throw new LiekanError('日志读取边界无效', 400);
     const target = part === 'summary' ? 'feature:log-summary' : 'feature:log-count';
     if (analysisAsyncRequested(request, target)) {

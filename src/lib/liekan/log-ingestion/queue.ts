@@ -42,6 +42,14 @@ export function getQueue() {
   });
   return queuePromise;
 }
+
+/** Close the producer's own pg-boss timers/pool after background work drains. */
+export async function closeQueue() {
+  const pending = queuePromise;
+  queuePromise = undefined;
+  const boss = await pending?.catch(() => undefined);
+  await boss?.stop({ graceful: true, timeout: 30000 });
+}
 export async function enqueue(tx: any, queue: string, data: object, id?: string) {
   const boss = await getQueue();
   await boss.send(queue, data, {

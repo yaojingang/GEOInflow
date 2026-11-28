@@ -1,3 +1,4 @@
+import { prepareWarehouseCascade } from '@/lib/liekan/upstream/warehouse-cascade';
 import { Prisma } from '@/generated/prisma/client';
 import { ROLES } from '@/lib/constants';
 import { getRandomChars } from '@/lib/generate';
@@ -164,10 +165,25 @@ export async function deleteUser(userId: string) {
         ...reports.map(report => report.websiteId),
       ]),
     ];
-    await (await import('@/lib/liekan/upstream/ai-lifecycle')).clearAiUserInTransaction(tx, userId, !cloudMode);
-    await tx.$queryRawUnsafe('SELECT user_id FROM "user" WHERE user_id=$1::uuid FOR UPDATE', userId);
+    await prepareWarehouseCascade(tx, [
+      ...ownedWebsiteIds.map(id => ({ id, kind: 'website' as const })),
+      ...links.map(w => ({ id: w.id, kind: 'link' as const })),
+      ...pixels.map(w => ({ id: w.id, kind: 'pixel' as const })),
+    ]);
+    await (await import('@/lib/liekan/upstream/ai-lifecycle')).clearAiUserInTransaction(
+      tx,
+      userId,
+      !cloudMode,
+    );
+    await tx.$queryRawUnsafe(
+      'SELECT user_id FROM "user" WHERE user_id=$1::uuid FOR UPDATE',
+      userId,
+    );
     if (!cloudMode && teamIds.length)
-      await tx.$queryRawUnsafe('SELECT team_id FROM team WHERE team_id=ANY($1::uuid[]) ORDER BY team_id FOR UPDATE', [...teamIds].sort());
+      await tx.$queryRawUnsafe(
+        'SELECT team_id FROM team WHERE team_id=ANY($1::uuid[]) ORDER BY team_id FOR UPDATE',
+        [...teamIds].sort(),
+      );
     const result: any[] = [];
     const deletedAt = new Date();
     if (cloudMode) {

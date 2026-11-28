@@ -1,4 +1,10 @@
 'use client';
+import { isScheduledReport } from '@/lib/liekan/contracts/scheduled-reports';
+import {
+  isReportPreparing,
+  publishedReportQuery,
+  type ReportPreparing,
+} from '@/lib/liekan/contracts/report-status';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { useQueryClient } from '@tanstack/react-query';
@@ -17,7 +23,12 @@ import {
   websiteAnalysisFamily,
 } from '@/lib/liekan/contracts/navigation';
 import { pageSearch, pageUrl } from '@/lib/liekan/contracts/page-url';
-import { crawlerPageFiltersSchema, crawlerProductFormForLabel } from '@/lib/liekan/contracts/query';
+import {
+  crawlerPageFiltersSchema,
+  crawlerProductFormForLabel,
+  overviewVersionConflict,
+  overviewVersionSchema,
+} from '@/lib/liekan/contracts/query';
 import { reportEvidenceViewPayload } from '@/lib/liekan/contracts/report-evidence-view';
 import { useLiekanI18n } from '@/lib/liekan/i18n/client';
 import { crawlerDetailSelection } from '@/lib/liekan/rules/editor';
@@ -38,7 +49,10 @@ import {
   streamFeatureExport,
 } from '@/lib/liekan/upstream/features-client';
 import { useLogReportParts } from '@/lib/liekan/upstream/log-report-client';
-import { pageReportQuery } from '@/lib/liekan/upstream/page-report-client';
+import {
+  canReuseReportPlaceholder,
+  pageReportQuery,
+} from '@/lib/liekan/upstream/page-report-client';
 import { websiteMatchesHandle } from '@/lib/liekan/website-handle';
 import styles from '@/styles/liekan/Shell.module.css';
 import { AnalysisLoading, reportViews } from './AnalysisLoading';
@@ -64,6 +78,7 @@ import { useLiekanShell } from './LiekanShell';
 import { ManagementDrawer } from './ManagementDrawer';
 import { ManualRefreshControl } from './ManualRefreshControl';
 import { ReportContext } from './ReportContext';
+import { fallbackReportRangeLabel, ReportSnapshotNotice } from './ReportSnapshotNotice';
 import type { LiekanReport, Resource } from './types';
 import {
   clearTablePages,
@@ -71,6 +86,7 @@ import {
   isLiveLogView,
   previousWeekRange,
   readViewState,
+  readReportPage,
 } from './viewState';
 
 export function LiekanPage({ resource }: { resource: Resource }) {
@@ -101,6 +117,17 @@ export function LiekanPage({ resource }: { resource: Resource }) {
       { ...params, date: dynamicDefault ? '0day' : params.date || getFeaturePreferences().range },
       resource,
     );
+  const independentTrend = resource === 'overview' || resource === 'human/overview';
+  const reportChartPeriod = independentTrend
+    ? readViewState(
+        {
+          ...params,
+          chartPeriod: undefined,
+          date: dynamicDefault ? '0day' : params.date || getFeaturePreferences().range,
+        },
+        resource,
+      ).chartPeriod
+    : chartPeriod;
   const keywordParsed = keywordConditionsSchema.safeParse(params);
   const otherCrawlers =
     resource === 'ai/bots'
@@ -128,12 +155,7 @@ export function LiekanPage({ resource }: { resource: Resource }) {
   const keywordConditions = keywordParsed.success
     ? keywordParsed.data
     : keywordConditionsSchema.parse({});
-  const keywordPage =
-    Number.isSafeInteger(Number(params.page)) &&
-    Number(params.page) > 0 &&
-    Number(params.page) <= 100000
-      ? Number(params.page)
-      : 1;
+  const keywordPage = readReportPage(params.page);
   const pageIdentity = JSON.stringify([
     userId,
     websiteId,
@@ -175,7 +197,6 @@ export function LiekanPage({ resource }: { resource: Resource }) {
       : defaultRange.startAt;
   const endAt = liveLogs ? liveNow : dynamicDefault ? defaultRange.endAt : actualRange.endAt;
   const page = pages.find(page => page.resource === resource);
-  const shiftedRange = previousWeekRange(startAt, endAt, timezone);
   const updateView = (next: Record<string, string | number>) =>
     router.push(updateParams(next), { scroll: false });
   useEffect(() => {
@@ -231,7 +252,7 @@ export function LiekanPage({ resource }: { resource: Resource }) {
     startAt,
     endAt,
     timezone,
-    chartPeriod,
+    chartPeriod: reportChartPeriod,
     ...(resource.startsWith('ai/') || resource === 'logs'
       ? {
           crawlerIdentityScope:
@@ -251,7 +272,7 @@ export function LiekanPage({ resource }: { resource: Resource }) {
                 : endAt,
         }
       : {}),
-    ...(Object.keys(tablePages).length ? { tablePages } : {}),
+    ...(!isScheduledReport(resource) && Object.keys(tablePages).length ? { tablePages } : {}),
     ...(resource === 'human/geo'
       ? {
           search: search.slice(0, 200),
@@ -292,7 +313,9 @@ export function LiekanPage({ resource }: { resource: Resource }) {
                   ? 'other'
                   : '',
           search: pageSearch(search, website?.domain).slice(0, 200),
-          ...(!resetLogBatch && cursor ? { cursor, seek, readBoundary: params.readBoundary } : {}),
+          ...(!resetLogBatch && (cursor || displayedLogPage > 1)
+            ? { cursor, seek, readBoundary: params.readBoundary }
+            : {}),
         }
       : {}),
   };
@@ -302,33 +325,26 @@ export function LiekanPage({ resource }: { resource: Resource }) {
     forceRefresh.current = false;
     return value;
   });
-  const rawQuery = api.useQuery<LiekanReport>({
+  const rawQuery = api.useQuery<LiekanReport | ReportPreparing>({
     ...currentReport,
     enabled: !!websiteId && !metadataLoading,
     placeholderData: (previous, previousQuery) => {
-      // logs 换批与 tp_* 翻页都会换 queryKey：queryKey[13] 是 tp_ 页码集合槽位，
-      // 仅该槽位变化时保留上一份数据，翻页期间显示旧切片 + 更新提示而非整页骨架。
-      const pageTurnOnly =
-        !!previousQuery &&
-        currentReport.queryKey.length === previousQuery.queryKey.length &&
-        currentReport.queryKey.every(
-          (value, index) => index === 13 || value === previousQuery.queryKey[index],
-        );
-      const sameLogConditions =
-        resource === 'logs' &&
-        previousQuery &&
-        [8, 9, 15].every(index => currentReport.queryKey[index] === previousQuery.queryKey[index]);
-      return (sameLogConditions || pageTurnOnly) &&
+      return previousQuery &&
+        !isReportPreparing(previous) &&
         websiteMatchesHandle(previous?.website, websiteId) &&
-        previousQuery?.queryKey[3] === resource &&
-        previousQuery?.queryKey[14] === userId &&
-        (liveLogs || (previous.range.startAt === startAt && previous.range.endAt === endAt))
+        canReuseReportPlaceholder(
+          currentReport.queryKey,
+          previousQuery.queryKey,
+          previous?.meta.logReadBoundary,
+          reportInput.readBoundary,
+        )
         ? previous
         : undefined;
     },
     refetchInterval: false,
   });
-  const entryQuery = useFreshnessLifecycle(rawQuery, {
+  const preparing = !rawQuery.error && isReportPreparing(rawQuery.data);
+  const entryQuery = useFreshnessLifecycle(publishedReportQuery(rawQuery), {
     queryKey: currentReport.queryKey,
     enabled: !!websiteId && !metadataLoading,
     aggregate: resource !== 'logs',
@@ -341,24 +357,73 @@ export function LiekanPage({ resource }: { resource: Resource }) {
     reportInput,
     resource === 'logs' && !!websiteId && !metadataLoading,
   );
+  const recoverLogParts = useRef<string>(null);
+  const logReadKey = JSON.stringify([
+    reportWebsiteId,
+    teamId,
+    userId,
+    logEpoch,
+    reportInput.startAt,
+    reportInput.endAt,
+    timezone,
+    reportInput.filter,
+    reportInput.search,
+    reportInput.crawlerIdentityScope,
+  ]);
+  const entriesBoundaryConflict = [
+    'log-read-boundary-conflict',
+    'history-repair-cursor-conflict',
+  ].includes((query.error as any)?.code);
+  const logPartsReady = query.logPartsReady;
+  const refetchEntries = entryQuery.refetch;
   useEffect(() => {
-    if (
-      resource === 'logs' &&
-      params.cursor &&
-      ['log-read-boundary-conflict', 'history-repair-cursor-conflict'].includes(
-        (query.error as any)?.code,
-      )
-    )
-      router.replace(
-        updateParams({
-          page: undefined,
-          cursor: undefined,
-          seek: undefined,
-          readBoundary: undefined,
-        }),
-        { scroll: false },
-      );
-  }, [resource, params.cursor, (query.error as any)?.code, router, updateParams]);
+    if (resource !== 'logs') return;
+    if (logPartsReady && !query.logPartsBoundaryConflict) recoverLogParts.current = null;
+    if (query.isPlaceholderData || entryQuery.isFetching) return;
+    if (entriesBoundaryConflict || query.logPartsBoundaryConflict) {
+      if (recoverLogParts.current === logReadKey) return;
+      recoverLogParts.current = logReadKey;
+      if (reportInput.cursor || reportInput.readBoundary || displayedLogPage > 1) {
+        const firstPage = pageReportQuery(
+          userId,
+          reportWebsiteId,
+          { ...reportInput, page: 1, cursor: '', seek: '', readBoundary: undefined },
+          teamId,
+        );
+        queryClient.removeQueries({ queryKey: firstPage.queryKey, exact: true, type: 'inactive' });
+        router.replace(
+          updateParams({
+            page: undefined,
+            cursor: undefined,
+            seek: undefined,
+            readBoundary: undefined,
+          }),
+          { scroll: false },
+        );
+      } else {
+        void refetchEntries({ cancelRefetch: false });
+      }
+    }
+  }, [
+    resource,
+    logReadKey,
+    logPartsReady,
+    query.logPartsBoundaryConflict,
+    query.isPlaceholderData,
+    entryQuery.isFetching,
+    entriesBoundaryConflict,
+    reportInput.cursor,
+    reportInput.readBoundary,
+    displayedLogPage,
+    refetchEntries,
+    queryClient,
+    reportInput,
+    reportWebsiteId,
+    teamId,
+    userId,
+    router,
+    updateParams,
+  ]);
   const reportKey = JSON.stringify(currentReport.queryKey);
   const activeReportKey = useRef(reportKey);
   activeReportKey.current = reportKey;
@@ -366,11 +431,13 @@ export function LiekanPage({ resource }: { resource: Resource }) {
     key: string;
     promise: Promise<boolean | undefined>;
   }>(null);
-  const rawPrevious = api.useQuery<LiekanReport>({
+  const comparisonRange = query.data?.meta.snapshot?.fallback?.sourceRange ?? { startAt, endAt };
+  const shiftedRange = previousWeekRange(comparisonRange.startAt, comparisonRange.endAt, timezone);
+  const rawPrevious = api.useQuery<LiekanReport | ReportPreparing>({
     ...pageReportQuery(userId, reportWebsiteId, { resource, ...shiftedRange, timezone }, teamId),
     enabled: compare && !!websiteId && !metadataLoading,
   });
-  const previous = useFreshnessLifecycle(rawPrevious, {
+  const previous = useFreshnessLifecycle(publishedReportQuery(rawPrevious), {
     queryKey: pageReportQuery(
       userId,
       reportWebsiteId,
@@ -382,7 +449,81 @@ export function LiekanPage({ resource }: { resource: Resource }) {
     endAt: shiftedRange.endAt,
     timezone,
   });
-  const restricted = [401, 403, 404].includes((query.error as any)?.status);
+  const [activeRankingTable, setActiveRankingTable] = useState<string>(null);
+  const requestedRankings = Object.fromEntries(
+    Object.entries(tablePages).filter(
+      ([table, page]) => page > 1 && query.data?.meta.tablePages?.[table],
+    ),
+  );
+  const rankingTable =
+    activeRankingTable && requestedRankings[activeRankingTable]
+      ? activeRankingTable
+      : (Object.keys(requestedRankings)[0] ??
+        (query.data?.meta.aiCrawlerEnabled === false ? 'visitorTopBody' : 'topBody'));
+  const rankingPage = tablePages[rankingTable] ?? 1;
+  const snapshot = query.data?.meta.snapshot;
+  const snapshotVersion = snapshot?.version ?? snapshot?.dataThrough;
+  const expectedOverviewVersion = overviewVersionSchema.safeParse(snapshot?.version).data;
+  const [refreshingOverviewVersion, setRefreshingOverviewVersion] = useState<string>(null);
+  const overviewRecovery = useRef<string>(null);
+  const readRankingPage =
+    isScheduledReport(resource) &&
+    !metadataLoading &&
+    refreshingOverviewVersion !== reportKey &&
+    rankingPage > 1 &&
+    !!query.data?.meta.tablePages?.[rankingTable];
+  const rankingOptions = pageReportQuery(
+    userId,
+    reportWebsiteId,
+    {
+      ...reportInput,
+      reportVersion: expectedOverviewVersion,
+      tablePages: requestedRankings,
+    },
+    teamId,
+  );
+  const rawRanking = api.useQuery<LiekanReport | ReportPreparing>({
+    ...rankingOptions,
+    queryKey: [
+      ...rankingOptions.queryKey,
+      'overview-ranking',
+      snapshotVersion ?? query.dataUpdatedAt,
+    ],
+    enabled: readRankingPage,
+    ...(expectedOverviewVersion && { meta: { cacheDirect: true, cacheAggregate: false } }),
+  });
+  const ranking = publishedReportQuery(rawRanking);
+  const [trendFailure, setTrendFailure] = useState<{ key: string; at: number; error: any }>(null);
+  const recoveredTrend = useRef<string>(null);
+  const onTrendInvalidated = useCallback(
+    (error: unknown) => {
+      setTrendFailure({ key: reportKey, at: query.dataUpdatedAt, error });
+      const recovery = JSON.stringify([
+        reportKey,
+        reading?.page.round,
+        (error as any)?.status,
+        (error as any)?.code,
+      ]);
+      if (recoveredTrend.current === recovery) return;
+      recoveredTrend.current = recovery;
+      // One revalidation of the parent; a control or permission failure in any part
+      // invalidates the visible report, not just that chart.
+      void query.refetch({ cancelRefetch: false });
+    },
+    [reportKey, query.dataUpdatedAt, query.refetch, reading?.page.round],
+  );
+  const invalidTrend =
+    trendFailure?.key === reportKey && trendFailure.at === query.dataUpdatedAt
+      ? trendFailure.error
+      : undefined;
+  const rankingRestricted =
+    readRankingPage && [401, 403, 404].includes((ranking.error as any)?.status);
+  const restricted =
+    [401, 403, 404].includes(invalidTrend?.status) ||
+    rankingRestricted ||
+    [401, 403, 404].includes((query.error as any)?.status);
+  const reportFailed = query.isError || rankingRestricted || !!invalidTrend;
+  const reportError = invalidTrend || (rankingRestricted ? ranking.error : query.error);
   const previousRestricted = [401, 403, 404].includes((previous.error as any)?.status);
   const displayKey = ['liekan-feature', userId, 'website-display-settings', websiteId];
   const displayQuery = api.useQuery<{ aiCrawlerEnabled?: boolean }>({
@@ -421,7 +562,91 @@ export function LiekanPage({ resource }: { resource: Resource }) {
     displayQuery.isFetching,
     displayQuery.error,
   ]);
-  const report = restricted || metadataLoading || displayMismatch ? undefined : query.data;
+  const baseReport =
+    invalidTrend || restricted || metadataLoading || displayMismatch ? undefined : query.data;
+  const rankedSnapshot = ranking.data?.meta.snapshot;
+  const rankingMismatch =
+    readRankingPage &&
+    !!ranking.data &&
+    (rankedSnapshot?.version ?? rankedSnapshot?.dataThrough) !== snapshotVersion;
+  const rankingRecoveryKey = JSON.stringify([reportKey, snapshotVersion]);
+  // A late ranking response can refresh the base once for this version.
+  const recoveredRanking = useRef<string>(null);
+  const syncingRanking =
+    rankingMismatch && (query.isFetching || recoveredRanking.current !== rankingRecoveryKey);
+  const refetchReport = query.refetch;
+  const invalidatedRanking =
+    readRankingPage &&
+    ((rankingMismatch && !!expectedOverviewVersion) ||
+      (ranking.error as any)?.code === overviewVersionConflict);
+  useEffect(() => {
+    if (rankingPage === 1) overviewRecovery.current = null;
+    if (invalidatedRanking) {
+      const recovery = JSON.stringify([pageIdentity, snapshotVersion]);
+      if (overviewRecovery.current === recovery) return;
+      overviewRecovery.current = recovery;
+      setRefreshingOverviewVersion(reportKey);
+      router.replace(updateParams(clearTablePages(tablePages)), { scroll: false });
+      void refetchReport({ cancelRefetch: false }).finally(() =>
+        setRefreshingOverviewVersion(current => (current === reportKey ? null : current)),
+      );
+      return;
+    }
+    if (!baseReport || !syncingRanking || query.isFetching) return;
+    recoveredRanking.current = rankingRecoveryKey;
+    void refetchReport({ cancelRefetch: false });
+  }, [
+    baseReport,
+    invalidatedRanking,
+    pageIdentity,
+    query.isFetching,
+    rankingPage,
+    rankingRecoveryKey,
+    refetchReport,
+    reportKey,
+    router,
+    syncingRanking,
+    snapshotVersion,
+    tablePages,
+    updateParams,
+  ]);
+  const rankingReport =
+    readRankingPage &&
+    !invalidatedRanking &&
+    !rankingMismatch &&
+    Object.entries(requestedRankings).every(
+      ([table, page]) => ranking.data?.meta.tablePages?.[table]?.page === page,
+    )
+      ? ranking.data
+      : undefined;
+  const rankingReadFailed =
+    !syncingRanking &&
+    (ranking.isError || (ranking.isSuccess && !ranking.isFetching && !rankingReport));
+  const report = useMemo(() => {
+    if (!baseReport || !rankingReport) return baseReport;
+    return {
+      ...baseReport,
+      tables: {
+        ...baseReport.tables,
+        ...Object.fromEntries(
+          Object.keys(requestedRankings).map(table => [table, rankingReport.tables[table]]),
+        ),
+      },
+      meta: {
+        ...baseReport.meta,
+        ...(rankingReport.meta.geography ? { geography: rankingReport.meta.geography } : {}),
+        tablePages: {
+          ...baseReport.meta.tablePages,
+          ...Object.fromEntries(
+            Object.keys(requestedRankings).map(table => [
+              table,
+              rankingReport.meta.tablePages[table],
+            ]),
+          ),
+        },
+      },
+    };
+  }, [baseReport, rankingReport, JSON.stringify(requestedRankings)]);
   const keywordResetSeen = useRef('');
   useEffect(() => {
     if (
@@ -556,6 +781,7 @@ export function LiekanPage({ resource }: { resource: Resource }) {
       }).format(value);
     return `${date(startAt)} 至 ${date(endAt)}`;
   }, [startAt, endAt, timezone]);
+  const fallbackRangeLabel = fallbackReportRangeLabel(report, i18n.locale);
   useEffect(() => {
     if (!shell) return;
     if (report?.website)
@@ -631,7 +857,7 @@ export function LiekanPage({ resource }: { resource: Resource }) {
       page,
       cursor: cursor || undefined,
       seek: cursor ? (next ? 'after' : 'before') : undefined,
-      readBoundary: cursor ? report?.meta.logReadBoundary : undefined,
+      readBoundary: cursor || page > 1 ? report?.meta.logReadBoundary : undefined,
     });
   };
   const exportGeography = async () => {
@@ -659,7 +885,8 @@ export function LiekanPage({ resource }: { resource: Resource }) {
         frame => {
           if (owner !== currentPage.current.identity || controller.signal.aborted) return;
           if (frame.type === 'file') {
-            if (frame.size > EXPORT_MAX_BYTES) throw new Error('导出文件超过 50 MiB');
+            if (!frame.downloadUrl && frame.size > EXPORT_MAX_BYTES)
+              throw new Error('导出文件超过 50 MiB');
             file = frame;
           }
           if (frame.type === 'chunk') {
@@ -672,13 +899,15 @@ export function LiekanPage({ resource }: { resource: Resource }) {
         report.meta?.catalogVersion,
       );
       if (owner !== currentPage.current.identity || controller.signal.aborted) return;
-      if (!file || file.size !== bytes) throw new Error('导出传输未完成');
-      const url = URL.createObjectURL(new Blob(chunks as BlobPart[], { type: file.mime }));
+      if (!file || (!file.downloadUrl && file.size !== bytes)) throw new Error('导出传输未完成');
+      const url =
+        file.downloadUrl ||
+        URL.createObjectURL(new Blob(chunks as BlobPart[], { type: file.mime }));
       const link = document.createElement('a');
       link.href = url;
       link.download = file.name;
       link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      if (url.startsWith('blob:')) setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (error) {
       if (owner === currentPage.current.identity && !controller.signal.aborted)
         setActionError(error instanceof Error ? error.message : '导出失败');
@@ -942,7 +1171,24 @@ export function LiekanPage({ resource }: { resource: Resource }) {
         onAction,
         onLogsPage: gotoLogsPage,
         // 翻页只改本表页码；各表白名单独立，其他表已请求的页码保持不变。
-        onTablePage: (table, page) => updateView({ [`tp_${table}`]: page > 1 ? page : undefined }),
+        onTablePage: (table, page) => {
+          const change = { [`tp_${table}`]: page > 1 ? page : undefined };
+          if (isScheduledReport(resource)) {
+            setActiveRankingTable(table);
+            window.history.pushState(null, '', updateParams(change));
+          } else updateView(change);
+        },
+        tablePageRead:
+          baseReport && readRankingPage && (!rankingReport || rankingReadFailed)
+            ? {
+                table: rankingTable,
+                page: rankingPage,
+                loading: !rankingReadFailed,
+                retry: rankingReadFailed
+                  ? () => void (rankingMismatch ? refetchReport() : ranking.refetch())
+                  : undefined,
+              }
+            : undefined,
       }}
     >
       {shell?.websiteActionsTarget && createPortal(headerActions, shell.websiteActionsTarget)}
@@ -964,19 +1210,7 @@ export function LiekanPage({ resource }: { resource: Resource }) {
         <AnalysisTabs route={route} href={href} />
       </div>
       <div className={styles.analysisTools}>
-        {report?.meta.snapshot && (
-          <span>
-            {i18n.text('数据截至 {v0}，后台每 30 秒检查更新', [
-              new Date(report.meta.snapshot.dataThrough).toLocaleString(i18n.locale, {
-                timeZone: report.range.timezone,
-                hour12: false,
-              }),
-            ])}
-            {report.meta.snapshot.updateError && (
-              <span role="status"> · {i18n.text('更新失败，当前显示上次读取的数据')}</span>
-            )}
-          </span>
-        )}
+        {report?.meta.snapshot && <ReportSnapshotNotice report={report} />}
         {resource === 'logs' && (
           <span>
             {i18n.fragment('最近导入：', false, true)}
@@ -1055,23 +1289,26 @@ export function LiekanPage({ resource }: { resource: Resource }) {
           {i18n.text('已清除当前页面不支持的筛选，统计采用页面显示的条件。')}
         </div>
       )}
-      {(query.isError || actionError) && (
+      {(reportFailed || actionError) && (
         <div className={styles.notice} role="alert">
-          {query.isError
+          {reportFailed
             ? report
               ? i18n.text('更新失败，当前显示上次读取的数据')
               : query.isStaleAggregate && !restricted
-                ? i18n.system(query.error?.message) || i18n.text('统计数据已过期，请重试读取。')
-                : !restricted && query.error?.message
-                  ? i18n.system(query.error.message)
+                ? i18n.system(reportError?.message) || i18n.text('统计数据已过期，请重试读取。')
+                : !restricted && reportError?.message
+                  ? i18n.system(reportError.message)
                   : i18n.text('无法读取此范围的数据')
             : i18n.system(actionError)}
-          {query.isError && (
-            <button type="button" onClick={() => refresh()}>
+          {reportFailed && (
+            <button
+              type="button"
+              onClick={() => (rankingRestricted ? ranking.refetch() : refresh())}
+            >
               {i18n.text('重试')}
             </button>
           )}
-          {query.isError && !report && !restricted && !liveLogs && (
+          {reportFailed && !report && !restricted && !liveLogs && (
             <>
               <span>{i18n.text('也可缩小时间范围后重试：')}</span>
               {(
@@ -1106,6 +1343,14 @@ export function LiekanPage({ resource }: { resource: Resource }) {
           )}
         </div>
       )}
+      {preparing && !restricted && (
+        <div className={styles.notice} role="status" aria-live="polite">
+          {i18n.text('数据准备中，请稍后查看')}
+          <button type="button" onClick={() => query.refetch()}>
+            {i18n.text('重新查看')}
+          </button>
+        </div>
+      )}
       <AnalysisPendingNotice websiteId={reportWebsiteId} websiteHandle={websiteId} />
       {displayMismatch && !restricted && (displayQuery.error || query.error) && (
         <div className={styles.notice} role="alert">
@@ -1113,7 +1358,7 @@ export function LiekanPage({ resource }: { resource: Resource }) {
           <button onClick={refresh}>{i18n.text('重新读取设置与报表')}</button>
         </div>
       )}
-      {query.isError && !report ? (
+      {preparing ? null : reportFailed && !report ? (
         geoWeight && !restricted ? (
           <main className="max-w-[1200px] mx-auto px-8 py-6">
             <section className="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -1133,16 +1378,43 @@ export function LiekanPage({ resource }: { resource: Resource }) {
             report={report}
             geoWeight={geoWeight}
             aiCrawlerEnabled={!crawlerHidden}
-            rangeLabel={i18n.system(rangeLabel)}
+            rangeLabel={fallbackRangeLabel || i18n.system(rangeLabel)}
             live={liveLogs}
+            trend={
+              independentTrend
+                ? {
+                    key: JSON.stringify([
+                      userId,
+                      reportWebsiteId,
+                      teamId,
+                      resource,
+                      startAt,
+                      endAt,
+                      timezone,
+                      reportChartPeriod,
+                    ]),
+                    onInvalidated: onTrendInvalidated,
+                    userId,
+                    websiteId: reportWebsiteId,
+                    teamId,
+                    timezone,
+                    endAt,
+                    resource: resource as 'overview' | 'human/overview',
+                    basePeriod: reportChartPeriod,
+                    initialPeriod: chartPeriod,
+                  }
+                : undefined
+            }
             trendLabel={
-              chartPeriod === 'today'
-                ? i18n.text('今天')
-                : chartPeriod === '24h'
-                  ? i18n.text('近 24 小时')
-                  : chartPeriod === '7d'
-                    ? i18n.text('近 7 天')
-                    : i18n.text('近 30 天')
+              fallbackRangeLabel
+                ? i18n.text('上次统计：{v0}', [fallbackRangeLabel])
+                : reportChartPeriod === 'today'
+                  ? i18n.text('今天')
+                  : reportChartPeriod === '24h'
+                    ? i18n.text('近 24 小时')
+                    : reportChartPeriod === '7d'
+                      ? i18n.text('近 7 天')
+                      : i18n.text('近 30 天')
             }
           />
         </DataLoading>
@@ -1153,11 +1425,11 @@ export function LiekanPage({ resource }: { resource: Resource }) {
           aiCrawlerEnabled={!crawlerHidden}
           rangeLabel={i18n.system(rangeLabel)}
           trendLabel={
-            chartPeriod === 'today'
+            reportChartPeriod === 'today'
               ? i18n.text('今天')
-              : chartPeriod === '24h'
+              : reportChartPeriod === '24h'
                 ? i18n.text('近 24 小时')
-                : chartPeriod === '7d'
+                : reportChartPeriod === '7d'
                   ? i18n.text('近 7 天')
                   : i18n.text('近 30 天')
           }
@@ -1212,9 +1484,14 @@ export function LiekanPage({ resource }: { resource: Resource }) {
                 compare
                   ? {
                       current: report,
-                      previous: previousRestricted || metadataLoading ? undefined : previous.data,
-                      startAt,
-                      endAt,
+                      previous:
+                        previousRestricted ||
+                        metadataLoading ||
+                        previous.data?.meta.snapshot?.fallback
+                          ? undefined
+                          : previous.data,
+                      startAt: comparisonRange.startAt,
+                      endAt: comparisonRange.endAt,
                       previousStartAt: shiftedRange.startAt,
                       previousEndAt: shiftedRange.endAt,
                       labels:

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { getCompareDate } from '@/lib/date';
 import { projectToday, projectTrend, websiteDayWindow } from './website-day-metrics';
 
 describe('websiteDayWindow', () => {
@@ -7,9 +8,18 @@ describe('websiteDayWindow', () => {
     const now = Date.parse('2026-10-08T02:30:00Z');
     expect(websiteDayWindow('Asia/Shanghai', now)).toEqual({
       startAt: Date.parse('2026-10-07T16:00:00Z'),
-      endAt: Date.parse('2026-10-08T16:00:00Z'),
+      endAt: Date.parse('2026-10-08T15:59:59.999Z'),
       timezone: 'Asia/Shanghai',
     });
+  });
+
+  it('compares a 23-hour day to the full previous local day', () => {
+    const timezone = 'America/New_York';
+    const { startAt, endAt } = websiteDayWindow(timezone, Date.parse('2026-03-08T16:00:00Z'));
+    expect(endAt + 1 - startAt).toBe(23 * 3600000);
+    const previous = getCompareDate('prev', new Date(startAt), new Date(endAt), timezone);
+    expect(previous.startDate.toISOString()).toBe('2026-03-07T05:00:00.000Z');
+    expect(previous.endDate.toISOString()).toBe('2026-03-08T04:59:59.999Z');
   });
 
   it('keeps the local calendar day across DST transitions', () => {
