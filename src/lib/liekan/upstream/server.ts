@@ -197,8 +197,13 @@ export async function humanTotals(
   timezone = 'UTC',
 ) {
   const raw: unknown = warehouseEnabled()
-    ? await (await import('./warehouse-browser-queries')).warehouseBrowserTotals(websiteId,startDate,endDate,timezone)
+    ? await (
+        await import('./warehouse-browser-queries')
+      ).warehouseBrowserTotals(websiteId, startDate, endDate, timezone)
     : await getWebsiteStats(websiteId, { startDate, endDate, timezone });
+  return normalizeHumanTotals(raw);
+}
+export function normalizeHumanTotals(raw: unknown) {
   const incompatible = () => new LiekanError('统计数据契约不兼容', 500);
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw incompatible();
   const totals = {} as {

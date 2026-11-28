@@ -109,6 +109,7 @@ export async function warehouseBrowserPopulation(
           start: warehouseTime(start),
           end: warehouseTime(end),
         },
+        { traceStage: 'browser-population' },
       );
       return {
         ...populationFromRow(

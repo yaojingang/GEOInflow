@@ -172,14 +172,17 @@ export async function getHumanFacts(
   timezone: string,
   fields?: readonly HumanFact[],
   geographyReadLimit?: { rows: number; bytes: number },
-  projection?: { crawlerContext?: boolean },
+  projection?: { crawlerContext?: boolean; totals?: Awaited<ReturnType<typeof humanTotals>> },
 ) {
   const args: unknown[] = [id, start, end, timezone];
   const selected = new Set(fields);
   const needs = (field: HumanFact) => !fields || selected.has(field);
   const statements: Record<string, string> = {
     daily: humanBinsSql(),
-    geo: ` SELECT ${getPostgresCountrySQL('v.country')} AS country,${getPostgresRegionSQL('v.country', 'v.region')} AS region,v.city,sum(v.duration)::float AS "durationTotal",count(v.duration)::int AS "durationSamples",${visitMetrics} FROM visits v ${convertedJoin} GROUP BY 1,2,3 ORDER BY sessions DESC,1,2,3`,
+    geo: ` SELECT ${getPostgresCountrySQL('v.country')} AS country,${getPostgresRegionSQL(
+      'v.country',
+      'v.region',
+    )} AS region,v.city,sum(v.duration)::float AS "durationTotal",count(v.duration)::int AS "durationSamples",${visitMetrics} FROM visits v ${convertedJoin} GROUP BY 1,2,3 ORDER BY sessions DESC,1,2,3`,
     sources: ` SELECT v.referrer,v."utmSource",v."utmMedium",v."utmCampaign",${visitMetrics} FROM visits v ${convertedJoin} GROUP BY 1,2,3,4 ORDER BY sessions DESC,1,2,3,4`,
     environment: ` SELECT device,browser,os,count(*)::int AS sessions FROM visits GROUP BY 1,2,3 ORDER BY sessions DESC,1,2,3`,
     pages: `, ordered AS (SELECT *,row_number() OVER(PARTITION BY visit_id,session_id ORDER BY created_at,event_id) AS ordinal,extract(epoch FROM lead(created_at) OVER(PARTITION BY visit_id,session_id ORDER BY created_at,event_id)-created_at)::float AS dwell FROM events WHERE event_type NOT IN(2,5))
@@ -223,7 +226,9 @@ export async function getHumanFacts(
   // Path projections share one eligible scan with the original date and identity boundaries.
   const currentCte =
     remaining.length && remaining.every(([key]) => key === 'journeys' || key === 'exits')
-      ? `WITH ${boundedBrowserEventsSql('e.website_id=$1::uuid AND e.created_at BETWEEN $2::timestamptz AND $3::timestamptz AND e.event_type != 5 AND $4::text IS NOT NULL')}, events AS MATERIALIZED (SELECT e.event_id,e.session_id,e.visit_id,e.created_at,e.event_type,e.url_path FROM bounded_events e)`
+      ? `WITH ${boundedBrowserEventsSql(
+          'e.website_id=$1::uuid AND e.created_at BETWEEN $2::timestamptz AND $3::timestamptz AND e.event_type != 5 AND $4::text IS NOT NULL',
+        )}, events AS MATERIALIZED (SELECT e.event_id,e.session_id,e.visit_id,e.created_at,e.event_type,e.url_path FROM bounded_events e)`
       : humanVisitsSql(false, true, {
           geography: remaining.some(([key]) => key === 'geo'),
           environment: remaining.some(([key]) => key === 'environment'),
@@ -243,9 +248,11 @@ export async function getHumanFacts(
       ? Promise.resolve(
           applyNativePopulation([context.totals], 'getWebsiteStats', context.population)[0],
         )
-      : humanTotals(id, start, end, timezone),
+      : projection?.totals ?? humanTotals(id, start, end, timezone),
     warehouseEnabled()
-      ? (await import('./warehouse-report-snapshot')).warehouseReportMetadata(id).then(m => m.reports)
+      ? (await import('./warehouse-report-snapshot'))
+          .warehouseReportMetadata(id)
+          .then(m => m.reports)
       : query(
           "SELECT report_id AS id,name,type,parameters FROM report WHERE website_id=$1::uuid AND type IN('goal','funnel') ORDER BY created_at LIMIT 100",
           id,
@@ -421,13 +428,20 @@ export async function getHumanDays(
         timezone,
       ));
     const population = await readBrowserPopulation(id, start, end, timezone);
-    return {
-      population,
-      rows: identityUsable(population)
-        ? rows
-        : rows.map(row =>
-            unavailableFields(row, ['uv', 'sessions', 'duration', 'bounces', 'conversions']),
-          ),
-    };
+    return humanDaysWithPopulation(rows, population);
   });
+}
+
+export function humanDaysWithPopulation(
+  rows: any[],
+  population: Awaited<ReturnType<typeof readBrowserPopulation>>,
+) {
+  return {
+    population,
+    rows: identityUsable(population)
+      ? rows
+      : rows.map(row =>
+          unavailableFields(row, ['uv', 'sessions', 'duration', 'bounces', 'conversions']),
+        ),
+  };
 }

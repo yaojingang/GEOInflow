@@ -360,14 +360,21 @@ async function calculateGeoWeightAtBoundary(
 
 export class GeoWeightLockBusy extends Error {}
 function warehouseGeoCompute<T>(deadline: number, signal: AbortSignal | undefined, work: (tx: AiTx) => Promise<T>, _repeatableRead = false) {
-  return warehouseControlRead(work, { deadline, signal, stable: (sql, values) => {
-    const rows = values as Record<string, unknown>[];
-    // New accepted log facts use the pinned CH publication. Their PG diagnostic
-    // revision may advance without changing the permissions or evidence policy.
-    if (/FROM liekan_log_state\b/.test(sql)) return rows.map(({data_revision: _data, ...row}) => row);
-    if (/FROM liekan_ingest_batch\b/.test(sql)) return rows.map(row => ({...row, count: Number(row.count) > 0}));
-    return rows;
-  } });
+  return warehouseControlRead(work, {
+    deadline,
+    signal,
+    verifyInput: sql => /FROM liekan_ingest_batch\b/.test(sql),
+    stable: (sql, values) => {
+      const rows = values as Record<string, unknown>[];
+      // New accepted log facts use the pinned CH publication. Their PG diagnostic
+      // revision may advance without changing the permissions or evidence policy.
+      if (/FROM liekan_log_state\b/.test(sql))
+        return rows.map(({ data_revision: _data, ...row }) => row);
+      if (/FROM liekan_ingest_batch\b/.test(sql))
+        return rows.map(row => ({ ...row, count: Number(row.count) > 0 }));
+      return rows;
+    },
+  });
 }
 /** Compatibility callers share the durable daily publication path. */
 export async function readGeoWeight(

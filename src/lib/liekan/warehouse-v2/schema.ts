@@ -33,6 +33,13 @@ export const v2Views = {
   browserPathHourAgg: 'mv_v2_browser_path_hour_agg',
 } as const;
 
+export const geoHistoryRowHash = `reinterpretAsUInt128(sipHash128(tuple(
+  id,created_at,source_id,path,method,status,user_agent,verification,verification_version,
+  verification_reason,verification_observed_at,ai_eligible,recognition_state,crawler_id,
+  catalog_version,classification_version,request_host,host_basis,content_type_state,
+  content_type_value,sampling_rate,identity_evidence,evidence_json)))`;
+export const geoLogFingerprint = 'sumWithOverflow(geo_history_row_hash)';
+
 export const logPathStates = `countState() AS requests,
       sumState(toUInt64(method = 'GET' AND status >= 200 AND status <= 299)) AS get2xx,
       sumState(toUInt64(method = 'GET' AND status >= 200 AND status <= 299 AND NOT is_unknown_crawler)) AS crawler,
@@ -109,6 +116,8 @@ export function warehouseV2DDL(): string[] {
     PARTITION BY toYYYYMM(created_at)
     ORDER BY (website_id, epoch, toStartOfHour(created_at), id)
     SETTINGS index_granularity = 8192`,
+
+    `ALTER TABLE ${v2Tables.logs} MODIFY SETTING deduplicate_merge_projection_mode='rebuild', lightweight_mutation_projection_mode='rebuild'`,
 
     // 2. Flat Browser Event Fact Table (merges website_event + session + quality + env + observation + geo + risk)
     `CREATE TABLE IF NOT EXISTS ${v2Tables.browserEvents} (

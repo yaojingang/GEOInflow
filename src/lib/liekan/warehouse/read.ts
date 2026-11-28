@@ -1,7 +1,7 @@
 import { factTable, identifier } from './catalog';
 import { recordKeyColumns } from './codec';
 import { factMetadata } from './schema';
-import { v2EventDetailRelation } from '../warehouse-v2/relations';
+import { v2EventDetailRelation, v2GeoEvidenceColumns } from '../warehouse-v2/relations';
 import { v2Tables, warehouseV2Enabled } from '../warehouse-v2/index';
 
 export type ReadBoundary = {
@@ -119,17 +119,7 @@ export function factRelation(name: string, options: FactReadOptions = {}): strin
       FROM ${v2Tables.logs} WHERE website_id={wh_site:UUID} AND epoch={wh_epoch:UInt64} AND _deleted=0${timeFilter})`;
     }
     if (name === 'liekan_crawler_evidence') {
-      const geoCols = options.geoEvidence
-        ? `,
-        nullIf(request_host, '') AS _geo_host,
-        nullIf(host_basis, '') AS _geo_basis,
-        JSONExtract(coalesce(nullIf(JSONExtractRaw(evidence_json,'measurement'),''),'{}'),'samplingTimeBasis','Nullable(String)') AS _geo_sampling_time,
-        JSONExtract(coalesce(nullIf(JSONExtractRaw(evidence_json,'measurement'),''),'{}'),'samplingBasis','Nullable(String)') AS _geo_sampling_basis,
-        sampling_rate AS _geo_sampling_rate,
-        JSONExtract(coalesce(identity_evidence,'{}'),'reason','Nullable(String)') AS _geo_reason,
-        nullIf(content_type_state, '') AS _geo_mime_state,
-        nullIf(content_type_value, '') AS _geo_mime`
-        : '';
+      const geoCols = options.geoEvidence ? `, ${v2GeoEvidenceColumns}` : '';
       return `(SELECT website_id, id AS log_id, classification_version, crawler_id, security_action,
         terminating_rule_id, matched_rule_ids, cache_status, duration_ms,
         JSONExtractRaw(evidence_json,'measurement') AS measurement,

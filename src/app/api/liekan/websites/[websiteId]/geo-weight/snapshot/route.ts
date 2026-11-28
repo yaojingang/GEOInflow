@@ -7,9 +7,11 @@ export async function GET(
   return geoSnapshotApi(request, async actor => {
     const { websiteId } = await params;
     const search = new URL(request.url).searchParams;
+    const fresh = search.get('refresh') === '1';
     search.delete('refresh');
     return readGeoWeightSnapshot(actor, websiteId, Object.fromEntries(search), {
       signal: request.signal,
+      fresh,
     });
   });
 }

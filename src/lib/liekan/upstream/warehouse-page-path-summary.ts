@@ -7,6 +7,21 @@ import type {
 } from './warehouse-evidence-spool';
 
 const lexical = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+const smallCatalogLimit = 4096;
+
+// A small catalog fits in a bound ClickHouse parameter. Larger catalogs keep
+// the existing streaming comparison, including its external sort.
+export async function overviewCatalogPaths(site: string, expected: number) {
+  if (expected > smallCatalogLimit) return;
+  const rows = await warehouseReader().db.read<{ path: string }>(
+    'SELECT path FROM liekan_catalog WHERE website_id=$1::uuid LIMIT $2',
+    [site, smallCatalogLimit + 1],
+  );
+  if (rows.length > smallCatalogLimit) return;
+  const paths = rows.map(row => row.path);
+  if (Buffer.byteLength(encodeURIComponent(JSON.stringify(paths))) > 32768) return;
+  return paths;
+}
 export async function streamWarehouseCatalogPaths(
   site: string,
   emit: (row: { path: string }) => Promise<void>,
@@ -29,13 +44,12 @@ export async function countUncrawledCatalogPaths(
   pages: SpoolRows<{ path: string }>,
   produceCatalog: EvidenceProducer<{ path: string }>,
 ) {
-  const smallLimit = 4096;
   const pending = new Set<string>();
   let large = false;
   await produceCatalog(async ({ path }) => {
     if (large) return;
     pending.add(path);
-    if (pending.size > smallLimit) large = true;
+    if (pending.size > smallCatalogLimit) large = true;
   });
   if (!large) {
     const catalogCount = pending.size;

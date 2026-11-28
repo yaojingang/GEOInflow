@@ -1,6 +1,7 @@
 import { recordReportRanking } from './upstream/report-ranking-artifact';
 import {
   reportLogRange,
+  reportPlotStart,
   reportLogRow,
   reportBotRow,
   reportAiPageRow,
@@ -121,18 +122,10 @@ export async function buildReport(
     pageOnly === 'share'
       ? resources.includes('human/overview')
       : !pageOnly || resources.includes(p.resource);
-  const { clock, now, start, end, readEndAt, days, halfOpen } =
-    prepared?.range ?? reportLogRange(p);
+  const range = prepared?.range ?? reportLogRange(p);
+  const { clock, now, start, end, readEndAt, days, halfOpen } = range;
   const todayStart = new Date(calendarDayRange(clock?.dayAt ?? now, p.timezone).startAt);
-  const plotStart = new Date(
-    p.chartPeriod === 'today'
-      ? calendarDayRange(p.endAt, p.timezone).startAt
-      : Math.max(
-          pageOnly === 'share' ? p.startAt : 0,
-          (clock ? p.endAt : readEndAt) -
-            { '30d': 30, '7d': 7, '24h': 1 }[p.chartPeriod] * 86400000,
-        ),
-  );
+  const plotStart = new Date(reportPlotStart(p, range, pageOnly === 'share'));
   const module = <T>(
     kind: Parameters<typeof timeReportQuery>[0],
     from: Date,
@@ -224,65 +217,69 @@ export async function buildReport(
         ),
       ),
     timeReportQuery('settings', () => getSettings(website.id)),
-    !prepared?.sharedTodayRequests && needed('overview', 'logs') && (!clock || now > +todayStart)
-      ? timeReportQuery('today-logs', () =>
-          getLogToday(website.id, todayStart, new Date(Math.max(+todayStart, now))),
-        )
-      : Promise.resolve({ requests: 0, accepted: 0, abnormal: 0 }),
-    needed('overview', 'conversions') && (!clock || now > +todayStart)
-      ? timeReportQuery('today-conversions', () =>
-          getHumanConversions(
-            website.id,
-            todayStart,
-            new Date(Math.max(+todayStart, now)),
-            p.timezone,
-          ),
-        )
-      : Promise.resolve(0),
+    prepared?.todayLogs ??
+      (!prepared?.sharedTodayRequests && needed('overview', 'logs') && (!clock || now > +todayStart)
+        ? timeReportQuery('today-logs', () =>
+            getLogToday(website.id, todayStart, new Date(Math.max(+todayStart, now))),
+          )
+        : Promise.resolve({ requests: 0, accepted: 0, abnormal: 0 })),
+    prepared?.todayConversions ??
+      (needed('overview', 'conversions') && (!clock || now > +todayStart)
+        ? timeReportQuery('today-conversions', () =>
+            getHumanConversions(
+              website.id,
+              todayStart,
+              new Date(Math.max(+todayStart, now)),
+              p.timezone,
+            ),
+          )
+        : Promise.resolve(0)),
     needed('content')
       ? timeReportQuery('content-impact', () => getContentImpact(website.id, start, end, p))
       : Promise.resolve([]),
     needed('ai/overview')
       ? timeReportQuery('monthly-ai', () => getMonthlyAiShare(website.id, end, p.timezone, p))
       : Promise.resolve([]),
-    needed('overview', 'human/overview')
-      ? module(
-          'plot-human',
-          plotStart,
-          end,
-          { timezone: p.timezone, hour: ['today', '24h'].includes(p.chartPeriod) },
-          () =>
-            getHumanDays(
-              website.id,
-              plotStart,
-              end,
-              p.timezone,
-              ['today', '24h'].includes(p.chartPeriod),
-            ),
-        )
-      : Promise.resolve({ rows: [], population: undefined }),
-    needed('overview', 'human/overview')
-      ? module(
-          'plot-logs',
-          plotStart,
-          end,
-          {
-            timezone: p.timezone,
-            hour: ['today', '24h'].includes(p.chartPeriod),
-            crawlerIdentityScope: p.crawlerIdentityScope,
-            crawlerMetricsVersion: p.crawlerMetricsVersion,
-          },
-          () =>
-            getPlotLogs(
-              website.id,
-              plotStart,
-              end,
-              p.timezone,
-              ['today', '24h'].includes(p.chartPeriod),
-              p,
-            ),
-        )
-      : Promise.resolve([]),
+    (prepared?.browserBins && +plotStart === +start ? prepared.browserBins : undefined) ??
+      (needed('overview', 'human/overview')
+        ? module(
+            'plot-human',
+            plotStart,
+            end,
+            { timezone: p.timezone, hour: ['today', '24h'].includes(p.chartPeriod) },
+            () =>
+              getHumanDays(
+                website.id,
+                plotStart,
+                end,
+                p.timezone,
+                ['today', '24h'].includes(p.chartPeriod),
+              ),
+          )
+        : Promise.resolve({ rows: [], population: undefined })),
+    prepared?.logBins ??
+      (needed('overview', 'human/overview')
+        ? module(
+            'plot-logs',
+            plotStart,
+            end,
+            {
+              timezone: p.timezone,
+              hour: ['today', '24h'].includes(p.chartPeriod),
+              crawlerIdentityScope: p.crawlerIdentityScope,
+              crawlerMetricsVersion: p.crawlerMetricsVersion,
+            },
+            () =>
+              getPlotLogs(
+                website.id,
+                plotStart,
+                end,
+                p.timezone,
+                ['today', '24h'].includes(p.chartPeriod),
+                p,
+              ),
+          )
+        : Promise.resolve([])),
   ]);
   const plotHuman = plotFacts.rows;
   const trendState: DataState = !identityUsable(plotFacts.population)

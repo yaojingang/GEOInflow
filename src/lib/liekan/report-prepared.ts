@@ -1,5 +1,6 @@
 import type { LiekanReport } from './contracts/report';
-import type { getHumanFacts } from './upstream/analytics';
+import type { getHumanDays, getHumanFacts } from './upstream/analytics';
+import type { LogTrendRow } from './upstream/warehouse-log-queries';
 import type { getLogFacts } from './upstream/logs';
 import type { reportLogRange } from './report-log-tables';
 
@@ -8,6 +9,10 @@ import type { reportLogRange } from './report-log-tables';
 export type PreparedReport = {
   /** The canonical Today preset supplies this card at read time. */
   sharedTodayRequests?: boolean;
+  logBins?: LogTrendRow[];
+  browserBins?: Awaited<ReturnType<typeof getHumanDays>>;
+  todayConversions?: number;
+  todayLogs?: { requests: number; abnormal: number; accepted: number };
   range?: ReturnType<typeof reportLogRange>;
   catalogCount?: number;
   human?: Awaited<ReturnType<typeof getHumanFacts>>;

@@ -8,13 +8,18 @@ import { LiekanError } from './errors';
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value, (_key,v) => typeof v === 'bigint' ? v.toString() : v)).digest('hex');
 
 /** CH computation holds no PG transaction. In v2, control inputs are read once
- * without double-replay re-hashing; v1 retains its end-of-read digest check. */
+ * without replay unless the computed result will outlive this read. */
 export async function warehouseControlRead<T>(
   work: (tx: AiTx) => Promise<T>,
-  options: { deadline?: number; signal?: AbortSignal; stable?: (sql: string, rows: unknown[]) => unknown } = {},
+  options: {
+    deadline?: number;
+    signal?: AbortSignal;
+    verifyInput?: (sql: string) => boolean;
+    stable?: (sql: string, rows: unknown[]) => unknown;
+  } = {},
 ) {
   const reads: { sql: string; args: unknown[]; digest: string }[] = [];
-  const v2 = warehouseV2Enabled();
+  const verifyAll = !warehouseV2Enabled();
   const remaining = () => {
     if (options.signal?.aborted) throw new LiekanError('统计读取已取消', 499);
     const value = Math.min(5000, (options.deadline ?? Infinity) - Date.now());
@@ -29,20 +34,27 @@ export async function warehouseControlRead<T>(
     query: async <Row = Record<string, any>>(sql: string, ...args: unknown[]) => {
       if (reads.length >= 256) throw new AnalyticsUnavailable();
       const result = await execute(current => current.query<Row>(sql, ...args));
-      if (!v2) {
-        reads.push({ sql, args, digest: digest(options.stable ? options.stable(sql, result) : result) });
+      if (verifyAll || options.verifyInput?.(sql)) {
+        reads.push({
+          sql,
+          args,
+          digest: digest(options.stable ? options.stable(sql, result) : result),
+        });
       }
       return result;
     },
-    execute: async () => { throw new Error('warehouse-control-read-mutation'); },
+    execute: async () => {
+      throw new Error('warehouse-control-read-mutation');
+    },
   };
   const result = await work(tx);
-  if (!v2) {
+  if (reads.length) {
     await execute(async current => {
       for (const read of reads) {
         remaining();
         const rows = await current.query(read.sql, ...read.args);
-        if (digest(options.stable ? options.stable(read.sql, rows) : rows) !== read.digest) throw new AnalyticsRestart();
+        if (digest(options.stable ? options.stable(read.sql, rows) : rows) !== read.digest)
+          throw new AnalyticsRestart();
       }
     });
   }

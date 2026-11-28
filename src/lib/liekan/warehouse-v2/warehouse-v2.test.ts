@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
 import type { ClickHouseClient } from '@clickhouse/client';
+import { ensureV2Schema } from './client';
 import {
   buildCatalogMappings,
   buildV2LogRow,
@@ -28,6 +29,29 @@ import {
 } from './index';
 
 describe('warehouse-v2 schema', () => {
+  it.each([
+    { installed: 0, canInstall: 0, column: 'MATERIALIZED', addsProjection: false },
+    { installed: 0, canInstall: 1, column: 'MATERIALIZED', addsProjection: true },
+    { installed: 1, canInstall: 0, column: 'ALIAS', addsProjection: false },
+  ])('installs the GEO history read path for $installed/$canInstall', async scenario => {
+    const ddl: string[] = [];
+    const ch = {
+      query: async () => ({ json: async () => [scenario] }),
+      command: async ({ query }: { query: string }) => ddl.push(query),
+    } as unknown as ClickHouseClient;
+    await ensureV2Schema(ch);
+    const column = ddl.findIndex(q => q.includes('ADD COLUMN IF NOT EXISTS geo_history_row_hash'));
+    expect(column).toBeGreaterThanOrEqual(0);
+    expect(ddl[column]).toContain(`UInt128 ${scenario.column}`);
+    const projection = ddl.findIndex(q => q.includes('ADD PROJECTION'));
+    if (scenario.addsProjection) {
+      expect(projection).toBeGreaterThan(column);
+      expect(ddl[projection]).toContain('sumWithOverflow(geo_history_row_hash)');
+    } else {
+      expect(projection).toBe(-1);
+    }
+  });
+
   it('defines flat fact tables and native materialized views without fsync_after_insert', () => {
     const ddls = warehouseV2DDL();
     expect(ddls.length).toBeGreaterThanOrEqual(10);

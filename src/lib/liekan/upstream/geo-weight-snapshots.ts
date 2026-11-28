@@ -27,7 +27,11 @@ import {
   parseGeoWeightQuery,
 } from './geo-weight';
 import { LiekanError } from './errors';
-import { noteCacheResult } from './cache-context';
+import { geoControlHistory, geoLogHistory } from './warehouse-geo-history';
+import { QueryCache } from './query-cache';
+import { processSingleton } from './process-singleton';
+import { withPublishedRegistry } from './crawler-registry-context';
+import { currentCacheContext, noteCacheResult } from './cache-context';
 import { warehouseEnabled } from '../warehouse/runtime';
 import type { ReadBoundary } from '../warehouse/read';
 import { warehouseV2Enabled } from '../warehouse-v2/index';
@@ -107,10 +111,18 @@ export async function geoSnapshotAccess(
     websiteId,
   );
   if (setting?.ai_crawler_enabled === false) throw new LiekanError('AI 蜘蛛数据展示已关闭', 403);
-  const [state] = await tx.query(
-    'SELECT epoch,data_revision::text FROM liekan_log_state WHERE website_id=$1::uuid',
-    websiteId,
-  );
+  const [state] = warehouseV2Enabled()
+    ? await tx.query(
+        `SELECT s.epoch,s.data_revision::text,coalesce(d.revision,0)::text AS deletion_revision,d.pending_kind
+         FROM (SELECT $1::uuid AS website_id) w LEFT JOIN liekan_log_state s USING(website_id)
+         LEFT JOIN liekan_v2_evidence_deletion d USING(website_id)`,
+        websiteId,
+      )
+    : await tx.query(
+        'SELECT epoch,data_revision::text FROM liekan_log_state WHERE website_id=$1::uuid',
+        websiteId,
+      );
+  if (state?.pending_kind) throw new LiekanError('站点统计正在清理，请稍后重试', 503);
   const earliest = geoWindow(geoDateOffset(asOf, -30), timezone);
   const window = geoWindow(asOf, timezone);
   const [proof] = await tx.query(
@@ -127,16 +139,16 @@ export async function geoSnapshotAccess(
     algorithm: GEO_ALGORITHM,
     scopeHash: GEO_SCOPE_HASH,
     evidenceRevision: proof?.revision || '0',
-    ...(warehouseEnabled()
+    ...(warehouseV2Enabled() || warehouseEnabled()
       ? {
           warehouse: warehouseV2Enabled()
-            ? { epoch: String(state?.epoch || 1), deletion_revision: '0' }
-            : ((
+            ? { epoch: String(state?.epoch || 1), deletion_revision: state.deletion_revision }
+            : (
                 await tx.query(
                   "SELECT epoch::text,deletion_revision::text FROM liekan_warehouse_site WHERE website_id=$1::uuid AND state='active'",
                   websiteId,
                 )
-              )[0] ?? null),
+              )[0] ?? null,
         }
       : {}),
   };
@@ -610,40 +622,91 @@ async function register(
     return head;
   });
 }
+const geoLiveCache = processSingleton(
+  'v2-geo-live-results',
+  () => new QueryCache(128, 8 * 1024 * 1024),
+);
+const geoLiveTtl = 10 * 60000;
+
 export async function readGeoWeightSnapshot(
   actor: CrawlerActor,
   websiteId: string,
   input: unknown,
-  options: { signal?: AbortSignal; statusOnly?: boolean } = {},
+  options: {
+    signal?: AbortSignal;
+    statusOnly?: boolean;
+    legacyExportDigest?: boolean;
+    fresh?: boolean;
+  } = {},
 ): Promise<GeoWeightSnapshotResponse> {
   if (options.signal?.aborted) throw new LiekanError('统计读取已取消', 499);
   const p = parseGeoSnapshotQuery(input);
   if (warehouseV2Enabled() && !p.snapshotId && !p.taskId) {
-    const access = await transaction(tx =>
-      geoSnapshotAccess(tx, actor, websiteId, p.timezone, p.asOf),
-    );
-    const result = await calculateGeoWeight(
-      actor,
-      websiteId,
-      { asOf: p.asOf, timezone: p.timezone, view: 'detail' },
-      { fresh: true, signal: options.signal },
-    );
-    const snapshot: Snapshot = {
-      id: undefined,
-      as_of: p.asOf,
-      result,
-    };
-    const response = envelope(p, access, { id: null, task_status: 'ready' }, snapshot);
-    if (response.result) {
+    const view = options.legacyExportDigest ? 'detail' : p.view;
+    const end = geoWindow(p.asOf, p.timezone).endAt;
+    const start = geoWindow(
+      view === 'detail' ? geoDateOffset(p.asOf, -30) : p.asOf,
+      p.timezone,
+    ).startAt;
+    const boundary = () =>
+      transaction(async tx => {
+        const access = await geoSnapshotAccess(tx, actor, websiteId, p.timezone, p.asOf);
+        const controls = await geoControlHistory(tx, websiteId, start, end);
+        return { access, key: [access.strongVersion, access.ownership, controls] };
+      });
+    return withPublishedRegistry(async catalog => {
+      const before = await boundary();
+      const history = () => geoLogHistory(websiteId, end, options.signal);
+      const logs = await history();
+      const key = digest([
+        websiteId,
+        p.timezone,
+        p.asOf,
+        view,
+        catalog.version,
+        catalog.state,
+        catalog.contentHash,
+        before.key,
+        logs,
+      ]);
+      const context = currentCacheContext();
+      const cached =
+        options.fresh || context?.refresh || context?.bypass
+          ? undefined
+          : geoLiveCache.getLocal<GeoWeightResponse>(key);
+      const result =
+        cached?.value ??
+        (await calculateGeoWeight(
+          actor,
+          websiteId,
+          { asOf: p.asOf, timezone: p.timezone, view },
+          { fresh: true, signal: options.signal },
+        ));
+      if (!cached && digest(logs) !== digest(await history()))
+        throw new LiekanError('统计基准已变化，请重新读取', 409);
+      const after = await boundary();
+      if (digest(before.key) !== digest(after.key))
+        throw new LiekanError('统计基准已变化，请重新读取', 409);
+      if (options.signal?.aborted) throw new LiekanError('统计读取已取消', 499);
+      const generatedAt = Date.parse(result.calculatedAt);
+      const expiresAt = cached?.expiresAt ?? generatedAt + geoLiveTtl;
+      if (!cached && !context?.bypass)
+        geoLiveCache.putLocal(key, { value: result, generatedAt, expiresAt, status: 'miss' }, []);
+      const response = envelope(
+        p,
+        after.access,
+        { id: null, task_status: 'ready' },
+        { as_of: p.asOf, result: { ...result, dataRevision: after.access.dataRevision } },
+      );
       noteCacheResult({
         value: response,
-        generatedAt: Date.parse(response.result.calculatedAt),
-        expiresAt: Date.now() + 60000,
-        status: 'miss',
-        tier: 'database' as any,
+        generatedAt,
+        expiresAt,
+        status: cached ? 'hit' : 'miss',
+        tier: cached ? 'memory' : 'computed',
       });
-    }
-    return response;
+      return response;
+    });
   }
   let state = await inspect(actor, websiteId, p);
   if (
@@ -653,7 +716,8 @@ export async function readGeoWeightSnapshot(
     (!state.head ||
       (state.head.task_status === 'ready' &&
         (!state.snapshot || state.snapshot.as_of !== p.asOf)) ||
-      (warehouseEnabled() && ['capacity_exhausted','result_too_large'].includes(state.head.error_code)) ||
+      (warehouseEnabled() &&
+        ['capacity_exhausted', 'result_too_large'].includes(state.head.error_code)) ||
       state.head.error_code === 'authority_or_boundary_changed')
   ) {
     const head = await register(actor, websiteId, p);
@@ -687,7 +751,7 @@ export async function recalculateGeoWeight(actor: CrawlerActor, websiteId: strin
   const { requestId, ...query } = parsed.data;
   const p = parseGeoSnapshotQuery({ ...query, view: 'detail' });
   if (warehouseV2Enabled()) {
-    return readGeoWeightSnapshot(actor, websiteId, p);
+    return readGeoWeightSnapshot(actor, websiteId, p, { fresh: true });
   }
   const head = await register(actor, websiteId, p, { requestId });
   const state = await inspect(actor, websiteId, head.id ? { ...p, taskId: head.id } : p);
@@ -707,7 +771,9 @@ export async function readLegacyGeoWeight(
   const p = parseGeoWeightQuery(input);
   const query = { ...p, mode: 'historical' as const };
   const deadline = Math.min(options.deadline || Infinity, Date.now() + 5000);
-  let state = await readGeoWeightSnapshot(actor, websiteId, query, { signal: options.signal });
+  // The legacy export locates a saved detail result by the digest returned by this GET.
+  const readOptions = { signal: options.signal, legacyExportDigest: true };
+  let state = await readGeoWeightSnapshot(actor, websiteId, query, readOptions);
   while (
     !state.result &&
     ['queued', 'running'].includes(state.taskStatus) &&
@@ -719,7 +785,7 @@ export async function readLegacyGeoWeight(
       },
     );
     state = await readGeoWeightSnapshot(actor, websiteId, query, {
-      signal: options.signal,
+      ...readOptions,
       statusOnly: true,
     });
   }

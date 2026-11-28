@@ -2,7 +2,16 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { withControlReadTiming } from '../warehouse/control-db';
 
-export type ReadStage = 'analysis-coverage' | 'analysis-proof' | 'log-extent' | 'log-page';
+export type ReadStage =
+  | 'analysis-coverage'
+  | 'analysis-proof'
+  | 'log-extent'
+  | 'log-page'
+  | 'browser-population'
+  | 'overview-browser-window'
+  | 'overview-log-aggregate'
+  | 'log-window-presence'
+  | 'log-trend';
 
 // Bounded identifiers and numeric counters only; never query text, parameters or rows.
 type ReadTrace = {

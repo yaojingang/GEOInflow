@@ -9,6 +9,7 @@ const h = vi.hoisted(() => ({
   boss: null as any,
   catalog: null as any,
   aggregate: vi.fn(),
+  history: vi.fn(),
   first: vi.fn(),
   queries: [] as string[],
   queueFailure: false,
@@ -66,6 +67,10 @@ vi.mock('../log-ingestion/queue', () => ({
     }
     return h.boss;
   },
+}));
+vi.mock('./warehouse-geo-history', async original => ({
+  ...(await original<typeof import('./warehouse-geo-history')>()),
+  geoLogHistory: (...args: any[]) => h.history(...args),
 }));
 vi.mock('./geo-weight-sql', () => ({
   geoWeightAggregate: (...args: any[]) => h.aggregate(...args),
@@ -141,6 +146,9 @@ describe.skipIf(!enabled)('durable GEO snapshots in an owned PostgreSQL database
       CREATE TABLE team(team_id uuid PRIMARY KEY,deleted_at timestamptz);CREATE TABLE team_user(team_id uuid,user_id uuid,role text);
       CREATE TABLE liekan_setting(website_id uuid PRIMARY KEY,ai_crawler_enabled boolean);
       CREATE TABLE liekan_log_state(website_id uuid PRIMARY KEY,epoch int,data_revision bigint DEFAULT 0,policy_revision bigint DEFAULT 0);
+      CREATE TABLE liekan_v2_evidence_deletion(website_id uuid PRIMARY KEY, revision bigint, pending_kind text);
+      CREATE TABLE liekan_ingest_batch(website_id uuid,state text);
+      CREATE TABLE liekan_crawler_registry_current(id int,version uuid);
       CREATE TABLE liekan_crawler_state(website_id uuid PRIMARY KEY,deleted_at timestamptz);
       CREATE TABLE liekan_crawler_quality(website_id uuid,source_id uuid,starts_at timestamptz,ends_at timestamptz,state text,evidence jsonb,recorded_at timestamptz);
       CREATE TABLE liekan_log_source(id uuid PRIMARY KEY,website_id uuid,domain text,deleted_at timestamptz);
@@ -171,7 +179,7 @@ describe.skipIf(!enabled)('durable GEO snapshots in an owned PostgreSQL database
   }, 30000);
   beforeEach(async () => {
     await q(
-      `TRUNCATE liekan_warehouse_installation,liekan_geo_weight_request,liekan_geo_weight_head,liekan_geo_weight_snapshot,liekan_geo_weight_evidence_revision,"user",website,liekan_log_state,liekan_log_source,liekan_log,liekan_crawler_evidence,liekan_crawler_quality,liekan_crawler_rule_version,liekan_crawler_registry_version,liekan_crawler_range_snapshot,liekan_log_interval,liekan_crawler_state CASCADE`,
+      `TRUNCATE liekan_v2_evidence_deletion,liekan_ingest_batch,liekan_crawler_registry_current,liekan_warehouse_installation,liekan_geo_weight_request,liekan_geo_weight_head,liekan_geo_weight_snapshot,liekan_geo_weight_evidence_revision,"user",website,liekan_log_state,liekan_log_source,liekan_log,liekan_crawler_evidence,liekan_crawler_quality,liekan_crawler_rule_version,liekan_crawler_registry_version,liekan_crawler_range_snapshot,liekan_log_interval,liekan_crawler_state CASCADE`,
     );
     await boss.deleteAllJobs(GEO_SNAPSHOT_QUEUE);
     await q('INSERT INTO "user"(user_id,role) VALUES($1,\'admin\')', actor.id);
@@ -181,6 +189,9 @@ describe.skipIf(!enabled)('durable GEO snapshots in an owned PostgreSQL database
       actor.id,
     );
     await q('INSERT INTO liekan_log_state(website_id,epoch) VALUES($1,1)', site);
+    h.history
+      .mockReset()
+      .mockResolvedValue([{ segment: 'hours', rows: '1', fingerprint: randomUUID() }]);
     h.aggregate.mockReset().mockResolvedValue([]);
     h.first.mockReset().mockResolvedValue(null);
     h.queries = [];
@@ -193,6 +204,112 @@ describe.skipIf(!enabled)('durable GEO snapshots in an owned PostgreSQL database
   afterAll(async () => {
     await boss?.stop();
     await pool?.end();
+  });
+  it('scores one window for a live v2 summary and keeps the six-window digest on the legacy export path', async () => {
+    vi.stubEnv('LIEKAN_WAREHOUSE_V2', '1');
+    try {
+      h.aggregate.mockImplementation(async (_tx, _site, _host, _timezone, windows) =>
+        windows.map(({ asOf }) => ({
+          asOf,
+          stats: { requests: 8, accepted: 4, classificationVersions: ['class-1'] },
+          factors: [{ purpose: 'search', paths: 3, units: 4, days: 2, operators: 1 }],
+        })),
+      );
+      h.first.mockResolvedValue('2020-01-01');
+      const summary = await readGeoWeightSnapshot(actor, site, { ...input(), view: 'summary' });
+      const detail = await readGeoWeightSnapshot(actor, site, input());
+      const repeated = await readGeoWeightSnapshot(actor, site, { ...input(), view: 'summary' });
+      const legacy = await readLegacyGeoWeight(actor, site, {
+        asOf: summary.servedAsOf,
+        timezone: 'UTC',
+        view: 'summary',
+      });
+      expect(h.aggregate.mock.calls.map(call => call[4].length)).toEqual([1, 6]);
+      expect(summary.result.current).toEqual(detail.result.current);
+      expect(summary.result.current.weightedUnits).toBe(40);
+      expect(summary.result.snapshot).toBe(repeated.result.snapshot);
+      expect(summary.result.snapshot).not.toBe(detail.result.snapshot);
+      expect(legacy.snapshot).toBe(detail.result.snapshot);
+      expect(legacy.current).toEqual(summary.result.current);
+      expect(summary.snapshotId).toBeNull();
+      expect(detail.result.observations).toHaveLength(5);
+      for (const key of ['previous', 'observations', 'comparison']) {
+        expect(summary.result).not.toHaveProperty(key);
+        expect(legacy).not.toHaveProperty(key);
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+  it('recomputes when pending work or historical coverage changes without a new log', async () => {
+    vi.stubEnv('LIEKAN_WAREHOUSE_V2', '1');
+    try {
+      const request = input();
+      const first = await readGeoWeightSnapshot(actor, site, request);
+      await q("INSERT INTO liekan_ingest_batch(website_id,state) VALUES($1,'pending')", site);
+      await readGeoWeightSnapshot(actor, site, request);
+      expect(h.aggregate).toHaveBeenCalledTimes(2);
+      await q("DELETE FROM liekan_ingest_batch WHERE website_id=$1", site);
+      await q(
+        `INSERT INTO liekan_crawler_quality(website_id,starts_at,ends_at,state,evidence)
+         VALUES($1,$2::date - interval '1 day',$2::date,'partial','{}')`,
+        site,first.requestedAsOf,
+      );
+      await readGeoWeightSnapshot(actor, site, request);
+      expect(h.aggregate).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+  it('checks deletion and authorization again on a live v2 cache hit', async () => {
+    vi.stubEnv('LIEKAN_WAREHOUSE_V2', '1');
+    try {
+      await readGeoWeightSnapshot(actor, site, input());
+      h.history.mockImplementationOnce(async () => {
+        await q("INSERT INTO liekan_v2_evidence_deletion VALUES($1,1,'session')", site);
+        return h.history.getMockImplementation()();
+      });
+      await expect(readGeoWeightSnapshot(actor, site, input())).rejects.toMatchObject({
+        status: 503,
+      });
+      await q('UPDATE liekan_v2_evidence_deletion SET pending_kind=NULL WHERE website_id=$1', site);
+      await readGeoWeightSnapshot(actor, site, input());
+      h.history.mockImplementationOnce(async () => {
+        await q('UPDATE website SET deleted_at=now() WHERE website_id=$1', site);
+        return h.history.getMockImplementation()();
+      });
+      await expect(readGeoWeightSnapshot(actor, site, input())).rejects.toMatchObject({
+        status: 404,
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+  it('rejects a cached score if team access is revoked while reading its history key', async () => {
+    vi.stubEnv('LIEKAN_WAREHOUSE_V2', '1');
+    const team = randomUUID();
+    try {
+      await q('INSERT INTO team(team_id) VALUES($1)', team);
+      await q(
+        'INSERT INTO team_user(team_id,user_id,role) VALUES($1,$2,$3)',
+        team,
+        actor.id,
+        'team-member',
+      );
+      await q(`UPDATE "user" SET role='user' WHERE user_id=$1`, actor.id);
+      await q('UPDATE website SET user_id=NULL,team_id=$2 WHERE website_id=$1', site, team);
+      await readGeoWeightSnapshot(actor, site, input());
+      h.history.mockImplementationOnce(async () => {
+        await q('DELETE FROM team_user WHERE team_id=$1 AND user_id=$2', team, actor.id);
+        return h.history.getMockImplementation()();
+      });
+      await expect(readGeoWeightSnapshot(actor, site, input())).rejects.toMatchObject({
+        status: 404,
+      });
+      expect(h.aggregate).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
   it('coalesces fifty simultaneous readers into one durable demand and publishes null evidence as ready', async () => {
     const states = await Promise.all(

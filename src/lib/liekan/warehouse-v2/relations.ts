@@ -56,13 +56,25 @@ function logIntervalFilter(alias = 'l'): string {
   return `((isNull(${alias}.source_id) AND NOT ${interval}) OR (isNotNull(${alias}.source_id) AND ${interval}))`;
 }
 
+export const v2GeoEvidenceColumns = `nullIf(request_host, '') AS _geo_host,
+    nullIf(host_basis, '') AS _geo_basis,
+    JSONExtract(coalesce(nullIf(JSONExtractRaw(evidence_json,'measurement'),''),'{}'),'samplingTimeBasis','Nullable(String)') AS _geo_sampling_time,
+    JSONExtract(coalesce(nullIf(JSONExtractRaw(evidence_json,'measurement'),''),'{}'),'samplingBasis','Nullable(String)') AS _geo_sampling_basis,
+    sampling_rate AS _geo_sampling_rate,
+    JSONExtract(coalesce(identity_evidence,'{}'),'reason','Nullable(String)') AS _geo_reason,
+    nullIf(content_type_state, '') AS _geo_mime_state,
+    nullIf(content_type_value, '') AS _geo_mime`;
+
 export function v2EffectiveLogRelation(options: FactReadOptions = {}): string {
   const timeClause = timeWindowClause(options, 'l.created_at');
+  const evidence = options.geoEvidence
+    ? `, l.crawler_id, l.catalog_version, l.classification_version, ${v2GeoEvidenceColumns}`
+    : '';
   return `(SELECT
     l.id, l.website_id, l.import_id, l.created_at, l.path, l.method, l.status, l.bytes,
     l.ip_masked, l.ip_hash, l.user_agent, l.location, l.bot, l.vendor, l.bot_type,
     l.verification, l.source_id, l.event_digest, l.verification_version, l.ai_eligible,
-    l.recognition_state, l.recognition_candidates, l.verification_observed_at, l.verification_reason
+    l.recognition_state, l.recognition_candidates, l.verification_observed_at, l.verification_reason${evidence}
   FROM ${v2Tables.logs} l
   WHERE l.website_id = {wh_site:UUID} AND l.epoch = {wh_epoch:UInt64} AND l._deleted = 0
     ${timeClause}
@@ -80,6 +92,7 @@ export function v2ReportingLogRelation(
     import_id: 'l.import_id',
     created_at: 'l.created_at',
     path: 'l.path',
+    ...(projection?.includes('human_path') ? { human_path: 'l.human_path' } : {}),
     method: 'l.method',
     status: 'l.status',
     bytes: 'l.bytes',

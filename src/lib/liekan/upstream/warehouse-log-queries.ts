@@ -215,6 +215,7 @@ export async function warehouseLogWindowHasFacts(
         site,
         `SELECT 1 AS present ${rawLogWindow(endExclusive)} LIMIT 1`,
         range(start, end),
+        { traceStage: 'log-window-presence' },
       );
       return rows.length > 0;
     },
@@ -268,18 +269,24 @@ export async function warehouseLogToday(id: string, start: Date, end: Date) {
         );
         return { requests: exactCount(row.requests), abnormal: exactCount(row.abnormal) };
       }),
-      warehouseReader().db.read<{ accepted: string }>(
-        'SELECT coalesce(sum(accepted),0)::text AS accepted FROM liekan_import WHERE website_id=$1::uuid AND imported_at BETWEEN $2 AND $3',
-        [id, start, end],
-      ),
+      warehouseAcceptedImports(id,start,end),
     ]);
-    return { ...counts, accepted: exactCount(imports[0].accepted) };
+    return { ...counts, accepted: imports };
   });
 }
+
+export async function warehouseAcceptedImports(id:string,start:Date,end:Date) {
+  const [row] = await warehouseReader().db.read<{ accepted: string }>(
+    'SELECT coalesce(sum(accepted),0)::text AS accepted FROM liekan_import WHERE website_id=$1::uuid AND imported_at BETWEEN $2 AND $3',
+    [id, start, end],
+  );
+  return exactCount(row.accepted);
+}
+const trendHourFormat = '%Y-%m-%d %H:00';
 const trendColumns = ['created_at', 'bot', 'bot_type', 'ai_eligible'];
 const trendCounts = `count() AS count,countIf(${crawlerAiSql('l')}) AS aiRequests`;
 
-type LogTrendRow = { day: string; bot: string; type: string; count: number; aiRequests: number };
+export type LogTrendRow = { day: string; bot: string; type: string; count: number; aiRequests: number };
 
 const aiHourColumns = ['created_at', 'ai_eligible', 'bot_type'];
 function aiHourSql(source: string) {
@@ -313,9 +320,10 @@ export async function warehousePlotLogs(
         return warehouseNumbers(
           await warehouseReportQuery<LogTrendRow>(
             id,
-            `SELECT formatDateTime(created_at,'${hour ? '%Y-%m-%d %H:00' : '%Y-%m-%d'}',{timezone:String}) AS day,bot,bot_type AS type,
+            `SELECT formatDateTime(created_at,'${hour ? trendHourFormat : '%Y-%m-%d'}',{timezone:String}) AS day,bot,bot_type AS type,
        ${trendCounts} ${scoped(metrics, trendColumns, false, { endExclusive }, false, { start: +start, end: +end, endExclusive })} GROUP BY day,bot,type ORDER BY day`,
             range(start, end, timezone),
+            { traceStage: 'log-trend' },
           ),
         );
       },
@@ -539,8 +547,15 @@ export function warehouseOverviewAggregateStates(
   };
 }
 
-export function renderWarehouseOverviewAggregate(source: string) {
-  return `SELECT section,multiIf(section='summary',
+export function renderWarehouseOverviewAggregate(source: string, live?: LiveOverviewLogs) {
+  return `SELECT section,multiIf(${
+    live?.todayEnd
+      ? "section='today',toJSONString(map('requests',toString(requests),'abnormal',toString(abnormal))),"
+      : ''
+  }${live?.hourlyTrend
+    ? "section='trend',toJSONString(map('day',trendHour,'bot',name,'type',type,'count',toString(requests),'aiRequests',toString(ai))),"
+    : ''
+  }section='summary',
     toJSONString(map('requests',toString(requests),'ai',toString(ai),'pages',toString(pages),'abnormal',toString(abnormal),
       'classificationVersions',toString(classificationVersions),'legacyRequests',toString(legacyRequests),'unclassifiedRequests',toString(unclassifiedRequests))),
     section='bots',toJSONString(map('name',name,'vendor',vendor,'type',type,'botId',botId,'requests',toString(requests),'aiRequests',toString(ai),'pages',toString(pages),'lastVisit',toString(lastTime))),
@@ -550,16 +565,79 @@ export function renderWarehouseOverviewAggregate(source: string) {
   SETTINGS optimize_aggregation_in_order=1`;
 }
 
+type LiveOverviewLogs = {
+  paths: string[];
+  catalogPaths?: string[];
+  todayEnd?: Date;
+  hourlyTrend?: boolean;
+};
+export function liveOverviewLogs(
+  start: Date,
+  end: Date,
+  timezone: string,
+  metrics: CrawlerMetricOptions,
+  live: LiveOverviewLogs,
+) {
+  return {
+    sql: renderWarehouseOverviewAggregate(
+      overviewAggregateRows(metrics, false, 'counts', undefined, live),
+      live,
+    ),
+    params: {
+      ...range(start, end, timezone),
+      overviewPaths: live.paths,
+      ...(live.catalogPaths?.length ? { catalogPaths: live.catalogPaths } : {}),
+      staticPattern: logCountPattern,
+      ...(live.todayEnd ? { todayEnd: warehouseTime(live.todayEnd) } : {}),
+    },
+  };
+}
 function overviewAggregateRows(
   metrics: CrawlerMetricOptions,
   restrictEvidenceToWindow: boolean,
   output: 'counts' | 'states' | 'days',
   readWindow?: AnalysisWindow,
+  live?: LiveOverviewLogs,
 ) {
   const ai = crawlerAiSql('l');
   const unknown = unknownCrawlerSql('l');
-  const columns = overviewLogColumns;
   const groupDay = output === 'days';
+  const today = !!live?.todayEnd;
+  const trend = live?.hourlyTrend === true;
+  const separateSelfChecks = today && metrics.crawlerMetricsVersion === 1;
+  const columns = [
+    ...overviewLogColumns,
+    ...(live ? ['human_path'] : []),
+    ...(separateSelfChecks ? ['user_agent'] : []),
+  ];
+  const selected = live
+    ? `(l.human_path IN {overviewPaths:Array(String)} OR l.path IN {overviewPaths:Array(String)}
+    OR (l.human_path='' AND position(l.path,'%')>0))`
+    : '1';
+  const botGroup = live
+    ? `(section='bots' OR (section='pages' AND ${selected}))`
+    : `section!='summary'`;
+  const pageFilter = live?.catalogPaths
+    ? ` AND (${selected}${live.catalogPaths.length ? ' OR l.path IN {catalogPaths:Array(String)}' : ''})`
+    : '';
+  const reportSection = `(k='summary' OR (l._present AND ((k='bots' AND NOT ${unknown}) OR
+    (k='pages' AND ${ai}${pageFilter})${trend ? " OR k='trend'" : ''})))`;
+  const sections = today
+    ? `arrayFilter(k -> (k='today' AND (NOT l._present OR l.created_at<={todayEnd:DateTime64(6,'UTC')}))
+    OR (${reportSection}${
+        separateSelfChecks
+          ? " AND (NOT l._present OR l.user_agent NOT LIKE 'Liekan-Crawler-Check/%')"
+          : ''
+      }),['summary','bots','pages','today'${trend ? ",'trend'" : ''}])`
+    : `arrayFilter(k -> ${reportSection},['summary','bots','pages'${trend ? ",'trend'" : ''}])`;
+  const relation = scoped(
+    separateSelfChecks ? { ...metrics, crawlerMetricsVersion: undefined } : metrics,
+    columns,
+    true,
+    groupDay || separateSelfChecks ? { endExclusive: true } : undefined,
+    restrictEvidenceToWindow,
+    readWindow,
+  );
   const day = 'toDate32(assumeNotNull(l.created_at),{timezone:String})';
   const unique = (value: string, condition: string) =>
     output === 'counts'
@@ -568,20 +646,29 @@ function overviewAggregateRows(
   // One zero-weight seed preserves the empty aggregate row without another fact
   // scan. A complete day with no rows is recorded in the coverage checkpoint.
   return `SELECT ${groupDay ? `${day} AS day,` : ''}section,
-    if(section='summary',NULL,l.bot) AS name,if(section='bots',l.vendor,NULL) AS vendor,
-    if(section='bots',l.bot_type,NULL) AS type,if(section='summary',NULL,l.reporting_crawler_id) AS botId,
+    ${trend ? `if(section='trend',formatDateTime(l.created_at,'${trendHourFormat}',{timezone:String}),NULL) AS trendHour,` : ''}
+    if(${botGroup}${trend ? " OR section='trend'" : ''},l.bot,NULL) AS name,if(section='bots',l.vendor,NULL) AS vendor,
+    if(section='bots'${trend ? " OR section='trend'" : ''},l.bot_type,NULL) AS type,if(${botGroup},l.reporting_crawler_id,NULL) AS botId,
     if(section='pages',l.path,NULL) AS path,
-    countIf(l._present) AS requests,countIf(l._present AND ${ai}) AS ai,
-    ${unique('l.path', `l._present AND (section='bots' OR (section='summary' AND ${ai}))`)} AS pages,
+    countIf(l._present${
+      today ? " AND (section!='today' OR NOT match(l.path,{staticPattern:String}))" : ''
+    }) AS requests,countIf(l._present AND ${ai}) AS ai,
+    ${unique(
+      'l.path',
+      `l._present AND (section='bots' OR (section='summary' AND ${ai}))`,
+    )} AS pages,
     countIf(l._present AND l.status>=400) AS abnormal,
-    ${unique("coalesce(l.reporting_classification_version,'legacy')", "l._present AND section='summary'")} AS classificationVersions,
+    ${unique(
+      "coalesce(l.reporting_classification_version,'legacy')",
+      "l._present AND section='summary'",
+    )} AS classificationVersions,
     countIf(l._present AND isNull(l.ai_eligible)) AS legacyRequests,
     countIf(l._present AND ${unknown}) AS unclassifiedRequests,max(l.created_at) AS lastTime
-    FROM (SELECT ${columns.map(c => `l.${c}`).join(',')},1 AS _present ${scoped(metrics, columns, true, groupDay ? { endExclusive: true } : undefined, restrictEvidenceToWindow, readWindow)}
+    FROM (SELECT ${columns.map(c => `l.${c}`).join(',')},1 AS _present ${relation}
       UNION ALL SELECT ${columns.map(() => 'NULL').join(',')},0 AS _present) l
-    ARRAY JOIN arrayFilter(k -> k='summary' OR (l._present AND ((k='bots' AND NOT ${unknown}) OR (k='pages' AND ${ai}))),['summary','bots','pages']) AS section
+    ARRAY JOIN ${sections} AS section
     ${groupDay ? `WHERE l._present AND ${day} IN {overviewDays:Array(Date32)}` : ''}
-    GROUP BY ${groupDay ? 'day,' : ''}section,name,vendor,type,botId,path`;
+    GROUP BY ${groupDay ? 'day,' : ''}${trend ? 'trendHour,' : ''}section,name,vendor,type,botId,path`;
 }
 
 export async function warehouseLogFacts(...args: Parameters<typeof import('./logs').getLogFacts>) {

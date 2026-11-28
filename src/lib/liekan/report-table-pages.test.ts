@@ -140,6 +140,36 @@ describe('buildReport serialization slicing', () => {
     expect(mocks.today).toHaveBeenCalledTimes(1);
   });
 
+  it('uses the prepared hourly spider counts, including a proved empty window', async () => {
+    const logs = { ...(await mocks.logs()), latest: new Date(1) };
+    const day = '1970-01-01 00:00';
+    const input = { ...params, endAt: 20 * 60_000, chartPeriod: 'today' };
+    const bins = [
+      { day, bot: 'A', type: '搜索', count: 4, aiRequests: 3 },
+      { day, bot: 'B', type: '搜索', count: 2, aiRequests: 0 },
+    ];
+    const report = await buildReport(website, false, input, true, false, undefined, {
+      logs,
+      logBins: bins,
+    });
+    expect(report.charts.d1.labels).toEqual([day]);
+    expect(report.charts.d1.series[1].values).toEqual([3]);
+
+    const empty = await buildReport(website, false, input, true, false, undefined, { logBins: [] });
+    expect(empty.charts.d1.labels).toEqual([]);
+    expect(mocks.plotLogs).not.toHaveBeenCalled();
+
+    await buildReport(website, false, { ...input, startAt: 60_000 }, true);
+    expect(mocks.plotLogs).toHaveBeenCalledWith(
+      website.id,
+      new Date(0),
+      new Date(input.endAt),
+      'UTC',
+      true,
+      expect.anything(),
+    );
+  });
+
   it('keeps the prepared current-day cutoff after the adapter finishes later', async () => {
     const cutoff = Date.parse('2026-11-03T04:00:00Z');
     const clock = vi.spyOn(Date, 'now').mockReturnValue(cutoff);

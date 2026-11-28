@@ -19,7 +19,11 @@ import {
   warehouseOverviewLogWindow,
   warehousePlotLogs,
 } from './warehouse-log-queries';
-import { warehouseGeoWeightAggregate } from './warehouse-geo-weight';
+import {
+  warehouseCrawlerWindowVersions,
+  warehouseGeoWeightAggregate,
+  warehouseGeoWeightFirstEvidence,
+} from './warehouse-geo-weight';
 import { decodeWarehouseLogCursor } from './warehouse-log-cursor';
 import { factRelation } from '../warehouse/read';
 import { type AnalysisRead, withAnalysisRead } from '../warehouse/analysis-context';
@@ -374,6 +378,55 @@ it('evaluates GEO classification once before expanding its overlapping windows',
   expect(sql).toContain('enable_materialized_cte=1');
   expect(mocks.query.mock.calls[1][2].geoDates).toEqual(['2026-11-02', '2026-11-01']);
 });
+
+it('reads v2 GEO versions, scores and first evidence from one interval-filtered log relation each', async () => {
+  vi.stubEnv('LIEKAN_WAREHOUSE_V2', '1');
+  try {
+    const versions = [{ catalogs: [], verifications: [] }];
+    mocks.query
+      .mockResolvedValueOnce(versions)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(versions)
+      .mockResolvedValueOnce([{ day: null }]);
+    const tx = { query: async () => [], execute: async () => 0 };
+    await warehouseGeoWeightAggregate(tx, 'site', 'fixture.invalid', 'UTC', [
+      { asOf: '2026-11-02', startAt: +start, endAt: +end },
+    ]);
+    await warehouseGeoWeightFirstEvidence(tx, 'site', 'fixture.invalid', 'UTC', +end);
+    expect(mocks.query).toHaveBeenCalledTimes(4);
+    for (const [, sql] of mocks.query.mock.calls) {
+      expect(sql.match(/\bFROM ch_v2_logs\b/g)).toHaveLength(1);
+      expect(sql).toContain('l.website_id = {wh_site:UUID}');
+      expect(sql).toContain('l.epoch = {wh_epoch:UInt64}');
+      expect(sql).toContain('l._deleted = 0');
+      expect(sql).toContain('l.created_at < {geoEnd:');
+      expect(sql).toContain('wh_interval_source');
+    }
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+it.each([undefined, '55077568-2dfc-4632-98b2-35242eaa1863'])(
+  'reads crawler window quality from the same v2 row for source %s',
+  async source => {
+    vi.stubEnv('LIEKAN_WAREHOUSE_V2', '1');
+    try {
+      mocks.query.mockResolvedValueOnce([{ classes: '2', sources: '1', legacy: '3' }]);
+      const result = await warehouseCrawlerWindowVersions('site', +start, +end, source);
+      const [, sql, params] = mocks.query.mock.calls[0];
+      expect(sql.match(/\bFROM ch_v2_logs\b/g)).toHaveLength(1);
+      expect(sql).toContain("coalesce(l.classification_version,'legacy')");
+      expect(sql).toContain("coalesce(toString(l.source_id),'manual')");
+      expect(sql).toContain("l.user_agent NOT LIKE 'Liekan-Crawler-Check/%'");
+      expect(sql).toContain('l.created_at < {geoEnd:');
+      expect(params.geoSource).toBe(source ?? null);
+      expect(result.legacy).toBe(3);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  },
+);
 
 it('preserves microseconds and uses only visible rows for split log page cursors', async () => {
   const scope = 'a'.repeat(64);

@@ -1,4 +1,7 @@
-import { formatInTimeZone } from 'date-fns-tz';
+import { calendarDayRange } from '../contracts/calendar';
+import { normalizeHumanTotals } from './server';
+import { warehouseTime } from '../warehouse/fact-input';
+import { warehouseV2Enabled } from '../warehouse-v2/runtime';import { formatInTimeZone } from 'date-fns-tz';
 import { capturingReportRankings, recordReportRanking } from './report-ranking-artifact';
 import { identityComplete, identityUsable } from '../contracts/browser-population';
 import { pageReportParts } from '../contracts/page-report';
@@ -6,17 +9,20 @@ import { applyHumanFactsPopulation } from '../contracts/population-results';
 import { type ReportQuery, tablePageSize } from '../contracts/query';
 import type { LiekanReport, Row } from '../contracts/report';
 import { classifyEntrySourceForDisplay } from '../contracts/sources';
-import { addReportAiPage, compareReportAiPages, reportLogRange } from '../report-log-tables';
+import { addReportAiPage, compareReportAiPages, reportLogRange, reportPlotStart } from '../report-log-tables';
 import type { PreparedReport } from '../report-prepared';
 import { timeReportQuery } from './analysis-diagnostics';
-import { getHumanFacts, type HumanFact } from './analytics';
-import { readBrowserPopulation } from './browser-population';
+import { getHumanFacts, humanDaysWithPopulation, type HumanFact } from './analytics';
+import { applyNativePopulation, readBrowserPopulation } from './browser-population';
 import { currentAnalyticsSignal } from './cache-context';
 import { getLogFacts } from './logs';
 import { humanPathFromEncoded } from './paths';
-import { warehouseBrowserParameters, warehouseVisitsSQL } from './warehouse-browser-queries';
+import { browserBinsSQL, warehouseBrowserParameters, warehouseVisitsSQL } from './warehouse-browser-queries';
 import { type EvidenceProducer, WarehouseEvidenceSpool } from './warehouse-evidence-spool';
 import {
+  warehouseAcceptedImports,
+  liveOverviewLogs,
+  type LogTrendRow,
   warehouseLogDate,
   warehouseLogQuerySpec,
   warehouseLogWindowHasFacts,
@@ -25,6 +31,7 @@ import {
 } from './warehouse-log-queries';
 import {
   countUncrawledCatalogPaths,
+  overviewCatalogPaths,
   streamWarehouseCatalogPaths,
 } from './warehouse-page-path-summary';
 import {
@@ -53,10 +60,10 @@ const dailySourceTail = ` SELECT formatDateTime(started,'%Y-%m-%d',{timezone:Str
   FROM visits GROUP BY day,referrer,utmSource,utmMedium,utmCampaign ORDER BY day,referrer,utmSource,utmMedium,utmCampaign`;
 function numeric(row: any) {
   const result = { ...row };
-  for (const key of [...sourceMetrics, 'duration', 'uv', 'entries', 'samples']) {
+  for (const key of [...sourceMetrics, 'duration', 'uv', 'entries', 'samples', 'total', 'pageviews', 'visitors', 'visits', 'totaltime']) {
     if (result[key] == null) continue;
     const value = Number(result[key]);
-    if (!Number.isFinite(value) || (key !== 'duration' && !Number.isSafeInteger(value)))
+    if (!Number.isFinite(value) || (key !== 'duration' && key !== 'totaltime' && !Number.isSafeInteger(value)))
       throw new Error('warehouse-counter-out-of-range');
     result[key] = value;
   }
@@ -486,6 +493,158 @@ export async function buildWarehouseBrowserSources(
   };
 }
 
+function emptyVisitWindow(
+  population: Awaited<ReturnType<typeof readBrowserPopulation>> | undefined,
+  site: string,
+  start: Date,
+  end: Date,
+  timezone: string,
+) {
+  return (
+    population?.resourceId === site &&
+    population.identity.eligibleEvents === 0 &&
+    population.range.startAt === +start &&
+    population.range.endAt === +end &&
+    population.range.timezone === timezone &&
+    !population.range.endExclusive
+  );
+}
+// Share one qualified event window. Only the requested ranking slices cross the HTTP
+// server boundary; global cards and the full source groups retain their original scope.
+async function readOverviewBrowserWindow(
+  site: string,
+  p: ReportQuery,
+  range: ReturnType<typeof reportLogRange>,
+  spool: WarehouseEvidenceSpool,
+) {
+  const { start, end, now, clock } = range;
+  const population = await readBrowserPopulation(site, start, end, p.timezone);
+  const todayStart = calendarDayRange(clock?.dayAt ?? now, p.timezone).startAt;
+  const exactToday = todayStart === +start && now >= +start && now <= +end;
+  const plot =
+    p.chartPeriod === 'today' && calendarDayRange(p.endAt, p.timezone).startAt === +start;
+  const tables = ['topBody', 'visitorTopBody'];
+  const offsets = tables.map(t => ((p.tablePages[t] ?? 1) - 1) * tablePageSize);
+  const pages: Record<string, any[]> = Object.fromEntries(tables.map(t => [t, []]));
+  if (emptyVisitWindow(population, site, start, end, p.timezone)) {
+    const empty = { pageviews: 0, visitors: 0, visits: 0, bounces: 0, totaltime: 0 };
+    return {
+      totals: normalizeHumanTotals(
+        applyNativePopulation([empty], 'getWebsiteStats', population)[0],
+      ),
+      rows: pages,
+      sources: undefined,
+      total: 0,
+      entryPath: null,
+      duration: null,
+      todayConversions: exactToday ? 0 : undefined,
+      browserBins: plot ? humanDaysWithPopulation([], population) : undefined,
+    };
+  }
+  const params = await warehouseBrowserParameters(site, start, end, p.timezone);
+  const bins: any[] = [];
+  let totals: ReturnType<typeof normalizeHumanTotals>;
+  let total = 0,
+    entryPath: string | null = null,
+    duration: number | null = null,
+    todayConversions: number | undefined;
+  const asRows = (section: string, sql: string, order = '0') =>
+    `SELECT '${section}' AS section, ${order} AS seq, formatRowNoNewline('JSONEachRow', *) AS payload FROM (${sql})`;
+  const sql =
+    warehouseVisitsSQL(false, false, { start: +start, end: +end }, true) +
+    `,
+    paths AS MATERIALIZED (WITH ${pageTail.slice(1)}),
+    ranked AS (SELECT *, row_number() OVER (ORDER BY pv DESC,path) AS ordinal FROM paths)
+    SELECT * FROM (
+      ${asRows(
+        'totals',
+        'SELECT sum(pv) AS pageviews,uniqExact(session_id) AS visitors,count() AS visits,countIf(pv=1 AND custom=0) AS bounces,coalesce(sum(duration),0) AS totaltime FROM visits',
+      )}
+      UNION ALL ${asRows(
+        'global',
+        'SELECT count() AS total,argMinOrNull(path,tuple(-toInt64(entries),-toInt64(pv),path)) AS entryPath,sum(duration*samples)/nullIf(sum(samples),0) AS duration FROM paths',
+      )}
+      UNION ALL ${asRows(
+        'path',
+        'SELECT * FROM ranked WHERE arrayExists(off -> ordinal>off AND ordinal-off<={pageSize:UInt64}, {offsets:Array(UInt64)})',
+        'ordinal',
+      )}
+      UNION ALL ${asRows(
+        'source',
+        sourceTail,
+        'row_number() OVER (ORDER BY sessions DESC,referrer,utmSource,utmMedium,utmCampaign)',
+      )}
+      ${plot ? 'UNION ALL ' + asRows('bin', browserBinsSQL(true)) : ''}
+      ${
+        exactToday
+          ? 'UNION ALL ' +
+            asRows(
+              'converted',
+              "SELECT uniqExact(event_id) AS count FROM matches WHERE created_at<={todayEnd:DateTime64(6,'UTC')}",
+            )
+          : ''
+      }
+    ) ORDER BY section,seq SETTINGS enable_materialized_cte=1`;
+  const sources = await spool.write<any>(emit =>
+    warehouseReportStream<{ section: string; payload: string }>(
+      site,
+      sql,
+      { ...params, offsets, pageSize: tablePageSize, todayEnd: warehouseTime(new Date(now)) },
+      async batch => {
+        for (const { section, payload } of batch) {
+          const row = numeric(JSON.parse(payload));
+          switch (section) {
+            case 'totals':
+              totals = normalizeHumanTotals(
+                applyNativePopulation([row], 'getWebsiteStats', population)[0],
+              );
+              break;
+            case 'global':
+              total = Number(row.total);
+              entryPath = row.entryPath;
+              duration = row.duration;
+              break;
+            case 'path': {
+              const { ordinal, ...data } = row;
+              tables.forEach((t, i) => {
+                if (Number(ordinal) > offsets[i] && Number(ordinal) - offsets[i] <= tablePageSize)
+                  pages[t].push(data);
+              });
+              break;
+            }
+            case 'source':
+              await emit(row);
+              break;
+            case 'bin':
+              bins.push(row);
+              break;
+            case 'converted':
+              todayConversions = row.count;
+              break;
+            default:
+              throw new Error('warehouse-overview-section-invalid');
+          }
+        }
+      },
+      currentAnalyticsSignal(),
+      false,
+      'overview-browser-window',
+    ),
+  );
+  if (!totals || !Number.isSafeInteger(total)) throw new Error('warehouse-overview-window-invalid');
+  bins.sort((a, b) => lexical(a.day, b.day));
+  return {
+    totals,
+    sources,
+    rows: pages,
+    total,
+    entryPath,
+    duration,
+    todayConversions,
+    browserBins: plot ? humanDaysWithPopulation(bins, population) : undefined,
+  };
+}
+
 export async function prepareWarehouseBrowserPageReport(
   site: string,
   p: ReportQuery,
@@ -499,56 +658,102 @@ export async function prepareWarehouseBrowserPageReport(
   const parts = pageReportParts[p.resource],
     { start, end } = range;
   const skipped = new Set(['pages', 'sources', 'previousSources', 'dailySources']);
-  const human = await getHumanFacts(
-    site,
-    start,
-    end,
-    p.timezone,
-    parts.human.filter(field => !skipped.has(field)) as readonly HumanFact[],
-  );
-  const population = human.totals.population;
-  // The observed population includes every event eligible for the qualified
-  // visit streams. Only a proved empty, identical window can skip those reads.
-  const emptyBrowserWindow =
-    p.resource === 'overview' &&
-    population?.resourceId === site &&
-    population.identity.eligibleEvents === 0 &&
-    population.range.startAt === +start &&
-    population.range.endAt === +end &&
-    population.range.timezone === p.timezone &&
-    !population.range.endExclusive;
-  const streamCurrentBrowser = (sql: string, emit: (row: any) => Promise<void>) =>
-    emptyBrowserWindow ? Promise.resolve() : streamBrowser(site, start, end, p.timezone, sql, emit);
-  const logs = await getLogFacts(
-    site,
-    start,
-    end,
-    p.timezone,
-    p.page,
-    p.filter,
-    p.search,
-    p.cursor,
-    p.seek,
-    parts.logs.filter(
-      field =>
-        ![
-          'pages',
-          'catalog',
-          ...(p.resource === 'overview' ? ['summary', 'bots'] : []),
-          ...(p.resource === 'human/sources' ? ['daily'] : []),
-        ].includes(field),
-    ),
-    p,
-  );
-
   const spool = await WarehouseEvidenceSpool.create(warehouseReportSignal());
   try {
+    const useShared =
+      warehouseV2Enabled() &&
+      p.resource === 'overview' &&
+      !overviewSnapshot &&
+      !capturingReportRankings();
+    const readHuman = async () => {
+      const shared = useShared
+        ? await timeReportQuery('overview-browser-paths', () =>
+            readOverviewBrowserWindow(site, p, range, spool),
+          )
+        : undefined;
+      const human = await getHumanFacts(
+        site,
+        start,
+        end,
+        p.timezone,
+        parts.human.filter(field => !skipped.has(field)) as readonly HumanFact[],
+        undefined,
+        shared ? { totals: shared.totals } : undefined,
+      );
+      return { shared, human };
+    };
+    const readLogs = () =>
+      getLogFacts(
+        site,
+        start,
+        end,
+        p.timezone,
+        p.page,
+        p.filter,
+        p.search,
+        p.cursor,
+        p.seek,
+        parts.logs.filter(
+          field =>
+            ![
+              'pages',
+              'catalog',
+              ...(p.resource === 'overview' ? ['summary', 'bots'] : []),
+              ...(p.resource === 'human/sources' ? ['daily'] : []),
+            ].includes(field),
+        ),
+        p,
+      );
+    const inputs = async () => {
+      if (!useShared) return [await readHuman(), await readLogs()] as const;
+      const [human, logs] = await Promise.allSettled([readHuman(), readLogs()]);
+      if (human.status === 'rejected') throw human.reason;
+      if (logs.status === 'rejected') throw logs.reason;
+      return [human.value, logs.value] as const;
+    };
+    const [{ shared, human }, logs] = await inputs();
+    const population = human.totals.population;
+    // The observed population includes every event eligible for the qualified
+    // visit streams. Only a proved empty, identical window can skip those reads.
+    const emptyBrowserWindow =
+      p.resource === 'overview' && emptyVisitWindow(population, site, start, end, p.timezone);
+    const streamCurrentBrowser = (sql: string, emit: (row: any) => Promise<void>) =>
+      emptyBrowserWindow
+        ? Promise.resolve()
+        : streamBrowser(site, start, end, p.timezone, sql, emit);
+
+    const wanted = shared
+      ? new Set<string>(
+          Object.values(shared.rows)
+            .flat()
+            .map(row => row.path),
+        )
+      : undefined;
+    const dayStart = calendarDayRange(range.clock?.dayAt ?? range.now, p.timezone).startAt;
+    const until =
+      shared &&
+      dayStart === +start &&
+      range.now >= dayStart &&
+      (range.now < +end || (!range.halfOpen && range.now === +end)) &&
+      p.crawlerIdentityScope === 'all'
+        ? new Date(range.now)
+        : undefined;
+    const hourlyTrend =
+      !!shared && ['today', '24h'].includes(p.chartPeriod) && reportPlotStart(p, range) === +start;
+    const logBins: LogTrendRow[] | undefined = hourlyTrend ? [] : undefined;
+    let contentCounts: { requests: number; abnormal: number } | undefined;
+    const catalogPaths = shared && catalogCount && logs.latest
+      ? await overviewCatalogPaths(site, catalogCount)
+      : [];
+    const uncrawled = catalogPaths && new Set(catalogPaths);
     const overviewPages =
       p.resource === 'overview'
         ? await timeReportQuery('overview-log-aggregate', () =>
             spool.write<any>(async emit => {
-              const window = await warehouseOverviewLogWindow(site, start, end, range.halfOpen);
-              if (!window.hasFacts) {
+              const window = shared
+                ? undefined
+                : await warehouseOverviewLogWindow(site, start, end, range.halfOpen);
+              if (window && !window.hasFacts) {
                 logs.summary = {
                   requests: 0,
                   ai: 0,
@@ -560,18 +765,25 @@ export async function prepareWarehouseBrowserPageReport(
                 };
                 return;
               }
-              const spec = await warehouseLogQuerySpec(
-                start,
-                end,
-                p.timezone,
-                p,
-                p.filter,
-                p.search,
-                false,
-                site,
-                true,
-                window.restrictEvidenceToWindow,
-              ).then(({ overview, params }) => ({ sql: overview, params }));
+              const spec = shared
+                ? liveOverviewLogs(start, end, p.timezone, p, {
+                    paths: [...wanted],
+                    catalogPaths,
+                    todayEnd: until,
+                    hourlyTrend,
+                  })
+                : await warehouseLogQuerySpec(
+                    start,
+                    end,
+                    p.timezone,
+                    p,
+                    p.filter,
+                    p.search,
+                    false,
+                    site,
+                    true,
+                    window.restrictEvidenceToWindow,
+                  ).then(({ overview, params }) => ({ sql: overview, params }));
               let summarySeen = false;
               await warehouseReportStream<{ section: string; row: string }>(
                 site,
@@ -584,59 +796,81 @@ export async function prepareWarehouseBrowserPageReport(
                       if (summarySeen) throw new Error('warehouse-overview-duplicate-summary');
                       summarySeen = true;
                       logs.summary = row;
+                    } else if (item.section === 'trend' && logBins) {
+                      logBins.push(row as LogTrendRow);
+                    } else if (item.section === 'today') {
+                      contentCounts = { requests: row.requests, abnormal: row.abnormal };
                     } else if (item.section === 'bots')
                       logs.bots.push({ ...row, lastVisit: warehouseLogDate(row.lastVisit) });
-                    else if (item.section === 'pages') await emit(row);
+                    else if (item.section === 'pages') {
+                      if (shared && uncrawled) {
+                        uncrawled.delete(row.path);
+                        if (!wanted.has(humanPathFromEncoded(row.path))) continue;
+                      }
+                      await emit(row);
+                    }
                     else throw new Error('warehouse-overview-section-invalid');
                   }
                 },
                 currentAnalyticsSignal(),
+                false,
+                'overview-log-aggregate',
               );
               if (!summarySeen) throw new Error('warehouse-overview-summary-missing');
             }),
           )
         : undefined;
-    const pageData =
-      p.resource !== 'human/sources'
-        ? await timeReportQuery('overview-page-ranking', () =>
-            buildWarehouseBrowserPages(
-              spool,
-              p,
-              emit =>
-                timeReportQuery('overview-browser-paths', () =>
-                  streamCurrentBrowser(pageTail, emit),
-                ),
-              async emit => {
-                if (overviewPages) {
-                  for await (const row of overviewPages.iterate()) await emit(row);
-                  return;
-                }
-                const spec = await warehouseLogQuerySpec(
-                  start,
-                  end,
-                  p.timezone,
-                  p,
-                  p.filter,
-                  p.search,
-                  false,
-                  site,
-                );
-                await warehouseReportStream(
-                  site,
-                  spec.statements.pages,
-                  spec.params,
-                  async batch => {
-                    for (const row of warehouseNumbers(batch)) await emit(row);
-                  },
-                  currentAnalyticsSignal(),
-                );
-              },
-              overviewSnapshot,
-            ),
-          )
-        : undefined;
-    const catalogCoverage =
-      overviewPages && catalogCount && logs.latest && overviewPages.total
+
+    const pageData = shared
+      ? {
+          total: shared.total,
+          entryPath: shared.entryPath,
+          duration: shared.duration,
+          rows: shared.rows,
+          ranking: undefined,
+          ai: await browserPageCrawlerRows(spool, wanted, async emit => {
+            for await (const row of overviewPages.iterate()) await emit(row);
+          }),
+        }
+      : p.resource !== 'human/sources'
+      ? await timeReportQuery('overview-page-ranking', () =>
+          buildWarehouseBrowserPages(
+            spool,
+            p,
+            emit =>
+              timeReportQuery('overview-browser-paths', () => streamCurrentBrowser(pageTail, emit)),
+            async emit => {
+              if (overviewPages) {
+                for await (const row of overviewPages.iterate()) await emit(row);
+                return;
+              }
+              const spec = await warehouseLogQuerySpec(
+                start,
+                end,
+                p.timezone,
+                p,
+                p.filter,
+                p.search,
+                false,
+                site,
+              );
+              await warehouseReportStream(
+                site,
+                spec.statements.pages,
+                spec.params,
+                async batch => {
+                  for (const row of warehouseNumbers(batch)) await emit(row);
+                },
+                currentAnalyticsSignal(),
+              );
+            },
+            overviewSnapshot,
+          ),
+        )
+      : undefined;
+    const catalogCoverage = shared && logs.latest && uncrawled
+      ? { catalogCount:catalogPaths.length, blindCount:uncrawled.size }
+      : overviewPages && catalogCount && logs.latest && overviewPages.total
         ? await timeReportQuery('overview-catalog-coverage', () =>
             countUncrawledCatalogPaths(spool, overviewPages, emit =>
               streamWarehouseCatalogPaths(site, emit),
@@ -651,7 +885,10 @@ export async function prepareWarehouseBrowserPageReport(
         ? await buildWarehouseBrowserSources(
             spool,
             p,
-            emit => streamCurrentBrowser(sourceTail, emit),
+            async emit => {
+              if (!shared) return streamCurrentBrowser(sourceTail, emit);
+              if (shared.sources) for await (const row of shared.sources.iterate()) await emit(row);
+            },
             emit =>
               p.resource === 'human/sources'
                 ? streamBrowser(site, previousStart, previousEnd, p.timezone, sourceTail, emit)
@@ -677,6 +914,12 @@ export async function prepareWarehouseBrowserPageReport(
     return {
       range,
       human: masked,
+      browserBins: shared?.browserBins,
+      logBins,
+      todayConversions: shared?.todayConversions,
+      todayLogs: contentCounts
+        ? { ...contentCounts, accepted: await warehouseAcceptedImports(site, start, until) }
+        : undefined,
       logs,
       catalogCoverage,
       dispose: () => spool.dispose(),

@@ -40,6 +40,16 @@ export function reportLogRange(p: ReportQuery) {
   );
   return { clock, now, start, end, readEndAt, days, halfOpen };
 }
+export function reportPlotStart(
+  p: ReportQuery,
+  range: ReturnType<typeof reportLogRange>,
+  shared = false,
+) {
+  if (p.chartPeriod === 'today') return calendarDayRange(p.endAt, p.timezone).startAt;
+  const span = { '30d': 30, '7d': 7, '24h': 1 }[p.chartPeriod] * 86400000;
+  return Math.max(shared ? p.startAt : 0, (range.clock ? p.endAt : range.readEndAt) - span);
+}
+
 export const reportLogRow = (row: any) => ({
   ...row,
   ...(row.identityEvidence != null && typeof row.identityEvidence === 'object'

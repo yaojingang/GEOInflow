@@ -8,6 +8,7 @@ import { identifier } from '../warehouse/catalog';
 import { warehouseTime } from '../warehouse/fact-input';
 import { factRelation } from '../warehouse/read';
 import { effectiveLogRelation } from '../warehouse/reporting-relations';
+import { warehouseV2Enabled } from '../warehouse-v2/runtime';
 import type { AiTx } from './ai-db';
 import { warehouseReportQuery, withinWarehouseReport } from './warehouse-report-snapshot';
 
@@ -15,55 +16,59 @@ type Window = { asOf: string; startAt: number; endAt: number };
 const js = (v: string, ...keys: string[]) =>
   `JSONExtract(${v},${keys.map(k => `'${k}'`).join(',')},'Nullable(String)')`;
 const jb = (v: string, key: string) => `JSONExtract(${v},'${key}','Nullable(Bool)')`;
-const raw = (purpose: 'evaluation' | 'versions' | 'first' = 'evaluation') => {
+const raw = (purpose: 'evaluation' | 'versions' | 'first' | 'quality' = 'evaluation') => {
+  const immutableTimeWindow = { start: 'geoStart', end: 'geoEnd', endExclusive: true };
+  if (warehouseV2Enabled()) return effectiveLogRelation({ immutableTimeWindow, geoEvidence: true });
   const logColumns =
     purpose === 'versions'
       ? ['website_id', 'id', 'created_at', 'source_id', 'verification_version']
-      : purpose === 'first'
-        ? ['website_id', 'id', 'created_at', 'source_id', 'user_agent']
-        : [
-            'website_id',
-            'id',
-            'created_at',
-            'path',
-            'status',
-            'source_id',
-            'ai_eligible',
-            'recognition_state',
-            'verification',
-            'verification_version',
-            'verification_reason',
-            'verification_observed_at',
-            'method',
-            'user_agent',
-          ];
+      : purpose === 'first' || purpose === 'quality'
+      ? ['website_id', 'id', 'created_at', 'source_id', 'user_agent']
+      : [
+          'website_id',
+          'id',
+          'created_at',
+          'path',
+          'status',
+          'source_id',
+          'ai_eligible',
+          'recognition_state',
+          'verification',
+          'verification_version',
+          'verification_reason',
+          'verification_observed_at',
+          'method',
+          'user_agent',
+        ];
   const evidenceColumns =
-    purpose === 'versions'
+    purpose === 'quality'
+      ? ['classification_version']
+      : purpose === 'versions'
       ? ['catalog_version']
       : purpose === 'first'
-        ? ['catalog_version', 'classification_version', '_geo_host', '_geo_basis']
-        : [
-            'crawler_id',
-            'catalog_version',
-            'classification_version',
-            '_geo_host',
-            '_geo_basis',
-            '_geo_sampling_time',
-            '_geo_sampling_basis',
-            '_geo_sampling_rate',
-            '_geo_reason',
-            '_geo_mime_state',
-            '_geo_mime',
-          ];
+      ? ['catalog_version', 'classification_version', '_geo_host', '_geo_basis']
+      : [
+          'crawler_id',
+          'catalog_version',
+          'classification_version',
+          '_geo_host',
+          '_geo_basis',
+          '_geo_sampling_time',
+          '_geo_sampling_basis',
+          '_geo_sampling_rate',
+          '_geo_reason',
+          '_geo_mime_state',
+          '_geo_mime',
+        ];
   return `(SELECT ${logColumns.map(c => `l.${identifier(c)} AS ${identifier(c)}`).join(',')},
     ${evidenceColumns.map(c => `e.${identifier(c)} AS ${identifier(c)}`).join(',')}
     FROM ${effectiveLogRelation({
-      immutableTimeWindow: { start: 'geoStart', end: 'geoEnd', endExclusive: true },
+      immutableTimeWindow,
       columns: logColumns,
     })} l LEFT JOIN ${factRelation('liekan_crawler_evidence', {
-      columns: ['website_id', 'log_id', ...evidenceColumns],
-      ...(purpose !== 'versions' ? { geoEvidence: true } : {}),
-    })} e ON e.website_id=l.website_id AND e.log_id=l.id)`;
+    columns: ['website_id', 'log_id', ...evidenceColumns],
+    ...(['evaluation', 'first'].includes(purpose) ? { geoEvidence: true } : {}),
+  })} e ON e.website_id=l.website_id AND e.log_id=l.id)`;
 };
 async function metadata(tx: AiTx, site: string, range: Record<string, unknown>) {
   // Only catalog/rule-version identifiers cross to PG; paths and log IDs remain in CH.
@@ -356,15 +361,10 @@ export async function warehouseCrawlerWindowVersions(
 ) {
   const [r] = await warehouseReportQuery<any>(
     site,
-    `SELECT uniqExact(coalesce(e.classification_version,'legacy')) AS classes,
-    min(e.classification_version) AS classification,uniqExact(coalesce(toString(l.source_id),'manual')) AS sources,
-    min(toString(l.source_id)) AS source,countIf(isNull(e.classification_version)) AS legacy
-    FROM ${effectiveLogRelation({
-      immutableTimeWindow: { start: 'geoStart', end: 'geoEnd', endExclusive: true },
-      columns: ['website_id', 'id', 'created_at', 'source_id', 'user_agent'],
-    })} l LEFT JOIN ${factRelation('liekan_crawler_evidence', {
-      columns: ['website_id', 'log_id', 'classification_version'],
-    })} e ON e.website_id=l.website_id AND e.log_id=l.id
+    `SELECT uniqExact(coalesce(l.classification_version,'legacy')) AS classes,
+    min(l.classification_version) AS classification,uniqExact(coalesce(toString(l.source_id),'manual')) AS sources,
+    min(toString(l.source_id)) AS source,countIf(isNull(l.classification_version)) AS legacy
+    FROM ${raw('quality')} l
     WHERE l.user_agent NOT LIKE 'Liekan-Crawler-Check/%'
       AND ({geoSource:Nullable(UUID)} IS NULL OR l.source_id={geoSource:Nullable(UUID)})`,
     {

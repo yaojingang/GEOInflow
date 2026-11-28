@@ -42,7 +42,12 @@ export async function warehouseBrowserParameters(
     goalValues: definitions.map(d => d.parameters.value),
   };
 }
-export function warehouseVisitsSQL(halfOpen = false, geography = false, window?: AnalysisWindow) {
+export function warehouseVisitsSQL(
+  halfOpen = false,
+  geography = false,
+  window?: AnalysisWindow,
+  overview = false,
+) {
   const prepared = analysisWindowRelation(
     'browser',
     [
@@ -63,23 +68,32 @@ export function warehouseVisitsSQL(halfOpen = false, geography = false, window?:
     attributed AS (SELECT *,argMinIf(tuple(referrer_domain,utm_source,utm_medium,utm_campaign,referrer_path,referrer_query,utm_term),tuple(created_at,event_id),event_type NOT IN(2,5))
       OVER(PARTITION BY session_id,visit_id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS entry
       FROM all_events WHERE created_at<={end:DateTime64(6,'UTC')})`;
+  // Keep the materialized overview window narrow. All of its consumers share
+  // attribution and visit identity; none need raw properties or device dimensions.
+  const eventFields = overview
+    ? 'event_id,session_id,visit_id,created_at,event_type,url_path,entry,matched_goals'
+    : '*';
+  const environment = overview ? '' : `max(liekan_browser) OVER visit AS visit_browser,
+    max(liekan_os) OVER visit AS visit_os,max(liekan_device) OVER visit AS visit_device,`;
+  const visitDimensions = overview ? '' : `visit_browser AS browser,visit_os AS os,visit_device AS device,
+    liekan_country AS country,liekan_region AS region,liekan_city AS city,`;
   return `WITH ${attribution},
     events AS (SELECT *,arrayMap(g->g.1,arrayFilter(g ->
       ((g.2='path' AND event_type=1) OR (g.2!='path' AND event_type=2)) AND
       if(startsWith(g.3,'*') OR endsWith(g.3,'*'),if(g.2='path',url_path,event_name) LIKE replaceRegexpOne(replaceRegexpOne(g.3,'^[*]','%'),'[*]$','%'),if(g.2='path',url_path,event_name)=g.3),
       arrayZip({goalIds:Array(UUID)},{goalTypes:Array(String)},{goalValues:Array(String)}))) AS matched_goals
       FROM attributed WHERE created_at>={start:DateTime64(6,'UTC')} AND created_at${halfOpen ? '<' : '<='}{end:DateTime64(6,'UTC')} AND event_type!=5),
-    window_events AS (SELECT *,countIf(event_type NOT IN(2,5)) OVER visit AS visit_pv,countIf(event_type=2) OVER visit AS visit_custom,
+    window_events AS ${overview ? 'MATERIALIZED ' : ''}(SELECT ${eventFields},countIf(event_type NOT IN(2,5)) OVER visit AS visit_pv,countIf(event_type=2) OVER visit AS visit_custom,
       tupleElement(argMinIf(tuple(event_id),tuple(created_at,event_id),event_type NOT IN(2,5)) OVER visit,1) AS visit_first,
       minIf(created_at,event_type NOT IN(2,5)) OVER visit AS visit_started,
       (maxIf(toUnixTimestamp64Micro(created_at),event_type NOT IN(2,5)) OVER visit-minIf(toUnixTimestamp64Micro(created_at),event_type NOT IN(2,5)) OVER visit)/1000000.0 AS visit_duration,
-      max(liekan_browser) OVER visit AS visit_browser,max(liekan_os) OVER visit AS visit_os,max(liekan_device) OVER visit AS visit_device,
+      ${environment}
       countIf(notEmpty(matched_goals)) OVER visit>0 AS visit_converted
       FROM events WINDOW visit AS (PARTITION BY session_id,visit_id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)),
     visits AS (SELECT session_id,visit_id,visit_pv AS pv,visit_custom AS custom,visit_started AS started,visit_duration AS duration,
-      visit_browser AS browser,visit_os AS os,visit_device AS device,liekan_country AS country,liekan_region AS region,liekan_city AS city,
+      ${visitDimensions}
       entry.1 AS referrer,entry.2 AS utmSource,entry.3 AS utmMedium,entry.4 AS utmCampaign,entry.5 AS referrerPath,entry.6 AS referrerQuery,entry.7 AS utmTerm,
-      visit_converted AS converted,liekan_session_created_at AS session_created_at
+      visit_converted AS converted${overview ? '' : ',liekan_session_created_at AS session_created_at'}
       FROM window_events WHERE event_type NOT IN(2,5) AND event_id=visit_first),
     definitions AS (SELECT g.1 AS report_id,g.2 AS name,g.3 AS type,g.4 AS value FROM (SELECT arrayJoin(arrayZip({goalIds:Array(UUID)},{goalNames:Array(String)},{goalTypes:Array(String)},{goalValues:Array(String)})) AS g)),
     matches AS (SELECT arrayJoin(matched_goals) AS report_id,event_id,created_at,visit_id,session_id,visit_pv FROM window_events)`;

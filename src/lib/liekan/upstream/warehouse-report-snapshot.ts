@@ -389,6 +389,7 @@ export async function warehouseReportStream<T extends Record<string, unknown>>(
   consume: (rows: T[]) => Promise<void>,
   signal?: AbortSignal,
   longRunning = false,
+  traceStage?: ReadStage,
 ) {
   return withinWarehouseReport(
     () =>
@@ -419,6 +420,7 @@ export async function warehouseReportStream<T extends Record<string, unknown>>(
               result.close();
             }
           },
+          traceStage,
         );
       }),
     { signal },
